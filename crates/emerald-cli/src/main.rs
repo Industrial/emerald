@@ -25,10 +25,14 @@ fn main() {
     process::exit(1);
   });
 
-  let program = match emerald_parser::parse(&source) {
+  let program = match emerald_parser::parse_named(&source, source_path) {
     Ok(p) => p,
     Err(e) => {
-      eprintln!("parse error: {e}");
+      // `ParseError` implements `miette::Diagnostic` (plan 13) — its
+      // `{:?}` rendering, via miette's `fancy`-feature graphical
+      // handler, is the source-snippet-and-caret display, not a bare
+      // one-line message.
+      eprintln!("{:?}", miette::Report::new(e));
       process::exit(1);
     }
   };

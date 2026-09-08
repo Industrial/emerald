@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 lalrpop-util = { version = "0.22", features = ["lexer"] }
+miette = { version = "7", features = ["derive"] }
+thiserror = "2"
 
 [build-dependencies]
 lalrpop = "0.22"

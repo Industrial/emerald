@@ -14,10 +14,61 @@ mod grammar {
 
 pub use ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
 
-pub fn parse(src: &str) -> Result<Program, String> {
+/// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
+/// byte-offset location info (plan `13`) to render a real source
+/// snippet + caret via `miette` — not just a bare message string. This
+/// is the parser's ONLY diagnostic with a real span; sema/codegen
+/// diagnostics stay text-only (see plan `13`'s Decision log — spans
+/// there would mean threading a span through every `Expr`/`Stmt`
+/// variant, out of this plan's scope).
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{message}")]
+pub struct ParseError {
+  message: String,
+  #[source_code]
+  src: miette::NamedSource<String>,
+  #[label("here")]
+  span: miette::SourceSpan,
+}
+
+/// Extracts a byte-offset span from whichever `lalrpop_util::ParseError`
+/// variant matched. `User` (this grammar's one fallible `=>?` action,
+/// the assignment-target check) carries no location at all — see plan
+/// 13's Decision log for that one disclosed gap; every other variant
+/// already tracks a real offset LALRPOP computed during parsing.
+fn to_parse_error<T: std::fmt::Display>(
+  e: lalrpop_util::ParseError<usize, T, String>,
+  name: &str,
+  src: &str,
+) -> ParseError {
+  let message = e.to_string();
+  let (start, end) = match &e {
+    lalrpop_util::ParseError::InvalidToken { location } => (*location, *location),
+    lalrpop_util::ParseError::UnrecognizedEof { location, .. } => (*location, *location),
+    lalrpop_util::ParseError::UnrecognizedToken { token, .. } => (token.0, token.2),
+    lalrpop_util::ParseError::ExtraToken { token } => (token.0, token.2),
+    lalrpop_util::ParseError::User { .. } => (0, 0),
+  };
+  let len = end.saturating_sub(start).max(1);
+  ParseError {
+    message,
+    src: miette::NamedSource::new(name, src.to_string()),
+    span: (start, len).into(),
+  }
+}
+
+/// Same as [`parse`], but names the source (shown in the rendered
+/// diagnostic's snippet header) as `name` instead of the generic
+/// `"<source>"` placeholder — `emerald-cli` uses this with the real file
+/// path it read `src` from.
+pub fn parse_named(src: &str, name: &str) -> Result<Program, ParseError> {
   grammar::grammar::ProgramParser::new()
     .parse(src)
-    .map_err(|e| e.to_string())
+    .map_err(|e| to_parse_error(e, name, src))
+}
+
+pub fn parse(src: &str) -> Result<Program, ParseError> {
+  parse_named(src, "<source>")
 }
 
 #[cfg(test)]
@@ -62,7 +113,22 @@ mod tests {
     let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b";
     let err = parse(src).unwrap_err();
     eprintln!("LALRPOP ERROR: {err}");
-    assert!(!err.is_empty());
+    assert!(!err.to_string().is_empty());
+  }
+
+  #[test]
+  fn parse_error_span_points_at_the_offending_token() {
+    // Plan 13 AC1: the span isn't just "present" — it points at the
+    // token's *actual* byte offset, verified against the source
+    // string's own position, not merely asserted to exist.
+    let src = "x: Int64 = +\n";
+    let err = parse(src).expect_err("`+` alone is not a valid Expr");
+    let expected_offset = src.find('+').unwrap();
+    assert_eq!(err.span.offset(), expected_offset);
+    // `ParseError` must satisfy `miette::Diagnostic` for `emerald-cli`
+    // to render it — proven by actually constructing a `Report`.
+    let report: miette::Report = miette::Report::new(err);
+    assert!(!format!("{report:?}").is_empty());
   }
 
   const HELLO_EM: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
