@@ -1,0 +1,10 @@
+[package]
+name = "emerald-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+emerald-parser = { path = "../emerald-parser" }
+emerald-sema = { path = "../emerald-sema" }
+emerald-codegen = { path = "../emerald-codegen" }

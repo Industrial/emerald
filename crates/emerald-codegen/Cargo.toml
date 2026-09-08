@@ -7,5 +7,7 @@ license.workspace = true
 [dependencies]
 cranelift = "0.135"
 cranelift-jit = "0.135"
+cranelift-object = "0.135"
 cranelift-module = "0.135"
 cranelift-native = "0.135"
+emerald-parser = { path = "../emerald-parser" }
