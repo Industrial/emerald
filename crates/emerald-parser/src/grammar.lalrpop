@@ -1,4 +1,5 @@
 use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
+use crate::ast::decode_string_lit;
 
 grammar;
 
@@ -193,6 +194,7 @@ StmtPrimaryExpr: Expr = {
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
+  <s:StringLitTok> => Expr::StringLit(s),
   <name:InstanceVarTok> => Expr::InstanceVar(name),
   <name:Ident> => Expr::Ident(name),
 };
@@ -297,6 +299,7 @@ PrimaryExpr: Expr = {
   },
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
+  <s:StringLitTok> => Expr::StringLit(s),
   <name:InstanceVarTok> => Expr::InstanceVar(name),
   <name:Ident> => Expr::Ident(name),
 };
@@ -356,3 +359,14 @@ Ident: String = <s:r"[A-Za-z_][A-Za-z0-9_]*"> => s.to_string();
 
 // `@name` — strips the leading `@` in the action.
 InstanceVarTok: String = <s:r"@[A-Za-z_][A-Za-z0-9_]*"> => s[1..].to_string();
+
+// Plan 19: `"..."` — content is a run of any byte except `"`/`\`, or one
+// of the two recognized two-byte escapes (`\"`, `\n`). No other
+// backslash sequence is admitted by this regex at all, so `"\t"` (an
+// unrecognized escape) or an unterminated `"` with no closing quote
+// simply fails to match any token here — a real parse error (an
+// "invalid token"/"unrecognized EOF" from LALRPOP), never a silent
+// pass-through or a panic. `decode_string_lit` (above `grammar;`)
+// strips the quotes and decodes the two escapes into the literal's real
+// `String` value.
+StringLitTok: String = <s:r#""([^"\\]|\\[n"])*""#> => decode_string_lit(&s);

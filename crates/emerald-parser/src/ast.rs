@@ -4,6 +4,33 @@ pub struct Param {
   pub ty: String,
 }
 
+/// Decodes a raw `"..."` token's `\"`/`\n` escapes into the literal's
+/// real `String` value (plan 19's Decision log — only these two
+/// escapes are recognized; `grammar.lalrpop`'s `StringLitTok` regex
+/// admits no other backslash sequence, so an unrecognized escape fails
+/// to lex as a string token at all — a real parse error, not a silent
+/// pass-through). Strips the surrounding quotes. Lives here rather than
+/// inline in `grammar.lalrpop` — LALRPOP's grammar-file format doesn't
+/// support a bare top-level `fn` definition the way a plain Rust module
+/// does.
+pub fn decode_string_lit(raw: &str) -> String {
+  let inner = &raw[1..raw.len() - 1];
+  let mut out = String::with_capacity(inner.len());
+  let mut chars = inner.chars();
+  while let Some(c) = chars.next() {
+    if c == '\\' {
+      match chars.next() {
+        Some('"') => out.push('"'),
+        Some('n') => out.push('\n'),
+        _ => unreachable!("the lexer's regex only admits \\\" and \\n escapes"),
+      }
+    } else {
+      out.push(c);
+    }
+  }
+  out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
   Lt,
@@ -24,6 +51,10 @@ pub enum Expr {
   Ident(String),
   Int(i64),
   Float(f64),
+  /// `"..."` — plan 19's Decision log: a real, decoded `String` value
+  /// (only `\"`/`\n` escapes are ever recognized by the lexer that
+  /// produces this — see `grammar.lalrpop`'s `StringLitTok`).
+  StringLit(String),
   Add(Box<Expr>, Box<Expr>),
   Sub(Box<Expr>, Box<Expr>),
   Mul(Box<Expr>, Box<Expr>),

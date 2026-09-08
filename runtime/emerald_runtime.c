@@ -8,6 +8,7 @@
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 void emerald_print_i64(long long n) {
   printf("%lld\n", n);
@@ -22,6 +23,37 @@ void emerald_print_f64(double n) {
  * ownership system, no GC pressure, for now). */
 void *emerald_alloc(long long size) {
   return malloc((size_t) size);
+}
+
+/* Plan 19 (string literals). `String` is a bare pointer to a
+ * null-terminated UTF-8 buffer (spec/TYPE_SYSTEM.md §9) — no length
+ * header — specifically so these three helpers can reuse ordinary libc
+ * string functions with zero new conventions to hand-roll. */
+void emerald_print_str(const char *s) {
+  printf("%s\n", s);
+}
+
+/* `a + b` on two `String`s. Allocates via the existing `emerald_alloc`
+ * (no corresponding free — matches `emerald_alloc`'s own no-GC
+ * contract above) rather than calling `malloc` directly, so every
+ * heap allocation this runtime makes goes through the one path. */
+char *emerald_string_concat(const char *a, const char *b) {
+  size_t len_a = strlen(a);
+  size_t len_b = strlen(b);
+  char *out = emerald_alloc((long long) (len_a + len_b + 1));
+  memcpy(out, a, len_a);
+  memcpy(out + len_a, b, len_b);
+  out[len_a + len_b] = '\0';
+  return out;
+}
+
+/* `a == b` / `a != b` on two `String`s — byte-for-byte comparison, not
+ * pointer identity. Returns `0`/`1` rather than a real C `bool` so
+ * generated code can compare it against the `Int64` constant `0` via
+ * the same integer-comparison machinery every other codegen path
+ * already uses. */
+long long emerald_string_eq(const char *a, const char *b) {
+  return strcmp(a, b) == 0 ? 1 : 0;
 }
 
 /* `raise`/`begin...rescue...end` (plan 11) — a setjmp/longjmp handler

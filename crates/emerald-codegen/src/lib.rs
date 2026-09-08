@@ -36,21 +36,23 @@ use inkwell::{IntPredicate, OptimizationLevel};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Every runtime value this backend moves around is one of these three
-/// storage kinds — `Int64`/`Float64` scalars, or `Ptr` (a class
-/// instance, an `Array[T]` base address, or a `Proc`'s capture
-/// environment; all three are just addresses at this level, exactly as
-/// they were Cranelift `i64`s in the old backend). `Void`/`Bool` are
-/// bookkeeping-only: `Void` never labels an actual value, only a
-/// function's declared return kind; `Bool` only ever labels a
-/// `Expr::Compare` result on its way straight into a branch (the
-/// language has no boolean storage type any codegen path here actually
-/// exercises — see the Decision log).
+/// Every runtime value this backend moves around is one of these
+/// storage kinds — `Int64`/`Float64` scalars, `Ptr` (a class instance,
+/// an `Array[T]` base address, or a `Proc`'s capture environment; all
+/// just addresses at this level, exactly as they were Cranelift `i64`s
+/// in the old backend), or `Str` (plan 19 — a pointer to a
+/// null-terminated UTF-8 buffer, kept distinct from `Ptr` so `puts`/
+/// `Add`/`Compare` can dispatch to the right runtime helper without a
+/// side-table). `Void`/`Bool` are bookkeeping-only: `Void` never labels
+/// an actual value, only a function's declared return kind; `Bool`
+/// labels a `Expr::Compare`/`&&`/`||`/`!` result, or a real declared
+/// `Boolean`-typed value (plan 18) — both share the same `i1` storage.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ValKind {
   Int64,
   Float64,
   Ptr,
+  Str,
   Void,
   Bool,
 }
@@ -65,6 +67,9 @@ fn value_kind_for_type(ty: &str) -> ValKind {
     // `Compare`/`&&`/`||`/`!` result on its way straight into a
     // branch — both uses share the same `i1` storage kind.
     "Boolean" => ValKind::Bool,
+    // Plan 19: `String` is a real, declarable type too — kept distinct
+    // from the generic `Ptr` bucket (see `ValKind`'s doc comment).
+    "String" => ValKind::Str,
     _ => ValKind::Ptr,
   }
 }
@@ -77,7 +82,7 @@ fn local_llvm_type<'ctx>(context: &'ctx Context, kind: ValKind) -> BasicTypeEnum
   match kind {
     ValKind::Int64 => context.i64_type().into(),
     ValKind::Float64 => context.f64_type().into(),
-    ValKind::Ptr => context.ptr_type(AddressSpace::default()).into(),
+    ValKind::Ptr | ValKind::Str => context.ptr_type(AddressSpace::default()).into(),
     ValKind::Bool => context.bool_type().into(),
     ValKind::Void => unreachable!("internal: Void never used as a storage type"),
   }
@@ -96,7 +101,7 @@ fn make_fn_type<'ctx>(
     ValKind::Void => context.void_type().fn_type(&param_types, false),
     ValKind::Int64 => context.i64_type().fn_type(&param_types, false),
     ValKind::Float64 => context.f64_type().fn_type(&param_types, false),
-    ValKind::Ptr => context
+    ValKind::Ptr | ValKind::Str => context
       .ptr_type(AddressSpace::default())
       .fn_type(&param_types, false),
     ValKind::Bool => context.bool_type().fn_type(&param_types, false),
@@ -151,7 +156,11 @@ struct LambdaInfo {
 fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
   match expr {
     Expr::Ident(name) => out.push(name.clone()),
-    Expr::Int(_) | Expr::Float(_) | Expr::InstanceVar(_) | Expr::Lambda { .. } => {}
+    Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::InstanceVar(_)
+    | Expr::Lambda { .. } => {}
     Expr::Add(l, r)
     | Expr::Sub(l, r)
     | Expr::Mul(l, r)
@@ -468,6 +477,10 @@ struct Ctx<'a, 'ctx> {
   print_i64: FunctionValue<'ctx>,
   print_f64: FunctionValue<'ctx>,
   alloc: FunctionValue<'ctx>,
+  /// Plan 19's `String` runtime helpers.
+  print_str: FunctionValue<'ctx>,
+  string_concat: FunctionValue<'ctx>,
+  string_eq: FunctionValue<'ctx>,
   self_ctx: Option<(PointerValue<'ctx>, &'a HashMap<String, FieldInfo>)>,
   /// `{lambda's Let name} -> (its synthesized `__lambda_{name}` function,
   /// its declared return kind)`, for statically dispatching `.call`.
@@ -684,6 +697,19 @@ fn build_expr<'ctx>(
       ValKind::Int64,
     )),
     Expr::Float(f) => Ok((context.f64_type().const_float(*f).into(), ValKind::Float64)),
+    // Plan 19: `"..."` — a compile-time-constant byte sequence
+    // (plus a trailing NUL, matching `String`'s null-terminated
+    // representation) materialized as a private global constant, with
+    // a pointer to it returned as this expression's value.
+    // `build_global_string_ptr` deliberately does *not* deduplicate
+    // identical literals — a real, disclosed, low-risk optimization
+    // left for later (plan 19's Decision log AC2).
+    Expr::StringLit(s) => {
+      let global = builder
+        .build_global_string_ptr(s, "strlit")
+        .map_err(|e| e.to_string())?;
+      Ok((global.as_pointer_value().into(), ValKind::Str))
+    }
     Expr::Add(lhs, rhs) => {
       let (l, lk) = build_expr(
         context,
@@ -716,7 +742,16 @@ fn build_expr<'ctx>(
             .map_err(|e| e.to_string())?;
           Ok((sum.into(), ValKind::Float64))
         }
-        _ => Err("codegen: `+` operands must both be Int64 or both Float64".to_string()),
+        // Plan 19: `+` on two `String`s concatenates.
+        (ValKind::Str, ValKind::Str) => {
+          let call = builder
+            .build_call(ctx.string_concat, &[l.into(), r.into()], "concattmp")
+            .map_err(|e| e.to_string())?;
+          Ok((call_result(call)?, ValKind::Str))
+        }
+        _ => {
+          Err("codegen: `+` operands must both be Int64, both Float64, or both String".to_string())
+        }
       }
     }
     Expr::Sub(lhs, rhs) => build_numeric_binop(
@@ -896,6 +931,32 @@ fn build_expr<'ctx>(
           builder
             .build_float_compare(pred, l.into_float_value(), r.into_float_value(), "fcmptmp")
             .map_err(|e| e.to_string())?
+        }
+        // Plan 19: `==`/`!=` on two `String`s work "for free" under
+        // this generic `lt == rt` dispatch — `<`/`>`/`<=`/`>=` on
+        // strings are a real, disclosed, pre-existing gap (no
+        // lexicographic ordering is defined anywhere) this plan
+        // exposes but doesn't fix; they fail loudly here rather than
+        // silently emitting wrong code.
+        (ValKind::Str, ValKind::Str) if matches!(op, CompareOp::Eq | CompareOp::Ne) => {
+          let call = builder
+            .build_call(ctx.string_eq, &[l.into(), r.into()], "streqtmp")
+            .map_err(|e| e.to_string())?;
+          let eq_i64 = call_result(call)?.into_int_value();
+          let one = context.i64_type().const_int(1, false);
+          let pred = if matches!(op, CompareOp::Eq) {
+            IntPredicate::EQ
+          } else {
+            IntPredicate::NE
+          };
+          builder
+            .build_int_compare(pred, eq_i64, one, "strcmptmp")
+            .map_err(|e| e.to_string())?
+        }
+        (ValKind::Str, ValKind::Str) => {
+          return Err(format!(
+            "codegen: `{op:?}` is not supported on String — only `==`/`!=` are (no lexicographic ordering is defined)"
+          ));
         }
         _ => return Err("codegen: comparison operands must both be Int64 or both Float64".into()),
       };
@@ -1342,7 +1403,8 @@ fn build_puts<'ctx>(
   let target = match kind {
     ValKind::Int64 => ctx.print_i64,
     ValKind::Float64 => ctx.print_f64,
-    _ => return Err("codegen: `puts` only supports Int64/Float64 values".to_string()),
+    ValKind::Str => ctx.print_str,
+    _ => return Err("codegen: `puts` only supports Int64/Float64/String values".to_string()),
   };
   builder
     .build_call(target, &[v.into()], "puts")
@@ -2450,6 +2512,22 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 19 (string literals).
+  let print_str = module.add_function(
+    "emerald_print_str",
+    void_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_concat = module.add_function(
+    "emerald_string_concat",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_eq = module.add_function(
+    "emerald_string_eq",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let exc_funcs = declare_exception_runtime_funcs(&context, &module);
 
   // Class layouts (field offsets/kinds) and a stable per-class integer
@@ -2484,6 +2562,9 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     print_i64,
     print_f64,
     alloc,
+    print_str,
+    string_concat,
+    string_eq,
     self_ctx: None,
     lambda_func_ids: &lambda_func_ids,
     lambda_infos: &lambda_infos,
@@ -2828,6 +2909,44 @@ mod tests {
       )))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_rem_float_should_not_exist.o");
+    assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  // Plan 19 (string literals).
+
+  const STRING_EXAMPLE: &str = "s: String = \"hello\"\nputs s\na: String = \"foo\" + \"bar\"\nputs a\nif \"abc\" == \"abc\"\n  puts \"equal\"\nend\nputs \"line1\\nline2\"\nputs \"a\\\"b\"\n";
+
+  #[test]
+  fn string_example_linked_and_run() {
+    assert_eq!(
+      compile_link_run(STRING_EXAMPLE),
+      "hello\nfoobar\nequal\nline1\nline2\na\"b\n"
+    );
+  }
+
+  #[test]
+  fn two_identical_string_literals_each_produce_a_valid_independent_pointer() {
+    // AC2: no requirement that they alias the same data object.
+    let src = "puts \"same\"\nputs \"same\"\n";
+    assert_eq!(compile_link_run(src), "same\nsame\n");
+  }
+
+  #[test]
+  fn string_ordering_comparison_errors_not_panics() {
+    // AC3: `<`/`>`/`<=`/`>=` on two Strings — no lexicographic ordering
+    // is defined anywhere — is a descriptive `Err`, not a panic and not
+    // silently-wrong generated code.
+    let program = Program {
+      items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
+        "puts".into(),
+        vec![Expr::Compare(
+          Box::new(Expr::StringLit("a".into())),
+          CompareOp::Lt,
+          Box::new(Expr::StringLit("b".into())),
+        )],
+      )))],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_string_lt_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
   }
 }

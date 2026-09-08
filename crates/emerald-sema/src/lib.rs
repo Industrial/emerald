@@ -222,6 +222,9 @@ fn infer_expr_type(
       .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"))),
     Expr::Int(_) => Ok(Type::Int64),
     Expr::Float(_) => Ok(Type::Float64),
+    // Plan 19: a real `Type::String` value at last (the annotation
+    // already resolved; nothing could ever produce one before this).
+    Expr::StringLit(_) => Ok(Type::String),
     Expr::Add(lhs, rhs) => {
       let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
@@ -230,7 +233,10 @@ fn infer_expr_type(
           "type mismatch: `+` requires both operands to have the same type, found {lt:?} and {rt:?}"
         )));
       }
-      if lt != Type::Int64 && lt != Type::Float64 {
+      // Plan 19: `+` on two `String`s concatenates — this plan owns all
+      // of `Add`'s `Type::String` case (the separate operators plan is
+      // numeric/boolean-only and never touches `Add`/`String`).
+      if lt != Type::Int64 && lt != Type::Float64 && lt != Type::String {
         return Err(Diagnostic::new(format!(
           "type `{lt:?}` does not support `+`"
         )));
@@ -283,7 +289,7 @@ fn infer_expr_type(
         )));
       }
       let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields)?;
-      if arg_ty != Type::Int64 && arg_ty != Type::Float64 {
+      if arg_ty != Type::Int64 && arg_ty != Type::Float64 && arg_ty != Type::String {
         return Err(Diagnostic::new(format!(
           "`puts` does not support type {arg_ty:?}"
         )));
@@ -1313,6 +1319,37 @@ mod tests {
   #[test]
   fn sub_and_neg_agree_on_float64() {
     let src = "x: Float64 = 0.0 - 5.0\ny: Float64 = -5.0\nputs x\nputs y\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 19 (string literals).
+
+  #[test]
+  fn accepts_string_let_and_puts() {
+    let src = "s: String = \"hello\"\nputs s\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_string_concat() {
+    let src = "a: String = \"foo\" + \"bar\"\nputs a\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_string_plus_int() {
+    let src = "puts \"foo\" + 1\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject String + Int64");
+    assert!(errs[0].message.contains("String") && errs[0].message.contains("Int64"));
+  }
+
+  #[test]
+  fn accepts_string_equality_compare() {
+    let src = "if \"abc\" == \"abc\"\n  puts 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }

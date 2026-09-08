@@ -713,4 +713,72 @@ mod tests {
     // fully usable as a Let/return/argument value.
     assert!(parse("-5\n").is_err());
   }
+
+  // Plan 19 (string literals).
+
+  #[test]
+  fn parses_plain_string_literal() {
+    let program = parse("puts \"hello\"\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    assert_eq!(args[0], Expr::StringLit("hello".to_string()));
+  }
+
+  #[test]
+  fn decodes_escaped_quote() {
+    let program = parse("puts \"a\\\"b\"\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    assert_eq!(args[0], Expr::StringLit("a\"b".to_string()));
+  }
+
+  #[test]
+  fn decodes_escaped_newline() {
+    let program = parse("puts \"line1\\nline2\"\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    assert_eq!(args[0], Expr::StringLit("line1\nline2".to_string()));
+  }
+
+  #[test]
+  fn unterminated_string_literal_errors_not_panics() {
+    let src = "puts \"hello\n";
+    assert!(parse(src).is_err());
+  }
+
+  #[test]
+  fn unrecognized_escape_errors_not_panics() {
+    // `\t` isn't one of the two recognized escapes (`\"`/`\n`) — a real
+    // parse error, not a silent pass-through.
+    let src = "puts \"a\\tb\"\n";
+    assert!(parse(src).is_err());
+  }
+
+  #[test]
+  fn string_typed_let_and_concat_parse() {
+    let src = "s: String = \"hello\"\na: String = \"foo\" + \"bar\"\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Let {
+        name: "s".into(),
+        ty: "String".into(),
+        value: Expr::StringLit("hello".into()),
+      })
+    );
+    assert_eq!(
+      program.items[1],
+      Item::Stmt(Stmt::Let {
+        name: "a".into(),
+        ty: "String".into(),
+        value: Expr::Add(
+          Box::new(Expr::StringLit("foo".into())),
+          Box::new(Expr::StringLit("bar".into()))
+        ),
+      })
+    );
+  }
 }
