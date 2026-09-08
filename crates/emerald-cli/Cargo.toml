@@ -9,3 +9,4 @@ emerald-parser = { path = "../emerald-parser" }
 emerald-sema = { path = "../emerald-sema" }
 emerald-codegen = { path = "../emerald-codegen" }
 miette = { version = "7", features = ["fancy"] }
+id_effect = "0.4"
