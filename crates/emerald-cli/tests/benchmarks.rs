@@ -29,22 +29,18 @@ struct Measurement {
   binary_size: u64,
 }
 
-/// `backend` is `"cranelift"` or `"llvm"` (plan 16's bake-off — see
-/// `emerald-codegen-llvm`'s module doc for why the LLVM backend only
-/// covers `sum`/`array_traversal`'s AST shape, not the full language).
-fn compile_emerald(backend: &str, src: &Path, out: &Path) -> Duration {
+fn compile_emerald(src: &Path, out: &Path) -> Duration {
   let start = Instant::now();
   let status = Command::new(env!("CARGO_BIN_EXE_emerald-cli"))
     .arg(src)
     .arg("-o")
     .arg(out)
-    .arg(format!("--backend={backend}"))
     .status()
     .expect("failed to run emerald-cli");
   let elapsed = start.elapsed();
   assert!(
     status.success(),
-    "emerald-cli --backend={backend} should succeed compiling {src:?}"
+    "emerald-cli should succeed compiling {src:?}"
   );
   elapsed
 }
@@ -134,22 +130,7 @@ fn format_duration(d: Duration) -> String {
 fn benchmark(name: &str, expected: &str) -> Vec<Measurement> {
   let bench_dir = workspace_root().join("benchmarks").join(name);
   vec![
-    measure_one(
-      name,
-      "Emerald (Cranelift)",
-      "em",
-      |s, o| compile_emerald("cranelift", s, o),
-      expected,
-      &bench_dir,
-    ),
-    measure_one(
-      name,
-      "Emerald (LLVM)",
-      "em",
-      |s, o| compile_emerald("llvm", s, o),
-      expected,
-      &bench_dir,
-    ),
+    measure_one(name, "Emerald", "em", compile_emerald, expected, &bench_dir),
     measure_one(name, "Rust", "rs", compile_rustc, expected, &bench_dir),
     measure_one(
       name,
@@ -179,17 +160,18 @@ fn benchmarks() {
   report.push_str("# Emerald Benchmark Report\n\n");
   report.push_str(
     "Plan 15 (`benchmarking`) established this harness; plan 16 \
-     (`codegen-backend-bakeoff`), measured 2026-09-08, added a second, \
-     tuned Emerald backend (LLVM via `inkwell`) alongside a real \
-     `opt_level=speed` fix to the original Cranelift backend, and \
-     re-measured everything for real by compiling and running each \
-     program in `benchmarks/` during this test. Ruby is excluded (not \
-     installed in this environment); memory usage is not measured. See \
-     `.cursor/plans/benchmarking.plan.md` and \
-     `.cursor/plans/codegen-backend-bakeoff.plan.md` for the full \
+     (`codegen-backend-bakeoff`) benchmarked a tuned Cranelift backend \
+     against a new LLVM backend and found LLVM 5-18x faster on these two \
+     programs; the `consolidate-llvm-backend` plan then replaced \
+     Cranelift outright — `emerald-codegen` is now the single, \
+     full-language LLVM backend, measured for real by compiling and \
+     running each program in `benchmarks/` during this test. Ruby is \
+     excluded (not installed in this environment); memory usage is not \
+     measured. See `.cursor/plans/benchmarking.plan.md`, \
+     `.cursor/plans/codegen-backend-bakeoff.plan.md`, and \
+     `.cursor/plans/consolidate-llvm-backend.plan.md` for the full \
      Decision logs, including why only 2 of inception §21's 9 suggested \
-     benchmarks are expressible in this compiler today, and why the LLVM \
-     backend is scoped to exactly the AST shape those 2 programs use.\n\n\
+     benchmarks are expressible in this compiler today.\n\n\
      **These specific numbers are a snapshot from one run on one \
      machine** — they will vary on different hardware/load; the durable \
      artifacts are the benchmark source programs and this runner, not \

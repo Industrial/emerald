@@ -1,179 +1,148 @@
-//! Emerald's codegen backend, built on Cranelift — chosen in
-//! `02 toolchain-prototype` over Inkwell/LLVM for v1 (see
-//! `spec/COMPILER.md` for the decision record and the revisit trigger).
+//! Emerald's codegen backend, built on LLVM via `inkwell`.
 //!
-//! This prototype JIT-compiles a single hand-built function equivalent to
-//! `fn add(a: i64, b: i64) -> i64 { a + b }` — proving the codegen path
-//! inception §17's first milestone needs, ahead of a real typed-IR input
-//! (which does not exist until `emerald-ir` lands).
+//! Cranelift was v1's backend (`02 toolchain-prototype`); `16
+//! codegen-backend-bakeoff` measured LLVM 5-18x faster on loop-heavy
+//! code (`spec/COMPILER.md` has the full decision record and numbers).
+//! This crate is the result of `consolidate-llvm-backend`: a faithful,
+//! full-feature port of the old Cranelift backend onto LLVM, not a
+//! redesign — every restriction the old backend had (lambdas only as a
+//! top-level `Let`, method/index receivers must be a plain local
+//! variable, one `rescue` clause, no inheritance) is preserved exactly.
+//! Its own test suite below ports the old backend's tests verbatim
+//! (same source strings, same expected outputs) as the proof.
+//!
+//! One notable, deliberate improvement over the old backend: class
+//! instances / array bases / lambda environments / exception instances
+//! are real LLVM `ptr` values here, not Cranelift's undifferentiated
+//! `i64`. Byte layout is unchanged (every field/capture/element is
+//! still 8 bytes, matching `runtime/emerald_runtime.c`'s `emerald_alloc`)
+//! — this is a type-system correctness improvement with no behavior
+//! change for well-typed Emerald programs.
 
-use cranelift::prelude::*;
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
-
-/// Builds and JIT-compiles `fn add(i64, i64) -> i64 { a + b }`, then calls
-/// it with `(a, b)` and returns the result.
-pub fn build_and_run_add(a: i64, b: i64) -> i64 {
-  let mut flag_builder = settings::builder();
-  flag_builder.set("is_pic", "false").unwrap();
-  let isa_builder =
-    cranelift_native::builder().expect("host machine is not supported by Cranelift");
-  let isa = isa_builder
-    .finish(settings::Flags::new(flag_builder))
-    .unwrap();
-
-  let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-  let mut module = JITModule::new(jit_builder);
-
-  let mut ctx = module.make_context();
-  let mut func_ctx = FunctionBuilderContext::new();
-
-  ctx.func.signature.params.push(AbiParam::new(types::I64));
-  ctx.func.signature.params.push(AbiParam::new(types::I64));
-  ctx.func.signature.returns.push(AbiParam::new(types::I64));
-
-  let frontend_config = module.target_config();
-  {
-    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
-    let block = builder.create_block();
-    builder.append_block_params_for_function_params(block);
-    builder.switch_to_block(block);
-    builder.seal_block(block);
-
-    let a_val = builder.block_params(block)[0];
-    let b_val = builder.block_params(block)[1];
-    let sum = builder.ins().iadd(a_val, b_val);
-    builder.ins().return_(&[sum]);
-    builder.finalize(frontend_config);
-  }
-
-  let func_id = module
-    .declare_function("add", Linkage::Export, &ctx.func.signature)
-    .expect("declare add");
-  module
-    .define_function(func_id, &mut ctx)
-    .expect("define add");
-  module.clear_context(&mut ctx);
-  module.finalize_definitions().expect("finalize add");
-
-  let code_ptr = module.get_finalized_function(func_id);
-  // SAFETY: `code_ptr` points at freshly JIT-compiled code whose signature
-  // (two i64 params, one i64 return) exactly matches `fn(i64, i64) -> i64`
-  // as declared above.
-  let add_fn = unsafe { std::mem::transmute::<*const u8, fn(i64, i64) -> i64>(code_ptr) };
-  add_fn(a, b)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn add_20_and_22_is_42() {
-    assert_eq!(build_and_run_add(20, 22), 42);
-  }
-
-  #[test]
-  fn add_is_commutative_for_negatives() {
-    assert_eq!(build_and_run_add(-5, 3), -2);
-  }
-}
-
-// --- Ahead-of-time path: real Program -> object file (plans 06, 07, 08) -
-
-use cranelift::codegen::ir::MemFlagsData;
-use cranelift::codegen::ir::condcodes::IntCC;
-use cranelift_module::FuncId;
-use cranelift_object::{ObjectBuilder, ObjectModule};
 use emerald_parser::{
-  ClassDef, CompareOp, Expr, Function as AstFunction, Item, Param, Program, Stmt,
+  ClassDef, CompareOp, Expr, Function as AstFunction, Item, ModuleDef, Param, Program, Stmt,
 };
-use std::collections::HashMap;
+use inkwell::AddressSpace;
+use inkwell::basic_block::BasicBlock;
+use inkwell::builder::Builder;
+use inkwell::context::Context;
+use inkwell::module::{Linkage, Module};
+use inkwell::targets::{
+  CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
+use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue, ValueKind};
+use inkwell::{IntPredicate, OptimizationLevel};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// The header/exit blocks of the innermost enclosing loop, for `break`
-/// (jump to `exit`) / `next` (jump back to `header`) to target.
-struct LoopTargets {
-  header: Block,
-  exit: Block,
+/// Every runtime value this backend moves around is one of these three
+/// storage kinds — `Int64`/`Float64` scalars, or `Ptr` (a class
+/// instance, an `Array[T]` base address, or a `Proc`'s capture
+/// environment; all three are just addresses at this level, exactly as
+/// they were Cranelift `i64`s in the old backend). `Void`/`Bool` are
+/// bookkeeping-only: `Void` never labels an actual value, only a
+/// function's declared return kind; `Bool` only ever labels a
+/// `Expr::Compare` result on its way straight into a branch (the
+/// language has no boolean storage type any codegen path here actually
+/// exercises — see the Decision log).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ValKind {
+  Int64,
+  Float64,
+  Ptr,
+  Void,
+  Bool,
 }
 
-/// A field's byte offset and Cranelift storage type within its class's
-/// instance layout (plan 08: every field is naively 8 bytes — see the
-/// plan's Decision log).
+fn value_kind_for_type(ty: &str) -> ValKind {
+  match ty {
+    "Float64" => ValKind::Float64,
+    "Int64" => ValKind::Int64,
+    "Void" => ValKind::Void,
+    _ => ValKind::Ptr,
+  }
+}
+
+/// The LLVM storage type for a `Let`/param/field/array-element kind.
+/// `Void`/`Bool` never reach here — an internal invariant, not a
+/// user-input-dependent case (see `ValKind`'s doc comment).
+fn local_llvm_type<'ctx>(context: &'ctx Context, kind: ValKind) -> BasicTypeEnum<'ctx> {
+  match kind {
+    ValKind::Int64 => context.i64_type().into(),
+    ValKind::Float64 => context.f64_type().into(),
+    ValKind::Ptr => context.ptr_type(AddressSpace::default()).into(),
+    ValKind::Void | ValKind::Bool => {
+      unreachable!("internal: Void/Bool never used as a storage type")
+    }
+  }
+}
+
+fn make_fn_type<'ctx>(
+  context: &'ctx Context,
+  param_kinds: &[ValKind],
+  ret_kind: ValKind,
+) -> FunctionType<'ctx> {
+  let param_types: Vec<BasicMetadataTypeEnum> = param_kinds
+    .iter()
+    .map(|k| local_llvm_type(context, *k).into())
+    .collect();
+  match ret_kind {
+    ValKind::Void => context.void_type().fn_type(&param_types, false),
+    ValKind::Int64 => context.i64_type().fn_type(&param_types, false),
+    ValKind::Float64 => context.f64_type().fn_type(&param_types, false),
+    ValKind::Ptr => context
+      .ptr_type(AddressSpace::default())
+      .fn_type(&param_types, false),
+    ValKind::Bool => unreachable!("internal: a function never declares Bool as its return kind"),
+  }
+}
+
+/// A field's byte offset and storage kind within its class's instance
+/// layout — every field is naively 8 bytes (matches the old Cranelift
+/// backend's `FieldInfo`; see `spec/TYPE_SYSTEM.md` §8).
 #[derive(Clone, Copy)]
 struct FieldInfo {
-  offset: i32,
-  cl_type: types::Type,
+  offset: u64,
+  kind: ValKind,
 }
 
 struct ClassLayout {
   fields: HashMap<String, FieldInfo>,
-  size: i64,
-}
-
-/// A lambda literal's captured-variable layout — the closure-conversion
-/// counterpart to `ClassLayout` (plan 10's Decision log: env buffers are
-/// laid out exactly like an instance's fields, one 8-byte slot per
-/// capture, in first-occurrence order). `captures` is the ordered capture
-/// list; `capture_offsets`/`capture_types` are always populated for every
-/// name in `captures` (built together in `collect_lambda_infos`), so
-/// indexing them by a captured name is an internal invariant, not a
-/// user-input-dependent lookup.
-struct LambdaInfo {
-  captures: Vec<String>,
-  capture_offsets: HashMap<String, i32>,
-  capture_types: HashMap<String, types::Type>,
-}
-
-/// `Float64` fields/params/locals are Cranelift `F64`; everything else
-/// (`Int64`, and class-instance pointers, which are just addresses) is
-/// `I64`. No other primitive width is in the type universe this compiler
-/// supports yet.
-fn cranelift_type(ty_name: &str) -> types::Type {
-  if ty_name == "Float64" {
-    types::F64
-  } else {
-    types::I64
-  }
-}
-
-/// Pushes a return `AbiParam` for `ty_name` — unless it's `"Void"`, which
-/// gets a genuinely empty Cranelift return list rather than a phantom
-/// `I64` slot nothing in the body ever produces (a Void-returning method
-/// like `initialize`, whose body ends in `@field = value` rather than an
-/// expression, must not be forced to fabricate a return value).
-fn push_return_type(returns: &mut Vec<AbiParam>, ty_name: &str) {
-  if ty_name != "Void" {
-    returns.push(AbiParam::new(cranelift_type(ty_name)));
-  }
+  size: u64,
 }
 
 fn build_class_layout(c: &ClassDef) -> ClassLayout {
   let mut fields = HashMap::new();
-  let mut offset = 0i32;
+  let mut offset = 0u64;
   for f in &c.fields {
     fields.insert(
       f.name.clone(),
       FieldInfo {
         offset,
-        cl_type: cranelift_type(&f.ty),
+        kind: value_kind_for_type(&f.ty),
       },
     );
     offset += 8;
   }
   ClassLayout {
     fields,
-    size: offset as i64,
+    size: offset,
   }
 }
 
-/// Every `Expr::Ident` reachable from `expr`, in traversal order —
-/// duplicates and shadowing aside, `free_vars_in_lambda` below sorts
-/// that out. Nested `Expr::Lambda`s are treated as opaque leaves (their
-/// own captures are computed separately, when *they're* the one being
-/// analyzed) rather than walked into — consistent with plan 10's
-/// Decision log restricting lambdas to a single, non-nested level.
+/// A lambda literal's captured-variable layout — the closure-conversion
+/// counterpart to `ClassLayout` (env buffers are laid out exactly like
+/// an instance's fields, one 8-byte slot per capture, in
+/// first-occurrence order).
+struct LambdaInfo {
+  captures: Vec<String>,
+  capture_offsets: HashMap<String, u64>,
+  capture_kinds: HashMap<String, ValKind>,
+}
+
+// --- Free-variable analysis (language-only — no LLVM/Cranelift API) ---
+
 fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
   match expr {
     Expr::Ident(name) => out.push(name.clone()),
@@ -205,16 +174,7 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
   }
 }
 
-/// Walks one statement, recording every `Expr::Ident` it references
-/// (`referenced`) and every name it locally binds (`bound`) — a `Let`
-/// anywhere in the lambda body, at any nesting depth, counts as bound
-/// (order-insensitive: a genuine use-before-def is a separate bug this
-/// analysis doesn't need to catch, since it's not this pass's job).
-fn collect_idents_in_stmt(
-  stmt: &Stmt,
-  referenced: &mut Vec<String>,
-  bound: &mut std::collections::HashSet<String>,
-) {
+fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut HashSet<String>) {
   match stmt {
     Stmt::Let { name, value, .. } => {
       bound.insert(name.clone());
@@ -272,17 +232,13 @@ fn collect_idents_in_stmt(
   }
 }
 
-/// A lambda's free variables — every `Ident` its body references that
-/// isn't one of its own params or locally `Let`-bound inside it — in
-/// first-occurrence order (so the resulting env layout is deterministic).
 fn free_vars_in_lambda(params: &[Param], body: &[Stmt]) -> Vec<String> {
   let mut referenced = Vec::new();
-  let mut bound: std::collections::HashSet<String> =
-    params.iter().map(|p| p.name.clone()).collect();
+  let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
   for s in body {
     collect_idents_in_stmt(s, &mut referenced, &mut bound);
   }
-  let mut seen = std::collections::HashSet::new();
+  let mut seen = HashSet::new();
   let mut captures = Vec::new();
   for name in referenced {
     if !bound.contains(&name) && seen.insert(name.clone()) {
@@ -292,19 +248,7 @@ fn free_vars_in_lambda(params: &[Param], body: &[Stmt]) -> Vec<String> {
   captures
 }
 
-/// Finds every top-level `Stmt::Let` whose value is `Expr::Lambda` (the
-/// only position plan 10 supports, per its Decision log), computes each
-/// one's capture layout, and declares (but does not yet define) its
-/// synthesized `__lambda_{name}` function. A capture's Cranelift type is
-/// recovered from *its own* top-level `Let`'s declared annotation — since
-/// captures can only be other top-level locals (never a param, a field,
-/// or a name from inside another lambda/function), this is always
-/// available by the time a lambda referencing it is scanned, regardless
-/// of which one is declared first in source order.
-type LambdaCollectionResult =
-  Result<(HashMap<String, LambdaInfo>, HashMap<String, FuncId>), String>;
-
-fn collect_lambda_infos(program: &Program, module: &mut ObjectModule) -> LambdaCollectionResult {
+fn collect_lambda_infos(program: &Program) -> Result<HashMap<String, LambdaInfo>, String> {
   let mut top_level_types: HashMap<String, String> = HashMap::new();
   for item in &program.items {
     if let Item::Stmt(Stmt::Let { name, ty, .. }) = item {
@@ -313,16 +257,11 @@ fn collect_lambda_infos(program: &Program, module: &mut ObjectModule) -> LambdaC
   }
 
   let mut lambda_infos: HashMap<String, LambdaInfo> = HashMap::new();
-  let mut lambda_func_ids: HashMap<String, FuncId> = HashMap::new();
   for item in &program.items {
     let Item::Stmt(Stmt::Let {
       name,
       ty,
-      value: Expr::Lambda {
-        params,
-        return_type,
-        body,
-      },
+      value: Expr::Lambda { params, body, .. },
     }) = item
     else {
       continue;
@@ -333,252 +272,386 @@ fn collect_lambda_infos(program: &Program, module: &mut ObjectModule) -> LambdaC
 
     let captures = free_vars_in_lambda(params, body);
     let mut capture_offsets = HashMap::new();
-    let mut capture_types = HashMap::new();
+    let mut capture_kinds = HashMap::new();
     for (i, cap_name) in captures.iter().enumerate() {
-      capture_offsets.insert(cap_name.clone(), i as i32 * ARRAY_ELEM_SIZE as i32);
+      capture_offsets.insert(cap_name.clone(), i as u64 * 8);
       let cap_ty_name = top_level_types.get(cap_name).ok_or_else(|| {
         format!("codegen: cannot determine the type of captured variable `{cap_name}`")
       })?;
-      capture_types.insert(cap_name.clone(), cranelift_type(cap_ty_name));
+      capture_kinds.insert(cap_name.clone(), value_kind_for_type(cap_ty_name));
     }
 
-    let mut sig = module.make_signature();
-    sig.params.push(AbiParam::new(types::I64)); // env
-    for p in params {
-      sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
-    }
-    push_return_type(&mut sig.returns, return_type);
-    let id = module
-      .declare_function(&format!("__lambda_{name}"), Linkage::Export, &sig)
-      .map_err(|e| e.to_string())?;
-
-    lambda_func_ids.insert(name.clone(), id);
     lambda_infos.insert(
       name.clone(),
       LambdaInfo {
         captures,
         capture_offsets,
-        capture_types,
+        capture_kinds,
       },
     );
   }
-  Ok((lambda_infos, lambda_func_ids))
+  Ok(lambda_infos)
+}
+
+/// Recursively collects every `Let`-bound name (and every `rescue`
+/// clause's bound exception variable) reachable from `stmts`, at any
+/// `While`/`If`/`Begin` nesting depth, so every one of them gets a
+/// single `alloca` up front in the function's entry block — what makes
+/// LLVM's `mem2reg` pass able to promote them straight to SSA
+/// registers (an `alloca` created fresh inside a loop body, rather than
+/// once at entry, defeats that). Mirrors the old Cranelift backend's
+/// own flat, unscoped `vars` map (see `spec/SEMANTICS.md`'s flat-scope
+/// note) — just hoisted up front instead of declared lazily, since
+/// Cranelift's own `Variable` SSA construction doesn't need the entry-
+/// block-dominance discipline LLVM's `alloca`+`mem2reg` does.
+fn collect_lets(stmts: &[Stmt], out: &mut Vec<(String, ValKind)>) {
+  for stmt in stmts {
+    match stmt {
+      Stmt::Let { name, ty, .. } => out.push((name.clone(), value_kind_for_type(ty))),
+      Stmt::While { body, .. } => collect_lets(body, out),
+      Stmt::If {
+        then_branch,
+        else_branch,
+        ..
+      } => {
+        collect_lets(then_branch, out);
+        if let Some(else_b) = else_branch {
+          collect_lets(else_b, out);
+        }
+      }
+      Stmt::Begin {
+        body,
+        rescue_var,
+        rescue_body,
+        ..
+      } => {
+        collect_lets(body, out);
+        out.push((rescue_var.clone(), ValKind::Ptr));
+        collect_lets(rescue_body, out);
+      }
+      _ => {}
+    }
+  }
+}
+
+/// Pre-allocates one `alloca` per `(name, kind)` pair in the function's
+/// current (entry) block, skipping any name already present in `vars`
+/// (a param/capture that happens to share a name with a `Let` inside
+/// the body — the existing slot wins, matching the old backend's own
+/// "redefine, don't redeclare" behavior for a re-`Let` of an existing
+/// name).
+fn prealloc_lets<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  decls: &[(String, ValKind)],
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+) -> Result<(), String> {
+  for (name, kind) in decls {
+    if vars.contains_key(name) {
+      continue;
+    }
+    let alloca = builder
+      .build_alloca(local_llvm_type(context, *kind), name)
+      .map_err(|e| e.to_string())?;
+    vars.insert(name.clone(), (alloca, *kind));
+  }
+  Ok(())
 }
 
 /// The `setjmp`/longjmp-based exception runtime's imported functions
-/// (plan 11's Decision log — NOT true native unwinding; see
-/// `runtime/emerald_runtime.c`'s own comment for the full rationale).
-/// `setjmp` itself has to be a bare imported libc function, called
-/// *directly* by generated code (`build_begin`) rather than wrapped in a
-/// runtime helper — `longjmp` must target a `setjmp` call site in a
-/// still-live stack frame, which a wrapper function would violate.
+/// (NOT true native unwinding — see `runtime/emerald_runtime.c`'s own
+/// comment for the full rationale). `setjmp` is called *directly* by
+/// generated code (`build_begin`), never wrapped in a runtime helper —
+/// `longjmp` must target a `setjmp` call site in a still-live stack
+/// frame, which a wrapper function would violate.
 #[derive(Clone, Copy)]
-struct ExceptionRuntimeFuncs {
-  setjmp: FuncId,
-  push_handler: FuncId,
-  handler_jmpbuf: FuncId,
-  pop_handler: FuncId,
-  free_handler: FuncId,
-  handler_tag: FuncId,
-  handler_exception_ptr: FuncId,
-  raise: FuncId,
+struct ExceptionRuntimeFuncs<'ctx> {
+  setjmp: FunctionValue<'ctx>,
+  push_handler: FunctionValue<'ctx>,
+  handler_jmpbuf: FunctionValue<'ctx>,
+  pop_handler: FunctionValue<'ctx>,
+  free_handler: FunctionValue<'ctx>,
+  handler_tag: FunctionValue<'ctx>,
+  handler_exception_ptr: FunctionValue<'ctx>,
+  raise: FunctionValue<'ctx>,
 }
 
-/// Context that's fixed for the duration of compiling one function/method
-/// body — bundled to keep `build_expr`/`build_stmt`'s own parameter lists
-/// from growing without bound as plans 07/08 added control flow and
-/// classes. `self_ctx` is `Some((self_var, &class.fields))` only while
-/// compiling a method body (see `define_method`).
+fn declare_exception_runtime_funcs<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+) -> ExceptionRuntimeFuncs<'ctx> {
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let i64_ty = context.i64_type();
+  let i32_ty = context.i32_type();
+  let void_ty = context.void_type();
+
+  let setjmp = module.add_function(
+    "setjmp",
+    i32_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let push_handler = module.add_function(
+    "emerald_push_handler",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let handler_jmpbuf = module.add_function(
+    "emerald_handler_jmpbuf",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let pop_handler = module.add_function(
+    "emerald_pop_handler",
+    void_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let free_handler = module.add_function(
+    "emerald_free_handler",
+    void_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let handler_tag = module.add_function(
+    "emerald_handler_tag",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let handler_exception_ptr = module.add_function(
+    "emerald_handler_exception_ptr",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let raise = module.add_function(
+    "emerald_raise",
+    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+
+  ExceptionRuntimeFuncs {
+    setjmp,
+    push_handler,
+    handler_jmpbuf,
+    pop_handler,
+    free_handler,
+    handler_tag,
+    handler_exception_ptr,
+    raise,
+  }
+}
+
+/// The header/exit blocks of the innermost enclosing loop, for `break`
+/// (jump to `exit`) / `next` (jump back to `header`) to target.
+struct LoopTargets<'ctx> {
+  header: BasicBlock<'ctx>,
+  exit: BasicBlock<'ctx>,
+}
+
+/// Context that's fixed for the duration of compiling one function/
+/// method/lambda body. `self_ctx` is `Some((self_ptr, &class.fields))`
+/// only while compiling a method body.
 #[derive(Clone, Copy)]
-struct Ctx<'a> {
-  user_func_ids: &'a HashMap<String, FuncId>,
+struct Ctx<'a, 'ctx> {
+  user_func_ids: &'a HashMap<String, (FunctionValue<'ctx>, ValKind)>,
   classes: &'a HashMap<String, ClassLayout>,
-  print_i64_func_id: Option<FuncId>,
-  print_f64_func_id: Option<FuncId>,
-  alloc_func_id: FuncId,
-  self_ctx: Option<(Variable, &'a HashMap<String, FieldInfo>)>,
-  /// `{lambda's Let name} -> its synthesized `__lambda_{name}` FuncId,
-  /// for statically dispatching `.call` (plan 10's Decision log).
-  lambda_func_ids: &'a HashMap<String, FuncId>,
-  /// `{lambda's Let name} -> its capture layout, for both the env
-  /// allocation at the `Let` site and the loads inside the lambda's own
-  /// body (see `build_lambda_let`/`define_lambda`).
+  print_i64: FunctionValue<'ctx>,
+  print_f64: FunctionValue<'ctx>,
+  alloc: FunctionValue<'ctx>,
+  self_ctx: Option<(PointerValue<'ctx>, &'a HashMap<String, FieldInfo>)>,
+  /// `{lambda's Let name} -> (its synthesized `__lambda_{name}` function,
+  /// its declared return kind)`, for statically dispatching `.call`.
+  lambda_func_ids: &'a HashMap<String, (FunctionValue<'ctx>, ValKind)>,
   lambda_infos: &'a HashMap<String, LambdaInfo>,
-  /// `{class name} -> a stable integer tag (declaration order)` — plan
-  /// 11's `rescue` matching mechanism, standing in for RTTI/a class-name
-  /// string constant (see plan 11's Decision log: no inheritance exists
-  /// in this compiler yet, so exact-tag equality is fully correct, not a
-  /// shortcut).
+  /// `{class name} -> a stable integer tag (declaration order)` —
+  /// `rescue`'s matching mechanism, standing in for RTTI (no
+  /// inheritance exists in this compiler, so exact-tag equality is
+  /// fully correct, not a shortcut).
   class_tags: &'a HashMap<String, i64>,
-  exc_funcs: ExceptionRuntimeFuncs,
-  /// Names of every top-level `module` (plan 12) — `build_method_call`
-  /// checks this before anything else to route `Name.method(args)` to
-  /// the module's `{Name}_{method}` function directly, with no receiver
+  exc_funcs: ExceptionRuntimeFuncs<'ctx>,
+  /// Names of every top-level `module` — `build_method_call` checks
+  /// this before anything else to route `Name.method(args)` to the
+  /// module's `{Name}_{method}` function directly, with no receiver
   /// value at all (modules have no fields/self, unlike classes/Procs).
-  module_names: &'a std::collections::HashSet<String>,
+  module_names: &'a HashSet<String>,
 }
 
-fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, String> {
-  let mut flag_builder = settings::builder();
-  // Non-PIC: emerald-cli always links a plain executable, never a shared
-  // library, so position-dependent code avoids the DT_TEXTREL relocation
-  // ld otherwise warns about for calls into the runtime shim.
-  flag_builder
-    .set("is_pic", "false")
-    .map_err(|e| e.to_string())?;
-  // Plan 16: this was left at Cranelift's default (`OptLevel::None` — no
-  // CSE, no redundant load/store elimination, no loop-invariant code
-  // motion, weak regalloc), which plan 15's benchmarks showed costing
-  // 5-18x versus Rust/C on arithmetic-loop hot paths. `"speed"` is
-  // Cranelift's max non-size-tradeoff optimization level.
-  flag_builder
-    .set("opt_level", "speed")
-    .map_err(|e| e.to_string())?;
-  let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
-  isa_builder
-    .finish(settings::Flags::new(flag_builder))
-    .map_err(|e| e.to_string())
-}
-
-/// Every array element is 8 bytes — `Int64`/`Float64`/a class-instance
-/// pointer all are (plan 08's `FieldInfo` makes the same simplification
-/// for fields; plan 09's Decision log carries it forward for `Array[T]`
-/// storage, per `spec/TYPE_SYSTEM.md` §8's packed/contiguous requirement).
-const ARRAY_ELEM_SIZE: i64 = 8;
-
-/// `local_classes` maps a local variable name to its declared class name
-/// (from `Stmt::Let`'s explicit type annotation) — codegen has no typed
-/// IR to consult (see `spec/COMPILER.md`'s deferred-`emerald-ir` note), so
-/// a `.method` call on a local resolves its receiver's class this way
-/// rather than by inferring it from the (type-erased, both-just-`i64`)
+/// `local_classes` maps a local variable name to its declared class
+/// name (from `Stmt::Let`'s explicit type annotation) — this backend
+/// has no typed IR to consult, so a `.method` call on a local resolves
+/// its receiver's class this way rather than from the (type-erased)
 /// runtime pointer value. `local_array_elem_types` is the same idea for
-/// `Array[Elem]` locals, mapping to `Elem`'s type name (used to pick the
-/// Cranelift load type when indexing — an array's own runtime pointer
-/// value carries no element-type information).
-fn build_expr(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+/// `Array[Elem]` locals, mapping to `Elem`'s storage kind.
+fn build_expr<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   expr: &Expr,
-  vars: &HashMap<String, Variable>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
-  local_array_elem_types: &HashMap<String, String>,
-  ctx: &Ctx,
-) -> Result<Value, String> {
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
   match expr {
     Expr::Ident(name) => {
-      let var = vars
+      let (ptr, kind) = *vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
-      Ok(builder.use_var(*var))
+      let loaded = builder
+        .build_load(local_llvm_type(context, kind), ptr, name)
+        .map_err(|e| e.to_string())?;
+      Ok((loaded, kind))
     }
-    Expr::Int(n) => Ok(builder.ins().iconst(types::I64, *n)),
-    Expr::Float(f) => Ok(builder.ins().f64const(*f)),
+    Expr::Int(n) => Ok((
+      context.i64_type().const_int(*n as u64, true).into(),
+      ValKind::Int64,
+    )),
+    Expr::Float(f) => Ok((context.f64_type().const_float(*f).into(), ValKind::Float64)),
     Expr::Add(lhs, rhs) => {
-      let l = build_expr(
+      let (l, lk) = build_expr(
+        context,
         builder,
-        module,
         lhs,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      let r = build_expr(
+      let (r, rk) = build_expr(
+        context,
         builder,
-        module,
         rhs,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      if builder.func.dfg.value_type(l) == types::F64 {
-        Ok(builder.ins().fadd(l, r))
-      } else {
-        Ok(builder.ins().iadd(l, r))
+      match (lk, rk) {
+        (ValKind::Int64, ValKind::Int64) => {
+          let sum = builder
+            .build_int_add(l.into_int_value(), r.into_int_value(), "addtmp")
+            .map_err(|e| e.to_string())?;
+          Ok((sum.into(), ValKind::Int64))
+        }
+        (ValKind::Float64, ValKind::Float64) => {
+          let sum = builder
+            .build_float_add(l.into_float_value(), r.into_float_value(), "faddtmp")
+            .map_err(|e| e.to_string())?;
+          Ok((sum.into(), ValKind::Float64))
+        }
+        _ => Err("codegen: `+` operands must both be Int64 or both Float64".to_string()),
       }
     }
     Expr::Compare(lhs, op, rhs) => {
-      let l = build_expr(
+      let (l, lk) = build_expr(
+        context,
         builder,
-        module,
         lhs,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      let r = build_expr(
+      let (r, rk) = build_expr(
+        context,
         builder,
-        module,
         rhs,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      let cc = match op {
-        CompareOp::Lt => IntCC::SignedLessThan,
-        CompareOp::Gt => IntCC::SignedGreaterThan,
-        CompareOp::Le => IntCC::SignedLessThanOrEqual,
-        CompareOp::Ge => IntCC::SignedGreaterThanOrEqual,
-        CompareOp::Eq => IntCC::Equal,
-        CompareOp::Ne => IntCC::NotEqual,
+      let cmp = match (lk, rk) {
+        (ValKind::Int64, ValKind::Int64) => {
+          let pred = match op {
+            CompareOp::Lt => IntPredicate::SLT,
+            CompareOp::Gt => IntPredicate::SGT,
+            CompareOp::Le => IntPredicate::SLE,
+            CompareOp::Ge => IntPredicate::SGE,
+            CompareOp::Eq => IntPredicate::EQ,
+            CompareOp::Ne => IntPredicate::NE,
+          };
+          builder
+            .build_int_compare(pred, l.into_int_value(), r.into_int_value(), "cmptmp")
+            .map_err(|e| e.to_string())?
+        }
+        (ValKind::Float64, ValKind::Float64) => {
+          use inkwell::FloatPredicate;
+          let pred = match op {
+            CompareOp::Lt => FloatPredicate::OLT,
+            CompareOp::Gt => FloatPredicate::OGT,
+            CompareOp::Le => FloatPredicate::OLE,
+            CompareOp::Ge => FloatPredicate::OGE,
+            CompareOp::Eq => FloatPredicate::OEQ,
+            CompareOp::Ne => FloatPredicate::ONE,
+          };
+          builder
+            .build_float_compare(pred, l.into_float_value(), r.into_float_value(), "fcmptmp")
+            .map_err(|e| e.to_string())?
+        }
+        _ => return Err("codegen: comparison operands must both be Int64 or both Float64".into()),
       };
-      Ok(builder.ins().icmp(cc, l, r))
+      Ok((cmp.into(), ValKind::Bool))
     }
     Expr::Call(name, args) => {
-      let func_id = *ctx.user_func_ids.get(name).ok_or_else(|| {
+      let (fv, ret_kind) = *ctx.user_func_ids.get(name).ok_or_else(|| {
         format!("codegen: unsupported call to `{name}` (not a compiled user function)")
       })?;
-      let func_ref = module.declare_func_in_func(func_id, builder.func);
+      if ret_kind == ValKind::Void {
+        return Err(format!(
+          "codegen: `{name}` returns Void and can't be used as a value"
+        ));
+      }
       let mut arg_vals = Vec::with_capacity(args.len());
       for a in args {
-        arg_vals.push(build_expr(
+        let (v, _) = build_expr(
+          context,
           builder,
-          module,
           a,
           vars,
           local_classes,
           local_array_elem_types,
           ctx,
-        )?);
+        )?;
+        arg_vals.push(v.into());
       }
-      let call = builder.ins().call(func_ref, &arg_vals);
-      Ok(builder.inst_results(call)[0])
+      let call = builder
+        .build_call(fv, &arg_vals, "calltmp")
+        .map_err(|e| e.to_string())?;
+      let result = call_result(call)?;
+      Ok((result, ret_kind))
     }
     Expr::New(class_name, args) => {
       let layout = ctx
         .classes
         .get(class_name)
         .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
-      let size_val = builder.ins().iconst(types::I64, layout.size);
-      let alloc_ref = module.declare_func_in_func(ctx.alloc_func_id, builder.func);
-      let call = builder.ins().call(alloc_ref, &[size_val]);
-      let ptr = builder.inst_results(call)[0];
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let alloc_call = builder
+        .build_call(ctx.alloc, &[size_val.into()], "newtmp")
+        .map_err(|e| e.to_string())?;
+      let ptr = call_result(alloc_call)?.into_pointer_value();
 
       let init_key = format!("{class_name}_initialize");
-      if let Some(&init_id) = ctx.user_func_ids.get(&init_key) {
-        let init_ref = module.declare_func_in_func(init_id, builder.func);
-        let mut call_args = vec![ptr];
+      if let Some(&(init_fv, _)) = ctx.user_func_ids.get(&init_key) {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![ptr.into()];
         for a in args {
-          call_args.push(build_expr(
+          let (v, _) = build_expr(
+            context,
             builder,
-            module,
             a,
             vars,
             local_classes,
             local_array_elem_types,
             ctx,
-          )?);
+          )?;
+          call_args.push(v.into());
         }
-        builder.ins().call(init_ref, &call_args);
+        builder
+          .build_call(init_fv, &call_args, "inittmp")
+          .map_err(|e| e.to_string())?;
       }
-      Ok(ptr)
+      Ok((ptr.into(), ValKind::Ptr))
     }
     Expr::MethodCall(recv, method, args) => build_method_call(
+      context,
       builder,
-      module,
       recv,
       method,
       args,
@@ -588,96 +661,139 @@ fn build_expr(
       ctx,
     ),
     Expr::InstanceVar(name) => {
-      let (self_var, fields) = ctx
+      let (self_ptr, fields) = ctx
         .self_ctx
         .ok_or_else(|| format!("codegen: `@{name}` used outside of a method body"))?;
-      let field = fields
+      let field = *fields
         .get(name)
         .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?;
-      let self_ptr = builder.use_var(self_var);
-      Ok(
-        builder
-          .ins()
-          .load(field.cl_type, MemFlagsData::new(), self_ptr, field.offset),
-      )
+      let loaded = load_field(context, builder, self_ptr, field)?;
+      Ok((loaded, field.kind))
     }
-    Expr::ArrayLit(elements) => build_array_lit(
-      builder,
-      module,
-      elements,
-      vars,
-      local_classes,
-      local_array_elem_types,
-      ctx,
-    ),
-    Expr::Index(array, index) => build_index(
-      builder,
-      module,
-      array,
-      index,
-      vars,
-      local_classes,
-      local_array_elem_types,
-      ctx,
-    ),
+    Expr::ArrayLit(elements) => {
+      let ptr = build_array_lit(
+        context,
+        builder,
+        elements,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      Ok((ptr.into(), ValKind::Ptr))
+    }
+    Expr::Index(array, index) => {
+      let (v, kind) = build_index(
+        context,
+        builder,
+        array,
+        index,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      Ok((v, kind))
+    }
     // A lambda literal only has codegen meaning at a top-level `Let`'s
-    // value (`build_lambda_let`, invoked from `build_stmt`) — see plan
-    // 10's Decision log. Reached from anywhere else (a call argument, a
-    // nested expression, a non-top-level `Let`), it's an unsupported
-    // shape, not a panic.
+    // value (`build_lambda_let`, invoked from `build_stmt`). Reached
+    // from anywhere else, it's an unsupported shape, not a panic.
     Expr::Lambda { .. } => {
       Err("codegen: lambda literals are only supported as a top-level `Let`'s value".to_string())
     }
   }
 }
 
-/// `receiver.method(args)`. `.call` on a receiver `ctx.lambda_func_ids`
-/// can trace dispatches statically to that lambda's synthesized function
-/// (plan 10's Decision log); everything else is the existing
-/// `{Class}_{method}` dispatch plan 08 established.
+/// Extracts a call instruction's return value, erroring (not panicking)
+/// if it was actually void — an internal-consistency check, since every
+/// call site here already checked its callee's declared return kind
+/// before deciding to use the result as a value.
+fn call_result(call: inkwell::values::CallSiteValue<'_>) -> Result<BasicValueEnum<'_>, String> {
+  match call.try_as_basic_value() {
+    ValueKind::Basic(v) => Ok(v),
+    ValueKind::Instruction(_) => {
+      Err("codegen: internal error — call used as a value returned void".to_string())
+    }
+  }
+}
+
+fn load_field<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  base_ptr: PointerValue<'ctx>,
+  field: FieldInfo,
+) -> Result<BasicValueEnum<'ctx>, String> {
+  let field_ptr = field_ptr(context, builder, base_ptr, field.offset)?;
+  builder
+    .build_load(local_llvm_type(context, field.kind), field_ptr, "fieldval")
+    .map_err(|e| e.to_string())
+}
+
+fn field_ptr<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  base_ptr: PointerValue<'ctx>,
+  offset: u64,
+) -> Result<PointerValue<'ctx>, String> {
+  let idx = context.i64_type().const_int(offset, false);
+  unsafe {
+    builder
+      .build_in_bounds_gep(context.i8_type(), base_ptr, &[idx], "fieldptr")
+      .map_err(|e| e.to_string())
+  }
+}
+
+/// `receiver.method(args)`. `.call` on a receiver known to
+/// `ctx.lambda_func_ids` dispatches statically to that lambda's
+/// synthesized function; `Name.method(args)` on a known module name
+/// dispatches to `{Name}_{method}` with no receiver value at all;
+/// everything else is the `{Class}_{method}` dispatch established for
+/// ordinary class methods.
 #[allow(clippy::too_many_arguments)]
-fn build_method_call(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_method_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   recv: &Expr,
   method: &str,
   args: &[Expr],
-  vars: &HashMap<String, Variable>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
-  local_array_elem_types: &HashMap<String, String>,
-  ctx: &Ctx,
-) -> Result<Value, String> {
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
   let Expr::Ident(recv_name) = recv else {
     return Err(
       "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
     );
   };
-  // `Name.method(args)` on a module (plan 12): no receiver value at
-  // all — a module isn't a variable, and its methods take no implicit
-  // `self` (they compile exactly like free functions).
+
   if ctx.module_names.contains(recv_name) {
     let key = format!("{recv_name}_{method}");
-    let func_id = *ctx
+    let (fv, ret_kind) = *ctx
       .user_func_ids
       .get(&key)
       .ok_or_else(|| format!("codegen: unsupported module method call `{recv_name}.{method}`"))?;
-    let func_ref = module.declare_func_in_func(func_id, builder.func);
-    let mut call_args = Vec::with_capacity(args.len());
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
     for a in args {
-      call_args.push(build_expr(
+      let (v, _) = build_expr(
+        context,
         builder,
-        module,
         a,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
-      )?);
+      )?;
+      call_args.push(v.into());
     }
-    let call = builder.ins().call(func_ref, &call_args);
-    return Ok(builder.inst_results(call)[0]);
+    let call = builder
+      .build_call(fv, &call_args, "modcalltmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
   }
-  let func_id = if method == "call" {
+
+  let (fv, ret_kind) = if method == "call" {
     *ctx.lambda_func_ids.get(recv_name).ok_or_else(|| {
       format!("codegen: `.call` on `{recv_name}` — not a lambda literal bound to a top-level `Let`")
     })?
@@ -691,284 +807,312 @@ fn build_method_call(
       .get(&key)
       .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?
   };
-  let recv_val = build_expr(
+
+  let (recv_val, _) = build_expr(
+    context,
     builder,
-    module,
     recv,
     vars,
     local_classes,
     local_array_elem_types,
     ctx,
   )?;
-  let func_ref = module.declare_func_in_func(func_id, builder.func);
-  let mut call_args = vec![recv_val];
+  let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
   for a in args {
-    call_args.push(build_expr(
+    let (v, _) = build_expr(
+      context,
       builder,
-      module,
       a,
       vars,
       local_classes,
       local_array_elem_types,
       ctx,
-    )?);
+    )?;
+    call_args.push(v.into());
   }
-  let call = builder.ins().call(func_ref, &call_args);
-  Ok(builder.inst_results(call)[0])
+  let call = builder
+    .build_call(fv, &call_args, "methcalltmp")
+    .map_err(|e| e.to_string())?;
+  Ok((call_result(call)?, ret_kind))
 }
 
-/// `emerald_alloc`s a flat `elements.len() * 8`-byte buffer, then stores
-/// each element at its `i * 8` offset — no length prefix, no bounds
-/// checking (plan 09's Decision log). The returned `Value` is just the
-/// base pointer; nothing about it carries the element type, which is why
-/// `build_index` needs `local_array_elem_types`.
+/// `emerald_alloc`s a flat `elements.len() * 8`-byte buffer, then
+/// stores each element at its `i * 8` offset — no length prefix, no
+/// bounds checking. The returned pointer carries no element-type
+/// information; nothing about a bare `Expr::ArrayLit` value does, which
+/// is why indexing (`build_index`) only works through a named local via
+/// `local_array_elem_types`.
 #[allow(clippy::too_many_arguments)]
-fn build_array_lit(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_array_lit<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   elements: &[Expr],
-  vars: &HashMap<String, Variable>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
-  local_array_elem_types: &HashMap<String, String>,
-  ctx: &Ctx,
-) -> Result<Value, String> {
-  let size_val = builder
-    .ins()
-    .iconst(types::I64, elements.len() as i64 * ARRAY_ELEM_SIZE);
-  let alloc_ref = module.declare_func_in_func(ctx.alloc_func_id, builder.func);
-  let call = builder.ins().call(alloc_ref, &[size_val]);
-  let ptr = builder.inst_results(call)[0];
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+  let size_val = context
+    .i64_type()
+    .const_int(elements.len() as u64 * 8, false);
+  let call = builder
+    .build_call(ctx.alloc, &[size_val.into()], "arralloc")
+    .map_err(|e| e.to_string())?;
+  let ptr = call_result(call)?.into_pointer_value();
   for (i, e) in elements.iter().enumerate() {
-    let v = build_expr(
+    let (v, _) = build_expr(
+      context,
       builder,
-      module,
       e,
       vars,
       local_classes,
       local_array_elem_types,
       ctx,
     )?;
-    builder.ins().store(
-      MemFlagsData::new(),
-      v,
-      ptr,
-      i as i32 * ARRAY_ELEM_SIZE as i32,
-    );
+    let elem_ptr = field_ptr(context, builder, ptr, i as u64 * 8)?;
+    builder
+      .build_store(elem_ptr, v)
+      .map_err(|e| e.to_string())?;
   }
   Ok(ptr)
 }
 
 /// `arr[i]`. Same "plain local-variable" restriction as `MethodCall`'s
-/// receiver (plan 09's Decision log) — the element type comes from
-/// `local_array_elem_types`, keyed by the array's own local name.
+/// receiver — the element kind comes from `local_array_elem_types`,
+/// keyed by the array's own local name.
 #[allow(clippy::too_many_arguments)]
-fn build_index(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_index<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   array: &Expr,
   index: &Expr,
-  vars: &HashMap<String, Variable>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
-  local_array_elem_types: &HashMap<String, String>,
-  ctx: &Ctx,
-) -> Result<Value, String> {
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
   let Expr::Ident(arr_name) = array else {
     return Err(
       "codegen: array indexing is only supported on a plain local-variable array".to_string(),
     );
   };
-  let elem_ty_name = local_array_elem_types.get(arr_name).ok_or_else(|| {
+  let elem_kind = *local_array_elem_types.get(arr_name).ok_or_else(|| {
     format!("codegen: cannot determine the element type of `{arr_name}` for indexing")
   })?;
-  let cl_elem_ty = cranelift_type(elem_ty_name);
-  let base_ptr = build_expr(
+  let (base, _) = build_expr(
+    context,
     builder,
-    module,
     array,
     vars,
     local_classes,
     local_array_elem_types,
     ctx,
   )?;
-  let idx_val = build_expr(
+  let (idx, idx_kind) = build_expr(
+    context,
     builder,
-    module,
     index,
     vars,
     local_classes,
     local_array_elem_types,
     ctx,
   )?;
-  let byte_offset = builder.ins().imul_imm_s(idx_val, ARRAY_ELEM_SIZE);
-  let addr = builder.ins().iadd(base_ptr, byte_offset);
-  Ok(builder.ins().load(cl_elem_ty, MemFlagsData::new(), addr, 0))
-}
-
-/// Emits `puts <inner>` as a call to whichever of `emerald_print_i64` /
-/// `emerald_print_f64` matches the built argument's actual Cranelift
-/// value type (see `runtime/emerald_runtime.c` and plan 08's Decision
-/// log — `puts` is a call-site-polymorphic intrinsic, not an overloaded
-/// user function).
-#[allow(clippy::too_many_arguments)]
-fn build_puts(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
-  arg: &Expr,
-  vars: &HashMap<String, Variable>,
-  local_classes: &HashMap<String, String>,
-  local_array_elem_types: &HashMap<String, String>,
-  ctx: &Ctx,
-) -> Result<(), String> {
-  let val = build_expr(
-    builder,
-    module,
-    arg,
-    vars,
-    local_classes,
-    local_array_elem_types,
-    ctx,
-  )?;
-  let target_id = if builder.func.dfg.value_type(val) == types::F64 {
-    ctx.print_f64_func_id.ok_or(
-      "codegen: `puts` is only supported at the program's top level, not inside a function body",
-    )?
-  } else {
-    ctx.print_i64_func_id.ok_or(
-      "codegen: `puts` is only supported at the program's top level, not inside a function body",
-    )?
+  if idx_kind != ValKind::Int64 {
+    return Err("codegen: array index must be Int64".to_string());
+  }
+  let elem_llvm_ty = local_llvm_type(context, elem_kind);
+  let elem_ptr = unsafe {
+    builder
+      .build_in_bounds_gep(
+        elem_llvm_ty,
+        base.into_pointer_value(),
+        &[idx.into_int_value()],
+        "elemptr",
+      )
+      .map_err(|e| e.to_string())?
   };
-  let print_ref = module.declare_func_in_func(target_id, builder.func);
-  builder.ins().call(print_ref, &[val]);
-  Ok(())
+  let loaded = builder
+    .build_load(elem_llvm_ty, elem_ptr, "elemval")
+    .map_err(|e| e.to_string())?;
+  Ok((loaded, elem_kind))
 }
 
-/// `arr[i] = value`. Same "plain local-variable array" restriction as
-/// `build_index`'s read side (plan 09's Decision log) — the element size
-/// is always `ARRAY_ELEM_SIZE`, so unlike a read this needs no element
-/// type lookup, just the address arithmetic.
+/// `arr[i] = value`. Same restriction as `build_index`'s read side.
 #[allow(clippy::too_many_arguments)]
-fn build_set_index(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_set_index<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   array: &Expr,
   index: &Expr,
   value: &Expr,
-  vars: &HashMap<String, Variable>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
-  local_array_elem_types: &HashMap<String, String>,
-  ctx: &Ctx,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
 ) -> Result<bool, String> {
-  let Expr::Ident(_) = array else {
+  let Expr::Ident(arr_name) = array else {
     return Err(
       "codegen: array assignment is only supported on a plain local-variable array".to_string(),
     );
   };
-  let base_ptr = build_expr(
+  let elem_kind = *local_array_elem_types.get(arr_name).ok_or_else(|| {
+    format!("codegen: cannot determine the element type of `{arr_name}` for indexing")
+  })?;
+  let (base, _) = build_expr(
+    context,
     builder,
-    module,
     array,
     vars,
     local_classes,
     local_array_elem_types,
     ctx,
   )?;
-  let idx_val = build_expr(
+  let (idx, idx_kind) = build_expr(
+    context,
     builder,
-    module,
     index,
     vars,
     local_classes,
     local_array_elem_types,
     ctx,
   )?;
-  let v = build_expr(
+  if idx_kind != ValKind::Int64 {
+    return Err("codegen: array index must be Int64".to_string());
+  }
+  let (v, _) = build_expr(
+    context,
     builder,
-    module,
     value,
     vars,
     local_classes,
     local_array_elem_types,
     ctx,
   )?;
-  let byte_offset = builder.ins().imul_imm_s(idx_val, ARRAY_ELEM_SIZE);
-  let addr = builder.ins().iadd(base_ptr, byte_offset);
-  builder.ins().store(MemFlagsData::new(), v, addr, 0);
+  let elem_llvm_ty = local_llvm_type(context, elem_kind);
+  let elem_ptr = unsafe {
+    builder
+      .build_in_bounds_gep(
+        elem_llvm_ty,
+        base.into_pointer_value(),
+        &[idx.into_int_value()],
+        "elemptr",
+      )
+      .map_err(|e| e.to_string())?
+  };
+  builder
+    .build_store(elem_ptr, v)
+    .map_err(|e| e.to_string())?;
   Ok(false)
 }
 
+/// `puts <inner>` — a call-site-polymorphic intrinsic (not an
+/// overloaded user function) that routes to `emerald_print_i64` or
+/// `emerald_print_f64` based on the built argument's actual kind.
+#[allow(clippy::too_many_arguments)]
+fn build_puts<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  arg: &Expr,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  let (v, kind) = build_expr(
+    context,
+    builder,
+    arg,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let target = match kind {
+    ValKind::Int64 => ctx.print_i64,
+    ValKind::Float64 => ctx.print_f64,
+    _ => return Err("codegen: `puts` only supports Int64/Float64 values".to_string()),
+  };
+  builder
+    .build_call(target, &[v.into()], "puts")
+    .map_err(|e| e.to_string())?;
+  Ok(())
+}
+
 /// `name: Proc = ->(...) -> T { ... }`. Allocates the env buffer
-/// (`emerald_alloc`, sized by capture count), snapshots each captured
-/// local's *current* value into its slot (plan 10's Decision log: by
-/// value, not by reference), and binds `name` to the resulting pointer —
-/// exactly the value `.call` (`build_method_call`) later passes as the
-/// synthesized lambda function's leading `env` argument.
-fn build_lambda_let(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+/// (sized by capture count), snapshots each captured local's *current*
+/// value into its slot (by value, not by reference), and stores the
+/// resulting pointer into `name`'s pre-allocated slot — exactly the
+/// value `.call` later passes as the synthesized lambda function's
+/// leading `env` argument.
+fn build_lambda_let<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   name: &str,
-  vars: &mut HashMap<String, Variable>,
-  ctx: &Ctx,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(), String> {
   let info = ctx.lambda_infos.get(name).ok_or_else(|| {
     format!("codegen: lambda literal bound to `{name}` is not supported outside a top-level `Let`")
   })?;
-  let size_val = builder
-    .ins()
-    .iconst(types::I64, info.captures.len() as i64 * ARRAY_ELEM_SIZE);
-  let alloc_ref = module.declare_func_in_func(ctx.alloc_func_id, builder.func);
-  let call = builder.ins().call(alloc_ref, &[size_val]);
-  let env_ptr = builder.inst_results(call)[0];
+  let size_val = context
+    .i64_type()
+    .const_int(info.captures.len() as u64 * 8, false);
+  let call = builder
+    .build_call(ctx.alloc, &[size_val.into()], "envalloc")
+    .map_err(|e| e.to_string())?;
+  let env_ptr = call_result(call)?.into_pointer_value();
   for cap_name in &info.captures {
-    let cap_var = *vars.get(cap_name).ok_or_else(|| {
+    let (cap_ptr, cap_kind) = *vars.get(cap_name).ok_or_else(|| {
       format!("codegen: captured variable `{cap_name}` is not in scope at `{name}`'s creation site")
     })?;
-    let val = builder.use_var(cap_var);
+    let val = builder
+      .build_load(local_llvm_type(context, cap_kind), cap_ptr, cap_name)
+      .map_err(|e| e.to_string())?;
     let offset = info.capture_offsets[cap_name];
+    let slot_ptr = field_ptr(context, builder, env_ptr, offset)?;
     builder
-      .ins()
-      .store(MemFlagsData::new(), val, env_ptr, offset);
+      .build_store(slot_ptr, val)
+      .map_err(|e| e.to_string())?;
   }
-  let var = builder.declare_var(types::I64);
-  builder.def_var(var, env_ptr);
-  vars.insert(name.to_string(), var);
+  let (name_ptr, _) = *vars
+    .get(name)
+    .expect("pre-allocated by prealloc_lets for every top-level Let");
+  builder
+    .build_store(name_ptr, env_ptr)
+    .map_err(|e| e.to_string())?;
   Ok(())
 }
 
-/// Emits one statement. `vars`/`local_classes` are threaded flat (no
-/// block scoping — matches `emerald-sema`'s equally flat environment, see
-/// plan 07's Implementation Notes); `loop_stack`'s top is `break`/`next`'s
-/// target. Returns `true` if the statement emitted a block terminator
-/// (`return`/the loop-jump for `break`/`next`) — callers must not emit
-/// further instructions into the current block afterward.
+/// Emits one statement. Returns `true` if the statement emitted a
+/// block terminator (`return`/the loop-jump for `break`/`next`/
+/// `raise`'s unreachable) — callers must not emit further instructions
+/// into the current block afterward.
 #[allow(clippy::too_many_arguments)]
-fn build_stmt(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_stmt<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
   stmt: &Stmt,
-  vars: &mut HashMap<String, Variable>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
-  local_array_elem_types: &mut HashMap<String, String>,
-  loop_stack: &mut Vec<LoopTargets>,
-  ctx: &Ctx,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
 ) -> Result<bool, String> {
   match stmt {
-    // `name: Proc = ->(...) -> T { ... }` — the one shape codegen
-    // actually supports for `Expr::Lambda` (plan 10's Decision log).
-    // `build_expr`'s own `Expr::Lambda` arm exists only to reject every
-    // *other* position defensively; this special case is what makes the
-    // supported one work.
     Stmt::Let {
       name,
       ty,
       value: Expr::Lambda { .. },
     } if ty == "Proc" => {
-      build_lambda_let(builder, module, name, vars, ctx)?;
+      build_lambda_let(context, builder, name, vars, ctx)?;
       Ok(false)
     }
     Stmt::Let { name, ty, value } => {
-      let v = build_expr(
+      let (v, _) = build_expr(
+        context,
         builder,
-        module,
         value,
         vars,
         local_classes,
@@ -979,37 +1123,32 @@ fn build_stmt(
         local_classes.insert(name.clone(), ty.clone());
       }
       if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
-        local_array_elem_types.insert(name.clone(), elem_name.to_string());
+        local_array_elem_types.insert(name.clone(), value_kind_for_type(elem_name));
       }
-      if let Some(existing) = vars.get(name) {
-        builder.def_var(*existing, v);
-      } else {
-        let var = builder.declare_var(cranelift_type(ty));
-        builder.def_var(var, v);
-        vars.insert(name.clone(), var);
-      }
+      let (ptr, _) = *vars
+        .get(name)
+        .expect("pre-allocated by prealloc_lets for every reachable Let");
+      builder.build_store(ptr, v).map_err(|e| e.to_string())?;
       Ok(false)
     }
     Stmt::SetField { name, value } => {
-      let (self_var, fields) = ctx
+      let (self_ptr, fields) = ctx
         .self_ctx
         .ok_or_else(|| format!("codegen: `@{name} = ...` used outside of a method body"))?;
       let field = *fields
         .get(name)
         .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?;
-      let v = build_expr(
+      let (v, _) = build_expr(
+        context,
         builder,
-        module,
         value,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      let self_ptr = builder.use_var(self_var);
-      builder
-        .ins()
-        .store(MemFlagsData::new(), v, self_ptr, field.offset);
+      let fp = field_ptr(context, builder, self_ptr, field.offset)?;
+      builder.build_store(fp, v).map_err(|e| e.to_string())?;
       Ok(false)
     }
     Stmt::SetIndex {
@@ -1017,8 +1156,8 @@ fn build_stmt(
       index,
       value,
     } => build_set_index(
+      context,
       builder,
-      module,
       array,
       index,
       value,
@@ -1029,8 +1168,8 @@ fn build_stmt(
     ),
     Stmt::Expr(Expr::Call(name, args)) if name == "puts" && args.len() == 1 => {
       build_puts(
+        context,
         builder,
-        module,
         &args[0],
         vars,
         local_classes,
@@ -1041,8 +1180,8 @@ fn build_stmt(
     }
     Stmt::Expr(e) => {
       build_expr(
+        context,
         builder,
-        module,
         e,
         vars,
         local_classes,
@@ -1052,34 +1191,38 @@ fn build_stmt(
       Ok(false)
     }
     Stmt::Return(Some(e)) => {
-      let v = build_expr(
+      let (v, _) = build_expr(
+        context,
         builder,
-        module,
         e,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      builder.ins().return_(&[v]);
+      builder.build_return(Some(&v)).map_err(|e| e.to_string())?;
       Ok(true)
     }
     Stmt::Return(None) => {
-      builder.ins().return_(&[]);
+      builder.build_return(None).map_err(|e| e.to_string())?;
       Ok(true)
     }
     Stmt::Break => {
       let target = loop_stack
         .last()
         .ok_or("codegen: `break` outside of a loop")?;
-      builder.ins().jump(target.exit, &[]);
+      builder
+        .build_unconditional_branch(target.exit)
+        .map_err(|e| e.to_string())?;
       Ok(true)
     }
     Stmt::Next => {
       let target = loop_stack
         .last()
         .ok_or("codegen: `next` outside of a loop")?;
-      builder.ins().jump(target.header, &[]);
+      builder
+        .build_unconditional_branch(target.header)
+        .map_err(|e| e.to_string())?;
       Ok(true)
     }
     Stmt::If {
@@ -1087,115 +1230,122 @@ fn build_stmt(
       then_branch,
       else_branch,
     } => {
-      let cond_val = build_expr(
+      let cond_val = build_bool(
+        context,
         builder,
-        module,
         cond,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      let then_blk = builder.create_block();
-      let merge_blk = builder.create_block();
-      let else_target_blk = if else_branch.is_some() {
-        builder.create_block()
+      let then_blk = context.append_basic_block(func, "if.then");
+      let merge_blk = context.append_basic_block(func, "if.merge");
+      let else_target = if else_branch.is_some() {
+        context.append_basic_block(func, "if.else")
       } else {
         merge_blk
       };
-
       builder
-        .ins()
-        .brif(cond_val, then_blk, &[], else_target_blk, &[]);
+        .build_conditional_branch(cond_val, then_blk, else_target)
+        .map_err(|e| e.to_string())?;
 
-      builder.switch_to_block(then_blk);
-      builder.seal_block(then_blk);
+      builder.position_at_end(then_blk);
       let then_terminated = build_block(
+        context,
         builder,
-        module,
+        func,
         then_branch,
         vars,
         local_classes,
         local_array_elem_types,
         loop_stack,
+        ret_kind,
         ctx,
       )?;
       if !then_terminated {
-        builder.ins().jump(merge_blk, &[]);
+        builder
+          .build_unconditional_branch(merge_blk)
+          .map_err(|e| e.to_string())?;
       }
 
       if let Some(else_branch) = else_branch {
-        builder.switch_to_block(else_target_blk);
-        builder.seal_block(else_target_blk);
+        builder.position_at_end(else_target);
         let else_terminated = build_block(
+          context,
           builder,
-          module,
+          func,
           else_branch,
           vars,
           local_classes,
           local_array_elem_types,
           loop_stack,
+          ret_kind,
           ctx,
         )?;
         if !else_terminated {
-          builder.ins().jump(merge_blk, &[]);
+          builder
+            .build_unconditional_branch(merge_blk)
+            .map_err(|e| e.to_string())?;
         }
       }
 
-      builder.switch_to_block(merge_blk);
-      builder.seal_block(merge_blk);
+      builder.position_at_end(merge_blk);
       Ok(false)
     }
     Stmt::While { cond, body } => {
-      let header_blk = builder.create_block();
-      let body_blk = builder.create_block();
-      let exit_blk = builder.create_block();
+      let header_blk = context.append_basic_block(func, "while.cond");
+      let body_blk = context.append_basic_block(func, "while.body");
+      let exit_blk = context.append_basic_block(func, "while.after");
 
-      builder.ins().jump(header_blk, &[]);
+      builder
+        .build_unconditional_branch(header_blk)
+        .map_err(|e| e.to_string())?;
 
-      builder.switch_to_block(header_blk);
-      let cond_val = build_expr(
+      builder.position_at_end(header_blk);
+      let cond_val = build_bool(
+        context,
         builder,
-        module,
         cond,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      builder.ins().brif(cond_val, body_blk, &[], exit_blk, &[]);
-      // header_blk isn't sealed yet — the loop body's back-edge (below) is
-      // a predecessor that doesn't exist until after the body is built.
+      builder
+        .build_conditional_branch(cond_val, body_blk, exit_blk)
+        .map_err(|e| e.to_string())?;
 
-      builder.switch_to_block(body_blk);
-      builder.seal_block(body_blk);
+      builder.position_at_end(body_blk);
       loop_stack.push(LoopTargets {
         header: header_blk,
         exit: exit_blk,
       });
       let body_terminated = build_block(
+        context,
         builder,
-        module,
+        func,
         body,
         vars,
         local_classes,
         local_array_elem_types,
         loop_stack,
+        ret_kind,
         ctx,
       )?;
       loop_stack.pop();
       if !body_terminated {
-        builder.ins().jump(header_blk, &[]);
+        builder
+          .build_unconditional_branch(header_blk)
+          .map_err(|e| e.to_string())?;
       }
-      builder.seal_block(header_blk);
 
-      builder.switch_to_block(exit_blk);
-      builder.seal_block(exit_blk);
+      builder.position_at_end(exit_blk);
       Ok(false)
     }
     Stmt::Raise(e) => build_raise(
+      context,
       builder,
-      module,
       e,
       vars,
       local_classes,
@@ -1208,8 +1358,9 @@ fn build_stmt(
       rescue_var,
       rescue_body,
     } => build_begin(
+      context,
       builder,
-      module,
+      func,
       body,
       rescue_type,
       rescue_var,
@@ -1218,208 +1369,289 @@ fn build_stmt(
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ret_kind,
       ctx,
     ),
   }
 }
 
-/// `raise <expr>` — `expr` must be a direct `ClassName.new(args)` call
-/// (plan 11's Decision log), built exactly like an ordinary `Expr::New`
-/// (reusing `build_expr`'s own handling, not reimplemented here), then
-/// handed to `emerald_raise` with the class's compile-time-known tag.
-fn build_raise(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
-  e: &Expr,
-  vars: &HashMap<String, Variable>,
+/// Builds a `While`/`If` condition — always an `Expr::Compare` in every
+/// program this compiler accepts (the only boolean-producing expression
+/// in the AST) — straight to an `i1`.
+#[allow(clippy::too_many_arguments)]
+fn build_bool<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  cond: &Expr,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
-  local_array_elem_types: &HashMap<String, String>,
-  ctx: &Ctx,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<IntValue<'ctx>, String> {
+  let (v, kind) = build_expr(
+    context,
+    builder,
+    cond,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if kind != ValKind::Bool {
+    return Err("codegen: a condition must be a comparison expression".to_string());
+  }
+  Ok(v.into_int_value())
+}
+
+/// `raise <expr>` — `expr` must be a direct `ClassName.new(args)` call,
+/// built exactly like an ordinary `Expr::New` (reusing `build_expr`,
+/// not reimplemented here), then handed to `emerald_raise` with the
+/// class's compile-time-known tag.
+#[allow(clippy::too_many_arguments)]
+fn build_raise<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  e: &Expr,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
 ) -> Result<bool, String> {
   let Expr::New(class_name, _) = e else {
-    return Err(
-      "codegen: `raise` only supports a direct `ClassName.new(args)` expression".to_string(),
-    );
+    return Err("codegen: `raise` only supports a direct `ClassName.new(args)` expression".into());
   };
   let tag = *ctx
     .class_tags
     .get(class_name)
     .ok_or_else(|| format!("codegen: unknown class `{class_name}` in `raise`"))?;
-  let exc_ptr = build_expr(
+  let (exc_ptr, _) = build_expr(
+    context,
     builder,
-    module,
     e,
     vars,
     local_classes,
     local_array_elem_types,
     ctx,
   )?;
-  let tag_val = builder.ins().iconst(types::I64, tag);
-  let raise_ref = module.declare_func_in_func(ctx.exc_funcs.raise, builder.func);
-  builder.ins().call(raise_ref, &[tag_val, exc_ptr]);
+  let tag_val = context.i64_type().const_int(tag as u64, true);
+  builder
+    .build_call(
+      ctx.exc_funcs.raise,
+      &[tag_val.into(), exc_ptr.into()],
+      "raise",
+    )
+    .map_err(|e| e.to_string())?;
   // `emerald_raise` never returns to this call site in practice (it
   // longjmps to a handler, or exits the process on an uncaught
-  // exception) — Cranelift still requires the block to end in an
-  // explicit terminator, so this marks it unreachable.
-  builder
-    .ins()
-    .trap(cranelift::codegen::ir::TrapCode::user(1).unwrap());
+  // exception) — LLVM still requires the block to end in an explicit
+  // terminator.
+  builder.build_unreachable().map_err(|e| e.to_string())?;
   Ok(true)
 }
 
 /// `begin body rescue Type => e rescue_body end`. Pushes a handler,
-/// calls `setjmp` *directly* (see `ExceptionRuntimeFuncs`'s doc comment
-/// for why it can't be wrapped), and branches on the result: zero means
+/// calls `setjmp` *directly*, and branches on the result: zero means
 /// this is the normal first pass through (run `body`), nonzero means a
-/// `longjmp` landed here (an exception was raised somewhere inside
-/// `body`) — the landing pad then compares the caught class tag against
-/// `rescue_type`'s, binding `rescue_var` and running `rescue_body` on a
-/// match, or re-raising to the next-outer handler otherwise.
+/// `longjmp` landed here — the landing pad then compares the caught
+/// class tag against `rescue_type`'s, binding `rescue_var` and running
+/// `rescue_body` on a match, or re-raising to the next-outer handler
+/// otherwise.
 #[allow(clippy::too_many_arguments)]
-fn build_begin(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_begin<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
   body: &[Stmt],
   rescue_type: &str,
   rescue_var: &str,
   rescue_body: &[Stmt],
-  vars: &mut HashMap<String, Variable>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
-  local_array_elem_types: &mut HashMap<String, String>,
-  loop_stack: &mut Vec<LoopTargets>,
-  ctx: &Ctx,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
 ) -> Result<bool, String> {
   let rescue_tag = *ctx
     .class_tags
     .get(rescue_type)
     .ok_or_else(|| format!("codegen: unknown class `{rescue_type}` in `rescue`"))?;
 
-  let push_ref = module.declare_func_in_func(ctx.exc_funcs.push_handler, builder.func);
-  let push_call = builder.ins().call(push_ref, &[]);
-  let handler_ptr = builder.inst_results(push_call)[0];
+  let push_call = builder
+    .build_call(ctx.exc_funcs.push_handler, &[], "pushhandler")
+    .map_err(|e| e.to_string())?;
+  let handler_ptr = call_result(push_call)?.into_pointer_value();
 
-  let jmpbuf_ref = module.declare_func_in_func(ctx.exc_funcs.handler_jmpbuf, builder.func);
-  let jmpbuf_call = builder.ins().call(jmpbuf_ref, &[handler_ptr]);
-  let jmpbuf_ptr = builder.inst_results(jmpbuf_call)[0];
+  let jmpbuf_call = builder
+    .build_call(
+      ctx.exc_funcs.handler_jmpbuf,
+      &[handler_ptr.into()],
+      "jmpbuf",
+    )
+    .map_err(|e| e.to_string())?;
+  let jmpbuf_ptr = call_result(jmpbuf_call)?.into_pointer_value();
 
-  let setjmp_ref = module.declare_func_in_func(ctx.exc_funcs.setjmp, builder.func);
-  let setjmp_call = builder.ins().call(setjmp_ref, &[jmpbuf_ptr]);
-  let setjmp_result = builder.inst_results(setjmp_call)[0];
+  let setjmp_call = builder
+    .build_call(ctx.exc_funcs.setjmp, &[jmpbuf_ptr.into()], "setjmpres")
+    .map_err(|e| e.to_string())?;
+  let setjmp_result = call_result(setjmp_call)?.into_int_value();
 
-  let try_blk = builder.create_block();
-  let rescue_blk = builder.create_block();
-  let merge_blk = builder.create_block();
-  let is_first_pass = builder.ins().icmp_imm_s(IntCC::Equal, setjmp_result, 0);
+  let try_blk = context.append_basic_block(func, "begin.try");
+  let rescue_blk = context.append_basic_block(func, "begin.rescue");
+  let merge_blk = context.append_basic_block(func, "begin.merge");
+  let zero = context.i32_type().const_int(0, false);
+  let is_first_pass = builder
+    .build_int_compare(IntPredicate::EQ, setjmp_result, zero, "isfirstpass")
+    .map_err(|e| e.to_string())?;
   builder
-    .ins()
-    .brif(is_first_pass, try_blk, &[], rescue_blk, &[]);
+    .build_conditional_branch(is_first_pass, try_blk, rescue_blk)
+    .map_err(|e| e.to_string())?;
 
-  builder.switch_to_block(try_blk);
-  builder.seal_block(try_blk);
+  builder.position_at_end(try_blk);
   let try_terminated = build_block(
+    context,
     builder,
-    module,
+    func,
     body,
     vars,
     local_classes,
     local_array_elem_types,
     loop_stack,
+    ret_kind,
     ctx,
   )?;
   if !try_terminated {
-    let pop_ref = module.declare_func_in_func(ctx.exc_funcs.pop_handler, builder.func);
-    builder.ins().call(pop_ref, &[]);
-    builder.ins().jump(merge_blk, &[]);
+    builder
+      .build_call(ctx.exc_funcs.pop_handler, &[], "pophandler")
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_unconditional_branch(merge_blk)
+      .map_err(|e| e.to_string())?;
   }
 
-  builder.switch_to_block(rescue_blk);
-  builder.seal_block(rescue_blk);
-  let tag_ref = module.declare_func_in_func(ctx.exc_funcs.handler_tag, builder.func);
-  let tag_call = builder.ins().call(tag_ref, &[handler_ptr]);
-  let caught_tag = builder.inst_results(tag_call)[0];
-  let expected_tag = builder.ins().iconst(types::I64, rescue_tag);
-  let tag_matches = builder.ins().icmp(IntCC::Equal, caught_tag, expected_tag);
+  builder.position_at_end(rescue_blk);
+  let tag_call = builder
+    .build_call(
+      ctx.exc_funcs.handler_tag,
+      &[handler_ptr.into()],
+      "caughttag",
+    )
+    .map_err(|e| e.to_string())?;
+  let caught_tag = call_result(tag_call)?.into_int_value();
+  let expected_tag = context.i64_type().const_int(rescue_tag as u64, true);
+  let tag_matches = builder
+    .build_int_compare(IntPredicate::EQ, caught_tag, expected_tag, "tagmatches")
+    .map_err(|e| e.to_string())?;
 
-  let match_blk = builder.create_block();
-  let mismatch_blk = builder.create_block();
+  let match_blk = context.append_basic_block(func, "begin.match");
+  let mismatch_blk = context.append_basic_block(func, "begin.mismatch");
   builder
-    .ins()
-    .brif(tag_matches, match_blk, &[], mismatch_blk, &[]);
+    .build_conditional_branch(tag_matches, match_blk, mismatch_blk)
+    .map_err(|e| e.to_string())?;
 
-  // Caught, but it isn't this `rescue`'s type — free this handler (its
-  // job is done) and propagate to the next-outer one.
-  builder.switch_to_block(mismatch_blk);
-  builder.seal_block(mismatch_blk);
-  let exc_ptr_ref = module.declare_func_in_func(ctx.exc_funcs.handler_exception_ptr, builder.func);
-  let exc_ptr_call = builder.ins().call(exc_ptr_ref, &[handler_ptr]);
-  let mismatch_exc_ptr = builder.inst_results(exc_ptr_call)[0];
-  let free_ref = module.declare_func_in_func(ctx.exc_funcs.free_handler, builder.func);
-  builder.ins().call(free_ref, &[handler_ptr]);
-  let reraise_ref = module.declare_func_in_func(ctx.exc_funcs.raise, builder.func);
+  // Caught, but it isn't this `rescue`'s type — free this handler and
+  // propagate to the next-outer one.
+  builder.position_at_end(mismatch_blk);
+  let exc_ptr_call = builder
+    .build_call(
+      ctx.exc_funcs.handler_exception_ptr,
+      &[handler_ptr.into()],
+      "mismatchexc",
+    )
+    .map_err(|e| e.to_string())?;
+  let mismatch_exc_ptr = call_result(exc_ptr_call)?;
   builder
-    .ins()
-    .call(reraise_ref, &[caught_tag, mismatch_exc_ptr]);
+    .build_call(
+      ctx.exc_funcs.free_handler,
+      &[handler_ptr.into()],
+      "freehandler",
+    )
+    .map_err(|e| e.to_string())?;
   builder
-    .ins()
-    .trap(cranelift::codegen::ir::TrapCode::user(1).unwrap());
+    .build_call(
+      ctx.exc_funcs.raise,
+      &[caught_tag.into(), mismatch_exc_ptr.into()],
+      "reraise",
+    )
+    .map_err(|e| e.to_string())?;
+  builder.build_unreachable().map_err(|e| e.to_string())?;
 
-  builder.switch_to_block(match_blk);
-  builder.seal_block(match_blk);
-  let exc_ptr_ref2 = module.declare_func_in_func(ctx.exc_funcs.handler_exception_ptr, builder.func);
-  let exc_ptr_call2 = builder.ins().call(exc_ptr_ref2, &[handler_ptr]);
-  let match_exc_ptr = builder.inst_results(exc_ptr_call2)[0];
-  let free_ref2 = module.declare_func_in_func(ctx.exc_funcs.free_handler, builder.func);
-  builder.ins().call(free_ref2, &[handler_ptr]);
+  builder.position_at_end(match_blk);
+  let exc_ptr_call2 = builder
+    .build_call(
+      ctx.exc_funcs.handler_exception_ptr,
+      &[handler_ptr.into()],
+      "matchexc",
+    )
+    .map_err(|e| e.to_string())?;
+  let match_exc_ptr = call_result(exc_ptr_call2)?;
+  builder
+    .build_call(
+      ctx.exc_funcs.free_handler,
+      &[handler_ptr.into()],
+      "freehandler2",
+    )
+    .map_err(|e| e.to_string())?;
 
-  let rescue_var_slot = builder.declare_var(types::I64);
-  builder.def_var(rescue_var_slot, match_exc_ptr);
-  vars.insert(rescue_var.to_string(), rescue_var_slot);
+  let (rescue_var_ptr, _) = *vars
+    .get(rescue_var)
+    .expect("pre-allocated by prealloc_lets for every Begin's rescue_var");
+  builder
+    .build_store(rescue_var_ptr, match_exc_ptr)
+    .map_err(|e| e.to_string())?;
   local_classes.insert(rescue_var.to_string(), rescue_type.to_string());
 
   let rescue_terminated = build_block(
+    context,
     builder,
-    module,
+    func,
     rescue_body,
     vars,
     local_classes,
     local_array_elem_types,
     loop_stack,
+    ret_kind,
     ctx,
   )?;
   if !rescue_terminated {
-    builder.ins().jump(merge_blk, &[]);
+    builder
+      .build_unconditional_branch(merge_blk)
+      .map_err(|e| e.to_string())?;
   }
 
-  builder.switch_to_block(merge_blk);
-  builder.seal_block(merge_blk);
+  builder.position_at_end(merge_blk);
   Ok(false)
 }
 
 /// Emits a straight-line sequence of statements. Stops early (without
 /// erroring) after any statement that terminates the current block —
-/// anything syntactically after `return`/`break`/`next` in the same list
-/// is unreachable and must not be emitted into an already-terminated
-/// Cranelift block.
+/// anything syntactically after `return`/`break`/`next`/`raise` in the
+/// same list is unreachable and must not be emitted into an
+/// already-terminated LLVM block.
 #[allow(clippy::too_many_arguments)]
-fn build_block(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_block<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
   stmts: &[Stmt],
-  vars: &mut HashMap<String, Variable>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
-  local_array_elem_types: &mut HashMap<String, String>,
-  loop_stack: &mut Vec<LoopTargets>,
-  ctx: &Ctx,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
 ) -> Result<bool, String> {
   for stmt in stmts {
     let terminated = build_stmt(
+      context,
       builder,
-      module,
+      func,
       stmt,
       vars,
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ret_kind,
       ctx,
     )?;
     if terminated {
@@ -1429,36 +1661,40 @@ fn build_block(
   Ok(false)
 }
 
-/// Builds a function/method's `Vec<Stmt>` body, honoring Ruby-style
-/// implicit return: if the body doesn't already end in an explicit
-/// terminator (`return`/`break`/`next`), the last statement — if a bare
-/// `Stmt::Expr` — has its value returned, matching `emerald-sema`'s
-/// implicit-return check.
+/// Builds a function/method/lambda's `Vec<Stmt>` body, honoring
+/// Ruby-style implicit return: if the body doesn't already end in an
+/// explicit terminator, the last statement — if a bare `Stmt::Expr` —
+/// has its value returned, matching `emerald-sema`'s implicit-return
+/// check.
 #[allow(clippy::too_many_arguments)]
-fn build_function_body(
-  builder: &mut FunctionBuilder,
-  module: &mut ObjectModule,
+fn build_function_body<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
   body: &[Stmt],
-  vars: &mut HashMap<String, Variable>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
-  local_array_elem_types: &mut HashMap<String, String>,
-  gen_ctx: &Ctx,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(), String> {
   let mut loop_stack = Vec::new();
   let Some((last, init)) = body.split_last() else {
-    builder.ins().return_(&[]);
+    builder.build_return(None).map_err(|e| e.to_string())?;
     return Ok(());
   };
 
   let terminated = build_block(
+    context,
     builder,
-    module,
+    func,
     init,
     vars,
     local_classes,
     local_array_elem_types,
     &mut loop_stack,
-    gen_ctx,
+    ret_kind,
+    ctx,
   )?;
   if terminated {
     return Ok(());
@@ -1466,453 +1702,448 @@ fn build_function_body(
 
   match last {
     Stmt::Expr(e) => {
-      let v = build_expr(
+      let (v, _) = build_expr(
+        context,
         builder,
-        module,
         e,
         vars,
         local_classes,
         local_array_elem_types,
-        gen_ctx,
+        ctx,
       )?;
-      builder.ins().return_(&[v]);
+      builder.build_return(Some(&v)).map_err(|e| e.to_string())?;
     }
     other => {
       let terminated = build_stmt(
+        context,
         builder,
-        module,
+        func,
         other,
         vars,
         local_classes,
         local_array_elem_types,
         &mut loop_stack,
-        gen_ctx,
+        ret_kind,
+        ctx,
       )?;
-      // A Void-returning body whose last statement isn't a value-
-      // producing Stmt::Expr (e.g. `initialize`'s trailing `@y = y`)
-      // needs an explicit empty `return` — nothing else would ever
-      // terminate the block, and Cranelift requires every block to end
-      // in a terminator.
-      if !terminated && builder.func.signature.returns.is_empty() {
-        builder.ins().return_(&[]);
+      // A Void-returning body whose last statement isn't a
+      // value-producing `Stmt::Expr` (e.g. `initialize`'s trailing
+      // `@y = y`) needs an explicit empty `return` — nothing else
+      // would ever terminate the block.
+      if !terminated && ret_kind == ValKind::Void {
+        builder.build_return(None).map_err(|e| e.to_string())?;
       }
     }
   }
   Ok(())
 }
 
-fn define_user_function(
-  module: &mut ObjectModule,
-  ctx: &mut cranelift::codegen::Context,
-  func_ctx: &mut FunctionBuilderContext,
-  f: &AstFunction,
-  id: FuncId,
-  gen_ctx: &Ctx,
+fn param_kinds(params: &[Param]) -> Vec<ValKind> {
+  params.iter().map(|p| value_kind_for_type(&p.ty)).collect()
+}
+
+/// Binds `f`'s declared params to fresh entry-block `alloca`s (storing
+/// each incoming SSA parameter value into its slot), populating
+/// `local_classes`/`local_array_elem_types` bookkeeping for any
+/// class-/array-typed parameter along the way.
+#[allow(clippy::too_many_arguments)]
+fn bind_params<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  params: &[Param],
+  param_offset: u32,
+  classes: &HashMap<String, ClassLayout>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
 ) -> Result<(), String> {
-  ctx.func.signature.params.clear();
-  ctx.func.signature.returns.clear();
-  for p in &f.params {
-    ctx
-      .func
-      .signature
-      .params
-      .push(AbiParam::new(cranelift_type(&p.ty)));
-  }
-  push_return_type(&mut ctx.func.signature.returns, &f.return_type);
-
-  let frontend_config = module.target_config();
-  {
-    let mut builder = FunctionBuilder::new(&mut ctx.func, func_ctx);
-    let block = builder.create_block();
-    builder.append_block_params_for_function_params(block);
-    builder.switch_to_block(block);
-    builder.seal_block(block);
-
-    let mut vars: HashMap<String, Variable> = HashMap::new();
-    let mut local_classes: HashMap<String, String> = HashMap::new();
-    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
-    for (i, p) in f.params.iter().enumerate() {
-      let param_val = builder.block_params(block)[i];
-      let var = builder.declare_var(cranelift_type(&p.ty));
-      builder.def_var(var, param_val);
-      vars.insert(p.name.clone(), var);
-      if gen_ctx.classes.contains_key(p.ty.as_str()) {
-        local_classes.insert(p.name.clone(), p.ty.clone());
-      }
-      if let Some(elem_name) = p
-        .ty
-        .strip_prefix("Array[")
-        .and_then(|s| s.strip_suffix(']'))
-      {
-        local_array_elem_types.insert(p.name.clone(), elem_name.to_string());
-      }
+  for (i, p) in params.iter().enumerate() {
+    let kind = value_kind_for_type(&p.ty);
+    let param_val = func
+      .get_nth_param(param_offset + i as u32)
+      .expect("declared signature has this many params");
+    let alloca = builder
+      .build_alloca(local_llvm_type(context, kind), &p.name)
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_store(alloca, param_val)
+      .map_err(|e| e.to_string())?;
+    vars.insert(p.name.clone(), (alloca, kind));
+    if classes.contains_key(p.ty.as_str()) {
+      local_classes.insert(p.name.clone(), p.ty.clone());
     }
-
-    build_function_body(
-      &mut builder,
-      module,
-      &f.body,
-      &mut vars,
-      &mut local_classes,
-      &mut local_array_elem_types,
-      gen_ctx,
-    )?;
-    builder.finalize(frontend_config);
+    if let Some(elem_name) = p
+      .ty
+      .strip_prefix("Array[")
+      .and_then(|s| s.strip_suffix(']'))
+    {
+      local_array_elem_types.insert(p.name.clone(), value_kind_for_type(elem_name));
+    }
   }
-
-  module.define_function(id, ctx).map_err(|e| e.to_string())?;
-  module.clear_context(ctx);
   Ok(())
+}
+
+fn define_user_function<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  f: &AstFunction,
+  fv: FunctionValue<'ctx>,
+  gen_ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  let entry = context.append_basic_block(fv, "entry");
+  builder.position_at_end(entry);
+
+  let mut vars = HashMap::new();
+  let mut local_classes = HashMap::new();
+  let mut local_array_elem_types = HashMap::new();
+  bind_params(
+    context,
+    builder,
+    fv,
+    &f.params,
+    0,
+    gen_ctx.classes,
+    &mut vars,
+    &mut local_classes,
+    &mut local_array_elem_types,
+  )?;
+
+  let mut decls = Vec::new();
+  collect_lets(&f.body, &mut decls);
+  prealloc_lets(context, builder, &decls, &mut vars)?;
+
+  let ret_kind = value_kind_for_type(&f.return_type);
+  build_function_body(
+    context,
+    builder,
+    fv,
+    &f.body,
+    &mut vars,
+    &mut local_classes,
+    &mut local_array_elem_types,
+    ret_kind,
+    gen_ctx,
+  )
 }
 
 /// Compiles one class method as `{ClassName}_{methodName}`, taking an
-/// implicit leading `self: i64` pointer parameter ahead of the method's
-/// own declared parameters. `self_fields` (the class's field layout) is
+/// implicit leading `self: ptr` parameter ahead of the method's own
+/// declared parameters. `self_fields` (the class's field layout) is
 /// threaded through `gen_ctx.self_ctx` for the method body's `@field`
 /// reads/writes.
-fn define_method(
-  module: &mut ObjectModule,
-  ctx: &mut cranelift::codegen::Context,
-  func_ctx: &mut FunctionBuilderContext,
+fn define_method<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   m: &AstFunction,
-  id: FuncId,
+  fv: FunctionValue<'ctx>,
   self_fields: &HashMap<String, FieldInfo>,
-  gen_ctx: &Ctx,
+  gen_ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(), String> {
-  ctx.func.signature.params.clear();
-  ctx.func.signature.returns.clear();
-  ctx.func.signature.params.push(AbiParam::new(types::I64)); // self
-  for p in &m.params {
-    ctx
-      .func
-      .signature
-      .params
-      .push(AbiParam::new(cranelift_type(&p.ty)));
-  }
-  push_return_type(&mut ctx.func.signature.returns, &m.return_type);
+  let entry = context.append_basic_block(fv, "entry");
+  builder.position_at_end(entry);
 
-  let frontend_config = module.target_config();
-  {
-    let mut builder = FunctionBuilder::new(&mut ctx.func, func_ctx);
-    let block = builder.create_block();
-    builder.append_block_params_for_function_params(block);
-    builder.switch_to_block(block);
-    builder.seal_block(block);
+  let self_ptr = fv
+    .get_nth_param(0)
+    .expect("methods always declare a leading self param")
+    .into_pointer_value();
 
-    let self_var = builder.declare_var(types::I64);
-    builder.def_var(self_var, builder.block_params(block)[0]);
+  let mut vars = HashMap::new();
+  let mut local_classes = HashMap::new();
+  let mut local_array_elem_types = HashMap::new();
+  bind_params(
+    context,
+    builder,
+    fv,
+    &m.params,
+    1,
+    gen_ctx.classes,
+    &mut vars,
+    &mut local_classes,
+    &mut local_array_elem_types,
+  )?;
 
-    let mut vars: HashMap<String, Variable> = HashMap::new();
-    let mut local_classes: HashMap<String, String> = HashMap::new();
-    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
-    for (i, p) in m.params.iter().enumerate() {
-      let param_val = builder.block_params(block)[i + 1];
-      let var = builder.declare_var(cranelift_type(&p.ty));
-      builder.def_var(var, param_val);
-      vars.insert(p.name.clone(), var);
-      if gen_ctx.classes.contains_key(p.ty.as_str()) {
-        local_classes.insert(p.name.clone(), p.ty.clone());
-      }
-      if let Some(elem_name) = p
-        .ty
-        .strip_prefix("Array[")
-        .and_then(|s| s.strip_suffix(']'))
-      {
-        local_array_elem_types.insert(p.name.clone(), elem_name.to_string());
-      }
-    }
+  let mut decls = Vec::new();
+  collect_lets(&m.body, &mut decls);
+  prealloc_lets(context, builder, &decls, &mut vars)?;
 
-    let method_ctx = Ctx {
-      self_ctx: Some((self_var, self_fields)),
-      ..*gen_ctx
-    };
-    build_function_body(
-      &mut builder,
-      module,
-      &m.body,
-      &mut vars,
-      &mut local_classes,
-      &mut local_array_elem_types,
-      &method_ctx,
-    )?;
-    builder.finalize(frontend_config);
-  }
-
-  module.define_function(id, ctx).map_err(|e| e.to_string())?;
-  module.clear_context(ctx);
-  Ok(())
+  let method_ctx = Ctx {
+    self_ctx: Some((self_ptr, self_fields)),
+    ..*gen_ctx
+  };
+  let ret_kind = value_kind_for_type(&m.return_type);
+  build_function_body(
+    context,
+    builder,
+    fv,
+    &m.body,
+    &mut vars,
+    &mut local_classes,
+    &mut local_array_elem_types,
+    ret_kind,
+    &method_ctx,
+  )
 }
 
 /// Compiles one lambda's synthesized `__lambda_{name}` function — an
-/// implicit leading `env: i64` parameter ahead of the lambda's own
-/// declared params (mirroring `define_method`'s implicit leading `self`),
-/// with each captured name pre-loaded from `env` into an ordinary
-/// `Variable` before the body runs, so `build_expr`'s `Expr::Ident` path
-/// (which only knows about `vars`) doesn't need any special case for a
-/// captured vs. a locally-declared name.
+/// implicit leading `env: ptr` parameter ahead of the lambda's own
+/// declared params, with each captured name pre-loaded from `env` into
+/// an ordinary local before the body runs, so `build_expr`'s
+/// `Expr::Ident` path doesn't need any special case for a captured vs.
+/// a locally-declared name.
 #[allow(clippy::too_many_arguments)]
-fn define_lambda(
-  module: &mut ObjectModule,
-  ctx: &mut cranelift::codegen::Context,
-  func_ctx: &mut FunctionBuilderContext,
+fn define_lambda<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
   params: &[Param],
   return_type: &str,
   body: &[Stmt],
   info: &LambdaInfo,
-  id: FuncId,
-  gen_ctx: &Ctx,
+  fv: FunctionValue<'ctx>,
+  gen_ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(), String> {
-  ctx.func.signature.params.clear();
-  ctx.func.signature.returns.clear();
-  ctx.func.signature.params.push(AbiParam::new(types::I64)); // env
-  for p in params {
-    ctx
-      .func
-      .signature
-      .params
-      .push(AbiParam::new(cranelift_type(&p.ty)));
-  }
-  push_return_type(&mut ctx.func.signature.returns, return_type);
+  let entry = context.append_basic_block(fv, "entry");
+  builder.position_at_end(entry);
 
-  let frontend_config = module.target_config();
-  {
-    let mut builder = FunctionBuilder::new(&mut ctx.func, func_ctx);
-    let block = builder.create_block();
-    builder.append_block_params_for_function_params(block);
-    builder.switch_to_block(block);
-    builder.seal_block(block);
+  let env_ptr = fv
+    .get_nth_param(0)
+    .expect("lambdas always declare a leading env param")
+    .into_pointer_value();
 
-    let env_val = builder.block_params(block)[0];
+  let mut vars = HashMap::new();
+  let mut local_classes = HashMap::new();
+  let mut local_array_elem_types = HashMap::new();
 
-    let mut vars: HashMap<String, Variable> = HashMap::new();
-    let mut local_classes: HashMap<String, String> = HashMap::new();
-    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
-
-    for cap_name in &info.captures {
-      let cl_ty = info.capture_types[cap_name];
-      let offset = info.capture_offsets[cap_name];
-      let val = builder
-        .ins()
-        .load(cl_ty, MemFlagsData::new(), env_val, offset);
-      let var = builder.declare_var(cl_ty);
-      builder.def_var(var, val);
-      vars.insert(cap_name.clone(), var);
-    }
-
-    for (i, p) in params.iter().enumerate() {
-      let param_val = builder.block_params(block)[i + 1];
-      let var = builder.declare_var(cranelift_type(&p.ty));
-      builder.def_var(var, param_val);
-      vars.insert(p.name.clone(), var);
-      if gen_ctx.classes.contains_key(p.ty.as_str()) {
-        local_classes.insert(p.name.clone(), p.ty.clone());
-      }
-    }
-
-    build_function_body(
-      &mut builder,
-      module,
-      body,
-      &mut vars,
-      &mut local_classes,
-      &mut local_array_elem_types,
-      gen_ctx,
-    )?;
-    builder.finalize(frontend_config);
+  for cap_name in &info.captures {
+    let kind = info.capture_kinds[cap_name];
+    let offset = info.capture_offsets[cap_name];
+    let slot_ptr = field_ptr(context, builder, env_ptr, offset)?;
+    let val = builder
+      .build_load(local_llvm_type(context, kind), slot_ptr, cap_name)
+      .map_err(|e| e.to_string())?;
+    let alloca = builder
+      .build_alloca(local_llvm_type(context, kind), cap_name)
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_store(alloca, val)
+      .map_err(|e| e.to_string())?;
+    vars.insert(cap_name.clone(), (alloca, kind));
   }
 
-  module.define_function(id, ctx).map_err(|e| e.to_string())?;
-  module.clear_context(ctx);
-  Ok(())
-}
+  bind_params(
+    context,
+    builder,
+    fv,
+    params,
+    1,
+    gen_ctx.classes,
+    &mut vars,
+    &mut local_classes,
+    &mut local_array_elem_types,
+  )?;
 
-fn define_main(
-  module: &mut ObjectModule,
-  ctx: &mut cranelift::codegen::Context,
-  func_ctx: &mut FunctionBuilderContext,
-  program: &Program,
-  gen_ctx: &Ctx,
-) -> Result<(), String> {
-  ctx.func.signature.params.clear();
-  ctx.func.signature.returns.clear();
-  ctx.func.signature.returns.push(AbiParam::new(types::I32));
+  let mut decls = Vec::new();
+  collect_lets(body, &mut decls);
+  prealloc_lets(context, builder, &decls, &mut vars)?;
 
-  let main_id = module
-    .declare_function("main", Linkage::Export, &ctx.func.signature)
-    .map_err(|e| e.to_string())?;
-
-  let frontend_config = module.target_config();
-  {
-    let mut builder = FunctionBuilder::new(&mut ctx.func, func_ctx);
-    let block = builder.create_block();
-    builder.switch_to_block(block);
-    builder.seal_block(block);
-
-    let mut vars: HashMap<String, Variable> = HashMap::new();
-    let mut local_classes: HashMap<String, String> = HashMap::new();
-    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
-    let mut loop_stack = Vec::new();
-
-    let top_stmts: Vec<Stmt> = program
-      .items
-      .iter()
-      .filter_map(|it| {
-        if let Item::Stmt(s) = it {
-          Some(s.clone())
-        } else {
-          None
-        }
-      })
-      .collect();
-
-    let terminated = build_block(
-      &mut builder,
-      module,
-      &top_stmts,
-      &mut vars,
-      &mut local_classes,
-      &mut local_array_elem_types,
-      &mut loop_stack,
-      gen_ctx,
-    )?;
-
-    if !terminated {
-      let zero = builder.ins().iconst(types::I32, 0);
-      builder.ins().return_(&[zero]);
-    }
-    builder.finalize(frontend_config);
-  }
-
-  module
-    .define_function(main_id, ctx)
-    .map_err(|e| e.to_string())?;
-  module.clear_context(ctx);
-  Ok(())
-}
-
-/// Declares the plan 11 exception runtime's imports — `setjmp` straight
-/// from libc, plus `runtime/emerald_runtime.c`'s handler-stack helpers.
-fn declare_exception_runtime_funcs(
-  module: &mut ObjectModule,
-) -> Result<ExceptionRuntimeFuncs, String> {
-  let mut setjmp_sig = module.make_signature();
-  setjmp_sig.params.push(AbiParam::new(types::I64));
-  setjmp_sig.returns.push(AbiParam::new(types::I32));
-  let setjmp = module
-    .declare_function("setjmp", Linkage::Import, &setjmp_sig)
-    .map_err(|e| e.to_string())?;
-
-  let mut push_handler_sig = module.make_signature();
-  push_handler_sig.returns.push(AbiParam::new(types::I64));
-  let push_handler = module
-    .declare_function("emerald_push_handler", Linkage::Import, &push_handler_sig)
-    .map_err(|e| e.to_string())?;
-
-  let mut handler_jmpbuf_sig = module.make_signature();
-  handler_jmpbuf_sig.params.push(AbiParam::new(types::I64));
-  handler_jmpbuf_sig.returns.push(AbiParam::new(types::I64));
-  let handler_jmpbuf = module
-    .declare_function(
-      "emerald_handler_jmpbuf",
-      Linkage::Import,
-      &handler_jmpbuf_sig,
-    )
-    .map_err(|e| e.to_string())?;
-
-  let pop_handler_sig = module.make_signature();
-  let pop_handler = module
-    .declare_function("emerald_pop_handler", Linkage::Import, &pop_handler_sig)
-    .map_err(|e| e.to_string())?;
-
-  let mut free_handler_sig = module.make_signature();
-  free_handler_sig.params.push(AbiParam::new(types::I64));
-  let free_handler = module
-    .declare_function("emerald_free_handler", Linkage::Import, &free_handler_sig)
-    .map_err(|e| e.to_string())?;
-
-  let mut handler_tag_sig = module.make_signature();
-  handler_tag_sig.params.push(AbiParam::new(types::I64));
-  handler_tag_sig.returns.push(AbiParam::new(types::I64));
-  let handler_tag = module
-    .declare_function("emerald_handler_tag", Linkage::Import, &handler_tag_sig)
-    .map_err(|e| e.to_string())?;
-
-  let mut handler_exception_ptr_sig = module.make_signature();
-  handler_exception_ptr_sig
-    .params
-    .push(AbiParam::new(types::I64));
-  handler_exception_ptr_sig
-    .returns
-    .push(AbiParam::new(types::I64));
-  let handler_exception_ptr = module
-    .declare_function(
-      "emerald_handler_exception_ptr",
-      Linkage::Import,
-      &handler_exception_ptr_sig,
-    )
-    .map_err(|e| e.to_string())?;
-
-  let mut raise_sig = module.make_signature();
-  raise_sig.params.push(AbiParam::new(types::I64));
-  raise_sig.params.push(AbiParam::new(types::I64));
-  let raise = module
-    .declare_function("emerald_raise", Linkage::Import, &raise_sig)
-    .map_err(|e| e.to_string())?;
-
-  Ok(ExceptionRuntimeFuncs {
-    setjmp,
-    push_handler,
-    handler_jmpbuf,
-    pop_handler,
-    free_handler,
-    handler_tag,
-    handler_exception_ptr,
-    raise,
-  })
-}
-
-/// Compiles a type-checked `Program` to a native object file at `out_path`.
-/// One exported function per `Item::Function`, `{Class}_{method}` per
-/// class method (plan 08), plus a `main` (`extern "C" fn() -> i32`) that
-/// evaluates the top-level statements (including the `puts` call
-/// statement) via the imported `emerald_print_i64`/`emerald_print_f64`/
-/// `emerald_alloc` runtime symbols (see `runtime/emerald_runtime.c`) and
-/// returns 0.
-pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
-  let isa = host_isa()?;
-  let obj_builder = ObjectBuilder::new(
-    isa,
-    "emerald_module",
-    cranelift_module::default_libcall_names(),
+  let ret_kind = value_kind_for_type(return_type);
+  build_function_body(
+    context,
+    builder,
+    fv,
+    body,
+    &mut vars,
+    &mut local_classes,
+    &mut local_array_elem_types,
+    ret_kind,
+    gen_ctx,
   )
-  .map_err(|e| e.to_string())?;
-  let mut module = ObjectModule::new(obj_builder);
+}
 
-  let mut print_i64_sig = module.make_signature();
-  print_i64_sig.params.push(AbiParam::new(types::I64));
-  let print_i64_func_id = module
-    .declare_function("emerald_print_i64", Linkage::Import, &print_i64_sig)
-    .map_err(|e| e.to_string())?;
+/// Builds `main` (`extern "C" fn() -> i32`): evaluates the top-level
+/// statements (including `puts` calls and lambda-creating `Let`s) via
+/// the already-declared runtime/user functions, and returns 0.
+fn define_main<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  main_fn: FunctionValue<'ctx>,
+  program: &Program,
+  gen_ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  let entry = context.append_basic_block(main_fn, "entry");
+  builder.position_at_end(entry);
 
-  let mut print_f64_sig = module.make_signature();
-  print_f64_sig.params.push(AbiParam::new(types::F64));
-  let print_f64_func_id = module
-    .declare_function("emerald_print_f64", Linkage::Import, &print_f64_sig)
-    .map_err(|e| e.to_string())?;
+  let top_stmts: Vec<Stmt> = program
+    .items
+    .iter()
+    .filter_map(|it| match it {
+      Item::Stmt(s) => Some(s.clone()),
+      _ => None,
+    })
+    .collect();
 
-  let mut alloc_sig = module.make_signature();
-  alloc_sig.params.push(AbiParam::new(types::I64));
-  alloc_sig.returns.push(AbiParam::new(types::I64));
-  let alloc_func_id = module
-    .declare_function("emerald_alloc", Linkage::Import, &alloc_sig)
-    .map_err(|e| e.to_string())?;
+  let mut vars = HashMap::new();
+  let mut local_classes = HashMap::new();
+  let mut local_array_elem_types = HashMap::new();
+  let mut decls = Vec::new();
+  collect_lets(&top_stmts, &mut decls);
+  prealloc_lets(context, builder, &decls, &mut vars)?;
 
-  // Class layouts (field offsets/types) — computed once, independent of
-  // declaration order between classes (plan 08 doesn't support classes
-  // referencing each other's fields yet, so no ordering dependency here).
-  // `class_tags` (plan 11) is built in the same pass: a stable integer
-  // identity per class, standing in for RTTI in `rescue` matching (see
-  // `Ctx::class_tags`'s doc comment).
+  let mut loop_stack = Vec::new();
+  let terminated = build_block(
+    context,
+    builder,
+    main_fn,
+    &top_stmts,
+    &mut vars,
+    &mut local_classes,
+    &mut local_array_elem_types,
+    &mut loop_stack,
+    ValKind::Int64, // main's own AST-level "return kind" is never consulted -- top-level has no `return`
+    gen_ctx,
+  )?;
+  if !terminated {
+    let zero = context.i32_type().const_int(0, false);
+    builder
+      .build_return(Some(&zero))
+      .map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
+/// Declares every user function/method/module-method/lambda's LLVM
+/// signature up front (a two-pass declare-then-define structure, same
+/// shape as the old Cranelift backend's `declare_function`-before-
+/// `define_function` discipline) — so a call to a function declared
+/// later in source order, or a mutually-referencing pair, both resolve.
+fn declare_user_functions<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  program: &Program,
+  classes: &HashMap<String, ClassLayout>,
+) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
+  let mut user_func_ids = HashMap::new();
+  for item in &program.items {
+    match item {
+      Item::Function(f) => {
+        let ret_kind = value_kind_for_type(&f.return_type);
+        let fn_ty = make_fn_type(context, &param_kinds(&f.params), ret_kind);
+        let fv = module.add_function(&f.name, fn_ty, Some(Linkage::External));
+        user_func_ids.insert(f.name.clone(), (fv, ret_kind));
+      }
+      Item::Class(c) => {
+        for m in &c.methods {
+          let ret_kind = value_kind_for_type(&m.return_type);
+          let mut kinds = vec![ValKind::Ptr]; // self
+          kinds.extend(param_kinds(&m.params));
+          let fn_ty = make_fn_type(context, &kinds, ret_kind);
+          let mangled = format!("{}_{}", c.name, m.name);
+          let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
+          user_func_ids.insert(mangled, (fv, ret_kind));
+        }
+      }
+      Item::Module(m) => {
+        for f in &m.methods {
+          let ret_kind = value_kind_for_type(&f.return_type);
+          let fn_ty = make_fn_type(context, &param_kinds(&f.params), ret_kind);
+          let mangled = format!("{}_{}", m.name, f.name);
+          let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
+          user_func_ids.insert(mangled, (fv, ret_kind));
+        }
+      }
+      Item::Stmt(_) => {}
+    }
+  }
+  let _ = classes; // kept in the signature for symmetry with the define pass
+  user_func_ids
+}
+
+fn declare_lambda_functions<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  program: &Program,
+  lambda_infos: &HashMap<String, LambdaInfo>,
+) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
+  let mut lambda_func_ids = HashMap::new();
+  for item in &program.items {
+    let Item::Stmt(Stmt::Let {
+      name,
+      ty,
+      value: Expr::Lambda {
+        params,
+        return_type,
+        ..
+      },
+    }) = item
+    else {
+      continue;
+    };
+    if ty != "Proc" || !lambda_infos.contains_key(name) {
+      continue;
+    }
+    let ret_kind = value_kind_for_type(return_type);
+    let mut kinds = vec![ValKind::Ptr]; // env
+    kinds.extend(param_kinds(params));
+    let fn_ty = make_fn_type(context, &kinds, ret_kind);
+    let fv = module.add_function(&format!("__lambda_{name}"), fn_ty, Some(Linkage::External));
+    lambda_func_ids.insert(name.clone(), (fv, ret_kind));
+  }
+  lambda_func_ids
+}
+
+/// Compiles a type-checked `Program` to a native object file at
+/// `out_path` via LLVM, at `OptimizationLevel::Aggressive`. One
+/// exported function per `Item::Function`, `{Class}_{method}` per
+/// class method, `{Module}_{method}` per module method,
+/// `__lambda_{name}` per top-level `Proc` `Let`, plus a `main`
+/// (`extern "C" fn() -> i32`) that evaluates the top-level statements.
+pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
+  Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
+  let triple = TargetMachine::get_default_triple();
+  let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
+  let target_machine = target
+    .create_target_machine(
+      &triple,
+      &TargetMachine::get_host_cpu_name().to_string(),
+      &TargetMachine::get_host_cpu_features().to_string(),
+      OptimizationLevel::Aggressive,
+      RelocMode::Default,
+      CodeModel::Default,
+    )
+    .ok_or_else(|| "codegen: failed to create a target machine".to_string())?;
+
+  let context = Context::create();
+  let module = context.create_module("emerald_module");
+  module.set_triple(&triple);
+  module.set_data_layout(&target_machine.get_target_data().get_data_layout());
+  let builder = context.create_builder();
+
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let i64_ty = context.i64_type();
+  let f64_ty = context.f64_type();
+  let void_ty = context.void_type();
+
+  let print_i64 = module.add_function(
+    "emerald_print_i64",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let print_f64 = module.add_function(
+    "emerald_print_f64",
+    void_ty.fn_type(&[f64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let alloc = module.add_function(
+    "emerald_alloc",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let exc_funcs = declare_exception_runtime_funcs(&context, &module);
+
+  // Class layouts (field offsets/kinds) and a stable per-class integer
+  // tag (declaration order) for `rescue` matching — computed once,
+  // independent of declaration order between classes (no class
+  // references another's fields yet, so no ordering dependency here).
   let mut classes: HashMap<String, ClassLayout> = HashMap::new();
   let mut class_tags: HashMap<String, i64> = HashMap::new();
   for item in &program.items {
@@ -1922,72 +2153,25 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     }
   }
 
-  let exc_funcs = declare_exception_runtime_funcs(&mut module)?;
-
-  let mut user_func_ids: HashMap<String, FuncId> = HashMap::new();
-  for item in &program.items {
-    if let Item::Function(f) = item {
-      let mut sig = module.make_signature();
-      for p in &f.params {
-        sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
-      }
-      push_return_type(&mut sig.returns, &f.return_type);
-      let id = module
-        .declare_function(&f.name, Linkage::Export, &sig)
-        .map_err(|e| e.to_string())?;
-      user_func_ids.insert(f.name.clone(), id);
-    }
-    if let Item::Class(c) = item {
-      for m in &c.methods {
-        let mut sig = module.make_signature();
-        sig.params.push(AbiParam::new(types::I64)); // self
-        for p in &m.params {
-          sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
-        }
-        push_return_type(&mut sig.returns, &m.return_type);
-        let mangled = format!("{}_{}", c.name, m.name);
-        let id = module
-          .declare_function(&mangled, Linkage::Export, &sig)
-          .map_err(|e| e.to_string())?;
-        user_func_ids.insert(mangled, id);
-      }
-    }
-    // A module method's signature has no leading `self` — it compiles
-    // exactly like a free function, just declared under a namespaced
-    // `{Module}_{method}` name (plan 12's Decision log).
-    if let Item::Module(m) = item {
-      for f in &m.methods {
-        let mut sig = module.make_signature();
-        for p in &f.params {
-          sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
-        }
-        push_return_type(&mut sig.returns, &f.return_type);
-        let mangled = format!("{}_{}", m.name, f.name);
-        let id = module
-          .declare_function(&mangled, Linkage::Export, &sig)
-          .map_err(|e| e.to_string())?;
-        user_func_ids.insert(mangled, id);
-      }
-    }
-  }
-
-  let module_names: std::collections::HashSet<String> = program
+  let module_names: HashSet<String> = program
     .items
     .iter()
     .filter_map(|item| match item {
-      Item::Module(m) => Some(m.name.clone()),
+      Item::Module(ModuleDef { name, .. }) => Some(name.clone()),
       _ => None,
     })
     .collect();
 
-  let (lambda_infos, lambda_func_ids) = collect_lambda_infos(program, &mut module)?;
+  let lambda_infos = collect_lambda_infos(program)?;
+  let user_func_ids = declare_user_functions(&context, &module, program, &classes);
+  let lambda_func_ids = declare_lambda_functions(&context, &module, program, &lambda_infos);
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
     classes: &classes,
-    print_i64_func_id: Some(print_i64_func_id),
-    print_f64_func_id: Some(print_f64_func_id),
-    alloc_func_id,
+    print_i64,
+    print_f64,
+    alloc,
     self_ctx: None,
     lambda_func_ids: &lambda_func_ids,
     lambda_infos: &lambda_infos,
@@ -1996,78 +2180,74 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     module_names: &module_names,
   };
 
-  let mut ctx = module.make_context();
-  let mut func_ctx = FunctionBuilderContext::new();
-
   for item in &program.items {
-    if let Item::Function(f) = item {
-      let id = *user_func_ids.get(&f.name).unwrap();
-      define_user_function(&mut module, &mut ctx, &mut func_ctx, f, id, &gen_ctx)?;
-    }
-    if let Item::Class(c) = item {
-      let layout = classes.get(&c.name).unwrap();
-      for m in &c.methods {
-        let mangled = format!("{}_{}", c.name, m.name);
-        let id = *user_func_ids.get(&mangled).unwrap();
-        define_method(
-          &mut module,
-          &mut ctx,
-          &mut func_ctx,
-          m,
-          id,
-          &layout.fields,
-          &gen_ctx,
-        )?;
+    match item {
+      Item::Function(f) => {
+        let (fv, _) = user_func_ids[&f.name];
+        define_user_function(&context, &builder, f, fv, &gen_ctx)?;
       }
-    }
-    // Reuses `define_user_function` unchanged — a module method has no
-    // `self`, no `@field` access, so it compiles exactly like a free
-    // function (plan 12's Decision log), just under a mangled name.
-    if let Item::Module(m) = item {
-      for f in &m.methods {
-        let mangled = format!("{}_{}", m.name, f.name);
-        let id = *user_func_ids.get(&mangled).unwrap();
-        define_user_function(&mut module, &mut ctx, &mut func_ctx, f, id, &gen_ctx)?;
+      Item::Class(c) => {
+        let layout = &classes[&c.name];
+        for m in &c.methods {
+          let mangled = format!("{}_{}", c.name, m.name);
+          let (fv, _) = user_func_ids[&mangled];
+          define_method(&context, &builder, m, fv, &layout.fields, &gen_ctx)?;
+        }
       }
-    }
-    if let Item::Stmt(Stmt::Let {
-      name,
-      ty,
-      value: Expr::Lambda {
-        params,
-        return_type,
-        body,
-      },
-    }) = item
-    {
-      if ty == "Proc" {
-        let id = *lambda_func_ids.get(name).unwrap();
-        let info = lambda_infos.get(name).unwrap();
-        define_lambda(
-          &mut module,
-          &mut ctx,
-          &mut func_ctx,
+      Item::Module(m) => {
+        for f in &m.methods {
+          let mangled = format!("{}_{}", m.name, f.name);
+          let (fv, _) = user_func_ids[&mangled];
+          // A module method has no `self`/`@field` access — compiles
+          // exactly like a free function, just under a mangled name
+          // and a signature with no leading self param.
+          define_user_function(&context, &builder, f, fv, &gen_ctx)?;
+        }
+      }
+      Item::Stmt(Stmt::Let {
+        name,
+        ty,
+        value: Expr::Lambda {
           params,
           return_type,
           body,
-          info,
-          id,
-          &gen_ctx,
-        )?;
+        },
+      }) if ty == "Proc" => {
+        if let (Some(info), Some(&(fv, _))) = (lambda_infos.get(name), lambda_func_ids.get(name)) {
+          define_lambda(
+            &context,
+            &builder,
+            params,
+            return_type,
+            body,
+            info,
+            fv,
+            &gen_ctx,
+          )?;
+        }
       }
+      Item::Stmt(_) => {}
     }
   }
 
-  define_main(&mut module, &mut ctx, &mut func_ctx, program, &gen_ctx)?;
+  let main_ty = context.i32_type().fn_type(&[], false);
+  let main_fn = module.add_function("main", main_ty, Some(Linkage::External));
+  define_main(&context, &builder, main_fn, program, &gen_ctx)?;
 
-  let object = module.finish();
-  let bytes = object.emit().map_err(|e| e.to_string())?;
-  std::fs::write(out_path, bytes).map_err(|e| e.to_string())?;
-  Ok(())
+  module.verify().map_err(|e| e.to_string())?;
+
+  let pass_options = inkwell::passes::PassBuilderOptions::create();
+  module
+    .run_passes("default<O3>", &target_machine, pass_options)
+    .map_err(|e| e.to_string())?;
+
+  target_machine
+    .write_to_file(&module, FileType::Object, out_path)
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
-mod aot_tests {
+mod tests {
   use super::*;
   use std::process::Command;
 
@@ -2075,9 +2255,9 @@ mod aot_tests {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/emerald_runtime.c")
   }
 
-  /// Compiles `src` to an object file, links it with the runtime shim via
-  /// `cc`, runs the resulting binary, and returns its captured stdout.
-  /// Real, executed proof — not a simulation (matches plan 06's practice).
+  /// Compiles `src` to an object file, links it with the runtime shim
+  /// via `cc`, runs the resulting binary, and returns its captured
+  /// stdout. Real, executed proof — not a simulation.
   fn compile_link_run(src: &str) -> String {
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = std::env::temp_dir();
@@ -2119,7 +2299,6 @@ mod aot_tests {
 
     let bytes = std::fs::read(&out_path).expect("object file should exist");
     assert!(!bytes.is_empty(), "object file should not be empty");
-    // ELF magic number, since this environment targets Linux.
     assert_eq!(
       &bytes[0..4],
       b"\x7fELF",
@@ -2149,10 +2328,6 @@ mod aot_tests {
 
   #[test]
   fn break_exits_loop_early() {
-    // Without `break` this prints 6 (1+2+3); breaking when i==2 means only
-    // the first iteration's addition happens, so it prints 1 — proving
-    // `break` actually skips the remaining iterations, not just that the
-    // loop runs at all.
     let src = "total: Int64 = 0\ni: Int64 = 1\nwhile i < 4\n  if i == 2\n    break\n  end\n  total: Int64 = total + i\n  i: Int64 = i + 1\nend\nputs total\n";
     assert_eq!(compile_link_run(src), "1\n");
   }
@@ -2161,9 +2336,6 @@ mod aot_tests {
 
   #[test]
   fn inception_point_example_linked_and_run_prints_5() {
-    // 2.0 + 3.0 = 5.0; emerald_print_f64 uses "%g", which renders a whole
-    // number without a trailing ".0" — pinned from the real observed
-    // output, not guessed (plan 08's leaf-codegen-class AC1).
     assert_eq!(compile_link_run(POINT_EXAMPLE), "5\n");
   }
 
@@ -2171,18 +2343,11 @@ mod aot_tests {
 
   #[test]
   fn plan_09_collections_example_linked_and_run() {
-    // Plan 09's own worked example (inception has no literal one for
-    // collections): allocate, sum via a `while`-loop indexed read, mutate
-    // via `arr[1] = 99`, read back — real executed proof, not simulated
-    // (plan 09 AC1).
     assert_eq!(compile_link_run(ARRAY_EXAMPLE), "60\n99\n");
   }
 
   #[test]
   fn array_literal_index_read_and_write_linked_and_run() {
-    // Sums the literal (10+20+30=60), then overwrites index 1 and reads
-    // it back (99) — proves allocation, read-indexing, and write-indexing
-    // all touch the same underlying buffer, not simulated (plan 09 AC3).
     let src =
       "arr: Array[Int64] = [10, 20, 30]\nputs arr[0] + arr[1] + arr[2]\narr[1] = 99\nputs arr[1]\n";
     assert_eq!(compile_link_run(src), "60\n99\n");
@@ -2190,28 +2355,18 @@ mod aot_tests {
 
   #[test]
   fn array_of_float64_linked_and_run() {
-    // A second element type proves indexing picks its load width from
-    // `local_array_elem_types`, not a single hard-coded Cranelift type.
     let src = "arr: Array[Float64] = [1.5, 2.5]\nputs arr[0] + arr[1]\n";
     assert_eq!(compile_link_run(src), "4\n");
   }
 
   #[test]
   fn lambda_capture_and_call_linked_and_run() {
-    // Plan 10's own worked example: `add_x` captures `x` (10) by value at
-    // creation, `.call(5)` runs the synthesized function with that
-    // snapshot plus the call argument — 10 + 5 = 15. Real executed proof
-    // that env allocation, capture storage, and static `.call` dispatch
-    // all wire together correctly (plan 10 AC1).
     let src = "x: Int64 = 10\nadd_x: Proc = ->(y: Int64) -> Int64 { y + x }\nputs add_x.call(5)\n";
     assert_eq!(compile_link_run(src), "15\n");
   }
 
   #[test]
   fn lambda_with_no_captures_linked_and_run() {
-    // Zero-capture edge case: `emerald_alloc(0)`, no stores into the env,
-    // just a direct call — proves the capture-count-driven allocation
-    // size doesn't assume at least one capture exists.
     let src = "add_one: Proc = ->(y: Int64) -> Int64 { y + 1 }\nputs add_one.call(41)\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
@@ -2220,49 +2375,54 @@ mod aot_tests {
 
   #[test]
   fn plan_11_exceptions_example_linked_and_run() {
-    // Plan 11's own worked example: `risky(999)` raises `MyError.new(99)`,
-    // the setjmp/longjmp handler stack unwinds back to `begin`'s site, the
-    // caught exception's tag matches `rescue MyError`, `e` binds to the
-    // raised instance, and `e.code` reads 99 back out through its
-    // accessor method — real executed proof, not simulated (plan 11 AC1).
     assert_eq!(compile_link_run(EXCEPTION_EXAMPLE), "99\n");
   }
 
   #[test]
   fn no_exception_raised_skips_rescue_entirely() {
-    // The "happy path": when `risky` doesn't raise, `begin`'s body value
-    // flows through normally and `rescue_body` never runs — proves the
-    // setjmp first-pass branch (not just the longjmp landing pad) works.
     let src = "def risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nclass MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nbegin\n  puts risky(5)\nrescue MyError => e\n  puts 0\nend\n";
     assert_eq!(compile_link_run(src), "5\n");
   }
 
   #[test]
   fn plan_12_module_example_linked_and_run() {
-    // Plan 12's own worked example: a namespace-only module holding a
-    // static method, called via `MathUtils.double(21)` — no receiver
-    // value, no self, a direct call to the mangled function. Real
-    // executed proof, not simulated (plan 12 AC1).
     let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
 
   #[test]
   fn unsupported_top_level_shape_errors_not_panics() {
-    // A two-argument `puts` call — no such surface syntax exists yet (the
-    // grammar's `puts` production takes exactly one Expr), but codegen
-    // must not panic if it ever receives this AST shape. Constructed
-    // directly since the grammar can't produce it.
     let program = Program {
       items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
         "puts".into(),
         vec![Expr::Int(1), Expr::Int(2)],
       )))],
     };
-    let dir = std::env::temp_dir();
-    let out_path = dir.join(format!("emerald_codegen_test_bad_{}.o", std::process::id()));
-    let result = compile_to_object(&program, &out_path);
-    assert!(result.is_err());
-    std::fs::remove_file(&out_path).ok();
+    let out = std::env::temp_dir().join("emerald_codegen_should_not_exist.o");
+    // Grammar can't actually produce 2-arg `puts` (its production takes
+    // exactly one Expr), but codegen must not panic on this AST shape —
+    // it falls through to the generic `Stmt::Expr` arm, calling
+    // `build_expr` on `Expr::Call("puts", [..])`, which errors because
+    // `"puts"` isn't a compiled user function.
+    assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  #[test]
+  fn sum_benchmark_program_matches_expected_output() {
+    let src = std::fs::read_to_string(
+      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/sum/sum.em"),
+    )
+    .expect("benchmarks/sum/sum.em should exist");
+    assert_eq!(compile_link_run(&src), "49999995000000\n");
+  }
+
+  #[test]
+  fn array_traversal_benchmark_program_matches_expected_output() {
+    let src = std::fs::read_to_string(
+      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/array_traversal/array_traversal.em"),
+    )
+    .expect("benchmarks/array_traversal/array_traversal.em should exist");
+    assert_eq!(compile_link_run(&src), "210000000\n");
   }
 }

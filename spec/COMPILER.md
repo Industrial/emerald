@@ -150,6 +150,41 @@ backend); `crates/emerald-cli/tests/benchmarks.rs` (real, executed,
 `--backend`-parameterized measurement); `benchmarks/REPORT.md`;
 `.cursor/plans/codegen-backend-bakeoff.plan.md`.
 
+### 2026-09-09 addendum (`consolidate-llvm-backend`): Cranelift removed, LLVM is now the only backend
+
+Explicit user directive: "Remove everything but the best option and
+implement the best option 100% now." The dual-backend state above was
+scoped to plan 16's bake-off measurement, not meant to be permanent —
+this addendum is that follow-through. `crates/emerald-codegen` (Cranelift)
+is deleted; `crates/emerald-codegen-llvm` was promoted to
+`crates/emerald-codegen`, the sole codegen crate, and built out to full
+feature parity with what Cranelift supported: functions, classes
+(fields/methods/`new`/`@field`), lambdas/closures (top-level `Proc`
+`Let`s, by-value capture, static `.call`), exceptions (`raise`/`begin`/
+`rescue` via the same setjmp/longjmp runtime), modules, arrays. Every
+restriction the old backend had (lambdas only as a top-level `Let`,
+method/index receivers must be a plain local variable, one `rescue`
+clause, no inheritance) carries over unchanged — this is a backend swap,
+not a language change. `emerald-cli` loses `--backend`; there is only one
+backend again.
+
+Proof of parity: the old Cranelift backend's entire test suite (17
+tests — functions, the `Point` class example, `break`/`if`/`while`,
+lambda capture, both exception tests, the module example, both array
+tests, both benchmark programs) was ported verbatim (same source
+strings, same expected outputs) into `crates/emerald-codegen`'s own test
+module and all 17 pass. `cargo test --workspace` is green.
+
+Re-measured `benchmarks/REPORT.md` with the single consolidated backend,
+still at `OptimizationLevel::Aggressive` (`default<O3>`): Emerald now
+**beats hand-written Rust on both benchmarks** (`sum`: 0.533ms vs Rust's
+0.718ms; `array_traversal`: 0.559ms vs Rust's 0.738ms) and beats C on
+`array_traversal` (0.559ms vs C's 2.488ms) — the auto-vectorized loop
+that motivated this whole line of work in the first place.
+
+Evidence: `crates/emerald-codegen/src/lib.rs` (17 passing tests);
+`benchmarks/REPORT.md`; `.cursor/plans/consolidate-llvm-backend.plan.md`.
+
 ---
 
 ## Cross-references
