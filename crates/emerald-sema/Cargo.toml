@@ -1,0 +1,8 @@
+[package]
+name = "emerald-sema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+emerald-parser = { path = "../emerald-parser" }
