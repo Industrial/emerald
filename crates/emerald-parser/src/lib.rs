@@ -1006,6 +1006,52 @@ mod tests {
     parse(src).expect("plan 31's worked example must parse cleanly");
   }
 
+  // Plan 33 (field-access sugar).
+
+  #[test]
+  fn read_field_synthesizes_a_zero_arg_accessor() {
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a ClassDef");
+    };
+    // `fields` is unchanged: two plain, unmarked Params.
+    assert_eq!(
+      c.fields,
+      vec![
+        Param {
+          name: "x".to_string(),
+          ty: "Int64".to_string()
+        },
+        Param {
+          name: "y".to_string(),
+          ty: "Int64".to_string()
+        },
+      ]
+    );
+    // `methods` contains a synthesized zero-arg accessor for `x`,
+    // alongside the hand-written `initialize` — but nothing for `y`.
+    let x_accessor = c
+      .methods
+      .iter()
+      .find(|m| m.name == "x")
+      .expect("expected a synthesized `x` accessor method");
+    assert_eq!(x_accessor.params, vec![]);
+    assert_eq!(x_accessor.return_type, "Int64");
+    assert_eq!(
+      x_accessor.body,
+      vec![Stmt::Expr(Expr::InstanceVar("x".to_string()))]
+    );
+    assert!(c.methods.iter().any(|m| m.name == "initialize"));
+    assert!(!c.methods.iter().any(|m| m.name == "y"));
+  }
+
+  #[test]
+  fn plan_33_worked_example_parses() {
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
+    parse(src).expect("plan 33's worked example must parse cleanly");
+  }
+
   // Plan 32 (class inheritance).
 
   #[test]

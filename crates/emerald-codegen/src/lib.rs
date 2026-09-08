@@ -4302,4 +4302,15 @@ mod tests {
     let src = "class Counter\n  n: Int64\n\n  def initialize(n: Int64) -> Void\n    @n = n\n  end\n\n  def value -> Int64\n    @n\n  end\nend\n\nc: Counter = Counter.new(7)\nputs c.value\n";
     assert_eq!(compile_link_run(src), "7\n");
   }
+
+  // Plan 33 (field-access sugar).
+
+  #[test]
+  fn read_field_accessor_linked_and_run() {
+    // Real executed proof `p.x` dispatches through the synthesized
+    // zero-arg accessor exactly like a hand-written method — no codegen
+    // source changes needed for this plan at all.
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
+    assert_eq!(compile_link_run(src), "3\n");
+  }
 }

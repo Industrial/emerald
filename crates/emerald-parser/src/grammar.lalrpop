@@ -55,7 +55,35 @@ Item: Item = {
 // parameter) — fields and methods have disjoint FIRST sets (`Ident` vs
 // `"def"`), so `Param*` followed by `FuncDef*` is unambiguous.
 ClassDef: ClassDef = {
-  "class" <name:Ident> <superclass:SuperclassClause?> <fields:Param*> <methods:FuncDef*> "end" => ClassDef { name, superclass, fields, methods }
+  "class" <name:Ident> <superclass:SuperclassClause?> <class_fields:ClassField*> <methods:FuncDef*> "end" => {
+    let mut fields = Vec::new();
+    let mut all_methods = Vec::new();
+    for (p, synthesized) in class_fields {
+      fields.push(p);
+      all_methods.extend(synthesized);
+    }
+    all_methods.extend(methods);
+    ClassDef { name, superclass, fields, methods: all_methods }
+  }
+};
+
+// Plan 33: an opt-in `read <name>: <Type>` field marker synthesizes a
+// zero-arg accessor method returning `@<name>` (Decision log) — a pure
+// parse-time desugaring, `Param`/`ClassDef`'s shapes are unchanged;
+// `fields` still gets the same plain, unmarked `Param` either way.
+// `read` is reserved the same LALR(1) way every other class-body
+// keyword already is.
+ClassField: (Param, Vec<Function>) = {
+  <p:Param> => (p, vec![]),
+  "read" <p:Param> => {
+    let accessor = Function {
+      name: p.name.clone(),
+      params: vec![],
+      return_type: p.ty.clone(),
+      body: vec![Stmt::Expr(Expr::InstanceVar(p.name.clone()))],
+    };
+    (p, vec![accessor])
+  },
 };
 
 // `class Dog < Animal` (plan 32's Decision log). Reuses the already-

@@ -2034,4 +2034,25 @@ mod tests {
     let errs = check_program(&program).expect_err("must reject an undeclared superclass");
     assert!(errs[0].message.contains("NotAClass"));
   }
+
+  // Plan 33 (field-access sugar).
+
+  const READ_FIELD_EXAMPLE: &str = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
+
+  #[test]
+  fn accepts_read_field_accessed_from_outside() {
+    let program = emerald_parser::parse(READ_FIELD_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_non_read_field_accessed_from_outside() {
+    // Opt-in per field, not blanket exposure: `y` has no `read` marker,
+    // so `p.y` must be rejected with the same "no such method"
+    // diagnostic plan 08 already produces for any undeclared method.
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.y\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject `p.y` — `y` has no `read` marker");
+    assert!(errs[0].message.contains('y'));
+  }
 }
