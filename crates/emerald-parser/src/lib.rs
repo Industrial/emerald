@@ -934,6 +934,34 @@ mod tests {
     assert_eq!(*else_body, None);
   }
 
+  // Plan 30 (for-in iteration).
+
+  #[test]
+  fn for_in_over_a_literal_array_parses() {
+    let src = "for x in [10, 20, 30]\n  puts x\nend\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::For {
+        var: "x".to_string(),
+        elements: vec![Expr::Int(10), Expr::Int(20), Expr::Int(30)],
+        body: vec![Stmt::Expr(Expr::Call(
+          "puts".to_string(),
+          vec![Expr::Ident("x".to_string())]
+        ))],
+      })
+    );
+  }
+
+  #[test]
+  fn for_in_over_a_bare_identifier_is_a_parse_error() {
+    let src = "for x in arr\n  puts x\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "a non-literal scrutinee must be rejected at parse time"
+    );
+  }
+
   // Plan 29 (control-flow completeness).
 
   #[test]

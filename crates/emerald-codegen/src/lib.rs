@@ -296,6 +296,22 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
         }
       }
     }
+    // Plan 30: `var` is bound (like a `Let`'s `name`), `elements` are
+    // referenced (they're evaluated in the enclosing scope, before the
+    // loop var exists), `body` recurses normally.
+    Stmt::For {
+      var,
+      elements,
+      body,
+    } => {
+      bound.insert(var.clone());
+      for e in elements {
+        collect_idents_in_expr(e, referenced);
+      }
+      for s in body {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+    }
   }
 }
 
@@ -376,6 +392,16 @@ fn collect_lets(stmts: &[Stmt], out: &mut Vec<(String, ValKind)>) {
     match stmt {
       Stmt::Let { name, ty, .. } => out.push((name.clone(), value_kind_for_type(ty))),
       Stmt::While { body, .. } => collect_lets(body, out),
+      // Plan 30: `var` itself is deliberately NOT hoisted here — unlike
+      // a `Let`'s declared `ty` string, there's no syntactic type
+      // annotation to derive its `ValKind` from ahead of time (sema
+      // unifies it from `elements`' inferred types, which needs
+      // context this purely-syntactic pre-pass doesn't have). Its
+      // alloca is built inline at the `Stmt::For` codegen site instead,
+      // once the first element's real `ValKind` is known. Any ordinary
+      // `Let`s inside `body` still need hoisting, same as every other
+      // loop/branch body here.
+      Stmt::For { body, .. } => collect_lets(body, out),
       Stmt::If {
         then_branch,
         else_branch,
@@ -1934,6 +1960,152 @@ fn build_lambda_let<'ctx>(
   Ok(())
 }
 
+/// `for var in [e1, e2, ...] body end` (plan 30's Decision log):
+/// desugars to the same index-based `while` shape plan 09's array
+/// traversal already proved — a fresh hidden `Int64` index counter, a
+/// `for.cond`/`for.body`/`for.incr`/`for.after` block shape (four, not
+/// three like `while`, because `next` must resume at the increment
+/// step, not the condition check — otherwise a `next` would skip the
+/// index bump entirely and infinite-loop), and a per-iteration
+/// `Expr::Index`-shaped load bound to `var`.
+#[allow(clippy::too_many_arguments)]
+fn build_for<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  var: &str,
+  elements: &[Expr],
+  body: &[Stmt],
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<bool, String> {
+  // Built directly (not via `build_array_lit`) so the first element's
+  // real `ValKind` is captured in the same pass — calling `build_expr`
+  // on it a second time to discover the kind would double any side
+  // effects a non-literal element expr has.
+  let elem_count = elements.len() as u64;
+  let size_val = context.i64_type().const_int(elem_count * 8, false);
+  let call = builder
+    .build_call(ctx.alloc, &[size_val.into()], "forarralloc")
+    .map_err(|e| e.to_string())?;
+  let arr_ptr = call_result(call)?.into_pointer_value();
+  let mut elem_kind = ValKind::Int64;
+  for (i, e) in elements.iter().enumerate() {
+    let (v, k) = build_expr(
+      context,
+      builder,
+      e,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    if i == 0 {
+      elem_kind = k;
+    }
+    let elem_ptr = field_ptr(context, builder, arr_ptr, i as u64 * 8)?;
+    builder
+      .build_store(elem_ptr, v)
+      .map_err(|e| e.to_string())?;
+  }
+
+  let idx_alloca = builder
+    .build_alloca(context.i64_type(), "for.idx")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(idx_alloca, context.i64_type().const_int(0, false))
+    .map_err(|e| e.to_string())?;
+  let var_alloca = builder
+    .build_alloca(local_llvm_type(context, elem_kind), var)
+    .map_err(|e| e.to_string())?;
+  vars.insert(var.to_string(), (var_alloca, elem_kind));
+
+  let cond_blk = context.append_basic_block(func, "for.cond");
+  let body_blk = context.append_basic_block(func, "for.body");
+  let incr_blk = context.append_basic_block(func, "for.incr");
+  let exit_blk = context.append_basic_block(func, "for.after");
+
+  builder
+    .build_unconditional_branch(cond_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(cond_blk);
+  let idx_val = builder
+    .build_load(context.i64_type(), idx_alloca, "for.idx.val")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+  let len_val = context.i64_type().const_int(elem_count, false);
+  let cond_val = builder
+    .build_int_compare(IntPredicate::SLT, idx_val, len_val, "for.cond.cmp")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_conditional_branch(cond_val, body_blk, exit_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(body_blk);
+  let elem_llvm_ty = local_llvm_type(context, elem_kind);
+  let elem_ptr = unsafe {
+    builder
+      .build_in_bounds_gep(elem_llvm_ty, arr_ptr, &[idx_val], "for.elemptr")
+      .map_err(|e| e.to_string())?
+  };
+  let elem_val = builder
+    .build_load(elem_llvm_ty, elem_ptr, "for.elem")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(var_alloca, elem_val)
+    .map_err(|e| e.to_string())?;
+
+  loop_stack.push(LoopTargets {
+    header: incr_blk,
+    exit: exit_blk,
+  });
+  let body_terminated = build_block(
+    context,
+    builder,
+    func,
+    body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ret_kind,
+    ctx,
+  )?;
+  loop_stack.pop();
+  if !body_terminated {
+    builder
+      .build_unconditional_branch(incr_blk)
+      .map_err(|e| e.to_string())?;
+  }
+
+  builder.position_at_end(incr_blk);
+  let idx_val = builder
+    .build_load(context.i64_type(), idx_alloca, "for.idx.val")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+  let next_idx = builder
+    .build_int_add(
+      idx_val,
+      context.i64_type().const_int(1, false),
+      "for.idx.next",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(idx_alloca, next_idx)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(cond_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(exit_blk);
+  Ok(false)
+}
+
 /// Emits one statement. Returns `true` if the statement emitted a
 /// block terminator (`return`/the loop-jump for `break`/`next`/
 /// `raise`'s unreachable) — callers must not emit further instructions
@@ -2262,6 +2434,26 @@ fn build_stmt<'ctx>(
       builder.position_at_end(exit_blk);
       Ok(false)
     }
+    // Plan 30: desugars to the same index-based `while` shape plan 09's
+    // array traversal already proved. See `build_for`.
+    Stmt::For {
+      var,
+      elements,
+      body,
+    } => build_for(
+      context,
+      builder,
+      func,
+      var,
+      elements,
+      body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ret_kind,
+      ctx,
+    ),
     Stmt::Raise(e) => build_raise(
       context,
       builder,
@@ -3818,5 +4010,58 @@ mod tests {
   #[test]
   fn unless_until_example_linked_and_run() {
     assert_eq!(compile_link_run(UNLESS_UNTIL_EXAMPLE), "0\n1\n0\n1\n2\n");
+  }
+
+  // Plan 30 (for-in iteration).
+
+  #[test]
+  fn for_in_sums_a_literal_array() {
+    let src = "sum: Int64 = 0\nfor x in [10, 20, 30]\n  sum: Int64 = sum + x\nend\nputs sum\n";
+    assert_eq!(compile_link_run(src), "60\n");
+  }
+
+  #[test]
+  fn for_in_break_stops_after_the_second_element() {
+    let src = "for x in [10, 20, 30, 40]\n  if x == 30\n    break\n  end\n  puts x\nend\n";
+    assert_eq!(compile_link_run(src), "10\n20\n");
+  }
+
+  #[test]
+  fn for_in_next_skips_one_element() {
+    let src = "for x in [10, 20, 30]\n  if x == 20\n    next\n  end\n  puts x\nend\n";
+    assert_eq!(compile_link_run(src), "10\n30\n");
+  }
+
+  #[test]
+  fn for_in_over_a_string_array_linked_and_run() {
+    let src = "for x in [\"a\", \"b\", \"c\"]\n  puts x\nend\n";
+    assert_eq!(compile_link_run(src), "a\nb\nc\n");
+  }
+
+  #[test]
+  fn for_in_over_an_empty_element_list_does_not_panic() {
+    // AC3's "unsupported shape" standard, adapted: the grammar bakes
+    // literal-ness into `Stmt::For.elements` directly, so there is no
+    // representable non-literal-scrutinee shape to construct here — the
+    // one edge case codegen alone (bypassing sema's empty-literal
+    // rejection) can actually receive is an empty `elements` list. It
+    // must not panic; zero iterations is a coherent, defensible result.
+    let program = Program {
+      items: vec![Item::Stmt(Stmt::For {
+        var: "x".into(),
+        elements: vec![],
+        body: vec![Stmt::Expr(Expr::Call(
+          "puts".into(),
+          vec![Expr::Ident("x".into())],
+        ))],
+      })],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_empty_for_in_should_not_exist.o");
+    let result = compile_to_object(&program, &out);
+    std::fs::remove_file(&out).ok();
+    assert!(
+      result.is_ok(),
+      "must not panic on an empty for-in element list: {result:?}"
+    );
   }
 }

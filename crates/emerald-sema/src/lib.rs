@@ -884,6 +884,26 @@ fn check_stmt(
       return_type,
       in_loop,
     ),
+    // Plan 30: `elements`'s element type is unified exactly as
+    // `infer_array_lit_type` already does for a bare array literal
+    // (reject empty, reject heterogeneous) — `for` just also binds
+    // `var` at that type for `body`, and threads `in_loop = true` so
+    // `break`/`next` are legal inside it, same as `while`.
+    Stmt::For {
+      var,
+      elements,
+      body,
+    } => {
+      // `infer_array_lit_type` returns the literal's own `Array(elem)`
+      // type, not the element type `var` should be bound at — unwrap
+      // one layer.
+      let Type::Array(elem_ty) = infer_array_lit_type(elements, env, sigs, classes, self_fields)?
+      else {
+        unreachable!("infer_array_lit_type always returns Type::Array")
+      };
+      env.insert(var.clone(), *elem_ty);
+      check_block(body, env, sigs, classes, self_fields, return_type, true)
+    }
   }
 }
 
@@ -1704,6 +1724,41 @@ mod tests {
   #[test]
   fn bitwise_operators_type_check_as_int64() {
     let src = "a: Int64 = 1 << 2\nb: Int64 = 1 & 2\nc: Int64 = ~1\nputs a\nputs b\nputs c\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 30 (for-in iteration).
+
+  #[test]
+  fn accepts_for_in_with_var_usable_at_element_type() {
+    let src = "for x in [1, 2, 3]\n  y: Int64 = x + 1\n  puts y\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_for_in_over_empty_array_literal() {
+    // Grammar requires `[Args]`, and `Args` itself is grammar-legal
+    // empty (`[]` parses fine) — this is a sema-level rejection, same
+    // diagnostic as a bare `Expr::ArrayLit`.
+    let src = "for x in []\n  puts x\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject an empty for-in literal");
+    assert!(errs[0].message.contains("empty array literals"));
+  }
+
+  #[test]
+  fn rejects_for_in_over_heterogeneous_array_literal() {
+    let src = "for x in [1, \"two\"]\n  puts x\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a heterogeneous for-in literal");
+    assert!(errs[0].message.contains("Int64") && errs[0].message.contains("String"));
+  }
+
+  #[test]
+  fn accepts_break_and_next_inside_for_in() {
+    let src = "for x in [1, 2, 3]\n  if x == 2\n    next\n  end\n  if x == 3\n    break\n  end\n  puts x\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }

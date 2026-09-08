@@ -103,6 +103,15 @@ Stmt: Stmt = {
     cond: Expr::Not(Box::new(cond)),
     body,
   },
+  // Plan 30: deliberately mirrors `PrimaryExpr`'s own `"[" Args "]"`
+  // array-literal shape rather than accepting an arbitrary `Expr`
+  // scrutinee, so `for x in arr` (a bare identifier) is a parse error,
+  // not deferred to sema — see the Decision log's scope cut.
+  "for" <var:Ident> "in" "[" <elements:Args> "]" <body:Stmt*> "end" => Stmt::For {
+    var,
+    elements,
+    body,
+  },
   // Requires a value (no bare `return;`) — `<e:Expr?>` here is genuinely
   // LALR(1)-ambiguous: with no significant newlines (plan 04's
   // simplification), the parser can't tell "return" (empty, followed by a

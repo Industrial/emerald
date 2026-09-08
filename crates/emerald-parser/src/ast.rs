@@ -174,6 +174,18 @@ pub enum Stmt {
     arms: Vec<(Vec<Expr>, Vec<Stmt>)>,
     else_body: Option<Vec<Stmt>>,
   },
+  /// `for var in [e1, e2, ...] body end` (plan 30's Decision log) —
+  /// `elements` is restricted to a literal array at the grammar level
+  /// (an arbitrary `Array[T]`-typed scrutinee is a parse error, not a
+  /// sema error), since `Array[T]`'s own representation carries no
+  /// runtime length to iterate against. Codegen desugars this straight
+  /// into the same index-based `while` shape plan 09's array traversal
+  /// already proved.
+  For {
+    var: String,
+    elements: Vec<Expr>,
+    body: Vec<Stmt>,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq)]
