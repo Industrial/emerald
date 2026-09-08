@@ -1,0 +1,9 @@
+commands:
+  install: cargo fetch --locked
+  test: cargo nextest run --workspace
+  typecheck: cargo check --workspace --all-targets
+  build: cargo build --workspace
+  lint: cargo clippy --workspace --all-targets -- -D warnings
+  missionControlJson: echo "no mission-control UI for this project"
+  missionControlPreview: echo "no mission-control UI for this project"
+services: {}

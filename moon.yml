@@ -1,0 +1,152 @@
+# Root-level workspace tasks
+# https://moonrepo.dev/docs/config/project
+id: 'project-template'
+language: 'rust'
+layer: 'application'
+workspace:
+  inheritedTasks:
+    exclude:
+      - check
+      - test
+tasks:
+  format:
+    description: 'Format the workspace with treefmt (Rust, Nix, shell, JS/TS, YAML, TOML)'
+    command: 'treefmt'
+    inputs:
+      - 'treefmt.toml'
+      - '.git/**/*'
+      - '**/*.rs'
+      - '**/*.nix'
+      - '**/*.sh'
+      - '**/*.{js,jsx,ts,tsx,json}'
+      - '**/*.{yml,yaml}'
+      - '**/*.toml'
+      - '.github/workflows/*.yml'
+    options:
+      cache: false
+      outputStyle: buffer-only-failure
+  ci-format:
+    description: 'Format check for CI (treefmt with fail-on-change)'
+    command: 'treefmt'
+    args: ['--config-file', 'treefmt.ci.toml']
+    inputs:
+      - 'treefmt.ci.toml'
+      - '.git/**/*'
+      - '**/*.rs'
+      - '**/*.nix'
+      - '**/*.sh'
+      - '**/*.{js,jsx,ts,tsx,json}'
+      - '**/*.{yml,yaml}'
+      - '**/*.toml'
+      - '.github/workflows/*.yml'
+    options:
+      cache: false
+      outputStyle: buffer-only-failure
+  audit:
+    description: 'Run cargo audit for known Rust security advisories'
+    command: 'cargo'
+    args: ['audit']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+    options:
+      outputStyle: buffer-only-failure
+  coverage:
+    description: 'Run tests with llvm-cov and generate HTML coverage report'
+    command: 'cargo'
+    args: ['llvm-cov', 'nextest']
+    deps: ['~:format']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+    options:
+      cache: false
+  build:
+    description: 'Build the workspace with cargo'
+    command: 'cargo'
+    args: ['build']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**/*.rs'
+    options:
+      cache: true
+      outputStyle: buffer-only-failure
+  check:
+    description: 'Check the workspace compiles'
+    command: 'cargo'
+    args: ['check', '--workspace', '--all-features']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**/*.rs'
+    options:
+      cache: true
+      outputStyle: buffer-only-failure
+  lint:
+    description: 'Run fmt --check and clippy'
+    command: 'bash'
+    args: ['-c', 'cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+    options:
+      outputStyle: buffer-only-failure
+  test:
+    description: 'Run tests with nextest'
+    command: 'cargo'
+    args: ['nextest', 'run']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+      - 'tests/**/*'
+    options:
+      cache: false
+      outputStyle: buffer-only-failure
+  docs:
+    description: 'Build documentation'
+    command: 'cargo'
+    args: ['doc', '--no-deps', '--all-features']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+    options:
+      cache: true
+      outputStyle: buffer-only-failure
+  fix:
+    description: 'Auto-fix with cargo fix and clippy --fix'
+    command: 'bash'
+    args: ['-c', 'cargo fix --allow-dirty --allow-staged --workspace --all-features && cargo clippy --fix --allow-dirty --allow-staged --workspace --all-features -- -D warnings']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+    options:
+      cache: false
+      outputStyle: buffer-only-failure
+  bench:
+    description: 'Run benchmarks (no-op if no benches)'
+    command: 'bash'
+    args: ['-c', 'if [ -d benches ]; then cargo bench; else echo "No benches/ directory"; fi']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+      - 'benches/**/*'
+    options:
+      cache: false
+      outputStyle: buffer-only-failure
+  check-docs:
+    description: 'Build docs and run clippy with missing_docs_in_private_items'
+    command: 'bash'
+    args: ['-c', 'RUSTDOCFLAGS="" cargo doc --all-features --no-deps 2>&1 | tee log/docs-warnings.log | grep -E "(warning|error|Documenting|Finished)" || true && cargo clippy --lib --all-features -- -D warnings -W clippy::missing_docs_in_private_items']
+    inputs:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+    options:
+      outputStyle: buffer-only-failure

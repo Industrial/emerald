@@ -1,0 +1,7 @@
+# https://moonrepo.dev/docs/config/toolchains
+$schema: './cache/schemas/toolchains.json'
+# Rust toolchain configuration
+# We use devenv's Rust, so moon should use system Rust instead of installing via proto
+# Enabling rust (even empty) allows moon to auto-detect dependencies from Cargo.toml
+# Set MOON_TOOLCHAIN_FORCE_GLOBALS=rust to force using system Rust
+rust: {}

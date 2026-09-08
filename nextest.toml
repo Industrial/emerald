@@ -1,0 +1,34 @@
+# Configuration for cargo-nextest test runner
+# See https://nexte.st/book/config/ for full documentation
+
+[profile.default]
+retries = 3
+fail-fast = 5
+test-timeout = "60s"
+slow-timeout = "5s"
+
+cache = true
+
+[profile.default.output]
+status = "all"
+failure-output = "immediate"
+success-output = "immediate"
+
+[profile.default.run]
+threads = "auto"
+capture-output = true
+
+[profile.ci]
+retries = 1
+fail-fast = 1
+test-timeout = "120s"
+slow-timeout = "10s"
+
+[profile.ci.output]
+status = "all"
+failure-output = "immediate"
+success-output = "none"
+
+[profile.ci.run]
+threads = "auto"
+capture-output = true

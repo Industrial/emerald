@@ -1,0 +1,17 @@
+# Shared input defaults (nixpkgs, rust-overlay, git-hooks, nixpkgs-python, …)
+# live in `.cursor/nix/devenv.yaml`. Project-only pins stay here.
+imports:
+  - ./.cursor/nix
+# claude-code is unfree; permit it explicitly (cursor.features.program-claude-code).
+nixpkgs:
+  permittedUnfreePackages:
+    - claude-code
+inputs:
+  definitively:
+    url: github:Industrial/definitively/definitively-v0.4.1
+    flake: true
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+      nixpkgs-unstable:
+        follows: nixpkgs-unstable

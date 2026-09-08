@@ -1,0 +1,36 @@
+# Cargo-audit ignored advisories documentation
+# 
+# This file documents the security advisories that are ignored in the pre-commit hook.
+# The actual ignoring is done via command-line flags in devenv.nix:
+#   cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-20.6.0436
+#
+# This file serves as documentation for why these advisories are ignored.
+
+# RUSTSEC-2023-0071: rsa 0.9.9 - Marvin Attack timing side-channel
+# 
+# Justification:
+# - This is a transitive dependency through sqlx-mysql 0.8.6
+# - The advisory states "No fixed upgrade is available!" for rsa 0.9.9
+# - While rsa 0.10.0-rc.10 exists, it's a release candidate and may not be
+#   compatible with sqlx 0.8.x
+# - The vulnerability is medium severity (5.9) and is a timing side-channel
+#   attack, which requires specific conditions to exploit
+# - We are not directly using RSA; it's only used by sqlx for MySQL connections
+# - This will be resolved when sqlx updates to a version that uses a patched rsa
+#
+# Action items:
+# - Monitor sqlx releases for updates that fix this
+# - Consider upgrading to sqlx 0.9.x when it becomes stable if it fixes this
+# - Review if MySQL support is actually needed; if not, remove it to eliminate the dependency
+
+# RUSTSEC-20.6.0436: paste 1.0.15 - unmaintained
+#
+# Justification:
+# - This is a transitive dependency through rmp and parquet
+# - It's marked as unmaintained but not as vulnerable
+# - The crate is still functional and widely used
+# - We will monitor for alternatives or updates from upstream dependencies
+#
+# Action items:
+# - Monitor rmp and parquet for updates that use maintained alternatives
+# - Consider alternatives if security issues are discovered

@@ -1,0 +1,9 @@
+{
+	"name": "project-template",
+	"version": "0.0.0",
+	"private": true,
+	"devDependencies": {
+		"openskills": "1.5.0",
+		"prpm": "2.1.31"
+	}
+}
