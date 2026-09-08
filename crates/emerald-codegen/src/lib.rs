@@ -85,7 +85,9 @@ use cranelift::codegen::ir::MemFlagsData;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift_module::FuncId;
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use emerald_parser::{ClassDef, CompareOp, Expr, Function as AstFunction, Item, Program, Stmt};
+use emerald_parser::{
+  ClassDef, CompareOp, Expr, Function as AstFunction, Item, Param, Program, Stmt,
+};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -108,6 +110,20 @@ struct FieldInfo {
 struct ClassLayout {
   fields: HashMap<String, FieldInfo>,
   size: i64,
+}
+
+/// A lambda literal's captured-variable layout — the closure-conversion
+/// counterpart to `ClassLayout` (plan 10's Decision log: env buffers are
+/// laid out exactly like an instance's fields, one 8-byte slot per
+/// capture, in first-occurrence order). `captures` is the ordered capture
+/// list; `capture_offsets`/`capture_types` are always populated for every
+/// name in `captures` (built together in `collect_lambda_infos`), so
+/// indexing them by a captured name is an internal invariant, not a
+/// user-input-dependent lookup.
+struct LambdaInfo {
+  captures: Vec<String>,
+  capture_offsets: HashMap<String, i32>,
+  capture_types: HashMap<String, types::Type>,
 }
 
 /// `Float64` fields/params/locals are Cranelift `F64`; everything else
@@ -152,6 +168,188 @@ fn build_class_layout(c: &ClassDef) -> ClassLayout {
   }
 }
 
+/// Every `Expr::Ident` reachable from `expr`, in traversal order —
+/// duplicates and shadowing aside, `free_vars_in_lambda` below sorts
+/// that out. Nested `Expr::Lambda`s are treated as opaque leaves (their
+/// own captures are computed separately, when *they're* the one being
+/// analyzed) rather than walked into — consistent with plan 10's
+/// Decision log restricting lambdas to a single, non-nested level.
+fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
+  match expr {
+    Expr::Ident(name) => out.push(name.clone()),
+    Expr::Int(_) | Expr::Float(_) | Expr::InstanceVar(_) | Expr::Lambda { .. } => {}
+    Expr::Add(l, r) | Expr::Index(l, r) => {
+      collect_idents_in_expr(l, out);
+      collect_idents_in_expr(r, out);
+    }
+    Expr::Compare(l, _, r) => {
+      collect_idents_in_expr(l, out);
+      collect_idents_in_expr(r, out);
+    }
+    Expr::Call(_, args) | Expr::New(_, args) => {
+      for a in args {
+        collect_idents_in_expr(a, out);
+      }
+    }
+    Expr::MethodCall(recv, _, args) => {
+      collect_idents_in_expr(recv, out);
+      for a in args {
+        collect_idents_in_expr(a, out);
+      }
+    }
+    Expr::ArrayLit(elements) => {
+      for e in elements {
+        collect_idents_in_expr(e, out);
+      }
+    }
+  }
+}
+
+/// Walks one statement, recording every `Expr::Ident` it references
+/// (`referenced`) and every name it locally binds (`bound`) — a `Let`
+/// anywhere in the lambda body, at any nesting depth, counts as bound
+/// (order-insensitive: a genuine use-before-def is a separate bug this
+/// analysis doesn't need to catch, since it's not this pass's job).
+fn collect_idents_in_stmt(
+  stmt: &Stmt,
+  referenced: &mut Vec<String>,
+  bound: &mut std::collections::HashSet<String>,
+) {
+  match stmt {
+    Stmt::Let { name, value, .. } => {
+      bound.insert(name.clone());
+      collect_idents_in_expr(value, referenced);
+    }
+    Stmt::SetField { value, .. } => collect_idents_in_expr(value, referenced),
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      collect_idents_in_expr(array, referenced);
+      collect_idents_in_expr(index, referenced);
+      collect_idents_in_expr(value, referenced);
+    }
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      collect_idents_in_expr(cond, referenced);
+      for s in then_branch {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+      if let Some(else_b) = else_branch {
+        for s in else_b {
+          collect_idents_in_stmt(s, referenced, bound);
+        }
+      }
+    }
+    Stmt::While { cond, body } => {
+      collect_idents_in_expr(cond, referenced);
+      for s in body {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+    }
+    Stmt::Return(Some(e)) => collect_idents_in_expr(e, referenced),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next => {}
+    Stmt::Expr(e) => collect_idents_in_expr(e, referenced),
+  }
+}
+
+/// A lambda's free variables — every `Ident` its body references that
+/// isn't one of its own params or locally `Let`-bound inside it — in
+/// first-occurrence order (so the resulting env layout is deterministic).
+fn free_vars_in_lambda(params: &[Param], body: &[Stmt]) -> Vec<String> {
+  let mut referenced = Vec::new();
+  let mut bound: std::collections::HashSet<String> =
+    params.iter().map(|p| p.name.clone()).collect();
+  for s in body {
+    collect_idents_in_stmt(s, &mut referenced, &mut bound);
+  }
+  let mut seen = std::collections::HashSet::new();
+  let mut captures = Vec::new();
+  for name in referenced {
+    if !bound.contains(&name) && seen.insert(name.clone()) {
+      captures.push(name);
+    }
+  }
+  captures
+}
+
+/// Finds every top-level `Stmt::Let` whose value is `Expr::Lambda` (the
+/// only position plan 10 supports, per its Decision log), computes each
+/// one's capture layout, and declares (but does not yet define) its
+/// synthesized `__lambda_{name}` function. A capture's Cranelift type is
+/// recovered from *its own* top-level `Let`'s declared annotation — since
+/// captures can only be other top-level locals (never a param, a field,
+/// or a name from inside another lambda/function), this is always
+/// available by the time a lambda referencing it is scanned, regardless
+/// of which one is declared first in source order.
+fn collect_lambda_infos(
+  program: &Program,
+  module: &mut ObjectModule,
+) -> Result<(HashMap<String, LambdaInfo>, HashMap<String, FuncId>), String> {
+  let mut top_level_types: HashMap<String, String> = HashMap::new();
+  for item in &program.items {
+    if let Item::Stmt(Stmt::Let { name, ty, .. }) = item {
+      top_level_types.insert(name.clone(), ty.clone());
+    }
+  }
+
+  let mut lambda_infos: HashMap<String, LambdaInfo> = HashMap::new();
+  let mut lambda_func_ids: HashMap<String, FuncId> = HashMap::new();
+  for item in &program.items {
+    let Item::Stmt(Stmt::Let {
+      name,
+      ty,
+      value: Expr::Lambda {
+        params,
+        return_type,
+        body,
+      },
+    }) = item
+    else {
+      continue;
+    };
+    if ty != "Proc" {
+      continue;
+    }
+
+    let captures = free_vars_in_lambda(params, body);
+    let mut capture_offsets = HashMap::new();
+    let mut capture_types = HashMap::new();
+    for (i, cap_name) in captures.iter().enumerate() {
+      capture_offsets.insert(cap_name.clone(), i as i32 * ARRAY_ELEM_SIZE as i32);
+      let cap_ty_name = top_level_types.get(cap_name).ok_or_else(|| {
+        format!("codegen: cannot determine the type of captured variable `{cap_name}`")
+      })?;
+      capture_types.insert(cap_name.clone(), cranelift_type(cap_ty_name));
+    }
+
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64)); // env
+    for p in params {
+      sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
+    }
+    push_return_type(&mut sig.returns, return_type);
+    let id = module
+      .declare_function(&format!("__lambda_{name}"), Linkage::Export, &sig)
+      .map_err(|e| e.to_string())?;
+
+    lambda_func_ids.insert(name.clone(), id);
+    lambda_infos.insert(
+      name.clone(),
+      LambdaInfo {
+        captures,
+        capture_offsets,
+        capture_types,
+      },
+    );
+  }
+  Ok((lambda_infos, lambda_func_ids))
+}
+
 /// Context that's fixed for the duration of compiling one function/method
 /// body — bundled to keep `build_expr`/`build_stmt`'s own parameter lists
 /// from growing without bound as plans 07/08 added control flow and
@@ -165,6 +363,13 @@ struct Ctx<'a> {
   print_f64_func_id: Option<FuncId>,
   alloc_func_id: FuncId,
   self_ctx: Option<(Variable, &'a HashMap<String, FieldInfo>)>,
+  /// `{lambda's Let name} -> its synthesized `__lambda_{name}` FuncId,
+  /// for statically dispatching `.call` (plan 10's Decision log).
+  lambda_func_ids: &'a HashMap<String, FuncId>,
+  /// `{lambda's Let name} -> its capture layout, for both the env
+  /// allocation at the `Let` site and the loads inside the lambda's own
+  /// body (see `build_lambda_let`/`define_lambda`).
+  lambda_infos: &'a HashMap<String, LambdaInfo>,
 }
 
 fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, String> {
@@ -317,45 +522,17 @@ fn build_expr(
       }
       Ok(ptr)
     }
-    Expr::MethodCall(recv, method, args) => {
-      let Expr::Ident(recv_name) = recv.as_ref() else {
-        return Err(
-          "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
-        );
-      };
-      let class_name = local_classes.get(recv_name).ok_or_else(|| {
-        format!("codegen: cannot determine the class of `{recv_name}` for `.{method}`")
-      })?;
-      let recv_val = build_expr(
-        builder,
-        module,
-        recv,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
-      let key = format!("{class_name}_{method}");
-      let func_id = *ctx
-        .user_func_ids
-        .get(&key)
-        .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
-      let func_ref = module.declare_func_in_func(func_id, builder.func);
-      let mut call_args = vec![recv_val];
-      for a in args {
-        call_args.push(build_expr(
-          builder,
-          module,
-          a,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?);
-      }
-      let call = builder.ins().call(func_ref, &call_args);
-      Ok(builder.inst_results(call)[0])
-    }
+    Expr::MethodCall(recv, method, args) => build_method_call(
+      builder,
+      module,
+      recv,
+      method,
+      args,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
     Expr::InstanceVar(name) => {
       let (self_var, fields) = ctx
         .self_ctx
@@ -389,7 +566,76 @@ fn build_expr(
       local_array_elem_types,
       ctx,
     ),
+    // A lambda literal only has codegen meaning at a top-level `Let`'s
+    // value (`build_lambda_let`, invoked from `build_stmt`) — see plan
+    // 10's Decision log. Reached from anywhere else (a call argument, a
+    // nested expression, a non-top-level `Let`), it's an unsupported
+    // shape, not a panic.
+    Expr::Lambda { .. } => {
+      Err("codegen: lambda literals are only supported as a top-level `Let`'s value".to_string())
+    }
   }
+}
+
+/// `receiver.method(args)`. `.call` on a receiver `ctx.lambda_func_ids`
+/// can trace dispatches statically to that lambda's synthesized function
+/// (plan 10's Decision log); everything else is the existing
+/// `{Class}_{method}` dispatch plan 08 established.
+#[allow(clippy::too_many_arguments)]
+fn build_method_call(
+  builder: &mut FunctionBuilder,
+  module: &mut ObjectModule,
+  recv: &Expr,
+  method: &str,
+  args: &[Expr],
+  vars: &HashMap<String, Variable>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, String>,
+  ctx: &Ctx,
+) -> Result<Value, String> {
+  let Expr::Ident(recv_name) = recv else {
+    return Err(
+      "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
+    );
+  };
+  let func_id = if method == "call" {
+    *ctx.lambda_func_ids.get(recv_name).ok_or_else(|| {
+      format!("codegen: `.call` on `{recv_name}` — not a lambda literal bound to a top-level `Let`")
+    })?
+  } else {
+    let class_name = local_classes.get(recv_name).ok_or_else(|| {
+      format!("codegen: cannot determine the class of `{recv_name}` for `.{method}`")
+    })?;
+    let key = format!("{class_name}_{method}");
+    *ctx
+      .user_func_ids
+      .get(&key)
+      .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?
+  };
+  let recv_val = build_expr(
+    builder,
+    module,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let func_ref = module.declare_func_in_func(func_id, builder.func);
+  let mut call_args = vec![recv_val];
+  for a in args {
+    call_args.push(build_expr(
+      builder,
+      module,
+      a,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?);
+  }
+  let call = builder.ins().call(func_ref, &call_args);
+  Ok(builder.inst_results(call)[0])
 }
 
 /// `emerald_alloc`s a flat `elements.len() * 8`-byte buffer, then stores
@@ -571,6 +817,44 @@ fn build_set_index(
   Ok(false)
 }
 
+/// `name: Proc = ->(...) -> T { ... }`. Allocates the env buffer
+/// (`emerald_alloc`, sized by capture count), snapshots each captured
+/// local's *current* value into its slot (plan 10's Decision log: by
+/// value, not by reference), and binds `name` to the resulting pointer —
+/// exactly the value `.call` (`build_method_call`) later passes as the
+/// synthesized lambda function's leading `env` argument.
+fn build_lambda_let(
+  builder: &mut FunctionBuilder,
+  module: &mut ObjectModule,
+  name: &str,
+  vars: &mut HashMap<String, Variable>,
+  ctx: &Ctx,
+) -> Result<(), String> {
+  let info = ctx.lambda_infos.get(name).ok_or_else(|| {
+    format!("codegen: lambda literal bound to `{name}` is not supported outside a top-level `Let`")
+  })?;
+  let size_val = builder
+    .ins()
+    .iconst(types::I64, info.captures.len() as i64 * ARRAY_ELEM_SIZE);
+  let alloc_ref = module.declare_func_in_func(ctx.alloc_func_id, builder.func);
+  let call = builder.ins().call(alloc_ref, &[size_val]);
+  let env_ptr = builder.inst_results(call)[0];
+  for cap_name in &info.captures {
+    let cap_var = *vars.get(cap_name).ok_or_else(|| {
+      format!("codegen: captured variable `{cap_name}` is not in scope at `{name}`'s creation site")
+    })?;
+    let val = builder.use_var(cap_var);
+    let offset = info.capture_offsets[cap_name];
+    builder
+      .ins()
+      .store(MemFlagsData::new(), val, env_ptr, offset);
+  }
+  let var = builder.declare_var(types::I64);
+  builder.def_var(var, env_ptr);
+  vars.insert(name.to_string(), var);
+  Ok(())
+}
+
 /// Emits one statement. `vars`/`local_classes` are threaded flat (no
 /// block scoping — matches `emerald-sema`'s equally flat environment, see
 /// plan 07's Implementation Notes); `loop_stack`'s top is `break`/`next`'s
@@ -589,6 +873,19 @@ fn build_stmt(
   ctx: &Ctx,
 ) -> Result<bool, String> {
   match stmt {
+    // `name: Proc = ->(...) -> T { ... }` — the one shape codegen
+    // actually supports for `Expr::Lambda` (plan 10's Decision log).
+    // `build_expr`'s own `Expr::Lambda` arm exists only to reject every
+    // *other* position defensively; this special case is what makes the
+    // supported one work.
+    Stmt::Let {
+      name,
+      ty,
+      value: Expr::Lambda { .. },
+    } if ty == "Proc" => {
+      build_lambda_let(builder, module, name, vars, ctx)?;
+      Ok(false)
+    }
     Stmt::Let { name, ty, value } => {
       let v = build_expr(
         builder,
@@ -1068,6 +1365,89 @@ fn define_method(
   Ok(())
 }
 
+/// Compiles one lambda's synthesized `__lambda_{name}` function — an
+/// implicit leading `env: i64` parameter ahead of the lambda's own
+/// declared params (mirroring `define_method`'s implicit leading `self`),
+/// with each captured name pre-loaded from `env` into an ordinary
+/// `Variable` before the body runs, so `build_expr`'s `Expr::Ident` path
+/// (which only knows about `vars`) doesn't need any special case for a
+/// captured vs. a locally-declared name.
+#[allow(clippy::too_many_arguments)]
+fn define_lambda(
+  module: &mut ObjectModule,
+  ctx: &mut cranelift::codegen::Context,
+  func_ctx: &mut FunctionBuilderContext,
+  params: &[Param],
+  return_type: &str,
+  body: &[Stmt],
+  info: &LambdaInfo,
+  id: FuncId,
+  gen_ctx: &Ctx,
+) -> Result<(), String> {
+  ctx.func.signature.params.clear();
+  ctx.func.signature.returns.clear();
+  ctx.func.signature.params.push(AbiParam::new(types::I64)); // env
+  for p in params {
+    ctx
+      .func
+      .signature
+      .params
+      .push(AbiParam::new(cranelift_type(&p.ty)));
+  }
+  push_return_type(&mut ctx.func.signature.returns, return_type);
+
+  let frontend_config = module.target_config();
+  {
+    let mut builder = FunctionBuilder::new(&mut ctx.func, func_ctx);
+    let block = builder.create_block();
+    builder.append_block_params_for_function_params(block);
+    builder.switch_to_block(block);
+    builder.seal_block(block);
+
+    let env_val = builder.block_params(block)[0];
+
+    let mut vars: HashMap<String, Variable> = HashMap::new();
+    let mut local_classes: HashMap<String, String> = HashMap::new();
+    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
+
+    for cap_name in &info.captures {
+      let cl_ty = info.capture_types[cap_name];
+      let offset = info.capture_offsets[cap_name];
+      let val = builder
+        .ins()
+        .load(cl_ty, MemFlagsData::new(), env_val, offset);
+      let var = builder.declare_var(cl_ty);
+      builder.def_var(var, val);
+      vars.insert(cap_name.clone(), var);
+    }
+
+    for (i, p) in params.iter().enumerate() {
+      let param_val = builder.block_params(block)[i + 1];
+      let var = builder.declare_var(cranelift_type(&p.ty));
+      builder.def_var(var, param_val);
+      vars.insert(p.name.clone(), var);
+      if gen_ctx.classes.contains_key(p.ty.as_str()) {
+        local_classes.insert(p.name.clone(), p.ty.clone());
+      }
+    }
+
+    build_function_body(
+      &mut builder,
+      module,
+      body,
+      &mut vars,
+      &mut local_classes,
+      &mut local_array_elem_types,
+      gen_ctx,
+    )?;
+    builder.finalize(frontend_config);
+  }
+
+  module.define_function(id, ctx).map_err(|e| e.to_string())?;
+  module.clear_context(ctx);
+  Ok(())
+}
+
 fn define_main(
   module: &mut ObjectModule,
   ctx: &mut cranelift::codegen::Context,
@@ -1208,6 +1588,8 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     }
   }
 
+  let (lambda_infos, lambda_func_ids) = collect_lambda_infos(program, &mut module)?;
+
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
     classes: &classes,
@@ -1215,6 +1597,8 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     print_f64_func_id: Some(print_f64_func_id),
     alloc_func_id,
     self_ctx: None,
+    lambda_func_ids: &lambda_func_ids,
+    lambda_infos: &lambda_infos,
   };
 
   let mut ctx = module.make_context();
@@ -1237,6 +1621,32 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
           m,
           id,
           &layout.fields,
+          &gen_ctx,
+        )?;
+      }
+    }
+    if let Item::Stmt(Stmt::Let {
+      name,
+      ty,
+      value: Expr::Lambda {
+        params,
+        return_type,
+        body,
+      },
+    }) = item
+    {
+      if ty == "Proc" {
+        let id = *lambda_func_ids.get(name).unwrap();
+        let info = lambda_infos.get(name).unwrap();
+        define_lambda(
+          &mut module,
+          &mut ctx,
+          &mut func_ctx,
+          params,
+          return_type,
+          body,
+          info,
+          id,
           &gen_ctx,
         )?;
       }
@@ -1379,6 +1789,26 @@ mod aot_tests {
     // `local_array_elem_types`, not a single hard-coded Cranelift type.
     let src = "arr: Array[Float64] = [1.5, 2.5]\nputs arr[0] + arr[1]\n";
     assert_eq!(compile_link_run(src), "4\n");
+  }
+
+  #[test]
+  fn lambda_capture_and_call_linked_and_run() {
+    // Plan 10's own worked example: `add_x` captures `x` (10) by value at
+    // creation, `.call(5)` runs the synthesized function with that
+    // snapshot plus the call argument — 10 + 5 = 15. Real executed proof
+    // that env allocation, capture storage, and static `.call` dispatch
+    // all wire together correctly (plan 10 AC1).
+    let src = "x: Int64 = 10\nadd_x: Proc = ->(y: Int64) -> Int64 { y + x }\nputs add_x.call(5)\n";
+    assert_eq!(compile_link_run(src), "15\n");
+  }
+
+  #[test]
+  fn lambda_with_no_captures_linked_and_run() {
+    // Zero-capture edge case: `emerald_alloc(0)`, no stores into the env,
+    // just a direct call — proves the capture-count-driven allocation
+    // size doesn't assume at least one capture exists.
+    let src = "add_one: Proc = ->(y: Int64) -> Int64 { y + 1 }\nputs add_one.call(41)\n";
+    assert_eq!(compile_link_run(src), "42\n");
   }
 
   #[test]

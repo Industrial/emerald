@@ -29,8 +29,10 @@ pub enum Expr {
   Call(String, Vec<Expr>),
   /// `ClassName.new(args)`.
   New(String, Vec<Expr>),
-  /// `receiver.method` — bare, zero-argument method calls only (see plan
-  /// `08`'s Implementation Notes).
+  /// `receiver.method(args)` — `args` is empty for a bare `receiver.method`
+  /// call (plan `08`'s Point example, `sum`/`initialize` never take
+  /// arguments); plan `10` is the first to actually parse a non-empty
+  /// argument list here.
   MethodCall(Box<Expr>, String, Vec<Expr>),
   /// `@name` — instance-variable read, valid only inside a method body.
   InstanceVar(String),
@@ -38,6 +40,14 @@ pub enum Expr {
   ArrayLit(Vec<Expr>),
   /// `array[index]` — an indexed read.
   Index(Box<Expr>, Box<Expr>),
+  /// `->(params) -> ReturnType { body }` — a lambda literal (plan `10`'s
+  /// Decision log: by-value capture, top-level-`Let`-only, statically
+  /// dispatched `.call`).
+  Lambda {
+    params: Vec<Param>,
+    return_type: String,
+    body: Vec<Stmt>,
+  },
 }
 
 /// One statement in a block (a function body or the program's top level).

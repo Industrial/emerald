@@ -324,4 +324,77 @@ mod tests {
       )
     );
   }
+
+  const LAMBDA_EXAMPLE: &str =
+    "x: Int64 = 10\nadd_x: Proc = ->(y: Int64) -> Int64 { y + x }\nputs add_x.call(5)\n";
+
+  #[test]
+  fn parses_lambda_capture_and_call() {
+    let program = parse(LAMBDA_EXAMPLE).expect("lambda example should parse");
+    assert_eq!(program.items.len(), 3);
+
+    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[1] else {
+      panic!(
+        "expected item 1 to be `add_x: Proc = ->(...) -> Int64 {{...}}`, got {:?}",
+        program.items[1]
+      );
+    };
+    assert_eq!(name, "add_x");
+    assert_eq!(ty, "Proc");
+    assert_eq!(
+      *value,
+      Expr::Lambda {
+        params: vec![Param {
+          name: "y".into(),
+          ty: "Int64".into()
+        }],
+        return_type: "Int64".into(),
+        body: vec![Stmt::Expr(Expr::Add(
+          Box::new(Expr::Ident("y".into())),
+          Box::new(Expr::Ident("x".into()))
+        ))],
+      }
+    );
+
+    let Item::Stmt(Stmt::Expr(call)) = &program.items[2] else {
+      panic!(
+        "expected item 2 to be `puts add_x.call(5)`, got {:?}",
+        program.items[2]
+      );
+    };
+    assert_eq!(
+      *call,
+      Expr::Call(
+        "puts".into(),
+        vec![Expr::MethodCall(
+          Box::new(Expr::Ident("add_x".into())),
+          "call".into(),
+          vec![Expr::Int(5)]
+        )]
+      )
+    );
+  }
+
+  #[test]
+  fn parses_method_call_with_arguments() {
+    // Independent of Proc/lambdas: plan 10's grammar gap fix means an
+    // ordinary `.method(args)` call — never possible before this plan —
+    // now parses with a populated argument list.
+    let src = "p.move(1, 2)\n";
+    let program = parse(src).expect("method call with args should parse");
+    let Item::Stmt(Stmt::Expr(call)) = &program.items[0] else {
+      panic!(
+        "expected a method-call statement, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(
+      *call,
+      Expr::MethodCall(
+        Box::new(Expr::Ident("p".into())),
+        "move".into(),
+        vec![Expr::Int(1), Expr::Int(2)]
+      )
+    );
+  }
 }

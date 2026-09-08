@@ -122,6 +122,7 @@ StmtCallExpr: Expr = {
 StmtPrimaryExpr: Expr = {
   <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
+  <recv:Ident> "." <method:Ident> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
@@ -176,8 +177,19 @@ PrimaryExpr: Expr = {
   // `recv "." Ident` alternative below never compete for the same
   // lookahead token.
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
+  <recv:Ident> "." <method:Ident> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   "[" <elements:Args> "]" => Expr::ArrayLit(elements),
+  // `->(params) -> ReturnType { body }` — plan 10's lambda literal.
+  // `{`/`}` are brand-new terminals (nothing else in this grammar uses
+  // braces), and `"->"` doesn't start any other `PrimaryExpr`
+  // alternative, so this can't collide with the FuncDef-return-arrow
+  // usage of `"->"` or anything else.
+  "->" "(" <params:Params> ")" "->" <return_type:TypeName> "{" <body:Stmt*> "}" => Expr::Lambda {
+    params,
+    return_type,
+    body,
+  },
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
   <name:InstanceVarTok> => Expr::InstanceVar(name),
@@ -213,9 +225,14 @@ Param: Param = {
 // `Param.ty`/`Function.return_type` stay a plain `String` — a compound
 // name like `"Array[Int64]"` is grammar-level concatenation, not a
 // structured type AST node yet (see plan 09's Decision log).
+// `Proc` is reserved the same way (plan 10): a bare, unparameterized
+// annotation — `Type::Proc`'s actual signature is recovered sema-side
+// from the `Expr::Lambda` it's bound to, not from this string (plan 10's
+// Decision log — no `Proc[(Int64) -> Int64]` compound grammar).
 TypeName: String = {
   <name:Ident> => name,
   "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
+  "Proc" => "Proc".to_string(),
 };
 
 Num: i64 = <s:r"[0-9]+"> => s.parse().unwrap();

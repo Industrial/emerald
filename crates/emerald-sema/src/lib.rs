@@ -5,7 +5,7 @@
 //! don't carry spans) — diagnostics are function/call-scoped text.
 //! Line/column-precise diagnostics are `13 diagnostics`'s job.
 
-use emerald_parser::{ClassDef, Expr, Function, Item, Program, Stmt};
+use emerald_parser::{ClassDef, Expr, Function, Item, Param, Program, Stmt};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,14 @@ pub enum Type {
   /// A packed, contiguous array of a single element type
   /// (`spec/TYPE_SYSTEM.md` §8) — named `Array[Elem]` at the source level.
   Array(Box<Type>),
+  /// A closure's parameter types and return type. Unlike `Type::Class`,
+  /// which is just a name backed by a separate `ClassInfo` registry,
+  /// there's no such registry for lambdas — the signature has to travel
+  /// with the type value itself (plan 10's Decision log). The
+  /// *source-level* annotation is always the bare keyword `Proc`; the
+  /// real signature here always comes from the `Expr::Lambda` a `Proc`
+  /// local was bound to (see `check_stmt`'s `Let` case).
+  Proc(Vec<Type>, Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +76,13 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
       let elem_ty = resolve_type(elem_name, classes)?;
       Ok(Type::Array(Box::new(elem_ty)))
     }
+    // A bare `Proc` annotation carries no signature (see `Type::Proc`'s
+    // doc comment) — this opaque placeholder is only ever reached outside
+    // `check_stmt`'s `Let` special case (which instead stores the real
+    // signature straight from the bound `Expr::Lambda`), e.g. if `Proc`
+    // were used as a function parameter/return type, which this plan
+    // doesn't exercise.
+    "Proc" => Ok(Type::Proc(Vec::new(), Box::new(Type::Void))),
     other => Err(Diagnostic::new(format!("unknown type `{other}`"))),
   }
 }
@@ -196,6 +211,19 @@ fn infer_expr_type(
       }
       Ok(Type::Class(class_name.clone()))
     }
+    // `.call` on a `Proc`-typed receiver dispatches against the
+    // signature carried directly on `Type::Proc` (plan 10) — everything
+    // else falls through to the existing `Type::Class` method lookup.
+    Expr::MethodCall(recv, method, args) if method == "call" => {
+      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields)?;
+      let Type::Proc(param_types, return_type) = &recv_ty else {
+        return Err(Diagnostic::new(format!(
+          "method call `.call` on non-Proc type {recv_ty:?}"
+        )));
+      };
+      check_args("call", args, param_types, env, sigs, classes, self_fields)?;
+      Ok((**return_type).clone())
+    }
     Expr::MethodCall(recv, method, args) => {
       let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields)?;
       let Type::Class(class_name) = &recv_ty else {
@@ -241,7 +269,53 @@ fn infer_expr_type(
       }
       Ok(*elem_ty)
     }
+    Expr::Lambda {
+      params,
+      return_type,
+      body,
+    } => infer_lambda_type(params, return_type, body, env, sigs, classes),
   }
+}
+
+/// A lambda body is checked exactly like a function body — the outer
+/// scope's locals plus the lambda's own params, no `@field` access (`None`
+/// self_fields; plan 10's Decision log restricts lambdas to top-level
+/// `Let`s, where there's no enclosing method anyway).
+fn infer_lambda_type(
+  params: &[Param],
+  return_type: &str,
+  body: &[Stmt],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Type, Diagnostic> {
+  let mut lambda_env = env.clone();
+  let mut param_types = Vec::with_capacity(params.len());
+  for p in params {
+    let t = resolve_type(&p.ty, classes)?;
+    param_types.push(t.clone());
+    lambda_env.insert(p.name.clone(), t);
+  }
+  let declared_return = resolve_type(return_type, classes)?;
+  check_block(
+    body,
+    &mut lambda_env,
+    sigs,
+    classes,
+    None,
+    &declared_return,
+    false,
+  )?;
+  check_implicit_return(
+    body,
+    &lambda_env,
+    sigs,
+    classes,
+    None,
+    &declared_return,
+    "<lambda>",
+  )?;
+  Ok(Type::Proc(param_types, Box::new(declared_return)))
 }
 
 /// All elements of an array literal must share one type, and — since
@@ -350,6 +424,21 @@ fn check_stmt(
   in_loop: bool,
 ) -> Result<(), Diagnostic> {
   match stmt {
+    // `Proc` is special-cased: the bare annotation carries no signature
+    // (see `Type::Proc`'s doc comment), so instead of comparing against
+    // `resolve_type("Proc", ...)`'s opaque placeholder, any actual
+    // `Type::Proc(_, _)` is accepted and *that* — the real signature
+    // inferred from the bound `Expr::Lambda` — is what's stored in `env`.
+    Stmt::Let { name, ty, value } if ty == "Proc" => {
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+      if !matches!(actual, Type::Proc(_, _)) {
+        return Err(Diagnostic::new(format!(
+          "type mismatch in `{name}: Proc = ...`: expected a Proc (lambda literal), found {actual:?}"
+        )));
+      }
+      env.insert(name.clone(), actual);
+      Ok(())
+    }
     Stmt::Let { name, ty, value } => {
       let declared = resolve_type(ty, classes)?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
@@ -821,5 +910,47 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject indexing a non-Array");
     assert!(errs[0].message.contains("requires an Array"));
+  }
+
+  const LAMBDA_EXAMPLE: &str =
+    "x: Int64 = 10\nadd_x: Proc = ->(y: Int64) -> Int64 { y + x }\nputs add_x.call(5)\n";
+
+  #[test]
+  fn accepts_lambda_capture_and_call() {
+    let program = emerald_parser::parse(LAMBDA_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_call_arity_mismatch() {
+    let src = "add_x: Proc = ->(y: Int64) -> Int64 { y }\nputs add_x.call(5, 6)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject 2-arg call to a 1-param Proc");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("expects 1 argument"))
+    );
+  }
+
+  #[test]
+  fn rejects_call_argument_type_mismatch() {
+    let src = "add_x: Proc = ->(y: Int64) -> Int64 { y }\nputs add_x.call(1.5)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject a Float64 argument to an Int64 param");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Int64") && d.message.contains("Float64"))
+    );
+  }
+
+  #[test]
+  fn rejects_call_on_non_proc_receiver() {
+    let src = "x: Int64 = 5\nputs x.call(1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject .call on a non-Proc receiver");
+    assert!(errs[0].message.contains("non-Proc type"));
   }
 }
