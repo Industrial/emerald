@@ -401,6 +401,14 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
         collect_idents_in_stmt(s, referenced, bound);
       }
     }
+    // Plan 34: `yield`'s args are ordinary references, evaluated in the
+    // enclosing (callee's) scope — nothing about `yield` binds a new
+    // name.
+    Stmt::Yield(args) => {
+      for a in args {
+        collect_idents_in_expr(a, referenced);
+      }
+    }
   }
 }
 
@@ -679,6 +687,19 @@ struct Ctx<'a, 'ctx> {
   /// bare `malloc`) and `Hash[K, V]` key-not-found abort helper.
   alloc_zeroed: FunctionValue<'ctx>,
   hash_key_not_found: FunctionValue<'ctx>,
+  /// Plan 34: `{name} -> its raw AST}` for every `block_param`-
+  /// declaring free function — never compiled as an ordinary LLVM
+  /// function (see `declare_user_functions`'s matching arm), only ever
+  /// inline-expanded per call site by `build_inline_block_call`, which
+  /// needs the callee's real `params`/`body` to do that.
+  block_funcs: &'a HashMap<String, &'a AstFunction>,
+  /// `Some((block's params, block's body))` while compiling a
+  /// `block_param`-declaring function's body inline at one specific
+  /// call site that attached a literal block — `Stmt::Yield`'s codegen
+  /// reads this to know what to substitute. `None` everywhere else
+  /// (ordinary function/method/lambda bodies never reach a `Stmt::
+  /// Yield` — sema already guarantees that).
+  yield_target: Option<(&'a [Param], &'a [Stmt])>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -2219,6 +2240,129 @@ fn build_for<'ctx>(
   Ok(false)
 }
 
+/// `name(args) { |params| body }` where `name` declares `block_param`
+/// (plan 34's Decision log) — call-site specialization, not an ordinary
+/// call: this compiles a fresh copy of `callee`'s body inline, directly
+/// into the CALLER's current function, right here. There is no
+/// first-class `Proc` value or indirect call in this backend (plan
+/// 10's own constraint), so `yield` can only ever be lowered against
+/// one specific, statically-known block literal — the one attached at
+/// this exact call site. Reusing the same `vars`/`loop_stack` for the
+/// inlined body is also what makes a block's free-variable capture
+/// "just work" with zero closure-environment machinery: it's the same
+/// stack frame, so a variable the block reads or the callee's own
+/// locals are already in scope.
+///
+/// A real, disclosed limitation: `callee.body` is inlined verbatim, so
+/// a `return` inside it would terminate the *caller's* function, not
+/// just `callee`'s own invocation — this plan's worked example (and
+/// every function callable this way) is `Void`-returning with no
+/// `return` statement, so this is never exercised, but a `block_param`
+/// function containing `return` would misbehave. Fixing that needs
+/// either forbidding `return` in a `block_param` function's body
+/// (sema's job) or a real synthesized-callee-as-its-own-function
+/// design (this plan's own Decision log's heavier alternative) —
+/// neither is attempted here.
+#[allow(clippy::too_many_arguments)]
+fn build_inline_block_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  callee: &AstFunction,
+  args: &[Expr],
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<bool, String> {
+  let Some(Expr::Lambda {
+    params: blk_params,
+    body: blk_body,
+    ..
+  }) = args.last()
+  else {
+    return Err(format!(
+      "codegen: `{}` requires a trailing block literal",
+      callee.name
+    ));
+  };
+  let positional_args = &args[..args.len() - 1];
+  if positional_args.len() != callee.params.len() {
+    return Err(format!(
+      "codegen: `{}` expects {} argument(s), found {}",
+      callee.name,
+      callee.params.len(),
+      positional_args.len()
+    ));
+  }
+
+  // Evaluate the ordinary positional args in the CALLER's current scope
+  // before binding anything under the callee's own param names.
+  let mut evaluated = Vec::with_capacity(positional_args.len());
+  for a in positional_args {
+    let (v, k) = build_expr(
+      context,
+      builder,
+      a,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    evaluated.push((v, k));
+  }
+  for (p, (v, k)) in callee.params.iter().zip(evaluated) {
+    let alloca = builder
+      .build_alloca(local_llvm_type(context, k), &p.name)
+      .map_err(|e| e.to_string())?;
+    builder.build_store(alloca, v).map_err(|e| e.to_string())?;
+    vars.insert(p.name.clone(), (alloca, k));
+  }
+
+  // Pre-allocate the block's own param slots — every `yield` site
+  // inside `callee`'s body stores its args here before the block body
+  // (inlined fresh at each `yield`, since it can run any number of
+  // times — e.g. once per loop iteration) reads them back out.
+  for p in blk_params {
+    let kind = value_kind_for_type(&p.ty);
+    let alloca = builder
+      .build_alloca(local_llvm_type(context, kind), &p.name)
+      .map_err(|e| e.to_string())?;
+    vars.insert(p.name.clone(), (alloca, kind));
+  }
+
+  // `callee.body` (and `blk_body`, in case the block itself declares a
+  // fresh local) are being inlined straight into the CALLER's own
+  // function — their own `Let`s need the exact same `collect_lets`/
+  // `prealloc_lets` pre-pass an ordinary function body already gets in
+  // `define_user_function`/`define_method`, or `Stmt::Let`'s codegen
+  // (which expects every reachable `Let` to already be pre-allocated)
+  // panics.
+  let mut decls = Vec::new();
+  collect_lets(&callee.body, &mut decls);
+  collect_lets(blk_body, &mut decls);
+  prealloc_lets(context, builder, &decls, vars)?;
+
+  let inline_ctx = Ctx {
+    yield_target: Some((blk_params.as_slice(), blk_body.as_slice())),
+    ..*ctx
+  };
+  build_block(
+    context,
+    builder,
+    func,
+    &callee.body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ret_kind,
+    &inline_ctx,
+  )
+}
+
 /// Emits one statement. Returns `true` if the statement emitted a
 /// block terminator (`return`/the loop-jump for `break`/`next`/
 /// `raise`'s unreachable) — callers must not emit further instructions
@@ -2404,6 +2548,26 @@ fn build_stmt<'ctx>(
       local_array_elem_types,
       ctx,
     ),
+    // Plan 34: a call to a `block_param`-declaring function is never an
+    // ordinary LLVM `call` — the callee was never declared as one (see
+    // `declare_user_functions`). It's compiled fresh, inline, at this
+    // one call site instead — see `build_inline_block_call`.
+    Stmt::Expr(Expr::Call(name, args)) if ctx.block_funcs.contains_key(name.as_str()) => {
+      let callee = ctx.block_funcs[name.as_str()];
+      build_inline_block_call(
+        context,
+        builder,
+        func,
+        callee,
+        args,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ret_kind,
+        ctx,
+      )
+    }
     Stmt::Expr(Expr::Call(name, args)) if name == "puts" && args.len() == 1 => {
       build_puts(
         context,
@@ -2665,6 +2829,62 @@ fn build_stmt<'ctx>(
       ret_kind,
       ctx,
     ),
+    // Plan 34: `ctx.yield_target` is `Some((block's params, block's
+    // body))` exactly while this statement is reached via `build_
+    // inline_block_call`'s own inline expansion of a `block_param`-
+    // declaring callee's body (sema already guarantees `yield` never
+    // appears anywhere else) — store `args` into the block's own
+    // pre-allocated param slots, then build the block's body inline
+    // right here, reusing the exact same `vars`/`loop_stack`, so a
+    // block genuinely closes over the call site's surrounding scope
+    // the same way a lambda literal already does.
+    Stmt::Yield(args) => {
+      let Some((blk_params, blk_body)) = ctx.yield_target else {
+        return Err("codegen: `yield` reached codegen with no attached block".to_string());
+      };
+      if args.len() != blk_params.len() {
+        return Err(format!(
+          "codegen: `yield` passes {} argument(s), attached block declares {} parameter(s)",
+          args.len(),
+          blk_params.len()
+        ));
+      }
+      for (a, p) in args.iter().zip(blk_params) {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        let (ptr, _) = *vars
+          .get(&p.name)
+          .ok_or_else(|| format!("codegen: undefined variable `{}`", p.name))?;
+        builder.build_store(ptr, v).map_err(|e| e.to_string())?;
+      }
+      // A block's own body is never itself a `yield`-legal context —
+      // sema already enforces this, but codegen clears the target
+      // defensively too, matching the "not a panic" standard.
+      let block_ctx = Ctx {
+        yield_target: None,
+        ..*ctx
+      };
+      build_block(
+        context,
+        builder,
+        func,
+        blk_body,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ret_kind,
+        &block_ctx,
+      )?;
+      Ok(false)
+    }
   }
 }
 
@@ -3444,6 +3664,15 @@ fn declare_user_functions<'ctx>(
   let mut user_func_ids = HashMap::new();
   for item in &program.items {
     match item {
+      // Plan 34: a `block_param`-declaring function is never compiled
+      // as an ordinary, reusable LLVM function at all — every call site
+      // must attach a literal block (sema-enforced), and `yield` has no
+      // first-class value to dispatch through generically, so it's only
+      // ever compiled via call-site inline expansion (`build_inline_
+      // block_call`). Declaring an LLVM symbol for it here would be
+      // dead code with no valid body to give it (`yield` means nothing
+      // outside a specific attachment).
+      Item::Function(f) if f.block_param.is_some() => {}
       Item::Function(f) => {
         let ret_kind = value_kind_for_type(&f.return_type);
         let fn_ty = make_fn_type(context, &param_kinds(&f.params), ret_kind);
@@ -3613,6 +3842,17 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   }
   let method_owners = build_method_owners(&class_defs)?;
 
+  // Plan 34: every `block_param`-declaring free function, keyed by
+  // name — see `Ctx::block_funcs`'s own doc comment.
+  let mut block_funcs: HashMap<String, &AstFunction> = HashMap::new();
+  for item in &program.items {
+    if let Item::Function(f) = item {
+      if f.block_param.is_some() {
+        block_funcs.insert(f.name.clone(), f);
+      }
+    }
+  }
+
   let module_names: HashSet<String> = program
     .items
     .iter()
@@ -3644,10 +3884,15 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     module_names: &module_names,
     alloc_zeroed,
     hash_key_not_found,
+    block_funcs: &block_funcs,
+    yield_target: None,
   };
 
   for item in &program.items {
     match item {
+      // Plan 34: never declared in `user_func_ids` above — see
+      // `declare_user_functions`'s matching arm.
+      Item::Function(f) if f.block_param.is_some() => {}
       Item::Function(f) => {
         let (fv, _) = user_func_ids[&f.name];
         define_user_function(&context, &builder, f, fv, &gen_ctx)?;
@@ -4312,5 +4557,53 @@ mod tests {
     // source changes needed for this plan at all.
     let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
     assert_eq!(compile_link_run(src), "3\n");
+  }
+
+  // Plan 34 (blocks and yield).
+
+  const BLOCKS_EXAMPLE: &str = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+
+  #[test]
+  fn blocks_and_yield_example_linked_and_run() {
+    // Real executed proof call-site specialization, the index-loop
+    // control flow inlined straight into the caller, and `yield`'s
+    // direct-call-style lowering into the attached block's body all
+    // work together.
+    assert_eq!(compile_link_run(BLOCKS_EXAMPLE), "0\n1\n2\n");
+  }
+
+  #[test]
+  fn block_captures_an_outer_local_linked_and_run() {
+    // AC2: the block reads a variable from its enclosing scope (an
+    // accumulator), not just its own `yield`-bound parameter — real
+    // proof capture flows through this call-site-specialization path
+    // (reusing the same `vars` map as the call site itself), not just
+    // plan 10's original top-level-`Let` lambda path.
+    let src = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nmultiplier: Int64 = 10\nrepeat(3) { |i: Int64| puts i * multiplier }\n";
+    assert_eq!(compile_link_run(src), "0\n10\n20\n");
+  }
+
+  #[test]
+  fn block_param_call_missing_trailing_block_errors_not_panics() {
+    // AC3: an unsupported shape (should already be rejected by sema in
+    // the normal pipeline) defensively returns a descriptive `Err` if
+    // it ever reaches codegen regardless, not a panic.
+    let program = Program {
+      items: vec![
+        Item::Function(AstFunction {
+          name: "repeat".into(),
+          params: vec![Param {
+            name: "n".into(),
+            ty: "Int64".into(),
+          }],
+          return_type: "Void".into(),
+          body: vec![Stmt::Yield(vec![Expr::Ident("n".into())])],
+          block_param: Some("blk".into()),
+        }),
+        Item::Stmt(Stmt::Expr(Expr::Call("repeat".into(), vec![Expr::Int(3)]))),
+      ],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_missing_block_should_not_exist.o");
+    assert!(compile_to_object(&program, &out).is_err());
   }
 }

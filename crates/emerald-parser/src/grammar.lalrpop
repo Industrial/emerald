@@ -81,6 +81,7 @@ ClassField: (Param, Vec<Function>) = {
       params: vec![],
       return_type: p.ty.clone(),
       body: vec![Stmt::Expr(Expr::InstanceVar(p.name.clone()))],
+      block_param: None,
     };
     (p, vec![accessor])
   },
@@ -101,20 +102,31 @@ ModuleDef: ModuleDef = {
 };
 
 FuncDef: Function = {
-  "def" <name:Ident> <params:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+  "def" <name:Ident> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
-    params,
+    params: parts.0,
     return_type,
     body,
+    block_param: parts.1,
   }
 };
 
 // Parens are optional for zero-arg methods (`def sum -> Float64`,
 // inception §17's Point example) — Ruby allows omitting an empty
-// parameter list entirely.
-ParenParams: Vec<Param> = {
-  "(" <params:Params> ")" => params,
-  => Vec::new(),
+// parameter list entirely. Plan 34: an optional trailing `&blk` marker
+// (`def repeat(n: Int64, &blk)`) — NOT a separate `"," "&" Ident`
+// alternative, since `Params`'s own `(<Param> ",")*` repetition already
+// eagerly consumes a trailing comma whenever the token after it can't
+// start another `Param` (the same "stop the repetition, don't shift
+// the comma into a phantom next iteration" behavior every trailing-
+// comma-list use in this grammar already relies on) — by the time
+// `Params` reduces, any `n: Int64,` prefix has already swallowed its
+// own comma, leaving a bare `&blk` (no comma) for this rule to match
+// directly.
+ParenParams: (Vec<Param>, Option<String>) = {
+  "(" <params:Params> "&" <blk:Ident> ")" => (params, Some(blk)),
+  "(" <params:Params> ")" => (params, None),
+  => (Vec::new(), None),
 };
 
 // `puts` is a reserved keyword, not a generic identifier — see plan 07's
@@ -162,6 +174,17 @@ Stmt: Stmt = {
   // (no bare `<e:Expr?>` — genuinely LALR(1)-ambiguous with no
   // significant newlines).
   "raise" <e:Expr> => Stmt::Raise(e),
+  // Plan 34: `yield <args>` — legal only inside a function declaring
+  // `Function.block_param` (sema's job, not the grammar's). Uses
+  // `YieldArgs`, NOT the ordinary `Args` (which can derive zero
+  // elements) — the same "always requires something, no ambiguous
+  // optional" reasoning as `return`/`raise`/`puts` above: with no
+  // significant newlines, `"yield" <e:Expr?>`-shaped zero-or-more args
+  // would make the parser unable to tell "yield" (empty) followed by a
+  // fresh Expr-statement from "yield <expr>" whenever the next token
+  // can start an Expr either way — a real, disclosed narrowing versus
+  // Ruby's own bare zero-arg `yield`, not attempted here.
+  "yield" <args:YieldArgs> => Stmt::Yield(args),
   // A single typed handler (plan 11's Decision log — no `ensure`, no
   // multiple `rescue` clauses yet). `"rescue"` can't start a `Stmt`, so
   // `body`'s `Stmt*` unambiguously stops there, the same way `"end"`/
@@ -247,6 +270,18 @@ Stmt: Stmt = {
   // reasoning as plan 20's `CaseValues` right-recursion).
   <names:MultiAssignNames> "=" <values:MultiAssignValues> => Stmt::MultiAssign { names, values },
   <e:StmtExpr> => Stmt::Expr(e),
+};
+
+// Plan 34: mandatory-first-element, right-recursive — mirrors
+// `CaseValues`/`MultiAssignNames`'s own trick for the identical reason
+// (see `Stmt`'s `"yield" <args:YieldArgs>` comment).
+YieldArgs: Vec<Expr> = {
+  <e:Expr> => vec![e],
+  <e:Expr> "," <rest:YieldArgs> => {
+    let mut v = vec![e];
+    v.extend(rest);
+    v
+  },
 };
 
 MultiAssignNames: Vec<String> = {
@@ -365,10 +400,16 @@ StmtCallExpr: Expr = {
 };
 
 StmtPrimaryExpr: Expr = {
-  <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
+  <name:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
+    if let Some(b) = blk { args.push(b); }
+    Expr::Call(name, args)
+  },
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
   "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
-  <recv:Ident> "." <method:Ident> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
+  <recv:Ident> "." <method:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
+    if let Some(b) = blk { args.push(b); }
+    Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args)
+  },
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
@@ -376,9 +417,35 @@ StmtPrimaryExpr: Expr = {
   "true" => Expr::Bool(true),
   "false" => Expr::Bool(false),
   "nil" => Expr::Nil,
-  "{" <pairs:HashPairs> "}" => Expr::HashLit(pairs),
+  // Plan 34: `HashLit`'s bare `"{" HashPairs "}"` alternative is
+  // deliberately DROPPED from this Stmt-initial position (unlike
+  // `PrimaryExpr`, which keeps it) — a real, build-verified LALR(1)
+  // conflict, not a hypothetical one: with a trailing `BlockLiteral?`
+  // now attached to the two call productions above, `{` right after a
+  // completed call is genuinely ambiguous between "attach a block" and
+  // "reduce, a fresh bare hash-literal statement begins here," the same
+  // class of conflict plan 09 already hit and fixed for array literals
+  // at this exact position ("forbidding it as a *standalone* statement
+  // costs nothing real" — a bare hash-literal statement is equally
+  // side-effect-free and useless). `HashLit` remains fully available
+  // everywhere else (a `Let`'s RHS, a call argument) via the ordinary,
+  // non-`Stmt` `PrimaryExpr`.
   <name:InstanceVarTok> => Expr::InstanceVar(name),
   <name:Ident> => Expr::Ident(name),
+};
+
+// Plan 34: `{ |params| body }` — a trailing block literal, desugared to
+// `Expr::Lambda` (reusing plan 10's node wholesale — see the Decision
+// log) and pushed as an extra, implicit trailing argument onto the
+// call it attaches to. Always `Void`-returning (no `-> Type>` — real
+// Ruby block syntax has none either, and this plan's blocks are never
+// value-producing).
+BlockLiteral: Expr = {
+  "{" "|" <params:Params> "|" <body:Stmt*> "}" => Expr::Lambda {
+    params,
+    return_type: "Void".to_string(),
+    body,
+  },
 };
 
 // Plan 25: `{k1 => v1, k2 => v2, ...}` — reuses `"=>"` (already a
@@ -539,6 +606,21 @@ CallExpr: Expr = {
 };
 
 PrimaryExpr: Expr = {
+  // Plan 34: unlike `StmtPrimaryExpr` below, this non-Stmt-initial
+  // position doesn't gain a trailing `BlockLiteral?` — `PrimaryExpr`
+  // still has its own bare `"{" HashPairs "}"` alternative (below), and
+  // a real, build-verified LALR(1) conflict (a genuine shift/reduce
+  // ambiguity on `{`, not just a theoretical risk — see the Decision
+  // log) rules out attaching an optional block here too without
+  // removing `HashLit` from this position as well, which isn't a
+  // narrowing this plan is willing to make (a bare hash literal in
+  // non-Stmt-initial position — a call argument, a `Let`'s RHS — is a
+  // real, existing, tested use, unlike a *bare hash-literal statement*,
+  // which is genuinely useless the same way a bare array-literal
+  // statement already was in plan 09). Block attachment is therefore
+  // scoped to `StmtPrimaryExpr` only — exactly what this plan's own
+  // worked example (`repeat(3) { ... }` as a bare top-level statement)
+  // needs.
   <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
   // `new` is a reserved keyword (see plan 08's Decision log): LALRPOP
   // tokenizes the literal `"new"` distinctly from the generic `Ident`

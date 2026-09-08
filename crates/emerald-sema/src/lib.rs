@@ -54,6 +54,11 @@ impl Diagnostic {
 struct FunctionSig {
   params: Vec<Type>,
   return_type: Type,
+  /// Plan 34's `&blk` marker, carried alongside the ordinary signature
+  /// so a call site can tell whether it must attach a trailing block
+  /// literal — mirrors `Function.block_param` (see its own doc comment
+  /// for why this is a bare name, not a checkable `Type::Proc`).
+  block_param: Option<String>,
 }
 
 /// Shared by classes and modules (plan 12's Decision log — modules reuse
@@ -139,6 +144,7 @@ fn function_signature(
   Ok(FunctionSig {
     params,
     return_type,
+    block_param: f.block_param.clone(),
   })
 }
 
@@ -457,7 +463,28 @@ fn infer_expr_type(
       let sig = sigs
         .get(name)
         .ok_or_else(|| Diagnostic::new(format!("undefined function `{name}`")))?;
-      check_args(name, args, &sig.params, env, sigs, classes, self_fields)?;
+      // Plan 34: a trailing block literal desugars into an extra,
+      // implicit `Expr::Lambda` argument at parse time (`grammar.
+      // lalrpop`'s Decision log) — it's not one of `sig.params`'
+      // ordinary positional arguments, so it's excluded here before the
+      // ordinary arity/type check. Its own legality (present when
+      // required, well-typed, `yield`-arity-compatible) is
+      // `check_block_call_sites`' separate job, not this one's.
+      let positional =
+        if sig.block_param.is_some() && matches!(args.last(), Some(Expr::Lambda { .. })) {
+          &args[..args.len() - 1]
+        } else {
+          args.as_slice()
+        };
+      check_args(
+        name,
+        positional,
+        &sig.params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+      )?;
       Ok(sig.return_type.clone())
     }
     Expr::New(class_name, args) => {
@@ -670,6 +697,11 @@ fn infer_lambda_type(
     lambda_env.insert(p.name.clone(), t);
   }
   let declared_return = resolve_type(return_type, classes)?;
+  // Plan 34: `yields_allowed = false` — a lambda/block literal's own
+  // body is never itself a `yield`-legal context (only a function/
+  // method that declares `block_param` is), whether this is plan 10's
+  // original top-level `Proc` lambda or plan 34's block literal reusing
+  // the same `Expr::Lambda` node.
   check_block(
     body,
     &mut lambda_env,
@@ -677,6 +709,7 @@ fn infer_lambda_type(
     classes,
     None,
     &declared_return,
+    false,
     false,
   )?;
   check_implicit_return(
@@ -840,6 +873,7 @@ fn check_stmt(
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
   match stmt {
     // `Proc` is special-cased: the bare annotation carries no signature
@@ -952,6 +986,7 @@ fn check_stmt(
         self_fields,
         return_type,
         in_loop,
+        yields_allowed,
       )?;
       if let Some(else_b) = else_branch {
         check_block(
@@ -962,6 +997,7 @@ fn check_stmt(
           self_fields,
           return_type,
           in_loop,
+          yields_allowed,
         )?;
       }
       Ok(())
@@ -973,7 +1009,16 @@ fn check_stmt(
           "`while` condition must be Boolean, found {cond_ty:?}"
         )));
       }
-      check_block(body, env, sigs, classes, self_fields, return_type, true)
+      check_block(
+        body,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        return_type,
+        true,
+        yields_allowed,
+      )
     }
     Stmt::Return(Some(e)) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
@@ -1007,6 +1052,26 @@ fn check_stmt(
       }
       Ok(())
     }
+    // Plan 34: legal only inside a function/method declaring
+    // `block_param` — `yields_allowed` carries that down from
+    // `check_function_body`/`check_method_body`. This generic pass has
+    // no specific attached block to check `args`' types against yet
+    // (no single fixed block signature exists — see the Decision log),
+    // so it only verifies `args` are well-formed expressions (catching
+    // an undefined variable, etc.); the real per-attachment arity/type
+    // check happens separately, once per call site, in
+    // `check_block_call_sites`.
+    Stmt::Yield(args) => {
+      if !yields_allowed {
+        return Err(Diagnostic::new(
+          "`yield` used outside of a function or method that declares a block parameter (`&name`)",
+        ));
+      }
+      for a in args {
+        infer_expr_type(a, env, sigs, classes, self_fields)?;
+      }
+      Ok(())
+    }
     Stmt::Begin {
       body,
       rescue_type,
@@ -1023,6 +1088,7 @@ fn check_stmt(
       self_fields,
       return_type,
       in_loop,
+      yields_allowed,
     ),
     Stmt::Case {
       scrutinee,
@@ -1038,6 +1104,7 @@ fn check_stmt(
       self_fields,
       return_type,
       in_loop,
+      yields_allowed,
     ),
     // Plan 30: `elements`'s element type is unified exactly as
     // `infer_array_lit_type` already does for a bare array literal
@@ -1057,7 +1124,16 @@ fn check_stmt(
         unreachable!("infer_array_lit_type always returns Type::Array")
       };
       env.insert(var.clone(), *elem_ty);
-      check_block(body, env, sigs, classes, self_fields, return_type, true)
+      check_block(
+        body,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        return_type,
+        true,
+        yields_allowed,
+      )
     }
   }
 }
@@ -1078,6 +1154,7 @@ fn check_case(
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
   let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields)?;
   if scrutinee_ty != Type::Int64 {
@@ -1094,7 +1171,16 @@ fn check_case(
         )));
       }
     }
-    check_block(body, env, sigs, classes, self_fields, return_type, in_loop)?;
+    check_block(
+      body,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+      yields_allowed,
+    )?;
   }
   if let Some(else_b) = else_body {
     check_block(
@@ -1105,6 +1191,7 @@ fn check_case(
       self_fields,
       return_type,
       in_loop,
+      yields_allowed,
     )?;
   }
   Ok(())
@@ -1126,8 +1213,18 @@ fn check_begin(
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
-  check_block(body, env, sigs, classes, self_fields, return_type, in_loop)?;
+  check_block(
+    body,
+    env,
+    sigs,
+    classes,
+    self_fields,
+    return_type,
+    in_loop,
+    yields_allowed,
+  )?;
   let rescue_ty = resolve_type(rescue_type, classes)?;
   if !matches!(rescue_ty, Type::Class(_)) {
     return Err(Diagnostic::new(format!(
@@ -1143,6 +1240,7 @@ fn check_begin(
     self_fields,
     return_type,
     in_loop,
+    yields_allowed,
   )
 }
 
@@ -1155,9 +1253,19 @@ fn check_block(
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
   for stmt in stmts {
-    check_stmt(stmt, env, sigs, classes, self_fields, return_type, in_loop)?;
+    check_stmt(
+      stmt,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+      yields_allowed,
+    )?;
   }
   Ok(())
 }
@@ -1203,6 +1311,7 @@ fn check_function_body(
     None,
     &declared_return,
     false,
+    f.block_param.is_some(),
   )?;
   check_implicit_return(
     &f.body,
@@ -1235,6 +1344,7 @@ fn check_method_body(
     Some(fields),
     &declared_return,
     false,
+    m.block_param.is_some(),
   )?;
   check_implicit_return(
     &m.body,
@@ -1245,6 +1355,263 @@ fn check_method_body(
     &declared_return,
     &format!("{class_name}#{}", m.name),
   )
+}
+
+/// Plan 34: for every bare top-level statement call to a `block_param`-
+/// declaring free function (`Stmt::Expr(Expr::Call(...))` — the only
+/// shape a trailing block literal can attach to, since `BlockLiteral`
+/// is grammar-restricted to `StmtPrimaryExpr`, never the non-Stmt-
+/// initial `PrimaryExpr` — see `grammar.lalrpop`'s Decision log),
+/// checks that a block is actually attached, type-checks that block's
+/// own body, and then re-walks the callee's OWN body checking every
+/// `Stmt::Yield` site's arguments against this specific attachment's
+/// parameter types (Decision log: there is no single fixed block
+/// signature to check against once — two call sites attaching
+/// different blocks to the same function are each checked
+/// independently). Scoped to `Expr::Call` only, not `MethodCall` — this
+/// plan's own worked example and ACs only exercise a free function; a
+/// `block_param`-declaring method is real, disclosed future work.
+fn check_block_call_sites(
+  program: &Program,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  func_defs: &HashMap<String, &Function>,
+) -> Vec<Diagnostic> {
+  let mut diags = Vec::new();
+  for item in &program.items {
+    match item {
+      Item::Function(f) => scan_block_call_sites(&f.body, sigs, classes, func_defs, &mut diags),
+      Item::Class(c) => {
+        for m in &c.methods {
+          scan_block_call_sites(&m.body, sigs, classes, func_defs, &mut diags);
+        }
+      }
+      Item::Module(m) => {
+        for f in &m.methods {
+          scan_block_call_sites(&f.body, sigs, classes, func_defs, &mut diags);
+        }
+      }
+      Item::Stmt(s) => scan_block_call_site(s, sigs, classes, func_defs, &mut diags),
+      Item::Error => {}
+    }
+  }
+  diags
+}
+
+fn scan_block_call_sites(
+  stmts: &[Stmt],
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  func_defs: &HashMap<String, &Function>,
+  diags: &mut Vec<Diagnostic>,
+) {
+  for s in stmts {
+    scan_block_call_site(s, sigs, classes, func_defs, diags);
+  }
+}
+
+fn scan_block_call_site(
+  stmt: &Stmt,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  func_defs: &HashMap<String, &Function>,
+  diags: &mut Vec<Diagnostic>,
+) {
+  match stmt {
+    Stmt::Expr(Expr::Call(name, args)) => {
+      let declares_block = sigs.get(name).is_some_and(|s| s.block_param.is_some());
+      if declares_block {
+        check_one_block_call_site(name, args, sigs, classes, func_defs, diags);
+      }
+    }
+    Stmt::If {
+      then_branch,
+      else_branch,
+      ..
+    } => {
+      scan_block_call_sites(then_branch, sigs, classes, func_defs, diags);
+      if let Some(else_b) = else_branch {
+        scan_block_call_sites(else_b, sigs, classes, func_defs, diags);
+      }
+    }
+    Stmt::While { body, .. } => scan_block_call_sites(body, sigs, classes, func_defs, diags),
+    Stmt::Begin {
+      body, rescue_body, ..
+    } => {
+      scan_block_call_sites(body, sigs, classes, func_defs, diags);
+      scan_block_call_sites(rescue_body, sigs, classes, func_defs, diags);
+    }
+    Stmt::Case {
+      arms, else_body, ..
+    } => {
+      for (_, body) in arms {
+        scan_block_call_sites(body, sigs, classes, func_defs, diags);
+      }
+      if let Some(else_b) = else_body {
+        scan_block_call_sites(else_b, sigs, classes, func_defs, diags);
+      }
+    }
+    Stmt::For { body, .. } => scan_block_call_sites(body, sigs, classes, func_defs, diags),
+    _ => {}
+  }
+}
+
+fn check_one_block_call_site(
+  name: &str,
+  args: &[Expr],
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  func_defs: &HashMap<String, &Function>,
+  diags: &mut Vec<Diagnostic>,
+) {
+  let Some(Expr::Lambda {
+    params: blk_params,
+    body: blk_body,
+    ..
+  }) = args.last()
+  else {
+    diags.push(Diagnostic::new(format!(
+      "`{name}` requires a trailing block (`{{ |params| ... }}`) — it declares a block parameter"
+    )));
+    return;
+  };
+  let mut blk_env: HashMap<String, Type> = HashMap::new();
+  let mut blk_param_types = Vec::with_capacity(blk_params.len());
+  for p in blk_params {
+    let t = match resolve_type(&p.ty, classes) {
+      Ok(t) => t,
+      Err(d) => {
+        diags.push(d);
+        return;
+      }
+    };
+    blk_param_types.push(t.clone());
+    blk_env.insert(p.name.clone(), t);
+  }
+  if let Err(d) = check_block(
+    blk_body,
+    &mut blk_env,
+    sigs,
+    classes,
+    None,
+    &Type::Void,
+    false,
+    false,
+  ) {
+    diags.push(d);
+    return;
+  }
+  let Some(callee) = func_defs.get(name) else {
+    return;
+  };
+  let mut callee_env: HashMap<String, Type> = HashMap::new();
+  for p in &callee.params {
+    let t = match resolve_type(&p.ty, classes) {
+      Ok(t) => t,
+      Err(d) => {
+        diags.push(d);
+        return;
+      }
+    };
+    callee_env.insert(p.name.clone(), t);
+  }
+  if let Err(d) = check_yields_against_block(
+    &callee.body,
+    &blk_param_types,
+    &mut callee_env,
+    sigs,
+    classes,
+  ) {
+    diags.push(d);
+  }
+}
+
+/// Re-walks a `block_param`-declaring function's body, tracking the
+/// same flat local-variable environment `check_block` would (so a
+/// `yield` site referencing an earlier `Let`-bound local still
+/// type-checks), but checking only `Stmt::Yield` sites — every other
+/// statement kind was already fully checked once by this function's own
+/// routine `check_function_body` pass; re-verifying it here would be
+/// redundant, not incorrect.
+fn check_yields_against_block(
+  stmts: &[Stmt],
+  expected: &[Type],
+  env: &mut HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<(), Diagnostic> {
+  for stmt in stmts {
+    match stmt {
+      Stmt::Yield(args) => {
+        if args.len() != expected.len() {
+          return Err(Diagnostic::new(format!(
+            "block arity mismatch: `yield` passes {} argument(s), attached block declares {} parameter(s)",
+            args.len(),
+            expected.len()
+          )));
+        }
+        for (i, (a, want)) in args.iter().zip(expected).enumerate() {
+          let actual = infer_expr_type(a, env, sigs, classes, None)?;
+          if actual != *want {
+            return Err(Diagnostic::new(format!(
+              "type mismatch in `yield` argument {}: attached block's parameter has type {want:?}, value has type {actual:?}",
+              i + 1
+            )));
+          }
+        }
+      }
+      Stmt::Let { name, ty, .. } => {
+        if let Ok(t) = resolve_type(ty, classes) {
+          env.insert(name.clone(), t);
+        }
+      }
+      Stmt::If {
+        then_branch,
+        else_branch,
+        ..
+      } => {
+        check_yields_against_block(then_branch, expected, env, sigs, classes)?;
+        if let Some(else_b) = else_branch {
+          check_yields_against_block(else_b, expected, env, sigs, classes)?;
+        }
+      }
+      Stmt::While { body, .. } => check_yields_against_block(body, expected, env, sigs, classes)?,
+      Stmt::Begin {
+        body,
+        rescue_type,
+        rescue_var,
+        rescue_body,
+      } => {
+        check_yields_against_block(body, expected, env, sigs, classes)?;
+        if let Ok(t) = resolve_type(rescue_type, classes) {
+          env.insert(rescue_var.clone(), t);
+        }
+        check_yields_against_block(rescue_body, expected, env, sigs, classes)?;
+      }
+      Stmt::Case {
+        arms, else_body, ..
+      } => {
+        for (_, body) in arms {
+          check_yields_against_block(body, expected, env, sigs, classes)?;
+        }
+        if let Some(else_b) = else_body {
+          check_yields_against_block(else_b, expected, env, sigs, classes)?;
+        }
+      }
+      Stmt::For {
+        var,
+        elements,
+        body,
+      } => {
+        if let Ok(Type::Array(elem_ty)) = infer_array_lit_type(elements, env, sigs, classes, None) {
+          env.insert(var.clone(), *elem_ty);
+        }
+        check_yields_against_block(body, expected, env, sigs, classes)?;
+      }
+      _ => {}
+    }
+  }
+  Ok(())
 }
 
 /// Type-checks a full program: registers classes (two sub-passes — names
@@ -1313,8 +1680,13 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   }
 
   let mut sigs: HashMap<String, FunctionSig> = HashMap::new();
+  // Plan 34: raw `Function`s keyed by name, alongside `sigs` — a
+  // block-attaching call site needs the callee's actual body (to
+  // re-walk its `Stmt::Yield` sites), not just its signature.
+  let mut func_defs: HashMap<String, &Function> = HashMap::new();
   for item in &program.items {
     if let Item::Function(f) = item {
+      func_defs.insert(f.name.clone(), f);
       match function_signature(f, &classes) {
         Ok(sig) => {
           sigs.insert(f.name.clone(), sig);
@@ -1358,7 +1730,16 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // bare `return` at top level is not exercised by this milestone),
       // and never inside a method (`self_fields: None`).
       Item::Stmt(s) => {
-        if let Err(d) = check_stmt(s, &mut top_env, &sigs, &classes, None, &Type::Void, false) {
+        if let Err(d) = check_stmt(
+          s,
+          &mut top_env,
+          &sigs,
+          &classes,
+          None,
+          &Type::Void,
+          false,
+          false,
+        ) {
           diags.push(d);
         }
       }
@@ -1369,6 +1750,8 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
     }
   }
+
+  diags.extend(check_block_call_sites(program, &sigs, &classes, &func_defs));
 
   if diags.is_empty() { Ok(()) } else { Err(diags) }
 }
@@ -2054,5 +2437,42 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject `p.y` — `y` has no `read` marker");
     assert!(errs[0].message.contains('y'));
+  }
+
+  // Plan 34 (blocks and yield).
+
+  const BLOCKS_EXAMPLE: &str = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+
+  #[test]
+  fn accepts_blocks_and_yield_example() {
+    let program = emerald_parser::parse(BLOCKS_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_call_to_block_param_function_with_no_trailing_block() {
+    let src = "def repeat(n: Int64, &blk) -> Void\n  yield n\nend\n\nrepeat(3)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject calling a &blk function with no block");
+    assert!(errs[0].message.contains("repeat") && errs[0].message.contains("block"));
+  }
+
+  #[test]
+  fn rejects_block_arity_mismatch_against_yield() {
+    let src = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64, extra: Int64| puts i }\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("must reject a block whose arity doesn't match yield's call sites");
+    assert!(errs[0].message.contains("arity"));
+  }
+
+  #[test]
+  fn rejects_yield_outside_a_block_param_function() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  yield 5\n  a + b\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("must reject `yield` in a function with no block parameter");
+    assert!(errs[0].message.contains("yield"));
   }
 }

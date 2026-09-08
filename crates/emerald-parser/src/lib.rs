@@ -1006,6 +1006,101 @@ mod tests {
     parse(src).expect("plan 31's worked example must parse cleanly");
   }
 
+  // Plan 34 (blocks and yield).
+
+  #[test]
+  fn block_param_marker_parses_separately_from_params() {
+    let src = "def repeat(n: Int64, &blk) -> Void\n  yield n\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert_eq!(
+      f.params,
+      vec![Param {
+        name: "n".to_string(),
+        ty: "Int64".to_string()
+      }]
+    );
+    assert_eq!(f.block_param, Some("blk".to_string()));
+  }
+
+  #[test]
+  fn zero_arg_block_param_parses() {
+    let src = "def once(&blk) -> Void\n  yield 1\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert_eq!(f.params, vec![]);
+    assert_eq!(f.block_param, Some("blk".to_string()));
+  }
+
+  #[test]
+  fn function_with_no_block_param_is_none() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert_eq!(f.block_param, None);
+  }
+
+  #[test]
+  fn trailing_block_literal_desugars_to_an_extra_call_argument() {
+    let src = "repeat(3) { |i: Int64| puts i }\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::Call(
+        "repeat".to_string(),
+        vec![
+          Expr::Int(3),
+          Expr::Lambda {
+            params: vec![Param {
+              name: "i".to_string(),
+              ty: "Int64".to_string()
+            }],
+            return_type: "Void".to_string(),
+            body: vec![Stmt::Expr(Expr::Call(
+              "puts".to_string(),
+              vec![Expr::Ident("i".to_string())]
+            ))],
+          },
+        ]
+      )))
+    );
+  }
+
+  #[test]
+  fn call_with_no_trailing_block_parses_unchanged() {
+    let src = "add(1, 2)\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::Call(
+        "add".to_string(),
+        vec![Expr::Int(1), Expr::Int(2)]
+      )))
+    );
+  }
+
+  #[test]
+  fn yield_parses_to_stmt_yield() {
+    let src = "yield i\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Yield(vec![Expr::Ident("i".to_string())]))
+    );
+  }
+
+  #[test]
+  fn plan_34_worked_example_parses() {
+    let src = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+    parse(src).expect("plan 34's worked example must parse cleanly");
+  }
+
   // Plan 33 (field-access sugar).
 
   #[test]

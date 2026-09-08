@@ -207,6 +207,13 @@ pub enum Stmt {
     elements: Vec<Expr>,
     body: Vec<Stmt>,
   },
+  /// `yield <args>` (plan 34's Decision log) — legal only inside a
+  /// function that declares `Function.block_param`. Codegen lowers this
+  /// via call-site specialization: a `yield`-using function is compiled
+  /// fresh per call site that attaches a literal block, and each
+  /// `Stmt::Yield` becomes a direct call to that block's synthesized
+  /// function — never an indirect/first-class call.
+  Yield(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +222,15 @@ pub struct Function {
   pub params: Vec<Param>,
   pub return_type: String,
   pub body: Vec<Stmt>,
+  /// `&blk` in the parameter list (plan 34's Decision log) — a bare
+  /// name, not a `Param`: unlike an ordinary parameter, its type can't
+  /// be pinned at the function's own declaration site (no first-class
+  /// `Proc` value exists to check a caller's argument against; a
+  /// `yield`-using function is instead call-site-specialized fresh
+  /// against whichever block literal a given call attaches). `None` for
+  /// every function that doesn't declare one — unchanged from before
+  /// this plan.
+  pub block_param: Option<String>,
 }
 
 /// A class declaration: fields (reusing `Param`'s `{name, ty}` shape —
