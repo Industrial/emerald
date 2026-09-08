@@ -426,6 +426,14 @@ fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, 
   flag_builder
     .set("is_pic", "false")
     .map_err(|e| e.to_string())?;
+  // Plan 16: this was left at Cranelift's default (`OptLevel::None` — no
+  // CSE, no redundant load/store elimination, no loop-invariant code
+  // motion, weak regalloc), which plan 15's benchmarks showed costing
+  // 5-18x versus Rust/C on arithmetic-loop hot paths. `"speed"` is
+  // Cranelift's max non-size-tradeoff optimization level.
+  flag_builder
+    .set("opt_level", "speed")
+    .map_err(|e| e.to_string())?;
   let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
   isa_builder
     .finish(settings::Flags::new(flag_builder))

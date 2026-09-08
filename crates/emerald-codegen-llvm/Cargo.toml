@@ -1,0 +1,9 @@
+[package]
+name = "emerald-codegen-llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+inkwell = { version = "0.10", features = ["llvm21-1"] }
+emerald-parser = { path = "../emerald-parser" }

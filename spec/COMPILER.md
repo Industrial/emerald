@@ -90,6 +90,66 @@ milestone1-codegen`'s "link an executable" requirement needs
 `cranelift-object` (object-file emission) instead — noted as follow-up
 work for that plan, not built here.
 
+### 2026-09-08 addendum (plan `16 codegen-backend-bakeoff`): revisit trigger resolved
+
+The revisit trigger above fired for real: `15 benchmarking`'s numbers
+(`benchmarks/REPORT.md`, measured 2026-09-08) showed Emerald 4.9x slower
+than Rust and 9.3x slower than C on `sum`, and 18x slower than Rust and
+5.3x slower than C on `array_traversal`. Root cause: `host_isa()` in
+`crates/emerald-codegen/src/lib.rs` never configured Cranelift's
+`opt_level`, defaulting to `OptLevel::None`.
+
+Two things happened, both real and measured, not simulated:
+
+1. **Cranelift got tuned first**, so the bake-off wouldn't be rigged:
+   `host_isa()` now sets `opt_level=speed`. Effect on these two
+   benchmarks was small — `sum` run time went from 4.279ms to 4.260ms,
+   `array_traversal` from 12.633ms to 12.729ms (within noise). Cranelift's
+   `speed` level does not include the loop-invariant code motion /
+   auto-vectorization inception §11's hot-path concern is actually about.
+2. **LLVM was wired into `devenv.nix` for real** (`pkgs.llvmPackages_21.llvm`,
+   `libffi`, `libxml2`, `LLVM_SYS_211_PREFIX`) and a genuine second backend,
+   `crates/emerald-codegen-llvm`, was built on `inkwell` (`llvm21-1`),
+   running LLVM's `default<O3>` pass pipeline before object emission.
+   Deliberately scoped to the AST subset `sum.em`/`array_traversal.em`
+   use (top-level statements, `Int64`/`Float64`, arrays — no
+   functions/classes/modules/lambdas/exceptions yet; see
+   `.cursor/plans/codegen-backend-bakeoff.plan.md`'s Decision log for why
+   that's the right amount of scope for a bake-off).
+
+**Result** (`benchmarks/REPORT.md`, re-measured 2026-09-08 with both
+backends tuned):
+
+| Benchmark | Emerald (Cranelift) | Emerald (LLVM) | Rust | C |
+|---|---|---|---|---|
+| `sum` run time | 4.260 ms | **0.762 ms** | 0.824 ms | 0.620 ms |
+| `array_traversal` run time | 12.729 ms | **0.716 ms** | 0.906 ms | 2.360 ms |
+
+LLVM at O3 doesn't just close the gap — on both loop-heavy benchmarks it
+matches or beats hand-written Rust, and beats hand-written C on
+`array_traversal` (auto-vectorizing the inner 20-element loop in a way
+neither Cranelift nor the hand-written C did). This is exactly the "loop
+optimization, vectorization" gap inception §11 flagged as worth revisiting
+Cranelift over.
+
+**Decision: dual-backend, Cranelift stays the CLI default, LLVM is
+opt-in.** `emerald-cli` gains `--backend=cranelift|llvm`. Cranelift
+remains the default because it is the only backend covering the full
+language (classes, lambdas, exceptions, modules) — `emerald-codegen-llvm`
+does not, by explicit scope decision (see above), and building that parity
+is real, separate future work, not assumed here. For numeric,
+loop-dominated code that fits the LLVM backend's current scope, `--backend=llvm`
+is measurably faster than either Cranelift or hand-written C/Rust on this
+benchmark pair. This is not a "permanent" decision either
+(inception §14.6) — if/when `emerald-codegen-llvm` reaches feature parity,
+revisit which backend the CLI defaults to.
+
+Evidence: `crates/emerald-codegen-llvm/src/lib.rs` (6 passing tests,
+including both benchmark programs run end-to-end through the LLVM
+backend); `crates/emerald-cli/tests/benchmarks.rs` (real, executed,
+`--backend`-parameterized measurement); `benchmarks/REPORT.md`;
+`.cursor/plans/codegen-backend-bakeoff.plan.md`.
+
 ---
 
 ## Cross-references

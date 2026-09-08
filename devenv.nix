@@ -56,11 +56,20 @@
   env = {
     RUST_BACKTRACE = "1";
     RUSTC_WRAPPER = "sccache";
+    # LLVM 21 for the `inkwell`-based codegen backend (plan 16 — the
+    # Cranelift-vs-LLVM bake-off spec/COMPILER.md's plan-02 decision
+    # record flagged as its own revisit trigger). `llvm-sys` looks for
+    # this exact env var name to find `llvm-config` without needing it
+    # on PATH.
+    LLVM_SYS_211_PREFIX = "${pkgs.llvmPackages_21.llvm.dev}";
   };
 
   # Project-only packages (beads removed upstream in favor of Maestro).
   packages = [
     inputs.definitively.packages.${pkgs.stdenv.hostPlatform.system}.definitively
+    pkgs.llvmPackages_21.llvm
+    pkgs.libffi
+    pkgs.libxml2
   ];
 
   # Project-only shell wiring (shared features handle moon-sync, prek install).

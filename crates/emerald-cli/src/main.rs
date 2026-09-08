@@ -38,11 +38,28 @@ fn check_stage(program: Program) -> Effect<Program, CliError, ()> {
   })
 }
 
-fn codegen_stage(program: Program, obj_path: PathBuf) -> Effect<PathBuf, CliError, ()> {
+/// Which codegen crate `codegen_stage` calls into (plan 16's bake-off).
+/// `Llvm` is deliberately narrower than `Cranelift` — see
+/// `emerald-codegen-llvm`'s module doc for the exact AST subset it
+/// supports; a program outside that subset surfaces as an ordinary
+/// `CliError::Codegen`, same as any other codegen failure.
+#[derive(Clone, Copy)]
+enum Backend {
+  Cranelift,
+  Llvm,
+}
+
+fn codegen_stage(
+  program: Program,
+  obj_path: PathBuf,
+  backend: Backend,
+) -> Effect<PathBuf, CliError, ()> {
   Effect::new(move |_env: &mut ()| {
-    emerald_codegen::compile_to_object(&program, &obj_path)
-      .map(|()| obj_path)
-      .map_err(CliError::Codegen)
+    let result = match backend {
+      Backend::Cranelift => emerald_codegen::compile_to_object(&program, &obj_path),
+      Backend::Llvm => emerald_codegen_llvm::compile_to_object(&program, &obj_path),
+    };
+    result.map(|()| obj_path).map_err(CliError::Codegen)
   })
 }
 
@@ -89,6 +106,22 @@ fn main() {
     .map(PathBuf::from)
     .unwrap_or_else(|| PathBuf::from("a.out"));
 
+  // Plan 16's bake-off: `--backend=cranelift|llvm`, defaulting to
+  // Cranelift (the CLI's existing, full-language-coverage backend — see
+  // `spec/COMPILER.md`'s plan-16 addendum for why it stays the default).
+  let backend = match args
+    .iter()
+    .find_map(|a| a.strip_prefix("--backend="))
+    .unwrap_or("cranelift")
+  {
+    "cranelift" => Backend::Cranelift,
+    "llvm" => Backend::Llvm,
+    other => {
+      eprintln!("error: unknown --backend `{other}` (expected `cranelift` or `llvm`)");
+      process::exit(2);
+    }
+  };
+
   let source = std::fs::read_to_string(source_path).unwrap_or_else(|e| {
     eprintln!("error: cannot read `{source_path}`: {e}");
     process::exit(1);
@@ -98,7 +131,7 @@ fn main() {
 
   let pipeline = parse_stage(source, source_path.clone())
     .flat_map(check_stage)
-    .flat_map(move |program| codegen_stage(program, obj_path))
+    .flat_map(move |program| codegen_stage(program, obj_path, backend))
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
 
   if let Err(e) = run_blocking(pipeline, ()) {

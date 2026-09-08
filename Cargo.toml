@@ -4,6 +4,7 @@ members = [
   "crates/emerald-lexer",
   "crates/emerald-parser",
   "crates/emerald-codegen",
+  "crates/emerald-codegen-llvm",
   "crates/emerald-sema",
   "crates/emerald-cli",
 ]
