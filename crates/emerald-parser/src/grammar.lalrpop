@@ -2,6 +2,13 @@ use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, Param, Program, Stmt
 
 grammar;
 
+// LALRPOP's `=>?` fallible actions default to a `&'static str` user-error
+// type; the assignment-target check below wants an interpolated message
+// (`format!`), so this widens it to `String`.
+extern {
+  type Error = String;
+}
+
 match {
   r"\s*" => { },
   _
@@ -26,7 +33,7 @@ ClassDef: ClassDef = {
 };
 
 FuncDef: Function = {
-  "def" <name:Ident> <params:ParenParams> "->" <return_type:Ident> <body:Stmt*> "end" => Function {
+  "def" <name:Ident> <params:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
     params,
     return_type,
@@ -48,7 +55,7 @@ ParenParams: Vec<Param> = {
 // LALR(1) shift/reduce conflict when both start with Ident; reserving the
 // one builtin this compiler has sidesteps it entirely.
 Stmt: Stmt = {
-  <name:Ident> ":" <ty:Ident> "=" <value:Expr> => Stmt::Let { name, ty, value },
+  <name:Ident> ":" <ty:TypeName> "=" <value:Expr> => Stmt::Let { name, ty, value },
   "if" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" => Stmt::If { cond, then_branch, else_branch },
   "while" <cond:Expr> <body:Stmt*> "end" => Stmt::While { cond, body },
   // Requires a value (no bare `return;`) — `<e:Expr?>` here is genuinely
@@ -61,11 +68,65 @@ Stmt: Stmt = {
   "break" => Stmt::Break,
   "next" => Stmt::Next,
   "puts" <arg:Expr> => Stmt::Expr(Expr::Call("puts".to_string(), vec![arg])),
-  // `@name = value` — instance-variable write. `InstanceVarTok` is its own
-  // terminal (starts with `@`), disjoint from `Ident`'s FIRST set, so this
-  // doesn't compete with the `Let` alternative above.
-  <name:InstanceVarTok> "=" <value:Expr> => Stmt::SetField { name, value },
-  <e:Expr> => Stmt::Expr(e),
+  // Assignment to an instance variable (`@x = value`) or an array index
+  // (`arr[i] = value`). Both are just `Expr` on the left — `CallExpr`'s
+  // left-recursive indexing rule (below) already parses `arr[i]`
+  // unambiguously, so re-deriving a *separate* `Ident "[" Expr "]"`
+  // grammar production here (plan 09's first attempt) would compete with
+  // it for the same lookahead and is a genuine LALR(1) conflict.
+  // Accepting a general `Expr` on the left and checking its shape in the
+  // action (`=>?`, a real parse error on an invalid target — not a panic)
+  // is the standard fix. `+=` etc. aren't in inception's initial-scope
+  // list, so this only ever needs to recognize these two shapes.
+  <lhs:StmtExpr> "=" <value:Expr> =>? match lhs {
+    Expr::InstanceVar(name) => Ok(Stmt::SetField { name, value }),
+    Expr::Index(array, index) => Ok(Stmt::SetIndex { array: *array, index: *index, value }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid assignment target: {other:?}"),
+    }),
+  },
+  <e:StmtExpr> => Stmt::Expr(e),
+};
+
+// A restricted mirror of `Expr`/`AddExpr`/`CallExpr` used *only* for the
+// two Stmt-initial positions above (the bare-expression statement, and an
+// assignment's LHS). It's identical except its base case drops
+// `PrimaryExpr`'s bare `"[" Args "]"` (array-literal) alternative.
+//
+// Without this split, `[` ends up in FIRST(Stmt) — reachable via a bare
+// array-literal statement — which in turn puts `[` in FOLLOW(CallExpr),
+// directly colliding with `CallExpr`'s own left-recursive indexing shift
+// (`CallExpr "[" Expr "]"`): after building a `CallExpr`, seeing `[` next
+// is genuinely ambiguous between "keep indexing" and "finish this
+// statement, a new one starting with an array literal begins here" —
+// there are no statement separators (newlines are insignificant, plan
+// 04) to break the tie. A bare array literal has no side effects, so
+// forbidding it as a *standalone* statement (it's still fully usable as
+// a Let/assignment/Return value, an Args element, etc. — anywhere it
+// isn't the first token of a fresh Stmt) costs nothing real.
+StmtExpr: Expr = {
+  <lhs:StmtAddExpr> <op:CompareOp> <rhs:AddExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+  StmtAddExpr,
+};
+
+StmtAddExpr: Expr = {
+  <lhs:StmtAddExpr> "+" <rhs:CallExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
+  StmtCallExpr,
+};
+
+StmtCallExpr: Expr = {
+  <base:StmtCallExpr> "[" <idx:Expr> "]" => Expr::Index(Box::new(base), Box::new(idx)),
+  StmtPrimaryExpr,
+};
+
+StmtPrimaryExpr: Expr = {
+  <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
+  <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
+  <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <f:FloatLit> => Expr::Float(f),
+  <n:Num> => Expr::Int(n),
+  <name:InstanceVarTok> => Expr::InstanceVar(name),
+  <name:Ident> => Expr::Ident(name),
 };
 
 ElseClause: Vec<Stmt> = {
@@ -92,7 +153,22 @@ AddExpr: Expr = {
   CallExpr,
 };
 
+// Left-recursive postfix indexing (`a[i]`, and — once chained expressions
+// exist — `a[i][j]`): the standard LALR technique for "zero or more
+// trailing `[Expr]` suffixes on anything that can already be indexed".
+// A *dedicated* `Ident "[" Expr "]"` production (plan 09's first attempt,
+// named `IndexTarget`) put `[` in FOLLOW(CallExpr) two different ways at
+// once — once for that production's own leading `[`, once because an
+// array literal (`PrimaryExpr`'s `"[" Args "]"`) can itself start a new
+// `Stmt` right after a completed one — which is exactly the shift/reduce
+// conflict LALRPOP reported. Routing *all* indexing through this single
+// recursive rule means there is only ever one derivation for `arr[i]`.
 CallExpr: Expr = {
+  <base:CallExpr> "[" <idx:Expr> "]" => Expr::Index(Box::new(base), Box::new(idx)),
+  PrimaryExpr,
+};
+
+PrimaryExpr: Expr = {
   <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
   // `new` is a reserved keyword (see plan 08's Decision log): LALRPOP
   // tokenizes the literal `"new"` distinctly from the generic `Ident`
@@ -101,6 +177,7 @@ CallExpr: Expr = {
   // lookahead token.
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  "[" <elements:Args> "]" => Expr::ArrayLit(elements),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
   <name:InstanceVarTok> => Expr::InstanceVar(name),
@@ -126,7 +203,19 @@ Params: Vec<Param> = {
 };
 
 Param: Param = {
-  <name:Ident> ":" <ty:Ident> => Param { name, ty }
+  <name:Ident> ":" <ty:TypeName> => Param { name, ty }
+};
+
+// `Array` is a reserved keyword (same LALR(1) reason `puts`/`new` were
+// reserved in plans 07/08): the literal `"Array"` token is tokenized
+// distinctly from the generic `Ident` regex, so this alternative and the
+// bare-`Ident` one below never compete for the same lookahead token.
+// `Param.ty`/`Function.return_type` stay a plain `String` — a compound
+// name like `"Array[Int64]"` is grammar-level concatenation, not a
+// structured type AST node yet (see plan 09's Decision log).
+TypeName: String = {
+  <name:Ident> => name,
+  "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
 };
 
 Num: i64 = <s:r"[0-9]+"> => s.parse().unwrap();

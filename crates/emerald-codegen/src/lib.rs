@@ -181,18 +181,28 @@ fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, 
     .map_err(|e| e.to_string())
 }
 
+/// Every array element is 8 bytes — `Int64`/`Float64`/a class-instance
+/// pointer all are (plan 08's `FieldInfo` makes the same simplification
+/// for fields; plan 09's Decision log carries it forward for `Array[T]`
+/// storage, per `spec/TYPE_SYSTEM.md` §8's packed/contiguous requirement).
+const ARRAY_ELEM_SIZE: i64 = 8;
+
 /// `local_classes` maps a local variable name to its declared class name
 /// (from `Stmt::Let`'s explicit type annotation) — codegen has no typed
 /// IR to consult (see `spec/COMPILER.md`'s deferred-`emerald-ir` note), so
 /// a `.method` call on a local resolves its receiver's class this way
 /// rather than by inferring it from the (type-erased, both-just-`i64`)
-/// runtime pointer value.
+/// runtime pointer value. `local_array_elem_types` is the same idea for
+/// `Array[Elem]` locals, mapping to `Elem`'s type name (used to pick the
+/// Cranelift load type when indexing — an array's own runtime pointer
+/// value carries no element-type information).
 fn build_expr(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   expr: &Expr,
   vars: &HashMap<String, Variable>,
   local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, String>,
   ctx: &Ctx,
 ) -> Result<Value, String> {
   match expr {
@@ -205,8 +215,24 @@ fn build_expr(
     Expr::Int(n) => Ok(builder.ins().iconst(types::I64, *n)),
     Expr::Float(f) => Ok(builder.ins().f64const(*f)),
     Expr::Add(lhs, rhs) => {
-      let l = build_expr(builder, module, lhs, vars, local_classes, ctx)?;
-      let r = build_expr(builder, module, rhs, vars, local_classes, ctx)?;
+      let l = build_expr(
+        builder,
+        module,
+        lhs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let r = build_expr(
+        builder,
+        module,
+        rhs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       if builder.func.dfg.value_type(l) == types::F64 {
         Ok(builder.ins().fadd(l, r))
       } else {
@@ -214,8 +240,24 @@ fn build_expr(
       }
     }
     Expr::Compare(lhs, op, rhs) => {
-      let l = build_expr(builder, module, lhs, vars, local_classes, ctx)?;
-      let r = build_expr(builder, module, rhs, vars, local_classes, ctx)?;
+      let l = build_expr(
+        builder,
+        module,
+        lhs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let r = build_expr(
+        builder,
+        module,
+        rhs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       let cc = match op {
         CompareOp::Lt => IntCC::SignedLessThan,
         CompareOp::Gt => IntCC::SignedGreaterThan,
@@ -233,7 +275,15 @@ fn build_expr(
       let func_ref = module.declare_func_in_func(func_id, builder.func);
       let mut arg_vals = Vec::with_capacity(args.len());
       for a in args {
-        arg_vals.push(build_expr(builder, module, a, vars, local_classes, ctx)?);
+        arg_vals.push(build_expr(
+          builder,
+          module,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?);
       }
       let call = builder.ins().call(func_ref, &arg_vals);
       Ok(builder.inst_results(call)[0])
@@ -253,7 +303,15 @@ fn build_expr(
         let init_ref = module.declare_func_in_func(init_id, builder.func);
         let mut call_args = vec![ptr];
         for a in args {
-          call_args.push(build_expr(builder, module, a, vars, local_classes, ctx)?);
+          call_args.push(build_expr(
+            builder,
+            module,
+            a,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?);
         }
         builder.ins().call(init_ref, &call_args);
       }
@@ -268,7 +326,15 @@ fn build_expr(
       let class_name = local_classes.get(recv_name).ok_or_else(|| {
         format!("codegen: cannot determine the class of `{recv_name}` for `.{method}`")
       })?;
-      let recv_val = build_expr(builder, module, recv, vars, local_classes, ctx)?;
+      let recv_val = build_expr(
+        builder,
+        module,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       let key = format!("{class_name}_{method}");
       let func_id = *ctx
         .user_func_ids
@@ -277,7 +343,15 @@ fn build_expr(
       let func_ref = module.declare_func_in_func(func_id, builder.func);
       let mut call_args = vec![recv_val];
       for a in args {
-        call_args.push(build_expr(builder, module, a, vars, local_classes, ctx)?);
+        call_args.push(build_expr(
+          builder,
+          module,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?);
       }
       let call = builder.ins().call(func_ref, &call_args);
       Ok(builder.inst_results(call)[0])
@@ -296,7 +370,113 @@ fn build_expr(
           .load(field.cl_type, MemFlagsData::new(), self_ptr, field.offset),
       )
     }
+    Expr::ArrayLit(elements) => build_array_lit(
+      builder,
+      module,
+      elements,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
+    Expr::Index(array, index) => build_index(
+      builder,
+      module,
+      array,
+      index,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
   }
+}
+
+/// `emerald_alloc`s a flat `elements.len() * 8`-byte buffer, then stores
+/// each element at its `i * 8` offset — no length prefix, no bounds
+/// checking (plan 09's Decision log). The returned `Value` is just the
+/// base pointer; nothing about it carries the element type, which is why
+/// `build_index` needs `local_array_elem_types`.
+#[allow(clippy::too_many_arguments)]
+fn build_array_lit(
+  builder: &mut FunctionBuilder,
+  module: &mut ObjectModule,
+  elements: &[Expr],
+  vars: &HashMap<String, Variable>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, String>,
+  ctx: &Ctx,
+) -> Result<Value, String> {
+  let size_val = builder
+    .ins()
+    .iconst(types::I64, elements.len() as i64 * ARRAY_ELEM_SIZE);
+  let alloc_ref = module.declare_func_in_func(ctx.alloc_func_id, builder.func);
+  let call = builder.ins().call(alloc_ref, &[size_val]);
+  let ptr = builder.inst_results(call)[0];
+  for (i, e) in elements.iter().enumerate() {
+    let v = build_expr(
+      builder,
+      module,
+      e,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    builder.ins().store(
+      MemFlagsData::new(),
+      v,
+      ptr,
+      i as i32 * ARRAY_ELEM_SIZE as i32,
+    );
+  }
+  Ok(ptr)
+}
+
+/// `arr[i]`. Same "plain local-variable" restriction as `MethodCall`'s
+/// receiver (plan 09's Decision log) — the element type comes from
+/// `local_array_elem_types`, keyed by the array's own local name.
+#[allow(clippy::too_many_arguments)]
+fn build_index(
+  builder: &mut FunctionBuilder,
+  module: &mut ObjectModule,
+  array: &Expr,
+  index: &Expr,
+  vars: &HashMap<String, Variable>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, String>,
+  ctx: &Ctx,
+) -> Result<Value, String> {
+  let Expr::Ident(arr_name) = array else {
+    return Err(
+      "codegen: array indexing is only supported on a plain local-variable array".to_string(),
+    );
+  };
+  let elem_ty_name = local_array_elem_types.get(arr_name).ok_or_else(|| {
+    format!("codegen: cannot determine the element type of `{arr_name}` for indexing")
+  })?;
+  let cl_elem_ty = cranelift_type(elem_ty_name);
+  let base_ptr = build_expr(
+    builder,
+    module,
+    array,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let idx_val = build_expr(
+    builder,
+    module,
+    index,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let byte_offset = builder.ins().imul_imm_s(idx_val, ARRAY_ELEM_SIZE);
+  let addr = builder.ins().iadd(base_ptr, byte_offset);
+  Ok(builder.ins().load(cl_elem_ty, MemFlagsData::new(), addr, 0))
 }
 
 /// Emits `puts <inner>` as a call to whichever of `emerald_print_i64` /
@@ -304,15 +484,25 @@ fn build_expr(
 /// value type (see `runtime/emerald_runtime.c` and plan 08's Decision
 /// log — `puts` is a call-site-polymorphic intrinsic, not an overloaded
 /// user function).
+#[allow(clippy::too_many_arguments)]
 fn build_puts(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   arg: &Expr,
   vars: &HashMap<String, Variable>,
   local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, String>,
   ctx: &Ctx,
 ) -> Result<(), String> {
-  let val = build_expr(builder, module, arg, vars, local_classes, ctx)?;
+  let val = build_expr(
+    builder,
+    module,
+    arg,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
   let target_id = if builder.func.dfg.value_type(val) == types::F64 {
     ctx.print_f64_func_id.ok_or(
       "codegen: `puts` is only supported at the program's top level, not inside a function body",
@@ -327,26 +517,93 @@ fn build_puts(
   Ok(())
 }
 
+/// `arr[i] = value`. Same "plain local-variable array" restriction as
+/// `build_index`'s read side (plan 09's Decision log) — the element size
+/// is always `ARRAY_ELEM_SIZE`, so unlike a read this needs no element
+/// type lookup, just the address arithmetic.
+#[allow(clippy::too_many_arguments)]
+fn build_set_index(
+  builder: &mut FunctionBuilder,
+  module: &mut ObjectModule,
+  array: &Expr,
+  index: &Expr,
+  value: &Expr,
+  vars: &HashMap<String, Variable>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, String>,
+  ctx: &Ctx,
+) -> Result<bool, String> {
+  let Expr::Ident(_) = array else {
+    return Err(
+      "codegen: array assignment is only supported on a plain local-variable array".to_string(),
+    );
+  };
+  let base_ptr = build_expr(
+    builder,
+    module,
+    array,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let idx_val = build_expr(
+    builder,
+    module,
+    index,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let v = build_expr(
+    builder,
+    module,
+    value,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let byte_offset = builder.ins().imul_imm_s(idx_val, ARRAY_ELEM_SIZE);
+  let addr = builder.ins().iadd(base_ptr, byte_offset);
+  builder.ins().store(MemFlagsData::new(), v, addr, 0);
+  Ok(false)
+}
+
 /// Emits one statement. `vars`/`local_classes` are threaded flat (no
 /// block scoping — matches `emerald-sema`'s equally flat environment, see
 /// plan 07's Implementation Notes); `loop_stack`'s top is `break`/`next`'s
 /// target. Returns `true` if the statement emitted a block terminator
 /// (`return`/the loop-jump for `break`/`next`) — callers must not emit
 /// further instructions into the current block afterward.
+#[allow(clippy::too_many_arguments)]
 fn build_stmt(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   stmt: &Stmt,
   vars: &mut HashMap<String, Variable>,
   local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, String>,
   loop_stack: &mut Vec<LoopTargets>,
   ctx: &Ctx,
 ) -> Result<bool, String> {
   match stmt {
     Stmt::Let { name, ty, value } => {
-      let v = build_expr(builder, module, value, vars, local_classes, ctx)?;
+      let v = build_expr(
+        builder,
+        module,
+        value,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       if ctx.classes.contains_key(ty.as_str()) {
         local_classes.insert(name.clone(), ty.clone());
+      }
+      if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
+        local_array_elem_types.insert(name.clone(), elem_name.to_string());
       }
       if let Some(existing) = vars.get(name) {
         builder.def_var(*existing, v);
@@ -364,23 +621,70 @@ fn build_stmt(
       let field = *fields
         .get(name)
         .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?;
-      let v = build_expr(builder, module, value, vars, local_classes, ctx)?;
+      let v = build_expr(
+        builder,
+        module,
+        value,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       let self_ptr = builder.use_var(self_var);
       builder
         .ins()
         .store(MemFlagsData::new(), v, self_ptr, field.offset);
       Ok(false)
     }
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => build_set_index(
+      builder,
+      module,
+      array,
+      index,
+      value,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
     Stmt::Expr(Expr::Call(name, args)) if name == "puts" && args.len() == 1 => {
-      build_puts(builder, module, &args[0], vars, local_classes, ctx)?;
+      build_puts(
+        builder,
+        module,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       Ok(false)
     }
     Stmt::Expr(e) => {
-      build_expr(builder, module, e, vars, local_classes, ctx)?;
+      build_expr(
+        builder,
+        module,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       Ok(false)
     }
     Stmt::Return(Some(e)) => {
-      let v = build_expr(builder, module, e, vars, local_classes, ctx)?;
+      let v = build_expr(
+        builder,
+        module,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       builder.ins().return_(&[v]);
       Ok(true)
     }
@@ -407,7 +711,15 @@ fn build_stmt(
       then_branch,
       else_branch,
     } => {
-      let cond_val = build_expr(builder, module, cond, vars, local_classes, ctx)?;
+      let cond_val = build_expr(
+        builder,
+        module,
+        cond,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       let then_blk = builder.create_block();
       let merge_blk = builder.create_block();
       let else_target_blk = if else_branch.is_some() {
@@ -428,6 +740,7 @@ fn build_stmt(
         then_branch,
         vars,
         local_classes,
+        local_array_elem_types,
         loop_stack,
         ctx,
       )?;
@@ -444,6 +757,7 @@ fn build_stmt(
           else_branch,
           vars,
           local_classes,
+          local_array_elem_types,
           loop_stack,
           ctx,
         )?;
@@ -464,7 +778,15 @@ fn build_stmt(
       builder.ins().jump(header_blk, &[]);
 
       builder.switch_to_block(header_blk);
-      let cond_val = build_expr(builder, module, cond, vars, local_classes, ctx)?;
+      let cond_val = build_expr(
+        builder,
+        module,
+        cond,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       builder.ins().brif(cond_val, body_blk, &[], exit_blk, &[]);
       // header_blk isn't sealed yet — the loop body's back-edge (below) is
       // a predecessor that doesn't exist until after the body is built.
@@ -475,8 +797,16 @@ fn build_stmt(
         header: header_blk,
         exit: exit_blk,
       });
-      let body_terminated =
-        build_block(builder, module, body, vars, local_classes, loop_stack, ctx)?;
+      let body_terminated = build_block(
+        builder,
+        module,
+        body,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ctx,
+      )?;
       loop_stack.pop();
       if !body_terminated {
         builder.ins().jump(header_blk, &[]);
@@ -495,17 +825,28 @@ fn build_stmt(
 /// anything syntactically after `return`/`break`/`next` in the same list
 /// is unreachable and must not be emitted into an already-terminated
 /// Cranelift block.
+#[allow(clippy::too_many_arguments)]
 fn build_block(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   stmts: &[Stmt],
   vars: &mut HashMap<String, Variable>,
   local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, String>,
   loop_stack: &mut Vec<LoopTargets>,
   ctx: &Ctx,
 ) -> Result<bool, String> {
   for stmt in stmts {
-    let terminated = build_stmt(builder, module, stmt, vars, local_classes, loop_stack, ctx)?;
+    let terminated = build_stmt(
+      builder,
+      module,
+      stmt,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ctx,
+    )?;
     if terminated {
       return Ok(true);
     }
@@ -518,12 +859,14 @@ fn build_block(
 /// terminator (`return`/`break`/`next`), the last statement — if a bare
 /// `Stmt::Expr` — has its value returned, matching `emerald-sema`'s
 /// implicit-return check.
+#[allow(clippy::too_many_arguments)]
 fn build_function_body(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   body: &[Stmt],
   vars: &mut HashMap<String, Variable>,
   local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, String>,
   gen_ctx: &Ctx,
 ) -> Result<(), String> {
   let mut loop_stack = Vec::new();
@@ -538,6 +881,7 @@ fn build_function_body(
     init,
     vars,
     local_classes,
+    local_array_elem_types,
     &mut loop_stack,
     gen_ctx,
   )?;
@@ -547,7 +891,15 @@ fn build_function_body(
 
   match last {
     Stmt::Expr(e) => {
-      let v = build_expr(builder, module, e, vars, local_classes, gen_ctx)?;
+      let v = build_expr(
+        builder,
+        module,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        gen_ctx,
+      )?;
       builder.ins().return_(&[v]);
     }
     other => {
@@ -557,6 +909,7 @@ fn build_function_body(
         other,
         vars,
         local_classes,
+        local_array_elem_types,
         &mut loop_stack,
         gen_ctx,
       )?;
@@ -602,6 +955,7 @@ fn define_user_function(
 
     let mut vars: HashMap<String, Variable> = HashMap::new();
     let mut local_classes: HashMap<String, String> = HashMap::new();
+    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
     for (i, p) in f.params.iter().enumerate() {
       let param_val = builder.block_params(block)[i];
       let var = builder.declare_var(cranelift_type(&p.ty));
@@ -609,6 +963,13 @@ fn define_user_function(
       vars.insert(p.name.clone(), var);
       if gen_ctx.classes.contains_key(p.ty.as_str()) {
         local_classes.insert(p.name.clone(), p.ty.clone());
+      }
+      if let Some(elem_name) = p
+        .ty
+        .strip_prefix("Array[")
+        .and_then(|s| s.strip_suffix(']'))
+      {
+        local_array_elem_types.insert(p.name.clone(), elem_name.to_string());
       }
     }
 
@@ -618,6 +979,7 @@ fn define_user_function(
       &f.body,
       &mut vars,
       &mut local_classes,
+      &mut local_array_elem_types,
       gen_ctx,
     )?;
     builder.finalize(frontend_config);
@@ -667,6 +1029,7 @@ fn define_method(
 
     let mut vars: HashMap<String, Variable> = HashMap::new();
     let mut local_classes: HashMap<String, String> = HashMap::new();
+    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
     for (i, p) in m.params.iter().enumerate() {
       let param_val = builder.block_params(block)[i + 1];
       let var = builder.declare_var(cranelift_type(&p.ty));
@@ -674,6 +1037,13 @@ fn define_method(
       vars.insert(p.name.clone(), var);
       if gen_ctx.classes.contains_key(p.ty.as_str()) {
         local_classes.insert(p.name.clone(), p.ty.clone());
+      }
+      if let Some(elem_name) = p
+        .ty
+        .strip_prefix("Array[")
+        .and_then(|s| s.strip_suffix(']'))
+      {
+        local_array_elem_types.insert(p.name.clone(), elem_name.to_string());
       }
     }
 
@@ -687,6 +1057,7 @@ fn define_method(
       &m.body,
       &mut vars,
       &mut local_classes,
+      &mut local_array_elem_types,
       &method_ctx,
     )?;
     builder.finalize(frontend_config);
@@ -721,6 +1092,7 @@ fn define_main(
 
     let mut vars: HashMap<String, Variable> = HashMap::new();
     let mut local_classes: HashMap<String, String> = HashMap::new();
+    let mut local_array_elem_types: HashMap<String, String> = HashMap::new();
     let mut loop_stack = Vec::new();
 
     let top_stmts: Vec<Stmt> = program
@@ -741,6 +1113,7 @@ fn define_main(
       &top_stmts,
       &mut vars,
       &mut local_classes,
+      &mut local_array_elem_types,
       &mut loop_stack,
       gen_ctx,
     )?;
@@ -977,6 +1350,35 @@ mod aot_tests {
     // number without a trailing ".0" — pinned from the real observed
     // output, not guessed (plan 08's leaf-codegen-class AC1).
     assert_eq!(compile_link_run(POINT_EXAMPLE), "5\n");
+  }
+
+  const ARRAY_EXAMPLE: &str = "arr: Array[Int64] = [10, 20, 30]\nsum: Int64 = 0\ni: Int64 = 0\nwhile i < 3\n  sum: Int64 = sum + arr[i]\n  i: Int64 = i + 1\nend\narr[1] = 99\nputs sum\nputs arr[1]\n";
+
+  #[test]
+  fn plan_09_collections_example_linked_and_run() {
+    // Plan 09's own worked example (inception has no literal one for
+    // collections): allocate, sum via a `while`-loop indexed read, mutate
+    // via `arr[1] = 99`, read back — real executed proof, not simulated
+    // (plan 09 AC1).
+    assert_eq!(compile_link_run(ARRAY_EXAMPLE), "60\n99\n");
+  }
+
+  #[test]
+  fn array_literal_index_read_and_write_linked_and_run() {
+    // Sums the literal (10+20+30=60), then overwrites index 1 and reads
+    // it back (99) — proves allocation, read-indexing, and write-indexing
+    // all touch the same underlying buffer, not simulated (plan 09 AC3).
+    let src =
+      "arr: Array[Int64] = [10, 20, 30]\nputs arr[0] + arr[1] + arr[2]\narr[1] = 99\nputs arr[1]\n";
+    assert_eq!(compile_link_run(src), "60\n99\n");
+  }
+
+  #[test]
+  fn array_of_float64_linked_and_run() {
+    // A second element type proves indexing picks its load width from
+    // `local_array_elem_types`, not a single hard-coded Cranelift type.
+    let src = "arr: Array[Float64] = [1.5, 2.5]\nputs arr[0] + arr[1]\n";
+    assert_eq!(compile_link_run(src), "4\n");
   }
 
   #[test]

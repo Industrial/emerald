@@ -34,6 +34,10 @@ pub enum Expr {
   MethodCall(Box<Expr>, String, Vec<Expr>),
   /// `@name` — instance-variable read, valid only inside a method body.
   InstanceVar(String),
+  /// `[e1, e2, ...]` — an array literal.
+  ArrayLit(Vec<Expr>),
+  /// `array[index]` — an indexed read.
+  Index(Box<Expr>, Box<Expr>),
 }
 
 /// One statement in a block (a function body or the program's top level).
@@ -49,6 +53,12 @@ pub enum Stmt {
   /// declared on the class), unlike `Let`.
   SetField {
     name: String,
+    value: Expr,
+  },
+  /// `array[index] = value` — an indexed write.
+  SetIndex {
+    array: Expr,
+    index: Expr,
     value: Expr,
   },
   If {

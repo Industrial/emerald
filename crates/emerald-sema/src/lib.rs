@@ -17,6 +17,9 @@ pub enum Type {
   Void,
   /// An instance of a user-defined class, named by its declaration.
   Class(String),
+  /// A packed, contiguous array of a single element type
+  /// (`spec/TYPE_SYSTEM.md` §8) — named `Array[Elem]` at the source level.
+  Array(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +58,16 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "Void" => Ok(Type::Void),
     "Boolean" => Ok(Type::Boolean),
     other if classes.contains_key(other) => Ok(Type::Class(other.to_string())),
+    // The grammar hands compound array annotations over as a plain
+    // `"Array[Elem]"` string (plan 09's Decision log — no structured
+    // type-annotation AST node yet), so this is where it turns into
+    // `Type::Array`. Recurses on `Elem` so `Array[Array[Int64]]` works
+    // for free, even though nothing exercises it yet.
+    other if other.starts_with("Array[") && other.ends_with(']') => {
+      let elem_name = &other["Array[".len()..other.len() - 1];
+      let elem_ty = resolve_type(elem_name, classes)?;
+      Ok(Type::Array(Box::new(elem_ty)))
+    }
     other => Err(Diagnostic::new(format!("unknown type `{other}`"))),
   }
 }
@@ -208,7 +221,55 @@ fn infer_expr_type(
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`")))
     }
+    // Empty arrays are rejected (plan 09's Decision log): with no
+    // structured type annotation on the literal itself, an empty
+    // `[]` has no element type to infer — `Array[T]`'s declared `T`
+    // on the enclosing `Let` isn't visible from here.
+    Expr::ArrayLit(elements) => infer_array_lit_type(elements, env, sigs, classes, self_fields),
+    Expr::Index(array, index) => {
+      let array_ty = infer_expr_type(array, env, sigs, classes, self_fields)?;
+      let Type::Array(elem_ty) = array_ty else {
+        return Err(Diagnostic::new(format!(
+          "`[...]` indexing requires an Array, found {array_ty:?}"
+        )));
+      };
+      let index_ty = infer_expr_type(index, env, sigs, classes, self_fields)?;
+      if index_ty != Type::Int64 {
+        return Err(Diagnostic::new(format!(
+          "array index must be Int64, found {index_ty:?}"
+        )));
+      }
+      Ok(*elem_ty)
+    }
   }
+}
+
+/// All elements of an array literal must share one type, and — since
+/// there's no structured type annotation on the literal itself to fall
+/// back on — the literal can't be empty (plan 09's Decision log).
+fn infer_array_lit_type(
+  elements: &[Expr],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<Type, Diagnostic> {
+  let Some((first, rest)) = elements.split_first() else {
+    return Err(Diagnostic::new(
+      "empty array literals are not supported — the element type can't be inferred",
+    ));
+  };
+  let elem_ty = infer_expr_type(first, env, sigs, classes, self_fields)?;
+  for (i, e) in rest.iter().enumerate() {
+    let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+    if t != elem_ty {
+      return Err(Diagnostic::new(format!(
+        "array literal element {} has type {t:?}, expected {elem_ty:?} (all elements must share one type)",
+        i + 2
+      )));
+    }
+  }
+  Ok(Type::Array(Box::new(elem_ty)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -236,6 +297,39 @@ fn check_args(
         i + 1
       )));
     }
+  }
+  Ok(())
+}
+
+/// `arr[i] = value` — array element must be Int64-indexed and the RHS
+/// must match the array's element type.
+#[allow(clippy::too_many_arguments)]
+fn check_set_index(
+  array: &Expr,
+  index: &Expr,
+  value: &Expr,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<(), Diagnostic> {
+  let array_ty = infer_expr_type(array, env, sigs, classes, self_fields)?;
+  let Type::Array(elem_ty) = array_ty else {
+    return Err(Diagnostic::new(format!(
+      "`[...] = ...` indexing requires an Array, found {array_ty:?}"
+    )));
+  };
+  let index_ty = infer_expr_type(index, env, sigs, classes, self_fields)?;
+  if index_ty != Type::Int64 {
+    return Err(Diagnostic::new(format!(
+      "array index must be Int64, found {index_ty:?}"
+    )));
+  }
+  let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+  if actual != *elem_ty {
+    return Err(Diagnostic::new(format!(
+      "type mismatch in array assignment: element type is {elem_ty:?}, value has type {actual:?}"
+    )));
   }
   Ok(())
 }
@@ -282,6 +376,11 @@ fn check_stmt(
       }
       Ok(())
     }
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => check_set_index(array, index, value, env, sigs, classes, self_fields),
     Stmt::If {
       cond,
       then_branch,
@@ -668,5 +767,59 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject .sum on an Int64 receiver");
     assert!(errs.iter().any(|d| d.message.contains("non-class type")));
+  }
+
+  const ARRAY_EXAMPLE: &str =
+    "arr: Array[Int64] = [10, 20, 30]\narr[1] = 99\nputs arr[1]\nputs arr[0] + arr[2]\n";
+
+  #[test]
+  fn accepts_array_literal_index_read_and_write() {
+    let program = emerald_parser::parse(ARRAY_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_empty_array_literal() {
+    let src = "arr: Array[Int64] = []\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject an empty array literal");
+    assert!(errs[0].message.contains("empty array literals"));
+  }
+
+  #[test]
+  fn rejects_mixed_type_array_literal() {
+    let src = "arr: Array[Int64] = [1, 2.0]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a mixed-type array literal");
+    assert!(errs[0].message.contains("all elements must share one type"));
+  }
+
+  #[test]
+  fn rejects_non_int64_array_index() {
+    let src = "arr: Array[Int64] = [1, 2]\nputs arr[2.0]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a non-Int64 array index");
+    assert!(errs[0].message.contains("array index must be Int64"));
+  }
+
+  #[test]
+  fn rejects_array_element_type_mismatch_on_write() {
+    let src = "arr: Array[Int64] = [1, 2]\narr[0] = 2.0\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject writing a Float64 into an Array[Int64]");
+    assert!(
+      errs[0]
+        .message
+        .contains("type mismatch in array assignment")
+    );
+  }
+
+  #[test]
+  fn rejects_indexing_a_non_array() {
+    let src = "x: Int64 = 5\nputs x[0]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject indexing a non-Array");
+    assert!(errs[0].message.contains("requires an Array"));
   }
 }

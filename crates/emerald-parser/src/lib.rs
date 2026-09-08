@@ -253,4 +253,75 @@ mod tests {
       )
     );
   }
+
+  const ARRAY_EXAMPLE: &str =
+    "arr: Array[Int64] = [10, 20, 30]\narr[1] = 99\nputs arr[1]\nputs arr[0] + arr[2]\n";
+
+  #[test]
+  fn parses_array_literal_index_read_and_write() {
+    let program = parse(ARRAY_EXAMPLE).expect("array example should parse");
+    assert_eq!(program.items.len(), 4);
+
+    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[0] else {
+      panic!(
+        "expected item 0 to be `arr: Array[Int64] = [...]`, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(name, "arr");
+    assert_eq!(ty, "Array[Int64]");
+    assert_eq!(
+      *value,
+      Expr::ArrayLit(vec![Expr::Int(10), Expr::Int(20), Expr::Int(30)])
+    );
+
+    assert_eq!(
+      program.items[1],
+      Item::Stmt(Stmt::SetIndex {
+        array: Expr::Ident("arr".into()),
+        index: Expr::Int(1),
+        value: Expr::Int(99),
+      })
+    );
+
+    let Item::Stmt(Stmt::Expr(call)) = &program.items[2] else {
+      panic!(
+        "expected item 2 to be `puts arr[1]`, got {:?}",
+        program.items[2]
+      );
+    };
+    assert_eq!(
+      *call,
+      Expr::Call(
+        "puts".into(),
+        vec![Expr::Index(
+          Box::new(Expr::Ident("arr".into())),
+          Box::new(Expr::Int(1))
+        )]
+      )
+    );
+
+    let Item::Stmt(Stmt::Expr(call)) = &program.items[3] else {
+      panic!(
+        "expected item 3 to be `puts arr[0] + arr[2]`, got {:?}",
+        program.items[3]
+      );
+    };
+    assert_eq!(
+      *call,
+      Expr::Call(
+        "puts".into(),
+        vec![Expr::Add(
+          Box::new(Expr::Index(
+            Box::new(Expr::Ident("arr".into())),
+            Box::new(Expr::Int(0))
+          )),
+          Box::new(Expr::Index(
+            Box::new(Expr::Ident("arr".into())),
+            Box::new(Expr::Int(2))
+          ))
+        )]
+      )
+    );
+  }
 }
