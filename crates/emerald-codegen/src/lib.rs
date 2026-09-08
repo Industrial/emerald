@@ -251,6 +251,26 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
         collect_idents_in_stmt(s, referenced, bound);
       }
     }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      collect_idents_in_expr(scrutinee, referenced);
+      for (values, body) in arms {
+        for v in values {
+          collect_idents_in_expr(v, referenced);
+        }
+        for s in body {
+          collect_idents_in_stmt(s, referenced, bound);
+        }
+      }
+      if let Some(else_b) = else_body {
+        for s in else_b {
+          collect_idents_in_stmt(s, referenced, bound);
+        }
+      }
+    }
   }
 }
 
@@ -350,6 +370,16 @@ fn collect_lets(stmts: &[Stmt], out: &mut Vec<(String, ValKind)>) {
         collect_lets(body, out);
         out.push((rescue_var.clone(), ValKind::Ptr));
         collect_lets(rescue_body, out);
+      }
+      Stmt::Case {
+        arms, else_body, ..
+      } => {
+        for (_, body) in arms {
+          collect_lets(body, out);
+        }
+        if let Some(else_b) = else_body {
+          collect_lets(else_b, out);
+        }
       }
       _ => {}
     }
@@ -1746,7 +1776,151 @@ fn build_stmt<'ctx>(
       ret_kind,
       ctx,
     ),
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => build_case(
+      context,
+      builder,
+      func,
+      scrutinee,
+      arms,
+      else_body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ret_kind,
+      ctx,
+    ),
   }
+}
+
+/// `case scrutinee when v1, v2 ... when v3 ... else ... end` (plan 20):
+/// lowers to the same `icmp(Equal)` `Expr::Compare`'s `Eq` arm already
+/// emits, chained across arms in source order (first matching arm
+/// wins) — a multi-value arm's values are OR-ed together (bitwise
+/// `or` over `i1`s, equivalent to logical or), falling through to
+/// `else_body` (or nothing) if no arm matches.
+#[allow(clippy::too_many_arguments)]
+fn build_case<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  scrutinee: &Expr,
+  arms: &[(Vec<Expr>, Vec<Stmt>)],
+  else_body: &Option<Vec<Stmt>>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<bool, String> {
+  let (scrut_val, scrut_kind) = build_expr(
+    context,
+    builder,
+    scrutinee,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if scrut_kind != ValKind::Int64 {
+    return Err("codegen: `case` scrutinee must be Int64".to_string());
+  }
+  let scrut_int = scrut_val.into_int_value();
+
+  let merge_blk = context.append_basic_block(func, "case.merge");
+
+  for (values, body) in arms {
+    let arm_blk = context.append_basic_block(func, "case.arm");
+    let next_check_blk = context.append_basic_block(func, "case.next");
+
+    let mut cond: Option<IntValue> = None;
+    for v in values {
+      let (v_val, v_kind) = build_expr(
+        context,
+        builder,
+        v,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if v_kind != ValKind::Int64 {
+        return Err("codegen: `when` value must be Int64".to_string());
+      }
+      let eq = builder
+        .build_int_compare(
+          IntPredicate::EQ,
+          scrut_int,
+          v_val.into_int_value(),
+          "wheneq",
+        )
+        .map_err(|e| e.to_string())?;
+      cond = Some(match cond {
+        None => eq,
+        Some(prev) => builder
+          .build_or(prev, eq, "whenor")
+          .map_err(|e| e.to_string())?,
+      });
+    }
+    let cond = cond.expect("the grammar guarantees at least one when-value per arm");
+    builder
+      .build_conditional_branch(cond, arm_blk, next_check_blk)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(arm_blk);
+    let terminated = build_block(
+      context,
+      builder,
+      func,
+      body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ret_kind,
+      ctx,
+    )?;
+    if !terminated {
+      builder
+        .build_unconditional_branch(merge_blk)
+        .map_err(|e| e.to_string())?;
+    }
+
+    builder.position_at_end(next_check_blk);
+  }
+
+  // Reached only when no arm matched.
+  if let Some(else_b) = else_body {
+    let terminated = build_block(
+      context,
+      builder,
+      func,
+      else_b,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ret_kind,
+      ctx,
+    )?;
+    if !terminated {
+      builder
+        .build_unconditional_branch(merge_blk)
+        .map_err(|e| e.to_string())?;
+    }
+  } else {
+    builder
+      .build_unconditional_branch(merge_blk)
+      .map_err(|e| e.to_string())?;
+  }
+
+  builder.position_at_end(merge_blk);
+  Ok(false)
 }
 
 /// Builds a `While`/`If` condition — always an `Expr::Compare` in every
@@ -2948,5 +3122,38 @@ mod tests {
     };
     let out = std::env::temp_dir().join("emerald_codegen_string_lt_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  // Plan 20 (comments and case/when).
+
+  fn case_example(n: i64) -> String {
+    format!(
+      "# classify an integer by a fixed set of buckets\nn: Int64 = {n}\nlabel: Int64 = 0\ncase n\nwhen 1\n  label: Int64 = 10\nwhen 2, 3\n  label: Int64 = 20\nelse\n  label: Int64 = 99\nend\nputs label\n"
+    )
+  }
+
+  #[test]
+  fn case_single_value_arm_matches() {
+    assert_eq!(compile_link_run(&case_example(1)), "10\n");
+  }
+
+  #[test]
+  fn case_multi_value_arm_matches() {
+    // AC1/AC2: proves the multi-value `when 2, 3` arm — both distinct
+    // values, both real, executed code paths.
+    assert_eq!(compile_link_run(&case_example(2)), "20\n");
+    assert_eq!(compile_link_run(&case_example(3)), "20\n");
+  }
+
+  #[test]
+  fn case_no_match_falls_to_else() {
+    assert_eq!(compile_link_run(&case_example(7)), "99\n");
+  }
+
+  #[test]
+  fn case_with_no_else_and_no_match_falls_through_harmlessly() {
+    // AC3: no diagnostic, no crash — matches `if` with no `else`.
+    let src = "n: Int64 = 7\ncase n\nwhen 1\n  puts 1\nend\nputs 42\n";
+    assert_eq!(compile_link_run(src), "42\n");
   }
 }

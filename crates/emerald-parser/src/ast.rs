@@ -136,6 +136,19 @@ pub enum Stmt {
     rescue_var: String,
     rescue_body: Vec<Stmt>,
   },
+  /// `case scrutinee when v1, v2 ... when v3 ... else ... end` (plan
+  /// 20's Decision log): value-match via the same `CompareOp::Eq`
+  /// `Expr::Compare` already performs, over an `Int64`-only scrutinee —
+  /// not `spec/GRAMMAR.md`'s eventual method-dispatched `===` (no
+  /// operator-overload dispatch mechanism exists in this compiler).
+  /// Each arm's `Vec<Expr>` holds one or more `when` values; the arm
+  /// matches if the scrutinee equals *any* of them. First matching arm
+  /// wins, source order, matching Ruby's own semantics.
+  Case {
+    scrutinee: Expr,
+    arms: Vec<(Vec<Expr>, Vec<Stmt>)>,
+    else_body: Option<Vec<Stmt>>,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -700,7 +700,70 @@ fn check_stmt(
       return_type,
       in_loop,
     ),
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => check_case(
+      scrutinee,
+      arms,
+      else_body,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+    ),
   }
+}
+
+/// `case scrutinee when v1, v2 ... when v3 ... else ... end` (plan 20's
+/// Decision log): the scrutinee and every `when` value must be
+/// `Int64` — not `Float64`/`String`/`Class` — value-matched via the
+/// same `CompareOp::Eq` `Expr::Compare` already performs, not
+/// `spec/GRAMMAR.md`'s eventual method-dispatched `===`.
+#[allow(clippy::too_many_arguments)]
+fn check_case(
+  scrutinee: &Expr,
+  arms: &[(Vec<Expr>, Vec<Stmt>)],
+  else_body: &Option<Vec<Stmt>>,
+  env: &mut HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  return_type: &Type,
+  in_loop: bool,
+) -> Result<(), Diagnostic> {
+  let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields)?;
+  if scrutinee_ty != Type::Int64 {
+    return Err(Diagnostic::new(format!(
+      "`case` scrutinee must be Int64, found {scrutinee_ty:?}"
+    )));
+  }
+  for (values, body) in arms {
+    for v in values {
+      let value_ty = infer_expr_type(v, env, sigs, classes, self_fields)?;
+      if value_ty != Type::Int64 {
+        return Err(Diagnostic::new(format!(
+          "`when` value must be Int64, found {value_ty:?}"
+        )));
+      }
+    }
+    check_block(body, env, sigs, classes, self_fields, return_type, in_loop)?;
+  }
+  if let Some(else_b) = else_body {
+    check_block(
+      else_b,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+    )?;
+  }
+  Ok(())
 }
 
 /// `begin body rescue Type => e rescue_body end`. Flat scoping, same as
@@ -1352,5 +1415,23 @@ mod tests {
     let src = "if \"abc\" == \"abc\"\n  puts 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 20 (comments and case/when).
+
+  const CASE_EXAMPLE: &str = "n: Int64 = 2\nlabel: Int64 = 0\ncase n\nwhen 1\n  label: Int64 = 10\nwhen 2, 3\n  label: Int64 = 20\nelse\n  label: Int64 = 99\nend\nputs label\n";
+
+  #[test]
+  fn accepts_case_when_example() {
+    let program = emerald_parser::parse(CASE_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_float64_case_scrutinee() {
+    let src = "n: Float64 = 1.0\ncase n\nwhen 1\n  puts 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a Float64 scrutinee");
+    assert!(errs[0].message.contains("Int64"));
   }
 }

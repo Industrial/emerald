@@ -757,6 +757,71 @@ mod tests {
     assert!(parse(src).is_err());
   }
 
+  // Plan 20 (comments and case/when).
+
+  #[test]
+  fn comment_only_file_is_an_empty_program() {
+    let program = parse("# just a comment\n").expect("should parse");
+    assert_eq!(program.items, vec![]);
+  }
+
+  #[test]
+  fn trailing_and_leading_comments_dont_change_the_ast() {
+    let with_comments = "# classify\nx: Int64 = 10 # ten\nputs x\n";
+    let without = "x: Int64 = 10\nputs x\n";
+    assert_eq!(
+      parse(with_comments).expect("should parse"),
+      parse(without).expect("should parse")
+    );
+  }
+
+  #[test]
+  fn hash_inside_string_literal_is_not_eaten_as_a_comment() {
+    let program = parse("puts \"a#b\"\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    assert_eq!(args[0], Expr::StringLit("a#b".to_string()));
+  }
+
+  const CASE_EXAMPLE: &str = "# classify an integer by a fixed set of buckets\nn: Int64 = 2\nlabel: Int64 = 0\ncase n\nwhen 1\n  label: Int64 = 10\nwhen 2, 3\n  label: Int64 = 20\nelse\n  label: Int64 = 99\nend\nputs label\n";
+
+  #[test]
+  fn parses_case_when_example() {
+    let program = parse(CASE_EXAMPLE).expect("should parse");
+    let Item::Stmt(Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    }) = &program.items[2]
+    else {
+      panic!("expected a case statement, got {:?}", program.items[2]);
+    };
+    assert_eq!(*scrutinee, Expr::Ident("n".into()));
+    assert_eq!(arms.len(), 2);
+    assert_eq!(arms[0].0, vec![Expr::Int(1)]);
+    assert_eq!(
+      arms[0].1,
+      vec![Stmt::Let {
+        name: "label".into(),
+        ty: "Int64".into(),
+        value: Expr::Int(10),
+      }]
+    );
+    assert_eq!(arms[1].0, vec![Expr::Int(2), Expr::Int(3)]);
+    assert!(else_body.is_some());
+  }
+
+  #[test]
+  fn case_with_no_else_parses() {
+    let src = "case n\nwhen 1\n  puts 1\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Case { else_body, .. }) = &program.items[0] else {
+      panic!("expected a case statement, got {:?}", program.items[0]);
+    };
+    assert_eq!(*else_body, None);
+  }
+
   #[test]
   fn string_typed_let_and_concat_parse() {
     let src = "s: String = \"hello\"\na: String = \"foo\" + \"bar\"\n";

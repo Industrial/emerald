@@ -12,6 +12,16 @@ extern {
 
 match {
   r"\s*" => { },
+  // Plan 20: `#` through end-of-line (newline excluded, so line/
+  // statement boundaries are unaffected) — usable anywhere trailing
+  // whitespace already can be, including at the end of a code line.
+  // No `.em` program can contain a string literal with a `#` in it at
+  // the time this pattern was added (see plan 20's Decision log for
+  // the note future string-literal work needs to re-check this
+  // against); LALRPOP's `match` block is priority-ordered top to
+  // bottom, so a later string-literal pattern placed *above* this one
+  // would take precedence for a `#` inside `"..."`.
+  r"#[^\n]*" => { },
   _
 }
 
@@ -89,6 +99,16 @@ Stmt: Stmt = {
     rescue_type,
     rescue_var,
     rescue_body,
+  },
+  // Plan 20: value-match, not `spec/GRAMMAR.md`'s eventual `===`
+  // dispatch (see the Decision log). `"when"` can't start a `Stmt`, so
+  // `CaseArm`'s own trailing `Stmt*` unambiguously stops at the next
+  // `"when"`/`"else"`/`"end"`, the same way `"rescue"` already
+  // terminates `begin`'s body above.
+  "case" <scrutinee:Expr> <arms:CaseArm+> <else_body:ElseClause?> "end" => Stmt::Case {
+    scrutinee,
+    arms,
+    else_body,
   },
   // Assignment to an instance variable (`@x = value`) or an array index
   // (`arr[i] = value`). Both are just `Expr` on the left — `CallExpr`'s
@@ -201,6 +221,31 @@ StmtPrimaryExpr: Expr = {
 
 ElseClause: Vec<Stmt> = {
   "else" <body:Stmt*> => body
+};
+
+// Plan 20: `when v1, v2, ... body`. NOT `Args` (the existing
+// left-recursive-with-optional-trailing-item comma list) — `Args` is
+// only ever followed by a known, Expr-disjoint delimiter (`)`/`]`)
+// everywhere else it's used, so LALR(1) can cleanly decide "reduce,
+// the list is done" the moment it sees that delimiter. Here the list
+// is followed by `Stmt*`, whose FIRST set overlaps `Expr`'s (a bare
+// `when 1, 2\n  3\nend` — the second `2`, or a nonsensical trailing
+// `3`, could ambiguously be "one more when-value" or "the body's
+// first, uselessly bare, statement"), a real conflict LALRPOP reported.
+// Right recursion sidesteps it: the only decision after a value is
+// "is the very next token a literal `,`" — never ambiguous with
+// `Stmt*`'s FIRST set, since no `Stmt` can start with `,`.
+CaseValues: Vec<Expr> = {
+  <n:Num> => vec![Expr::Int(n)],
+  <n:Num> "," <rest:CaseValues> => {
+    let mut v = vec![Expr::Int(n)];
+    v.extend(rest);
+    v
+  },
+};
+
+CaseArm: (Vec<Expr>, Vec<Stmt>) = {
+  "when" <values:CaseValues> <body:Stmt*> => (values, body)
 };
 
 // Plan 18's precedence ladder, loosest to tightest: `||` -> `&&` ->
