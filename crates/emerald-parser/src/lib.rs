@@ -934,6 +934,113 @@ mod tests {
     assert_eq!(*else_body, None);
   }
 
+  // Plan 29 (control-flow completeness).
+
+  #[test]
+  fn elsif_chain_desugars_to_nested_if_in_else_branch() {
+    let src = "if a\n  1\nelsif b\n  2\nelsif c\n  3\nelse\n  4\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Stmt(Stmt::If {
+      then_branch,
+      else_branch,
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a top-level If statement");
+    };
+    assert_eq!(*then_branch, vec![Stmt::Expr(Expr::Int(1))]);
+
+    // First elsif link.
+    let Some(outer_else) = else_branch else {
+      panic!("expected an else_branch from the first elsif");
+    };
+    assert_eq!(outer_else.len(), 1);
+    let Stmt::If {
+      then_branch: b2,
+      else_branch: e2,
+      ..
+    } = &outer_else[0]
+    else {
+      panic!("expected a nested If for the first elsif");
+    };
+    assert_eq!(*b2, vec![Stmt::Expr(Expr::Int(2))]);
+
+    // Second elsif link.
+    let Some(inner_else) = e2 else {
+      panic!("expected an else_branch from the second elsif");
+    };
+    assert_eq!(inner_else.len(), 1);
+    let Stmt::If {
+      then_branch: b3,
+      else_branch: e3,
+      ..
+    } = &inner_else[0]
+    else {
+      panic!("expected a nested If for the second elsif");
+    };
+    assert_eq!(*b3, vec![Stmt::Expr(Expr::Int(3))]);
+
+    // Trailing plain else.
+    assert_eq!(*e3, Some(vec![Stmt::Expr(Expr::Int(4))]));
+  }
+
+  #[test]
+  fn unless_desugars_to_if_not() {
+    let src = "unless x > 0\n  return 0\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Stmt(Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    }) = &program.items[0]
+    else {
+      panic!("expected an If statement");
+    };
+    assert_eq!(
+      *cond,
+      Expr::Not(Box::new(Expr::Compare(
+        Box::new(Expr::Ident("x".to_string())),
+        CompareOp::Gt,
+        Box::new(Expr::Int(0)),
+      )))
+    );
+    assert_eq!(*then_branch, vec![Stmt::Return(Some(Expr::Int(0)))]);
+    assert_eq!(*else_branch, None);
+  }
+
+  #[test]
+  fn until_desugars_to_while_not() {
+    let src = "until i >= 3\n  puts i\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Stmt(Stmt::While { cond, body }) = &program.items[0] else {
+      panic!("expected a While statement");
+    };
+    assert_eq!(
+      *cond,
+      Expr::Not(Box::new(Expr::Compare(
+        Box::new(Expr::Ident("i".to_string())),
+        CompareOp::Ge,
+        Box::new(Expr::Int(3)),
+      )))
+    );
+    assert_eq!(
+      *body,
+      vec![Stmt::Expr(Expr::Call(
+        "puts".to_string(),
+        vec![Expr::Ident("i".to_string())]
+      ))]
+    );
+  }
+
+  #[test]
+  fn plan_29_worked_examples_parse() {
+    let example_a = "def grade(score: Int64) -> Int64\n  if score >= 90\n    return 4\n  elsif score >= 80\n    return 3\n  elsif score >= 70\n    return 2\n  else\n    return 1\n  end\nend\n\nputs grade(95)\nputs grade(85)\nputs grade(72)\nputs grade(50)\n";
+    parse(example_a).expect("plan 29 example A must parse cleanly");
+
+    let example_b = "def describe(x: Int64) -> Int64\n  unless x > 0\n    return 0\n  end\n  return 1\nend\n\nputs describe(-5)\nputs describe(5)\n\ni: Int64 = 0\nuntil i >= 3\n  puts i\n  i: Int64 = i + 1\nend\n";
+    parse(example_b).expect("plan 29 example B must parse cleanly");
+  }
+
   // Plan 28 (bitwise operators).
 
   #[test]

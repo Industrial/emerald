@@ -2171,9 +2171,22 @@ fn build_stmt<'ctx>(
           .map_err(|e| e.to_string())?;
       }
 
+      // Plan 29 (surfaced by `elsif`'s fully-covering nested-If chains,
+      // but a pre-existing latent bug in `if`/`else` on its own): when
+      // there's an `else` and BOTH branches unconditionally terminate
+      // (e.g. every arm of an `elsif` chain `return`s), `merge_blk`
+      // ends up with zero predecessors — neither branch ever
+      // unconditionally-branches into it, and (unlike the no-`else`
+      // case below) the top conditional branch's false edge goes to a
+      // real `if.else` block instead. LLVM's verifier rejects a basic
+      // block with no terminator at all, so an unreachable-but-still-
+      // appended `merge_blk` needs an explicit `unreachable` terminator
+      // rather than being left empty.
+      let has_else = else_branch.is_some();
+      let mut else_terminated = false;
       if let Some(else_branch) = else_branch {
         builder.position_at_end(else_target);
-        let else_terminated = build_block(
+        else_terminated = build_block(
           context,
           builder,
           func,
@@ -2192,8 +2205,12 @@ fn build_stmt<'ctx>(
         }
       }
 
+      let if_terminated = has_else && then_terminated && else_terminated;
       builder.position_at_end(merge_blk);
-      Ok(false)
+      if if_terminated {
+        builder.build_unreachable().map_err(|e| e.to_string())?;
+      }
+      Ok(if_terminated)
     }
     Stmt::While { cond, body } => {
       let header_blk = context.append_basic_block(func, "while.cond");
@@ -3783,5 +3800,23 @@ mod tests {
     };
     let out = std::env::temp_dir().join("emerald_codegen_bitand_float_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  // Plan 29 (control-flow completeness): elsif/unless/until are pure
+  // parse-time desugarings into existing Stmt::If/Stmt::While shapes —
+  // no codegen source changes, real compiled-and-run proof only.
+
+  const ELSIF_EXAMPLE: &str = "def grade(score: Int64) -> Int64\n  if score >= 90\n    return 4\n  elsif score >= 80\n    return 3\n  elsif score >= 70\n    return 2\n  else\n    return 1\n  end\nend\n\nputs grade(95)\nputs grade(85)\nputs grade(72)\nputs grade(50)\n";
+
+  #[test]
+  fn elsif_example_linked_and_run() {
+    assert_eq!(compile_link_run(ELSIF_EXAMPLE), "4\n3\n2\n1\n");
+  }
+
+  const UNLESS_UNTIL_EXAMPLE: &str = "def describe(x: Int64) -> Int64\n  unless x > 0\n    return 0\n  end\n  return 1\nend\n\nputs describe(-5)\nputs describe(5)\n\ni: Int64 = 0\nuntil i >= 3\n  puts i\n  i: Int64 = i + 1\nend\n";
+
+  #[test]
+  fn unless_until_example_linked_and_run() {
+    assert_eq!(compile_link_run(UNLESS_UNTIL_EXAMPLE), "0\n1\n0\n1\n2\n");
   }
 }

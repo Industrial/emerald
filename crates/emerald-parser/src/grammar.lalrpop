@@ -90,6 +90,19 @@ Stmt: Stmt = {
   <name:Ident> ":" <ty:TypeName> "=" <value:Expr> => Stmt::Let { name, ty, value },
   "if" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" => Stmt::If { cond, then_branch, else_branch },
   "while" <cond:Expr> <body:Stmt*> "end" => Stmt::While { cond, body },
+  // Plan 29: pure parse-time desugaring — no new AST shape, just the
+  // condition wrapped in plan 18's `Expr::Not` (see the Decision log).
+  // Reuses `ElseClause` as-is, so `unless ... else ... end` falls out
+  // for free.
+  "unless" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" => Stmt::If {
+    cond: Expr::Not(Box::new(cond)),
+    then_branch,
+    else_branch,
+  },
+  "until" <cond:Expr> <body:Stmt*> "end" => Stmt::While {
+    cond: Expr::Not(Box::new(cond)),
+    body,
+  },
   // Requires a value (no bare `return;`) — `<e:Expr?>` here is genuinely
   // LALR(1)-ambiguous: with no significant newlines (plan 04's
   // simplification), the parser can't tell "return" (empty, followed by a
@@ -279,7 +292,17 @@ HashPair: (Expr, Expr) = {
 };
 
 ElseClause: Vec<Stmt> = {
-  "else" <body:Stmt*> => body
+  "else" <body:Stmt*> => body,
+  // Plan 29: an `elsif` chain is a real, correctly-nested `Stmt::If`
+  // sequence — one single-element `Vec<Stmt>` per link, wrapping the
+  // rest of the chain (another `elsif`, a trailing `else`, or nothing)
+  // as this nested `If`'s own `else_branch`. No new AST variant; see
+  // the Decision log.
+  "elsif" <cond:Expr> <then_branch:Stmt*> <rest:ElseClause?> => vec![Stmt::If {
+    cond,
+    then_branch,
+    else_branch: rest,
+  }],
 };
 
 // Plan 20: `when v1, v2, ... body`. NOT `Args` (the existing
