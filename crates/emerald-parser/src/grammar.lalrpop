@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Function, Param};
+use crate::ast::{Expr, Function, Item, Param, Program};
 
 grammar;
 
@@ -7,12 +7,54 @@ match {
   _
 }
 
-pub Func: Function = {
-  "def" <name:Ident> "(" <params:Params> ")" "->" <return_type:Ident> <body:Expr> "end" => Function {
+pub Program: Program = {
+  <items:Item*> => Program { items }
+};
+
+Item: Item = {
+  <f:FuncDef> => Item::Function(f),
+  <e:TopStmt> => Item::Expr(e),
+};
+
+FuncDef: Function = {
+  "def" <name:Ident> "(" <params:Params> ")" "->" <return_type:Ident> <body:BodyExpr> "end" => Function {
     name,
     params,
     return_type,
     body,
+  }
+};
+
+// Command call: `puts add(20, 22)` — a bare-identifier callee followed by
+// one argument that is itself a CallExpr. Deliberately narrower than
+// Ruby's general parenthesis-less call grammar (see plan 04's
+// Implementation Notes): a two-alternative "Ident CallExpr | CallExpr"
+// rule is a genuine LALR(1) shift/reduce conflict (both alternatives can
+// start with the same Ident lookahead), so this only supports the single
+// shape examples/hello.em needs.
+TopStmt: Expr = {
+  <name:Ident> <arg:CallExpr> => Expr::Call(name, vec![arg]),
+};
+
+// Function-body expression: just enough for `a + b` (inception §17
+// milestone-1). Growing beyond one binary op is a later plan's job.
+BodyExpr: Expr = {
+  <lhs:Ident> "+" <rhs:Ident> => Expr::Add(Box::new(Expr::Ident(lhs)), Box::new(Expr::Ident(rhs))),
+  <name:Ident> => Expr::Ident(name),
+};
+
+CallExpr: Expr = {
+  <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
+  <n:Num> => Expr::Int(n),
+  <name:Ident> => Expr::Ident(name),
+};
+
+Args: Vec<Expr> = {
+  <mut v:(<CallExpr> ",")*> <last:CallExpr?> => {
+    match last {
+      None => v,
+      Some(e) => { v.push(e); v }
+    }
   }
 };
 
@@ -29,9 +71,6 @@ Param: Param = {
   <name:Ident> ":" <ty:Ident> => Param { name, ty }
 };
 
-Expr: Expr = {
-  <lhs:Ident> "+" <rhs:Ident> => Expr::Add(Box::new(Expr::Ident(lhs)), Box::new(Expr::Ident(rhs))),
-  <name:Ident> => Expr::Ident(name),
-};
+Num: i64 = <s:r"[0-9]+"> => s.parse().unwrap();
 
 Ident: String = <s:r"[A-Za-z_][A-Za-z0-9_]*"> => s.to_string();

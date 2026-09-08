@@ -1,7 +1,8 @@
 //! Emerald's parser, built on LALRPOP — chosen in `02 toolchain-prototype`
-//! over Chumsky (see `spec/COMPILER.md` for the decision record). Currently
-//! covers only the inception §17 milestone-1 grammar slice; later
-//! milestones (`04`+) extend `grammar.lalrpop` as the real grammar grows.
+//! over Chumsky (see `spec/COMPILER.md` for the decision record). Parses a
+//! full `Program` (inception §17 milestone-1 scope: one function
+//! definition plus one top-level command-call statement); grows as later
+//! milestones extend `grammar.lalrpop`.
 
 pub mod ast;
 
@@ -10,10 +11,10 @@ mod grammar {
   lalrpop_util::lalrpop_mod!(pub grammar, "/grammar.rs");
 }
 
-pub use ast::{Expr, Function, Param};
+pub use ast::{Expr, Function, Item, Param, Program};
 
-pub fn parse(src: &str) -> Result<Function, String> {
-  grammar::grammar::FuncParser::new()
+pub fn parse(src: &str) -> Result<Program, String> {
+  grammar::grammar::ProgramParser::new()
     .parse(src)
     .map_err(|e| e.to_string())
 }
@@ -22,11 +23,15 @@ pub fn parse(src: &str) -> Result<Function, String> {
 mod tests {
   use super::*;
 
-  const SRC: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend";
+  const FUNC_ONLY: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend";
 
   #[test]
   fn parses_add_function() {
-    let f = parse(SRC).expect("should parse");
+    let program = parse(FUNC_ONLY).expect("should parse");
+    assert_eq!(program.items.len(), 1);
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
     assert_eq!(f.name, "add");
     assert_eq!(
       f.params,
@@ -57,5 +62,35 @@ mod tests {
     let err = parse(src).unwrap_err();
     eprintln!("LALRPOP ERROR: {err}");
     assert!(!err.is_empty());
+  }
+
+  const HELLO_EM: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+
+  #[test]
+  fn parses_hello_em_end_to_end() {
+    let program = parse(HELLO_EM).expect("hello.em should parse");
+    assert_eq!(program.items.len(), 2);
+
+    let Item::Function(f) = &program.items[0] else {
+      panic!(
+        "expected item 0 to be the add function, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(f.name, "add");
+
+    let Item::Expr(call) = &program.items[1] else {
+      panic!(
+        "expected item 1 to be the puts call, got {:?}",
+        program.items[1]
+      );
+    };
+    assert_eq!(
+      *call,
+      Expr::Call(
+        "puts".into(),
+        vec![Expr::Call("add".into(), vec![Expr::Int(20), Expr::Int(22)])]
+      )
+    );
   }
 }
