@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Function, Item, Param, Program};
+use crate::ast::{CompareOp, Expr, Function, Item, Param, Program, Stmt};
 
 grammar;
 
@@ -13,11 +13,11 @@ pub Program: Program = {
 
 Item: Item = {
   <f:FuncDef> => Item::Function(f),
-  <e:TopStmt> => Item::Expr(e),
+  <s:Stmt> => Item::Stmt(s),
 };
 
 FuncDef: Function = {
-  "def" <name:Ident> "(" <params:Params> ")" "->" <return_type:Ident> <body:BodyExpr> "end" => Function {
+  "def" <name:Ident> "(" <params:Params> ")" "->" <return_type:Ident> <body:Stmt*> "end" => Function {
     name,
     params,
     return_type,
@@ -25,22 +25,50 @@ FuncDef: Function = {
   }
 };
 
-// Command call: `puts add(20, 22)` — a bare-identifier callee followed by
-// one argument that is itself a CallExpr. Deliberately narrower than
-// Ruby's general parenthesis-less call grammar (see plan 04's
-// Implementation Notes): a two-alternative "Ident CallExpr | CallExpr"
-// rule is a genuine LALR(1) shift/reduce conflict (both alternatives can
-// start with the same Ident lookahead), so this only supports the single
-// shape examples/hello.em needs.
-TopStmt: Expr = {
-  <name:Ident> <arg:CallExpr> => Expr::Call(name, vec![arg]),
+// `puts` is a reserved keyword, not a generic identifier — see plan 07's
+// Decision log. A general "Ident followed by an expression" command-call
+// rule alongside a general "bare Expr statement" rule is a genuine
+// LALR(1) shift/reduce conflict when both start with Ident; reserving the
+// one builtin this compiler has sidesteps it entirely.
+Stmt: Stmt = {
+  <name:Ident> ":" <ty:Ident> "=" <value:Expr> => Stmt::Let { name, ty, value },
+  "if" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" => Stmt::If { cond, then_branch, else_branch },
+  "while" <cond:Expr> <body:Stmt*> "end" => Stmt::While { cond, body },
+  // Requires a value (no bare `return;`) — `<e:Expr?>` here is genuinely
+  // LALR(1)-ambiguous: with no significant newlines (plan 04's
+  // simplification), the parser can't tell "return" (empty, followed by a
+  // new Expr-statement) from "return <expr>" (one statement) when the
+  // next token can start an Expr either way. Bare Void-returning `return`
+  // is deferred until source-line significance is added.
+  "return" <e:Expr> => Stmt::Return(Some(e)),
+  "break" => Stmt::Break,
+  "next" => Stmt::Next,
+  "puts" <arg:Expr> => Stmt::Expr(Expr::Call("puts".to_string(), vec![arg])),
+  <e:Expr> => Stmt::Expr(e),
 };
 
-// Function-body expression: just enough for `a + b` (inception §17
-// milestone-1). Growing beyond one binary op is a later plan's job.
-BodyExpr: Expr = {
-  <lhs:Ident> "+" <rhs:Ident> => Expr::Add(Box::new(Expr::Ident(lhs)), Box::new(Expr::Ident(rhs))),
-  <name:Ident> => Expr::Ident(name),
+ElseClause: Vec<Stmt> = {
+  "else" <body:Stmt*> => body
+};
+
+// One precedence level above addition, non-associative (no `a > b > c`).
+Expr: Expr = {
+  <lhs:AddExpr> <op:CompareOp> <rhs:AddExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+  AddExpr,
+};
+
+CompareOp: CompareOp = {
+  ">" => CompareOp::Gt,
+  "<" => CompareOp::Lt,
+  ">=" => CompareOp::Ge,
+  "<=" => CompareOp::Le,
+  "==" => CompareOp::Eq,
+  "!=" => CompareOp::Ne,
+};
+
+AddExpr: Expr = {
+  <lhs:AddExpr> "+" <rhs:CallExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
+  CallExpr,
 };
 
 CallExpr: Expr = {
