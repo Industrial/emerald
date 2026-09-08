@@ -60,21 +60,26 @@ fn value_kind_for_type(ty: &str) -> ValKind {
     "Float64" => ValKind::Float64,
     "Int64" => ValKind::Int64,
     "Void" => ValKind::Void,
+    // Plan 18: `Boolean` is a real, declarable type now (e.g. `def
+    // noisy(n: Int64) -> Boolean`), not just an internal marker for a
+    // `Compare`/`&&`/`||`/`!` result on its way straight into a
+    // branch — both uses share the same `i1` storage kind.
+    "Boolean" => ValKind::Bool,
     _ => ValKind::Ptr,
   }
 }
 
-/// The LLVM storage type for a `Let`/param/field/array-element kind.
-/// `Void`/`Bool` never reach here — an internal invariant, not a
-/// user-input-dependent case (see `ValKind`'s doc comment).
+/// The LLVM storage type for a `Let`/param/field/array-element/return
+/// kind. `Void` never reaches here — an internal invariant (it only
+/// ever labels a function's return kind, handled separately in
+/// `make_fn_type`), not a user-input-dependent case.
 fn local_llvm_type<'ctx>(context: &'ctx Context, kind: ValKind) -> BasicTypeEnum<'ctx> {
   match kind {
     ValKind::Int64 => context.i64_type().into(),
     ValKind::Float64 => context.f64_type().into(),
     ValKind::Ptr => context.ptr_type(AddressSpace::default()).into(),
-    ValKind::Void | ValKind::Bool => {
-      unreachable!("internal: Void/Bool never used as a storage type")
-    }
+    ValKind::Bool => context.bool_type().into(),
+    ValKind::Void => unreachable!("internal: Void never used as a storage type"),
   }
 }
 
@@ -94,7 +99,7 @@ fn make_fn_type<'ctx>(
     ValKind::Ptr => context
       .ptr_type(AddressSpace::default())
       .fn_type(&param_types, false),
-    ValKind::Bool => unreachable!("internal: a function never declares Bool as its return kind"),
+    ValKind::Bool => context.bool_type().fn_type(&param_types, false),
   }
 }
 
@@ -147,10 +152,18 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
   match expr {
     Expr::Ident(name) => out.push(name.clone()),
     Expr::Int(_) | Expr::Float(_) | Expr::InstanceVar(_) | Expr::Lambda { .. } => {}
-    Expr::Add(l, r) | Expr::Index(l, r) => {
+    Expr::Add(l, r)
+    | Expr::Sub(l, r)
+    | Expr::Mul(l, r)
+    | Expr::Div(l, r)
+    | Expr::Rem(l, r)
+    | Expr::And(l, r)
+    | Expr::Or(l, r)
+    | Expr::Index(l, r) => {
       collect_idents_in_expr(l, out);
       collect_idents_in_expr(r, out);
     }
+    Expr::Neg(e) | Expr::Not(e) => collect_idents_in_expr(e, out),
     Expr::Compare(l, _, r) => {
       collect_idents_in_expr(l, out);
       collect_idents_in_expr(r, out);
@@ -479,6 +492,174 @@ struct Ctx<'a, 'ctx> {
 /// its receiver's class this way rather than from the (type-erased)
 /// runtime pointer value. `local_array_elem_types` is the same idea for
 /// `Array[Elem]` locals, mapping to `Elem`'s storage kind.
+type IntBinOp<'ctx> = fn(
+  &Builder<'ctx>,
+  IntValue<'ctx>,
+  IntValue<'ctx>,
+  &str,
+) -> Result<IntValue<'ctx>, inkwell::builder::BuilderError>;
+type FloatBinOp<'ctx> =
+  fn(
+    &Builder<'ctx>,
+    inkwell::values::FloatValue<'ctx>,
+    inkwell::values::FloatValue<'ctx>,
+    &str,
+  ) -> Result<inkwell::values::FloatValue<'ctx>, inkwell::builder::BuilderError>;
+
+/// `Sub`/`Mul`/`Div`/`Rem` (plan 18) each apply the exact rule `Add`
+/// already enforces: both operands must be Int64 or both Float64, no
+/// implicit conversion. `float_op` is `None` for `Rem` — LLVM has no
+/// native floating-point-remainder instruction and this backend has no
+/// general libm-call plumbing yet (plan 18's Decision log).
+#[allow(clippy::too_many_arguments)]
+fn build_numeric_binop<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  op_symbol: &str,
+  lhs: &Expr,
+  rhs: &Expr,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+  int_op: IntBinOp<'ctx>,
+  float_op: Option<FloatBinOp<'ctx>>,
+  name: &str,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (l, lk) = build_expr(
+    context,
+    builder,
+    lhs,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let (r, rk) = build_expr(
+    context,
+    builder,
+    rhs,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  match (lk, rk) {
+    (ValKind::Int64, ValKind::Int64) => {
+      let v =
+        int_op(builder, l.into_int_value(), r.into_int_value(), name).map_err(|e| e.to_string())?;
+      Ok((v.into(), ValKind::Int64))
+    }
+    (ValKind::Float64, ValKind::Float64) => {
+      let Some(float_op) = float_op else {
+        return Err(format!("codegen: `{op_symbol}` does not support Float64"));
+      };
+      let v = float_op(builder, l.into_float_value(), r.into_float_value(), name)
+        .map_err(|e| e.to_string())?;
+      Ok((v.into(), ValKind::Float64))
+    }
+    _ => Err(format!(
+      "codegen: `{op_symbol}` operands must both be Int64 or both Float64"
+    )),
+  }
+}
+
+/// `&&`/`||` (plan 18): real short-circuit branching, the same
+/// `append_basic_block`/`build_conditional_branch`/merge shape
+/// `Stmt::If` already uses — not an eager, unconditionally-evaluated
+/// bitwise AND/OR. For `&&`: a false left operand branches straight to
+/// `merge` carrying `false`, never evaluating (and never emitting code
+/// for) the right operand; a true left operand falls into a block that
+/// evaluates the right operand and branches to the same `merge`
+/// carrying that result. Mirrored, inverted, for `||`. The two
+/// incoming values are reconciled with a `phi` node at `merge`.
+#[allow(clippy::too_many_arguments)]
+fn build_short_circuit<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  is_and: bool,
+  lhs: &Expr,
+  rhs: &Expr,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let op_symbol = if is_and { "&&" } else { "||" };
+  let (lv, lk) = build_expr(
+    context,
+    builder,
+    lhs,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if lk != ValKind::Bool {
+    return Err(format!(
+      "codegen: `{op_symbol}` requires a Boolean left operand"
+    ));
+  }
+  let lhs_block = builder
+    .get_insert_block()
+    .ok_or("codegen: internal error — no current block")?;
+  let func = lhs_block
+    .get_parent()
+    .ok_or("codegen: internal error — block has no parent function")?;
+  let rhs_block = context.append_basic_block(func, if is_and { "and.rhs" } else { "or.rhs" });
+  let merge_block = context.append_basic_block(func, if is_and { "and.merge" } else { "or.merge" });
+
+  let lv_int = lv.into_int_value();
+  if is_and {
+    builder
+      .build_conditional_branch(lv_int, rhs_block, merge_block)
+      .map_err(|e| e.to_string())?;
+  } else {
+    builder
+      .build_conditional_branch(lv_int, merge_block, rhs_block)
+      .map_err(|e| e.to_string())?;
+  }
+
+  builder.position_at_end(rhs_block);
+  let (rv, rk) = build_expr(
+    context,
+    builder,
+    rhs,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if rk != ValKind::Bool {
+    return Err(format!(
+      "codegen: `{op_symbol}` requires a Boolean right operand"
+    ));
+  }
+  // The right operand may itself have branched internally (nested
+  // `&&`/`||`), so the predecessor to record for the `phi` is wherever
+  // the builder actually ended up, not `rhs_block` itself.
+  let rhs_end_block = builder
+    .get_insert_block()
+    .ok_or("codegen: internal error — no current block after right operand")?;
+  builder
+    .build_unconditional_branch(merge_block)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(merge_block);
+  let phi = builder
+    .build_phi(
+      context.bool_type(),
+      if is_and { "andresult" } else { "orresult" },
+    )
+    .map_err(|e| e.to_string())?;
+  let short_circuit_val = context.bool_type().const_int(u64::from(!is_and), false);
+  phi.add_incoming(&[
+    (&short_circuit_val, lhs_block),
+    (&rv.into_int_value(), rhs_end_block),
+  ]);
+  Ok((phi.as_basic_value(), ValKind::Bool))
+}
+
 fn build_expr<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
@@ -538,6 +719,137 @@ fn build_expr<'ctx>(
         _ => Err("codegen: `+` operands must both be Int64 or both Float64".to_string()),
       }
     }
+    Expr::Sub(lhs, rhs) => build_numeric_binop(
+      context,
+      builder,
+      "-",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_int_sub,
+      Some(Builder::build_float_sub),
+      "subtmp",
+    ),
+    Expr::Mul(lhs, rhs) => build_numeric_binop(
+      context,
+      builder,
+      "*",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_int_mul,
+      Some(Builder::build_float_mul),
+      "multmp",
+    ),
+    // Integer division/remainder by a runtime-zero divisor traps (LLVM's
+    // `sdiv`/`srem` lower straight to hardware `idiv`, which raises
+    // `SIGFPE` on zero — the same disclosed behavior the old Cranelift
+    // backend's `sdiv`/`srem` had; not a new safety regression).
+    Expr::Div(lhs, rhs) => build_numeric_binop(
+      context,
+      builder,
+      "/",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_int_signed_div,
+      Some(Builder::build_float_div),
+      "divtmp",
+    ),
+    // `Float64 %` is out of scope (plan 18's Decision log — no libm-call
+    // plumbing exists yet for `fmod`); `Int64 %` lowers directly to
+    // `srem`.
+    Expr::Rem(lhs, rhs) => build_numeric_binop(
+      context,
+      builder,
+      "%",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_int_signed_rem,
+      None,
+      "remtmp",
+    ),
+    Expr::Neg(e) => {
+      let (v, k) = build_expr(
+        context,
+        builder,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      match k {
+        ValKind::Int64 => {
+          let n = builder
+            .build_int_neg(v.into_int_value(), "negtmp")
+            .map_err(|e| e.to_string())?;
+          Ok((n.into(), ValKind::Int64))
+        }
+        ValKind::Float64 => {
+          let n = builder
+            .build_float_neg(v.into_float_value(), "fnegtmp")
+            .map_err(|e| e.to_string())?;
+          Ok((n.into(), ValKind::Float64))
+        }
+        _ => Err("codegen: unary `-` requires an Int64 or Float64 operand".to_string()),
+      }
+    }
+    Expr::Not(e) => {
+      let (v, k) = build_expr(
+        context,
+        builder,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if k != ValKind::Bool {
+        return Err("codegen: `!` requires a Boolean (comparison) operand".to_string());
+      }
+      let n = builder
+        .build_not(v.into_int_value(), "nottmp")
+        .map_err(|e| e.to_string())?;
+      Ok((n.into(), ValKind::Bool))
+    }
+    // Real short-circuit branching (not an eager bitwise AND/OR over two
+    // unconditionally-evaluated operands) — see `build_short_circuit`.
+    Expr::And(lhs, rhs) => build_short_circuit(
+      context,
+      builder,
+      true,
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
+    Expr::Or(lhs, rhs) => build_short_circuit(
+      context,
+      builder,
+      false,
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
     Expr::Compare(lhs, op, rhs) => {
       let (l, lk) = build_expr(
         context,
@@ -2424,5 +2736,98 @@ mod tests {
     )
     .expect("benchmarks/array_traversal/array_traversal.em should exist");
     assert_eq!(compile_link_run(&src), "210000000\n");
+  }
+
+  // Plan 18 (arithmetic & logical operators).
+
+  const ARITHMETIC_EXAMPLE: &str = "def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
+
+  #[test]
+  fn arithmetic_example_linked_and_run() {
+    assert_eq!(compile_link_run(ARITHMETIC_EXAMPLE), "120\n3\n2\n7\n");
+  }
+
+  const SHORT_CIRCUIT_EXAMPLE: &str = "def noisy(n: Int64) -> Boolean\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1)\n  puts 100\nend\nif x > -10 && noisy(3)\n  puts 300\nend\nif x < 0 || noisy(2)\n  puts 200\nend\nif x > 0 || noisy(4)\n  puts 400\nend\n";
+
+  #[test]
+  fn short_circuit_example_linked_and_run() {
+    // Real executed proof that `noisy(1)`/`noisy(2)` are genuinely
+    // never invoked (their `puts` never fires) — `1` and `2` never
+    // appear in the output, not just that the final booleans are right.
+    assert_eq!(
+      compile_link_run(SHORT_CIRCUIT_EXAMPLE),
+      "3\n300\n200\n4\n400\n"
+    );
+  }
+
+  #[test]
+  fn integer_division_by_zero_traps() {
+    // A single-element `[0]` array load is *not* good enough here: the
+    // store-then-immediate-load of a literal `0` is fully visible to
+    // LLVM within one function, so O3's local memory optimizations
+    // forward-substitute it back to a compile-time constant, and
+    // constant-time `sdiv x, 0` is undefined behavior LLVM is free to
+    // optimize away entirely (observed: the binary exited 0 instead of
+    // trapping). This instead mirrors `array_traversal_benchmark_
+    // program_matches_expected_output`'s own proven-not-constant-folded
+    // shape (that test's real, non-instant measured run time is direct
+    // evidence O3 doesn't fully evaluate it at compile time): sum a
+    // 20-element array over 1,000,000 iterations to a real runtime
+    // total of exactly 210000000, then subtract that same literal back
+    // out — genuinely 0 only once the loop has actually run, not
+    // something the optimizer can fold away.
+    let src = "arr: Array[Int64] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]\ntotal: Int64 = 0\nrep: Int64 = 0\nwhile rep < 1000000\n  i: Int64 = 0\n  while i < 20\n    total: Int64 = total + arr[i]\n    i: Int64 = i + 1\n  end\n  rep: Int64 = rep + 1\nend\nzero: Int64 = total - 210000000\nputs 10 / zero\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!(
+      "{}_{:?}_divzero",
+      std::process::id(),
+      std::thread::current().id()
+    );
+    let obj_path = dir.join(format!("emerald_codegen_aot_{unique}.o"));
+    let bin_path = dir.join(format!("emerald_codegen_aot_bin_{unique}"));
+    compile_to_object(&program, &obj_path).expect("should compile to object file");
+    let status = Command::new("cc")
+      .arg("-no-pie")
+      .arg(&obj_path)
+      .arg(runtime_path())
+      .arg("-o")
+      .arg(&bin_path)
+      .status()
+      .expect("failed to invoke cc");
+    assert!(status.success(), "linking should succeed");
+    let output = Command::new(&bin_path)
+      .output()
+      .expect("failed to run compiled binary");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&bin_path).ok();
+    assert!(
+      !output.status.success(),
+      "division by a runtime-zero divisor should not exit 0, got {:?}",
+      output.status
+    );
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+      output.status.signal().is_some(),
+      "division by a runtime-zero divisor should terminate via a signal (trap), got {:?}",
+      output.status
+    );
+  }
+
+  #[test]
+  fn unsupported_operator_shapes_error_not_panic() {
+    // Float64 `%` is explicitly out of scope (plan 18's Decision log) —
+    // codegen must reject it with an `Err`, not panic.
+    let program = Program {
+      items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
+        "puts".into(),
+        vec![Expr::Rem(
+          Box::new(Expr::Float(1.5)),
+          Box::new(Expr::Float(2.0)),
+        )],
+      )))],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_rem_float_should_not_exist.o");
+    assert!(compile_to_object(&program, &out).is_err());
   }
 }

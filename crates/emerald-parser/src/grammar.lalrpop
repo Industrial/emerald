@@ -125,13 +125,59 @@ Stmt: Stmt = {
 // forbidding it as a *standalone* statement (it's still fully usable as
 // a Let/assignment/Return value, an Args element, etc. — anywhere it
 // isn't the first token of a fresh Stmt) costs nothing real.
+// Plan 18's precedence ladder, mirrored on the Stmt-initial side exactly
+// like the pre-existing `StmtAddExpr`/`StmtCallExpr` split: only the
+// leftmost (base-case) position of each tier stays `Stmt`-restricted —
+// every operator's right-hand operand uses the ordinary (non-`Stmt`)
+// tier below it, since by the time the parser is past the operator
+// token it's no longer at a Stmt-initial position and the array-literal
+// ambiguity this split exists to avoid can't recur.
 StmtExpr: Expr = {
+  StmtOrExpr,
+};
+
+StmtOrExpr: Expr = {
+  <lhs:StmtOrExpr> "||" <rhs:AndExpr> => Expr::Or(Box::new(lhs), Box::new(rhs)),
+  StmtAndExpr,
+};
+
+StmtAndExpr: Expr = {
+  <lhs:StmtAndExpr> "&&" <rhs:CompareExpr> => Expr::And(Box::new(lhs), Box::new(rhs)),
+  StmtCompareExpr,
+};
+
+StmtCompareExpr: Expr = {
   <lhs:StmtAddExpr> <op:CompareOp> <rhs:AddExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
   StmtAddExpr,
 };
 
 StmtAddExpr: Expr = {
-  <lhs:StmtAddExpr> "+" <rhs:CallExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
+  <lhs:StmtAddExpr> "+" <rhs:MulExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
+  <lhs:StmtAddExpr> "-" <rhs:MulExpr> => Expr::Sub(Box::new(lhs), Box::new(rhs)),
+  StmtMulExpr,
+};
+
+StmtMulExpr: Expr = {
+  <lhs:StmtMulExpr> "*" <rhs:UnaryExpr> => Expr::Mul(Box::new(lhs), Box::new(rhs)),
+  <lhs:StmtMulExpr> "/" <rhs:UnaryExpr> => Expr::Div(Box::new(lhs), Box::new(rhs)),
+  <lhs:StmtMulExpr> "%" <rhs:UnaryExpr> => Expr::Rem(Box::new(lhs), Box::new(rhs)),
+  StmtUnaryExpr,
+};
+
+// Unlike `Expr`'s `UnaryExpr`, this mirror has no prefix `-`/`!`
+// alternative — the same "forbid it only at Stmt-initial position" fix
+// plan 09 used for bare array literals. A standalone `-x`/`!x` statement
+// (no assignment, no call) is side-effect-free and useless either way,
+// but *allowing* it here would put `-`/`!` in FIRST(Stmt) — reachable as
+// the first token of a fresh statement right after a completed one —
+// which collides with `StmtAddExpr`/`StmtMulExpr`'s own binary `-`
+// continuation: LALR(1) can't tell "shift `-` to keep extending the
+// current expression" from "reduce, a new statement starting with
+// unary `-` begins here" using one token of lookahead once both are
+// reachable from the same state. Unary `-`/`!` remain fully available
+// everywhere else (Let's RHS, a call argument, nested inside a binary
+// operator's operand) via the ordinary, non-`Stmt` `UnaryExpr`.
+StmtUnaryExpr: Expr = {
   StmtCallExpr,
 };
 
@@ -155,8 +201,28 @@ ElseClause: Vec<Stmt> = {
   "else" <body:Stmt*> => body
 };
 
-// One precedence level above addition, non-associative (no `a > b > c`).
+// Plan 18's precedence ladder, loosest to tightest: `||` -> `&&` ->
+// comparison (unchanged, still non-associative — no `a > b > c`) ->
+// `+`/`-` -> `*`/`/`/`%` -> prefix `-`/`!` (right-assoc via
+// self-recursion) -> `CallExpr`/`PrimaryExpr` (unchanged). Comparison
+// keeps sitting between `&&` and `+`/`-` rather than at the very top —
+// `spec/GRAMMAR.md` §4's aspirational full Ruby table has `&&`/`||`
+// looser than comparison, which this matches.
 Expr: Expr = {
+  OrExpr,
+};
+
+OrExpr: Expr = {
+  <lhs:OrExpr> "||" <rhs:AndExpr> => Expr::Or(Box::new(lhs), Box::new(rhs)),
+  AndExpr,
+};
+
+AndExpr: Expr = {
+  <lhs:AndExpr> "&&" <rhs:CompareExpr> => Expr::And(Box::new(lhs), Box::new(rhs)),
+  CompareExpr,
+};
+
+CompareExpr: Expr = {
   <lhs:AddExpr> <op:CompareOp> <rhs:AddExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
   AddExpr,
 };
@@ -171,7 +237,25 @@ CompareOp: CompareOp = {
 };
 
 AddExpr: Expr = {
-  <lhs:AddExpr> "+" <rhs:CallExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
+  <lhs:AddExpr> "+" <rhs:MulExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
+  <lhs:AddExpr> "-" <rhs:MulExpr> => Expr::Sub(Box::new(lhs), Box::new(rhs)),
+  MulExpr,
+};
+
+MulExpr: Expr = {
+  <lhs:MulExpr> "*" <rhs:UnaryExpr> => Expr::Mul(Box::new(lhs), Box::new(rhs)),
+  <lhs:MulExpr> "/" <rhs:UnaryExpr> => Expr::Div(Box::new(lhs), Box::new(rhs)),
+  <lhs:MulExpr> "%" <rhs:UnaryExpr> => Expr::Rem(Box::new(lhs), Box::new(rhs)),
+  UnaryExpr,
+};
+
+// Tightest binding, right-associative via self-recursion on the operand
+// (`--x` parses as `Neg(Neg(x))`, not that this language has any use for
+// it) — sits directly above `CallExpr`, so `-a.b`/`-a(1)`/`-a[0]` all
+// negate the *result* of the postfix chain, not just `a`.
+UnaryExpr: Expr = {
+  "-" <e:UnaryExpr> => Expr::Neg(Box::new(e)),
+  "!" <e:UnaryExpr> => Expr::Not(Box::new(e)),
   CallExpr,
 };
 
@@ -217,8 +301,14 @@ PrimaryExpr: Expr = {
   <name:Ident> => Expr::Ident(name),
 };
 
+// Plan 18: widened from `CallExpr` to the full `Expr` — a call argument
+// (`factorial(n - 1)`) needs the whole precedence ladder, not just
+// postfix indexing. No ambiguity from this widening: every use of
+// `Args` is already delimited by `(`/`)` or `[`/`]` with `,` separators,
+// so there's no bare-leading-token collision the `Stmt`-initial split
+// exists to avoid.
 Args: Vec<Expr> = {
-  <mut v:(<CallExpr> ",")*> <last:CallExpr?> => {
+  <mut v:(<Expr> ",")*> <last:Expr?> => {
     match last {
       None => v,
       Some(e) => { v.push(e); v }

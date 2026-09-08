@@ -151,6 +151,60 @@ fn module_info(
   })
 }
 
+/// `Sub`/`Mul`/`Div`/`Rem` each apply the exact rule `Add` already
+/// enforces (plan 18's Decision log): both operands must resolve to the
+/// same numeric type, no implicit conversion.
+#[allow(clippy::too_many_arguments)]
+fn check_numeric_binop(
+  op: &str,
+  lhs: &Expr,
+  rhs: &Expr,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<Type, Diagnostic> {
+  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+  if lt != rt {
+    return Err(Diagnostic::new(format!(
+      "type mismatch: `{op}` requires both operands to have the same type, found {lt:?} and {rt:?}"
+    )));
+  }
+  if lt != Type::Int64 && lt != Type::Float64 {
+    return Err(Diagnostic::new(format!(
+      "type `{lt:?}` does not support `{op}`"
+    )));
+  }
+  Ok(lt)
+}
+
+/// `&&`/`||` require both operands `Boolean`, return `Boolean`.
+#[allow(clippy::too_many_arguments)]
+fn check_boolean_binop(
+  op: &str,
+  lhs: &Expr,
+  rhs: &Expr,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<Type, Diagnostic> {
+  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+  if lt != Type::Boolean {
+    return Err(Diagnostic::new(format!(
+      "`{op}` requires a Boolean left operand, found {lt:?}"
+    )));
+  }
+  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+  if rt != Type::Boolean {
+    return Err(Diagnostic::new(format!(
+      "`{op}` requires a Boolean right operand, found {rt:?}"
+    )));
+  }
+  Ok(Type::Boolean)
+}
+
 /// `self_fields` is `Some(&class.fields)` while checking a method body,
 /// `None` everywhere else — gates `@field` legality (plan 08 AC4).
 #[allow(clippy::too_many_arguments)]
@@ -183,6 +237,30 @@ fn infer_expr_type(
       }
       Ok(lt)
     }
+    Expr::Sub(lhs, rhs) => check_numeric_binop("-", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Mul(lhs, rhs) => check_numeric_binop("*", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Div(lhs, rhs) => check_numeric_binop("/", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Rem(lhs, rhs) => check_numeric_binop("%", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Neg(e) => {
+      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      if t != Type::Int64 && t != Type::Float64 {
+        return Err(Diagnostic::new(format!(
+          "type `{t:?}` does not support unary `-`"
+        )));
+      }
+      Ok(t)
+    }
+    Expr::Not(e) => {
+      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      if t != Type::Boolean {
+        return Err(Diagnostic::new(format!(
+          "`!` requires a Boolean operand, found {t:?}"
+        )));
+      }
+      Ok(Type::Boolean)
+    }
+    Expr::And(lhs, rhs) => check_boolean_binop("&&", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Or(lhs, rhs) => check_boolean_binop("||", lhs, rhs, env, sigs, classes, self_fields),
     Expr::Compare(lhs, op, rhs) => {
       let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
@@ -1178,5 +1256,64 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a module used as a type annotation");
     assert!(errs[0].message.contains("unknown type"));
+  }
+
+  // Plan 18 (arithmetic & logical operators).
+
+  const ARITHMETIC_EXAMPLE: &str = "def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
+  const SHORT_CIRCUIT_EXAMPLE: &str = "def noisy(n: Int64) -> Boolean\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1)\n  puts 100\nend\nif x > -10 && noisy(3)\n  puts 300\nend\nif x < 0 || noisy(2)\n  puts 200\nend\nif x > 0 || noisy(4)\n  puts 400\nend\n";
+
+  #[test]
+  fn accepts_arithmetic_example() {
+    let program = emerald_parser::parse(ARITHMETIC_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_short_circuit_example() {
+    let program = emerald_parser::parse(SHORT_CIRCUIT_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_mismatched_numeric_sub_types() {
+    let src = "puts 5 - 2.0\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject Int64 - Float64");
+    assert!(errs[0].message.contains("Int64") && errs[0].message.contains("Float64"));
+  }
+
+  #[test]
+  fn rejects_not_on_non_boolean_operand() {
+    let src = "puts !5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject `!5`");
+    assert!(errs[0].message.contains("Boolean"));
+  }
+
+  #[test]
+  fn rejects_and_with_non_boolean_left_operand() {
+    // No parenthesized-grouping production exists in this grammar (a
+    // real, disclosed gap outside plan 18's scope) — `5 && 3 > 1`
+    // still exercises the intended shape since `&&` binds looser than
+    // comparison, so the right operand is `3 > 1` either way.
+    let src = "if 5 && 3 > 1\n  puts 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject `5 && ...`");
+    assert!(errs[0].message.contains("Boolean"));
+  }
+
+  #[test]
+  fn sub_and_neg_agree_on_int64() {
+    let src = "x: Int64 = 0 - 5\ny: Int64 = -5\nputs x\nputs y\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn sub_and_neg_agree_on_float64() {
+    let src = "x: Float64 = 0.0 - 5.0\ny: Float64 = -5.0\nputs x\nputs y\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 }

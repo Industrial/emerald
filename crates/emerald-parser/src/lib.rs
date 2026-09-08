@@ -568,4 +568,149 @@ mod tests {
       )
     );
   }
+
+  // Plan 18 (arithmetic & logical operators) — precedence is real, not
+  // just parseable (AC1).
+
+  #[test]
+  fn mul_binds_tighter_than_add() {
+    let program = parse("puts 2 + 3 * 4\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      args[0],
+      Expr::Add(
+        Box::new(Expr::Int(2)),
+        Box::new(Expr::Mul(Box::new(Expr::Int(3)), Box::new(Expr::Int(4))))
+      )
+    );
+  }
+
+  #[test]
+  fn unary_minus_binds_tighter_than_add() {
+    let program = parse("puts -3 + 10\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      args[0],
+      Expr::Add(
+        Box::new(Expr::Neg(Box::new(Expr::Int(3)))),
+        Box::new(Expr::Int(10))
+      )
+    );
+  }
+
+  #[test]
+  fn and_binds_tighter_than_or() {
+    let program = parse("puts a > 0 && b > 0 || c > 0\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    let gt = |name: &str, n: i64| {
+      Expr::Compare(
+        Box::new(Expr::Ident(name.into())),
+        CompareOp::Gt,
+        Box::new(Expr::Int(n)),
+      )
+    };
+    assert_eq!(
+      args[0],
+      Expr::Or(
+        Box::new(Expr::And(Box::new(gt("a", 0)), Box::new(gt("b", 0)))),
+        Box::new(gt("c", 0))
+      )
+    );
+  }
+
+  #[test]
+  fn not_binds_tighter_than_compare_not_looser() {
+    // AC3: `!` sits at the unary tier, tighter than comparison — `!x > 0`
+    // parses as `Compare(Not(x), Gt, 0)`, NOT `Not(Compare(x, Gt, 0))`.
+    // Real, Ruby-divergent precedence, documented by this test rather
+    // than left unspecified.
+    let program = parse("puts !x > 0\n").expect("should parse");
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+      panic!("expected a puts call, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      args[0],
+      Expr::Compare(
+        Box::new(Expr::Not(Box::new(Expr::Ident("x".into())))),
+        CompareOp::Gt,
+        Box::new(Expr::Int(0))
+      )
+    );
+  }
+
+  const ARITHMETIC_EXAMPLE: &str = "def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
+
+  #[test]
+  fn parses_arithmetic_example() {
+    let program = parse(ARITHMETIC_EXAMPLE).expect("arithmetic example should parse");
+    assert_eq!(program.items.len(), 5);
+    let Item::Function(f) = &program.items[0] else {
+      panic!(
+        "expected the factorial function, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(
+      f.body[0],
+      Stmt::If {
+        cond: Expr::Compare(
+          Box::new(Expr::Ident("n".into())),
+          CompareOp::Le,
+          Box::new(Expr::Int(1))
+        ),
+        then_branch: vec![Stmt::Return(Some(Expr::Int(1)))],
+        else_branch: None,
+      }
+    );
+    assert_eq!(
+      f.body[1],
+      Stmt::Return(Some(Expr::Mul(
+        Box::new(Expr::Ident("n".into())),
+        Box::new(Expr::Call(
+          "factorial".into(),
+          vec![Expr::Sub(
+            Box::new(Expr::Ident("n".into())),
+            Box::new(Expr::Int(1))
+          )]
+        ))
+      )))
+    );
+  }
+
+  const SHORT_CIRCUIT_EXAMPLE: &str = "def noisy(n: Int64) -> Boolean\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1)\n  puts 100\nend\nif x > -10 && noisy(3)\n  puts 300\nend\nif x < 0 || noisy(2)\n  puts 200\nend\nif x > 0 || noisy(4)\n  puts 400\nend\n";
+
+  #[test]
+  fn parses_short_circuit_example() {
+    let program = parse(SHORT_CIRCUIT_EXAMPLE).expect("short-circuit example should parse");
+    // 1 function + 1 let + 4 ifs.
+    assert_eq!(program.items.len(), 6);
+    let Item::Stmt(Stmt::If { cond, .. }) = &program.items[2] else {
+      panic!("expected the first if, got {:?}", program.items[2]);
+    };
+    assert_eq!(
+      *cond,
+      Expr::And(
+        Box::new(Expr::Compare(
+          Box::new(Expr::Ident("x".into())),
+          CompareOp::Gt,
+          Box::new(Expr::Int(0))
+        )),
+        Box::new(Expr::Call("noisy".into(), vec![Expr::Int(1)]))
+      )
+    );
+  }
+
+  #[test]
+  fn rejects_bare_unary_minus_as_a_statement() {
+    // A fresh statement can't start with unary `-`/`!` (see
+    // `StmtUnaryExpr`'s Decision-log comment in grammar.lalrpop) — still
+    // fully usable as a Let/return/argument value.
+    assert!(parse("-5\n").is_err());
+  }
 }
