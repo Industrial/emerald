@@ -117,13 +117,24 @@ pub struct ClassDef {
   pub methods: Vec<Function>,
 }
 
+/// A namespace-only module (plan `12`'s Decision log — `SEMANTICS.md`
+/// §10 explicitly removes `include`/`extend` mixin composition): a flat
+/// collection of methods, called as `ModuleName.method(args)`. No
+/// fields — there's no instance for them to live on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleDef {
+  pub name: String,
+  pub methods: Vec<Function>,
+}
+
 /// A single top-level construct: a function definition, a class
-/// definition, or a top-level statement (e.g. `x: Int64 = 10`,
-/// `if x > 5 ... end`, `puts x`).
+/// definition, a module definition, or a top-level statement (e.g.
+/// `x: Int64 = 10`, `if x > 5 ... end`, `puts x`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
   Function(Function),
   Class(ClassDef),
+  Module(ModuleDef),
   Stmt(Stmt),
 }
 

@@ -12,7 +12,7 @@ mod grammar {
   lalrpop_util::lalrpop_mod!(pub grammar, "/grammar.rs");
 }
 
-pub use ast::{ClassDef, CompareOp, Expr, Function, Item, Param, Program, Stmt};
+pub use ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
 
 pub fn parse(src: &str) -> Result<Program, String> {
   grammar::grammar::ProgramParser::new()
@@ -449,6 +449,57 @@ mod tests {
           vec![]
         )]
       ))]
+    );
+  }
+
+  const MODULE_EXAMPLE: &str = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
+
+  #[test]
+  fn parses_module_and_namespaced_call() {
+    let program = parse(MODULE_EXAMPLE).expect("module example should parse");
+    assert_eq!(program.items.len(), 2);
+
+    let Item::Module(m) = &program.items[0] else {
+      panic!(
+        "expected item 0 to be the MathUtils module, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(m.name, "MathUtils");
+    assert_eq!(m.methods.len(), 1);
+    assert_eq!(m.methods[0].name, "double");
+    assert_eq!(
+      m.methods[0].params,
+      vec![Param {
+        name: "x".into(),
+        ty: "Int64".into()
+      }]
+    );
+    assert_eq!(m.methods[0].return_type, "Int64");
+    assert_eq!(
+      m.methods[0].body,
+      vec![Stmt::Expr(Expr::Add(
+        Box::new(Expr::Ident("x".into())),
+        Box::new(Expr::Ident("x".into()))
+      ))]
+    );
+
+    let Item::Stmt(Stmt::Expr(call)) = &program.items[1] else {
+      panic!(
+        "expected item 1 to be `puts MathUtils.double(21)`, got {:?}",
+        program.items[1]
+      );
+    };
+    assert_eq!(
+      *call,
+      Expr::Call(
+        "puts".into(),
+        vec![Expr::MethodCall(
+          Box::new(Expr::Ident("MathUtils".into())),
+          "double".into(),
+          vec![Expr::Int(21)]
+        )]
+      )
     );
   }
 }

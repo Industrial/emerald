@@ -5,7 +5,7 @@
 //! don't carry spans) — diagnostics are function/call-scoped text.
 //! Line/column-precise diagnostics are `13 diagnostics`'s job.
 
-use emerald_parser::{ClassDef, Expr, Function, Item, Param, Program, Stmt};
+use emerald_parser::{ClassDef, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,10 +49,16 @@ struct FunctionSig {
   return_type: Type,
 }
 
+/// Shared by classes and modules (plan 12's Decision log — modules reuse
+/// this registry, tagged `is_module: true`, rather than a separate
+/// `modules` map threaded through every function that already carries
+/// `classes`). A module's `fields` is always empty (`SEMANTICS.md`
+/// §10.4 — no instance state to hold them).
 #[derive(Debug, Clone)]
 struct ClassInfo {
   fields: HashMap<String, Type>,
   methods: HashMap<String, FunctionSig>,
+  is_module: bool,
 }
 
 /// Resolves a type name against `spec/TYPE_SYSTEM.md`'s primitives, then
@@ -65,7 +71,10 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "String" => Ok(Type::String),
     "Void" => Ok(Type::Void),
     "Boolean" => Ok(Type::Boolean),
-    other if classes.contains_key(other) => Ok(Type::Class(other.to_string())),
+    // Modules are namespaces, not types (plan 12's Decision log) — a
+    // module name is excluded here so `x: MathUtils = ...` correctly
+    // falls through to the `unknown type` error below, not `Type::Class`.
+    other if classes.get(other).is_some_and(|c| !c.is_module) => Ok(Type::Class(other.to_string())),
     // The grammar hands compound array annotations over as a plain
     // `"Array[Elem]"` string (plan 09's Decision log — no structured
     // type-annotation AST node yet), so this is where it turns into
@@ -116,7 +125,30 @@ fn class_info(c: &ClassDef, classes: &HashMap<String, ClassInfo>) -> Result<Clas
   for m in &c.methods {
     methods.insert(m.name.clone(), function_signature(m, classes)?);
   }
-  Ok(ClassInfo { fields, methods })
+  Ok(ClassInfo {
+    fields,
+    methods,
+    is_module: false,
+  })
+}
+
+/// A module's method table — built via the exact same `function_signature`
+/// every free function's signature already goes through (plan 12's
+/// Decision log: a module method type-checks like a free function,
+/// because it is one, just namespaced). Always empty `fields`.
+fn module_info(
+  m: &ModuleDef,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<ClassInfo, Diagnostic> {
+  let mut methods = HashMap::new();
+  for f in &m.methods {
+    methods.insert(f.name.clone(), function_signature(f, classes)?);
+  }
+  Ok(ClassInfo {
+    fields: HashMap::new(),
+    methods,
+    is_module: true,
+  })
 }
 
 /// `self_fields` is `Some(&class.fields)` while checking a method body,
@@ -191,6 +223,11 @@ fn infer_expr_type(
       let info = classes
         .get(class_name)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`")))?;
+      if info.is_module {
+        return Err(Diagnostic::new(format!(
+          "cannot `.new` module `{class_name}` — modules are namespaces, not instantiable"
+        )));
+      }
       match info.methods.get("initialize") {
         Some(sig) => check_args(
           "initialize",
@@ -210,6 +247,24 @@ fn infer_expr_type(
         }
       }
       Ok(Type::Class(class_name.clone()))
+    }
+    // `Name.method(args)` on a module (plan 12) dispatches straight to
+    // its method table — checked *before* the `.call`/`Type::Proc` arm
+    // below (a module could in principle declare a method named `call`)
+    // and before `infer_expr_type(recv)` runs at all, since a bare
+    // module reference isn't a value — evaluating it as one would fail
+    // with "undefined variable" (a module name is never in `env`).
+    Expr::MethodCall(recv, method, args) if matches!(recv.as_ref(), Expr::Ident(n) if classes.get(n).is_some_and(|c| c.is_module)) =>
+    {
+      let Expr::Ident(module_name) = recv.as_ref() else {
+        unreachable!()
+      };
+      let info = &classes[module_name];
+      let sig = info.methods.get(method).ok_or_else(|| {
+        Diagnostic::new(format!("module `{module_name}` has no method `{method}`"))
+      })?;
+      check_args(method, args, &sig.params, env, sigs, classes, self_fields)?;
+      Ok(sig.return_type.clone())
     }
     // `.call` on a `Proc`-typed receiver dispatches against the
     // signature carried directly on `Type::Proc` (plan 10) — everything
@@ -712,6 +767,10 @@ fn check_method_body(
 pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   let mut diags = Vec::new();
 
+  // Modules register into the same two-pass table as classes (plan 12's
+  // Decision log) — names first (so a class/module's own fields/methods
+  // can reference any other class/module name regardless of declaration
+  // order), then full field/method tables.
   let mut classes: HashMap<String, ClassInfo> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
@@ -720,6 +779,17 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         ClassInfo {
           fields: HashMap::new(),
           methods: HashMap::new(),
+          is_module: false,
+        },
+      );
+    }
+    if let Item::Module(m) = item {
+      classes.insert(
+        m.name.clone(),
+        ClassInfo {
+          fields: HashMap::new(),
+          methods: HashMap::new(),
+          is_module: true,
         },
       );
     }
@@ -729,6 +799,14 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       match class_info(c, &classes) {
         Ok(info) => {
           classes.insert(c.name.clone(), info);
+        }
+        Err(d) => diags.push(d),
+      }
+    }
+    if let Item::Module(m) = item {
+      match module_info(m, &classes) {
+        Ok(info) => {
+          classes.insert(m.name.clone(), info);
         }
         Err(d) => diags.push(d),
       }
@@ -764,6 +842,15 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         };
         for m in &c.methods {
           if let Err(d) = check_method_body(&c.name, m, &sigs, &classes, &info.fields) {
+            diags.push(d);
+          }
+        }
+      }
+      // A module method type-checks exactly like a free function (plan
+      // 12's Decision log) — no `self`, no `@field` access.
+      Item::Module(m) => {
+        for f in &m.methods {
+          if let Err(d) = check_function_body(f, &sigs, &classes) {
             diags.push(d);
           }
         }
@@ -1042,5 +1129,54 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject `rescue Int64`");
     assert!(errs[0].message.contains("must name a class"));
+  }
+
+  const MODULE_EXAMPLE: &str = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
+
+  #[test]
+  fn accepts_module_namespaced_call() {
+    let program = emerald_parser::parse(MODULE_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_instantiating_a_module() {
+    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.new()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject `.new` on a module");
+    assert!(errs[0].message.contains("cannot `.new` module"));
+  }
+
+  #[test]
+  fn rejects_undeclared_module_method() {
+    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.missing(1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject an undeclared module method");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("has no method `missing`"))
+    );
+  }
+
+  #[test]
+  fn rejects_module_call_arity_mismatch() {
+    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(1, 2)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject a 2-arg call to a 1-param module method");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("expects 1 argument"))
+    );
+  }
+
+  #[test]
+  fn rejects_module_used_as_a_type_annotation() {
+    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nx: MathUtils = 5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a module used as a type annotation");
+    assert!(errs[0].message.contains("unknown type"));
   }
 }

@@ -1,4 +1,4 @@
-use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, Param, Program, Stmt};
+use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
 
 grammar;
 
@@ -21,6 +21,7 @@ pub Program: Program = {
 Item: Item = {
   <f:FuncDef> => Item::Function(f),
   <c:ClassDef> => Item::Class(c),
+  <m:ModuleDef> => Item::Module(m),
   <s:Stmt> => Item::Stmt(s),
 };
 
@@ -30,6 +31,12 @@ Item: Item = {
 // `"def"`), so `Param*` followed by `FuncDef*` is unambiguous.
 ClassDef: ClassDef = {
   "class" <name:Ident> <fields:Param*> <methods:FuncDef*> "end" => ClassDef { name, fields, methods }
+};
+
+// Namespace-only (plan 12's Decision log) — no fields, just methods.
+// `module` is reserved the same LALR(1) way `class`/`def` already are.
+ModuleDef: ModuleDef = {
+  "module" <name:Ident> <methods:FuncDef*> "end" => ModuleDef { name, methods }
 };
 
 FuncDef: Function = {

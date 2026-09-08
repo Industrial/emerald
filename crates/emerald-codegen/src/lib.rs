@@ -411,6 +411,11 @@ struct Ctx<'a> {
   /// shortcut).
   class_tags: &'a HashMap<String, i64>,
   exc_funcs: ExceptionRuntimeFuncs,
+  /// Names of every top-level `module` (plan 12) — `build_method_call`
+  /// checks this before anything else to route `Name.method(args)` to
+  /// the module's `{Name}_{method}` function directly, with no receiver
+  /// value at all (modules have no fields/self, unlike classes/Procs).
+  module_names: &'a std::collections::HashSet<String>,
 }
 
 fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, String> {
@@ -639,6 +644,31 @@ fn build_method_call(
       "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
     );
   };
+  // `Name.method(args)` on a module (plan 12): no receiver value at
+  // all — a module isn't a variable, and its methods take no implicit
+  // `self` (they compile exactly like free functions).
+  if ctx.module_names.contains(recv_name) {
+    let key = format!("{recv_name}_{method}");
+    let func_id = *ctx
+      .user_func_ids
+      .get(&key)
+      .ok_or_else(|| format!("codegen: unsupported module method call `{recv_name}.{method}`"))?;
+    let func_ref = module.declare_func_in_func(func_id, builder.func);
+    let mut call_args = Vec::with_capacity(args.len());
+    for a in args {
+      call_args.push(build_expr(
+        builder,
+        module,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?);
+    }
+    let call = builder.ins().call(func_ref, &call_args);
+    return Ok(builder.inst_results(call)[0]);
+  }
   let func_id = if method == "call" {
     *ctx.lambda_func_ids.get(recv_name).ok_or_else(|| {
       format!("codegen: `.call` on `{recv_name}` — not a lambda literal bound to a top-level `Let`")
@@ -1914,7 +1944,33 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
         user_func_ids.insert(mangled, id);
       }
     }
+    // A module method's signature has no leading `self` — it compiles
+    // exactly like a free function, just declared under a namespaced
+    // `{Module}_{method}` name (plan 12's Decision log).
+    if let Item::Module(m) = item {
+      for f in &m.methods {
+        let mut sig = module.make_signature();
+        for p in &f.params {
+          sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
+        }
+        push_return_type(&mut sig.returns, &f.return_type);
+        let mangled = format!("{}_{}", m.name, f.name);
+        let id = module
+          .declare_function(&mangled, Linkage::Export, &sig)
+          .map_err(|e| e.to_string())?;
+        user_func_ids.insert(mangled, id);
+      }
+    }
   }
+
+  let module_names: std::collections::HashSet<String> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Module(m) => Some(m.name.clone()),
+      _ => None,
+    })
+    .collect();
 
   let (lambda_infos, lambda_func_ids) = collect_lambda_infos(program, &mut module)?;
 
@@ -1929,6 +1985,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     lambda_infos: &lambda_infos,
     class_tags: &class_tags,
     exc_funcs,
+    module_names: &module_names,
   };
 
   let mut ctx = module.make_context();
@@ -1953,6 +2010,16 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
           &layout.fields,
           &gen_ctx,
         )?;
+      }
+    }
+    // Reuses `define_user_function` unchanged — a module method has no
+    // `self`, no `@field` access, so it compiles exactly like a free
+    // function (plan 12's Decision log), just under a mangled name.
+    if let Item::Module(m) = item {
+      for f in &m.methods {
+        let mangled = format!("{}_{}", m.name, f.name);
+        let id = *user_func_ids.get(&mangled).unwrap();
+        define_user_function(&mut module, &mut ctx, &mut func_ctx, f, id, &gen_ctx)?;
       }
     }
     if let Item::Stmt(Stmt::Let {
@@ -2160,6 +2227,16 @@ mod aot_tests {
     // setjmp first-pass branch (not just the longjmp landing pad) works.
     let src = "def risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nclass MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nbegin\n  puts risky(5)\nrescue MyError => e\n  puts 0\nend\n";
     assert_eq!(compile_link_run(src), "5\n");
+  }
+
+  #[test]
+  fn plan_12_module_example_linked_and_run() {
+    // Plan 12's own worked example: a namespace-only module holding a
+    // static method, called via `MathUtils.double(21)` — no receiver
+    // value, no self, a direct call to the mangled function. Real
+    // executed proof, not simulated (plan 12 AC1).
+    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
+    assert_eq!(compile_link_run(src), "42\n");
   }
 
   #[test]
