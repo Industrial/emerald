@@ -135,6 +135,27 @@ pub enum Stmt {
     index: Expr,
     value: Expr,
   },
+  /// `name = value` — reassignment of an already-declared plain local,
+  /// no type annotation restated (plan 31's Decision log: the
+  /// prerequisite shape neither compound nor multiple assignment can
+  /// exist without). `+=`/`-=`/`*=`/`/=`/`%=` desugar into this at
+  /// parse time (`value` becomes the corresponding `Expr::Add`/`Sub`/
+  /// `Mul`/`Div`/`Rem` over the current value). Sema requires `name`
+  /// already present in scope — this is never a fresh declaration.
+  Assign {
+    name: String,
+    value: Expr,
+  },
+  /// `n1, n2, ... = v1, v2, ...` — fixed-arity multiple assignment over
+  /// already-declared plain locals (plan 31's Decision log: no fresh
+  /// multi-declaration, no mixed instance-var/index targets, no
+  /// splat). `values` are evaluated in full before any `names` target
+  /// is written — codegen's proof this actually matters is a real
+  /// swap (`a, b = b, a`).
+  MultiAssign {
+    names: Vec<String>,
+    values: Vec<Expr>,
+  },
   If {
     cond: Expr,
     then_branch: Vec<Stmt>,

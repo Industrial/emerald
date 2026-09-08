@@ -237,6 +237,21 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
       collect_idents_in_expr(index, referenced);
       collect_idents_in_expr(value, referenced);
     }
+    // Plan 31: `name`/`names` are reassignments of an already-bound
+    // outer name, never a fresh declaration — unlike `Stmt::Let` above,
+    // this pushes to `referenced`, not `bound` (a lambda body
+    // reassigning a captured outer variable still needs that name
+    // captured, not treated as if declared here).
+    Stmt::Assign { name, value } => {
+      referenced.push(name.clone());
+      collect_idents_in_expr(value, referenced);
+    }
+    Stmt::MultiAssign { names, values } => {
+      referenced.extend(names.iter().cloned());
+      for v in values {
+        collect_idents_in_expr(v, referenced);
+      }
+    }
     Stmt::If {
       cond,
       then_branch,
@@ -2205,6 +2220,57 @@ fn build_stmt<'ctx>(
       builder.build_store(ptr, v).map_err(|e| e.to_string())?;
       Ok(false)
     }
+    // Plan 31: reuses the exact same existing-alloca/`build_store`
+    // mechanism `Stmt::Let` above already uses for a loop counter's
+    // repeated reassignment — `name` is never pre-allocated via
+    // `collect_lets` for this variant (it's always an already-declared
+    // outer name), so a genuinely-undefined target is a real `Err`
+    // here, not a panic, unlike `Let`'s `.expect(...)` (sema guarantees
+    // it in the normal pipeline, but codegen alone shouldn't assume
+    // that).
+    Stmt::Assign { name, value } => {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        value,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (ptr, _) = *vars
+        .get(name)
+        .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      builder.build_store(ptr, v).map_err(|e| e.to_string())?;
+      Ok(false)
+    }
+    // Plan 31: every `values` expression is built into a temporary SSA
+    // value BEFORE any `names` target is written — the entire point of
+    // this leaf (Decision log): `a, b = b, a` must read both original
+    // values before either alloca is overwritten, or the swap silently
+    // corrupts (`a = b` then `b = a` would print the new `a` twice).
+    Stmt::MultiAssign { names, values } => {
+      let mut evaluated = Vec::with_capacity(values.len());
+      for v in values {
+        let (val, _) = build_expr(
+          context,
+          builder,
+          v,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        evaluated.push(val);
+      }
+      for (name, val) in names.iter().zip(evaluated) {
+        let (ptr, _) = *vars
+          .get(name)
+          .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+        builder.build_store(ptr, val).map_err(|e| e.to_string())?;
+      }
+      Ok(false)
+    }
     Stmt::SetField { name, value } => {
       let (self_ptr, fields) = ctx
         .self_ctx
@@ -4063,5 +4129,46 @@ mod tests {
       result.is_ok(),
       "must not panic on an empty for-in element list: {result:?}"
     );
+  }
+
+  // Plan 31 (compound and multiple assignment).
+
+  #[test]
+  fn bare_reassignment_linked_and_run() {
+    let src = "x: Int64 = 1\nputs x\nx = 2\nputs x\n";
+    assert_eq!(compile_link_run(src), "1\n2\n");
+  }
+
+  const COMPOUND_ASSIGN_EXAMPLE: &str =
+    "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n";
+
+  #[test]
+  fn compound_plus_assign_accumulator_linked_and_run() {
+    assert_eq!(compile_link_run(COMPOUND_ASSIGN_EXAMPLE), "10\n");
+  }
+
+  #[test]
+  fn all_compound_assign_operators_linked_and_run() {
+    assert_eq!(compile_link_run("x: Int64 = 10\nx -= 3\nputs x\n"), "7\n");
+    assert_eq!(compile_link_run("x: Int64 = 10\nx *= 3\nputs x\n"), "30\n");
+    assert_eq!(compile_link_run("x: Int64 = 10\nx /= 3\nputs x\n"), "3\n");
+    assert_eq!(compile_link_run("x: Int64 = 10\nx %= 3\nputs x\n"), "1\n");
+  }
+
+  const MULTI_ASSIGN_SWAP_EXAMPLE: &str =
+    "a: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+
+  #[test]
+  fn multiple_assignment_swap_linked_and_run() {
+    // The whole point of this leaf: a left-to-right, unbuffered
+    // implementation would print `2\n2\n` (a real, easy-to-get-wrong
+    // correctness pitfall, not just an implementation detail).
+    assert_eq!(compile_link_run(MULTI_ASSIGN_SWAP_EXAMPLE), "2\n1\n");
+  }
+
+  #[test]
+  fn plan_31_worked_example_linked_and_run() {
+    let src = "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n\na: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+    assert_eq!(compile_link_run(src), "10\n2\n1\n");
   }
 }

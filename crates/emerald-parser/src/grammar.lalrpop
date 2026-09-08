@@ -146,24 +146,89 @@ Stmt: Stmt = {
     arms,
     else_body,
   },
-  // Assignment to an instance variable (`@x = value`) or an array index
-  // (`arr[i] = value`). Both are just `Expr` on the left — `CallExpr`'s
+  // Assignment to an instance variable (`@x = value`), an array index
+  // (`arr[i] = value`), or a plain local (`x = value`, plan 31's
+  // Decision log). All three are just `Expr` on the left — `CallExpr`'s
   // left-recursive indexing rule (below) already parses `arr[i]`
   // unambiguously, so re-deriving a *separate* `Ident "[" Expr "]"`
   // grammar production here (plan 09's first attempt) would compete with
   // it for the same lookahead and is a genuine LALR(1) conflict.
   // Accepting a general `Expr` on the left and checking its shape in the
-  // action (`=>?`, a real parse error on an invalid target — not a panic)
-  // is the standard fix. `+=` etc. aren't in inception's initial-scope
-  // list, so this only ever needs to recognize these two shapes.
+  // action (`=>?`, a real parse error on an invalid target — not a
+  // panic) is the standard fix.
   <lhs:StmtExpr> "=" <value:Expr> =>? match lhs {
     Expr::InstanceVar(name) => Ok(Stmt::SetField { name, value }),
     Expr::Index(array, index) => Ok(Stmt::SetIndex { array: *array, index: *index, value }),
+    Expr::Ident(name) => Ok(Stmt::Assign { name, value }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid assignment target: {other:?}"),
     }),
   },
+  // Plan 31: `x += 1` desugars at parse time into `Stmt::Assign { name,
+  // value: Expr::Add(Ident(name), rhs) }` — per `spec/GRAMMAR.md` §3's
+  // own description of compound assignment as sugar over `x = x + 1`.
+  // Restricted to a plain local target (`Expr::Ident`) only — unlike the
+  // plain `"="` rule above, compound assignment doesn't extend to
+  // `@field`/`arr[i]` targets (Decision log: `Stmt::Assign`'s `name` is
+  // a flat `String`, not a general assignable `Expr`).
+  <lhs:StmtExpr> "+=" <rhs:Expr> =>? match lhs {
+    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Add(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid compound-assignment target: {other:?}"),
+    }),
+  },
+  <lhs:StmtExpr> "-=" <rhs:Expr> =>? match lhs {
+    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Sub(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid compound-assignment target: {other:?}"),
+    }),
+  },
+  <lhs:StmtExpr> "*=" <rhs:Expr> =>? match lhs {
+    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Mul(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid compound-assignment target: {other:?}"),
+    }),
+  },
+  <lhs:StmtExpr> "/=" <rhs:Expr> =>? match lhs {
+    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Div(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid compound-assignment target: {other:?}"),
+    }),
+  },
+  <lhs:StmtExpr> "%=" <rhs:Expr> =>? match lhs {
+    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Rem(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid compound-assignment target: {other:?}"),
+    }),
+  },
+  // Plan 31: fixed-arity multiple assignment (`a, b = b, a`) — a raw,
+  // right-recursive `Ident`/`Expr` list (not routed through `StmtExpr`,
+  // unlike every rule above), since the deciding factor between this
+  // and an ordinary Stmt-initial expression is the very next token
+  // after the first `Ident`: a literal `,` here never follows a bare
+  // `StmtExpr` in any other Stmt-initial context in this grammar, so
+  // there's no existing FOLLOW-set overlap this collides with (same
+  // reasoning as plan 20's `CaseValues` right-recursion).
+  <names:MultiAssignNames> "=" <values:MultiAssignValues> => Stmt::MultiAssign { names, values },
   <e:StmtExpr> => Stmt::Expr(e),
+};
+
+MultiAssignNames: Vec<String> = {
+  <first:Ident> "," <last:Ident> => vec![first, last],
+  <first:Ident> "," <rest:MultiAssignNames> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+  },
+};
+
+MultiAssignValues: Vec<Expr> = {
+  <first:Expr> "," <last:Expr> => vec![first, last],
+  <first:Expr> "," <rest:MultiAssignValues> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+  },
 };
 
 // A restricted mirror of `Expr`/`AddExpr`/`CallExpr` used *only* for the

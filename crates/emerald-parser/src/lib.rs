@@ -934,6 +934,78 @@ mod tests {
     assert_eq!(*else_body, None);
   }
 
+  // Plan 31 (compound and multiple assignment).
+
+  #[test]
+  fn bare_reassignment_parses_as_assign() {
+    let src = "x: Int64 = 1\nx = 2\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[1],
+      Item::Stmt(Stmt::Assign {
+        name: "x".to_string(),
+        value: Expr::Int(2),
+      })
+    );
+  }
+
+  #[test]
+  fn compound_plus_assign_desugars_to_assign_of_add() {
+    let src = "total += i\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Assign {
+        name: "total".to_string(),
+        value: Expr::Add(
+          Box::new(Expr::Ident("total".to_string())),
+          Box::new(Expr::Ident("i".to_string())),
+        ),
+      })
+    );
+  }
+
+  fn assert_compound_assign_desugars_to(src: &str, expected_value: Expr) {
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Assign {
+        name: "x".to_string(),
+        value: expected_value,
+      }),
+      "mismatched desugaring for {src:?}"
+    );
+  }
+
+  #[test]
+  fn all_compound_assign_operators_desugar_to_the_matching_binop() {
+    let x = || Box::new(Expr::Ident("x".to_string()));
+    let one = || Box::new(Expr::Int(1));
+    assert_compound_assign_desugars_to("x -= 1\n", Expr::Sub(x(), one()));
+    assert_compound_assign_desugars_to("x *= 1\n", Expr::Mul(x(), one()));
+    assert_compound_assign_desugars_to("x /= 1\n", Expr::Div(x(), one()));
+    assert_compound_assign_desugars_to("x %= 1\n", Expr::Rem(x(), one()));
+  }
+
+  #[test]
+  fn multiple_assignment_swap_parses() {
+    let src = "a, b = b, a\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::MultiAssign {
+        names: vec!["a".to_string(), "b".to_string()],
+        values: vec![Expr::Ident("b".to_string()), Expr::Ident("a".to_string())],
+      })
+    );
+  }
+
+  #[test]
+  fn plan_31_worked_example_parses() {
+    let src = "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n\na: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+    parse(src).expect("plan 31's worked example must parse cleanly");
+  }
+
   // Plan 30 (for-in iteration).
 
   #[test]

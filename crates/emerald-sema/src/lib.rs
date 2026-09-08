@@ -692,6 +692,47 @@ fn check_set_index(
   Ok(())
 }
 
+/// `n1, n2, ... = v1, v2, ...` (plan 31's Decision log): fixed-arity
+/// only — an arity mismatch is a real diagnostic, not a panic or silent
+/// truncation/padding. Every `values` expression is type-checked before
+/// any `names` binding is consulted for its target type, matching
+/// codegen's own "evaluate all RHS before writing any target" ordering
+/// (what makes `a, b = b, a` a real swap).
+#[allow(clippy::too_many_arguments)]
+fn check_multi_assign(
+  names: &[String],
+  values: &[Expr],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<(), Diagnostic> {
+  if names.len() != values.len() {
+    return Err(Diagnostic::new(format!(
+      "multiple assignment arity mismatch: {} target(s), {} value(s)",
+      names.len(),
+      values.len()
+    )));
+  }
+  let value_types = values
+    .iter()
+    .map(|v| infer_expr_type(v, env, sigs, classes, self_fields))
+    .collect::<Result<Vec<_>, _>>()?;
+  for (i, (name, actual)) in names.iter().zip(value_types).enumerate() {
+    let declared = env
+      .get(name)
+      .cloned()
+      .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+    if actual != declared {
+      return Err(Diagnostic::new(format!(
+        "type mismatch in multiple assignment at position {}: `{name}` has type {declared:?}, value has type {actual:?}",
+        i + 1
+      )));
+    }
+  }
+  Ok(())
+}
+
 /// Type-checks one statement, threading a mutable local-variable
 /// environment and the enclosing function's declared return type (used to
 /// check every `return <expr>`, not just a trailing one). `in_loop` gates
@@ -778,6 +819,27 @@ fn check_stmt(
       index,
       value,
     } => check_set_index(array, index, value, env, sigs, classes, self_fields),
+    // Plan 31: `name` must already be bound — this is a reassignment,
+    // never a fresh declaration (the Decision log's whole reason this
+    // is a distinct `Stmt` from `Let`). Checked against the *existing*
+    // binding's type, same "no implicit conversion" rule `Let` and
+    // every other assignment shape here already enforces.
+    Stmt::Assign { name, value } => {
+      let declared = env
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+      if actual != declared {
+        return Err(Diagnostic::new(format!(
+          "type mismatch in `{name} = ...`: `{name}` has type {declared:?}, value has type {actual:?}"
+        )));
+      }
+      Ok(())
+    }
+    Stmt::MultiAssign { names, values } => {
+      check_multi_assign(names, values, env, sigs, classes, self_fields)
+    }
     Stmt::If {
       cond,
       then_branch,
@@ -1761,5 +1823,70 @@ mod tests {
     let src = "for x in [1, 2, 3]\n  if x == 2\n    next\n  end\n  if x == 3\n    break\n  end\n  puts x\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 31 (compound and multiple assignment).
+
+  #[test]
+  fn accepts_bare_reassignment_of_an_existing_local() {
+    let src = "x: Int64 = 1\nx = 2\nputs x\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_reassignment_of_an_undeclared_local() {
+    let src = "y = 5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject reassigning an undeclared local");
+    assert!(errs[0].message.contains("undefined variable"));
+  }
+
+  #[test]
+  fn rejects_reassignment_type_mismatch() {
+    let src = "x: Int64 = 1\nx = \"mismatched\"\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject Int64 reassigned to a String");
+    assert!(errs[0].message.contains("Int64") && errs[0].message.contains("String"));
+  }
+
+  #[test]
+  fn accepts_compound_plus_assign_accumulator() {
+    let src =
+      "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_multiple_assignment_swap() {
+    let src = "a: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_multiple_assignment_positional_type_mismatch() {
+    let src = "a: Int64 = 1\nb: Int64 = 2\na, b = \"s\", 1\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject a positional type mismatch in `a, b = ...`");
+    assert!(errs[0].message.contains("position 1"));
+  }
+
+  #[test]
+  fn rejects_multiple_assignment_arity_mismatch() {
+    let src = "a: Int64 = 1\nb: Int64 = 2\na, b = 1, 2, 3\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject an arity mismatch");
+    assert!(errs[0].message.contains("arity mismatch"));
+  }
+
+  #[test]
+  fn rejects_multiple_assignment_undefined_target() {
+    let src = "a: Int64 = 1\na, z = 1, 2\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject an undefined multi-assign target");
+    assert!(errs[0].message.contains("undefined variable"));
   }
 }
