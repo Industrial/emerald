@@ -12,7 +12,7 @@ mod grammar {
   lalrpop_util::lalrpop_mod!(pub grammar, "/grammar.rs");
 }
 
-pub use ast::{CompareOp, Expr, Function, Item, Param, Program, Stmt};
+pub use ast::{ClassDef, CompareOp, Expr, Function, Item, Param, Program, Stmt};
 
 pub fn parse(src: &str) -> Result<Program, String> {
   grammar::grammar::ProgramParser::new()
@@ -169,5 +169,88 @@ mod tests {
       panic!("expected a function, got {:?}", program.items[0]);
     };
     assert_eq!(f.body, vec![Stmt::Return(Some(Expr::Ident("a".into())))]);
+  }
+
+  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+
+  #[test]
+  fn parses_inception_point_example_end_to_end() {
+    let program = parse(POINT_EXAMPLE).expect("Point example should parse");
+    assert_eq!(program.items.len(), 3);
+
+    let Item::Class(class) = &program.items[0] else {
+      panic!(
+        "expected item 0 to be the Point class, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(class.name, "Point");
+    assert_eq!(
+      class.fields,
+      vec![
+        Param {
+          name: "x".into(),
+          ty: "Float64".into()
+        },
+        Param {
+          name: "y".into(),
+          ty: "Float64".into()
+        }
+      ]
+    );
+    assert_eq!(class.methods.len(), 2);
+    assert_eq!(class.methods[0].name, "initialize");
+    assert_eq!(
+      class.methods[0].body,
+      vec![
+        Stmt::SetField {
+          name: "x".into(),
+          value: Expr::Ident("x".into())
+        },
+        Stmt::SetField {
+          name: "y".into(),
+          value: Expr::Ident("y".into())
+        },
+      ]
+    );
+    assert_eq!(class.methods[1].name, "sum");
+    assert_eq!(
+      class.methods[1].body,
+      vec![Stmt::Expr(Expr::Add(
+        Box::new(Expr::InstanceVar("x".into())),
+        Box::new(Expr::InstanceVar("y".into()))
+      ))]
+    );
+
+    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[1] else {
+      panic!(
+        "expected item 1 to be `p: Point = Point.new(...)`, got {:?}",
+        program.items[1]
+      );
+    };
+    assert_eq!(name, "p");
+    assert_eq!(ty, "Point");
+    assert_eq!(
+      *value,
+      Expr::New("Point".into(), vec![Expr::Float(2.0), Expr::Float(3.0)])
+    );
+
+    let Item::Stmt(Stmt::Expr(call)) = &program.items[2] else {
+      panic!(
+        "expected item 2 to be `puts p.sum`, got {:?}",
+        program.items[2]
+      );
+    };
+    assert_eq!(
+      *call,
+      Expr::Call(
+        "puts".into(),
+        vec![Expr::MethodCall(
+          Box::new(Expr::Ident("p".into())),
+          "sum".into(),
+          vec![]
+        )]
+      )
+    );
   }
 }

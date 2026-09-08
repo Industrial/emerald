@@ -79,12 +79,13 @@ mod tests {
   }
 }
 
-// --- Ahead-of-time path: real Program -> object file (plan 06) --------
+// --- Ahead-of-time path: real Program -> object file (plans 06, 07, 08) -
 
+use cranelift::codegen::ir::MemFlagsData;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift_module::FuncId;
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use emerald_parser::{CompareOp, Expr, Function as AstFunction, Item, Program, Stmt};
+use emerald_parser::{ClassDef, CompareOp, Expr, Function as AstFunction, Item, Program, Stmt};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -93,6 +94,77 @@ use std::path::Path;
 struct LoopTargets {
   header: Block,
   exit: Block,
+}
+
+/// A field's byte offset and Cranelift storage type within its class's
+/// instance layout (plan 08: every field is naively 8 bytes — see the
+/// plan's Decision log).
+#[derive(Clone, Copy)]
+struct FieldInfo {
+  offset: i32,
+  cl_type: types::Type,
+}
+
+struct ClassLayout {
+  fields: HashMap<String, FieldInfo>,
+  size: i64,
+}
+
+/// `Float64` fields/params/locals are Cranelift `F64`; everything else
+/// (`Int64`, and class-instance pointers, which are just addresses) is
+/// `I64`. No other primitive width is in the type universe this compiler
+/// supports yet.
+fn cranelift_type(ty_name: &str) -> types::Type {
+  if ty_name == "Float64" {
+    types::F64
+  } else {
+    types::I64
+  }
+}
+
+/// Pushes a return `AbiParam` for `ty_name` — unless it's `"Void"`, which
+/// gets a genuinely empty Cranelift return list rather than a phantom
+/// `I64` slot nothing in the body ever produces (a Void-returning method
+/// like `initialize`, whose body ends in `@field = value` rather than an
+/// expression, must not be forced to fabricate a return value).
+fn push_return_type(returns: &mut Vec<AbiParam>, ty_name: &str) {
+  if ty_name != "Void" {
+    returns.push(AbiParam::new(cranelift_type(ty_name)));
+  }
+}
+
+fn build_class_layout(c: &ClassDef) -> ClassLayout {
+  let mut fields = HashMap::new();
+  let mut offset = 0i32;
+  for f in &c.fields {
+    fields.insert(
+      f.name.clone(),
+      FieldInfo {
+        offset,
+        cl_type: cranelift_type(&f.ty),
+      },
+    );
+    offset += 8;
+  }
+  ClassLayout {
+    fields,
+    size: offset as i64,
+  }
+}
+
+/// Context that's fixed for the duration of compiling one function/method
+/// body — bundled to keep `build_expr`/`build_stmt`'s own parameter lists
+/// from growing without bound as plans 07/08 added control flow and
+/// classes. `self_ctx` is `Some((self_var, &class.fields))` only while
+/// compiling a method body (see `define_method`).
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+  user_func_ids: &'a HashMap<String, FuncId>,
+  classes: &'a HashMap<String, ClassLayout>,
+  print_i64_func_id: Option<FuncId>,
+  print_f64_func_id: Option<FuncId>,
+  alloc_func_id: FuncId,
+  self_ctx: Option<(Variable, &'a HashMap<String, FieldInfo>)>,
 }
 
 fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, String> {
@@ -109,12 +181,19 @@ fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, 
     .map_err(|e| e.to_string())
 }
 
+/// `local_classes` maps a local variable name to its declared class name
+/// (from `Stmt::Let`'s explicit type annotation) — codegen has no typed
+/// IR to consult (see `spec/COMPILER.md`'s deferred-`emerald-ir` note), so
+/// a `.method` call on a local resolves its receiver's class this way
+/// rather than by inferring it from the (type-erased, both-just-`i64`)
+/// runtime pointer value.
 fn build_expr(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   expr: &Expr,
   vars: &HashMap<String, Variable>,
-  user_func_ids: &HashMap<String, FuncId>,
+  local_classes: &HashMap<String, String>,
+  ctx: &Ctx,
 ) -> Result<Value, String> {
   match expr {
     Expr::Ident(name) => {
@@ -124,14 +203,19 @@ fn build_expr(
       Ok(builder.use_var(*var))
     }
     Expr::Int(n) => Ok(builder.ins().iconst(types::I64, *n)),
+    Expr::Float(f) => Ok(builder.ins().f64const(*f)),
     Expr::Add(lhs, rhs) => {
-      let l = build_expr(builder, module, lhs, vars, user_func_ids)?;
-      let r = build_expr(builder, module, rhs, vars, user_func_ids)?;
-      Ok(builder.ins().iadd(l, r))
+      let l = build_expr(builder, module, lhs, vars, local_classes, ctx)?;
+      let r = build_expr(builder, module, rhs, vars, local_classes, ctx)?;
+      if builder.func.dfg.value_type(l) == types::F64 {
+        Ok(builder.ins().fadd(l, r))
+      } else {
+        Ok(builder.ins().iadd(l, r))
+      }
     }
     Expr::Compare(lhs, op, rhs) => {
-      let l = build_expr(builder, module, lhs, vars, user_func_ids)?;
-      let r = build_expr(builder, module, rhs, vars, user_func_ids)?;
+      let l = build_expr(builder, module, lhs, vars, local_classes, ctx)?;
+      let r = build_expr(builder, module, rhs, vars, local_classes, ctx)?;
       let cc = match op {
         CompareOp::Lt => IntCC::SignedLessThan,
         CompareOp::Gt => IntCC::SignedGreaterThan,
@@ -143,84 +227,160 @@ fn build_expr(
       Ok(builder.ins().icmp(cc, l, r))
     }
     Expr::Call(name, args) => {
-      let func_id = *user_func_ids.get(name).ok_or_else(|| {
+      let func_id = *ctx.user_func_ids.get(name).ok_or_else(|| {
         format!("codegen: unsupported call to `{name}` (not a compiled user function)")
       })?;
       let func_ref = module.declare_func_in_func(func_id, builder.func);
       let mut arg_vals = Vec::with_capacity(args.len());
       for a in args {
-        arg_vals.push(build_expr(builder, module, a, vars, user_func_ids)?);
+        arg_vals.push(build_expr(builder, module, a, vars, local_classes, ctx)?);
       }
       let call = builder.ins().call(func_ref, &arg_vals);
       Ok(builder.inst_results(call)[0])
     }
+    Expr::New(class_name, args) => {
+      let layout = ctx
+        .classes
+        .get(class_name)
+        .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
+      let size_val = builder.ins().iconst(types::I64, layout.size);
+      let alloc_ref = module.declare_func_in_func(ctx.alloc_func_id, builder.func);
+      let call = builder.ins().call(alloc_ref, &[size_val]);
+      let ptr = builder.inst_results(call)[0];
+
+      let init_key = format!("{class_name}_initialize");
+      if let Some(&init_id) = ctx.user_func_ids.get(&init_key) {
+        let init_ref = module.declare_func_in_func(init_id, builder.func);
+        let mut call_args = vec![ptr];
+        for a in args {
+          call_args.push(build_expr(builder, module, a, vars, local_classes, ctx)?);
+        }
+        builder.ins().call(init_ref, &call_args);
+      }
+      Ok(ptr)
+    }
+    Expr::MethodCall(recv, method, args) => {
+      let Expr::Ident(recv_name) = recv.as_ref() else {
+        return Err(
+          "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
+        );
+      };
+      let class_name = local_classes.get(recv_name).ok_or_else(|| {
+        format!("codegen: cannot determine the class of `{recv_name}` for `.{method}`")
+      })?;
+      let recv_val = build_expr(builder, module, recv, vars, local_classes, ctx)?;
+      let key = format!("{class_name}_{method}");
+      let func_id = *ctx
+        .user_func_ids
+        .get(&key)
+        .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
+      let func_ref = module.declare_func_in_func(func_id, builder.func);
+      let mut call_args = vec![recv_val];
+      for a in args {
+        call_args.push(build_expr(builder, module, a, vars, local_classes, ctx)?);
+      }
+      let call = builder.ins().call(func_ref, &call_args);
+      Ok(builder.inst_results(call)[0])
+    }
+    Expr::InstanceVar(name) => {
+      let (self_var, fields) = ctx
+        .self_ctx
+        .ok_or_else(|| format!("codegen: `@{name}` used outside of a method body"))?;
+      let field = fields
+        .get(name)
+        .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?;
+      let self_ptr = builder.use_var(self_var);
+      Ok(
+        builder
+          .ins()
+          .load(field.cl_type, MemFlagsData::new(), self_ptr, field.offset),
+      )
+    }
   }
 }
 
-/// Emits `puts <inner>` as a call to the imported `emerald_print_i64`
-/// runtime symbol (see `runtime/emerald_runtime.c`).
+/// Emits `puts <inner>` as a call to whichever of `emerald_print_i64` /
+/// `emerald_print_f64` matches the built argument's actual Cranelift
+/// value type (see `runtime/emerald_runtime.c` and plan 08's Decision
+/// log — `puts` is a call-site-polymorphic intrinsic, not an overloaded
+/// user function).
 fn build_puts(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   arg: &Expr,
   vars: &HashMap<String, Variable>,
-  user_func_ids: &HashMap<String, FuncId>,
-  print_func_id: Option<FuncId>,
+  local_classes: &HashMap<String, String>,
+  ctx: &Ctx,
 ) -> Result<(), String> {
-  let print_func_id = print_func_id.ok_or(
-    "codegen: `puts` is only supported at the program's top level, not inside a function body",
-  )?;
-  let val = build_expr(builder, module, arg, vars, user_func_ids)?;
-  let print_ref = module.declare_func_in_func(print_func_id, builder.func);
+  let val = build_expr(builder, module, arg, vars, local_classes, ctx)?;
+  let target_id = if builder.func.dfg.value_type(val) == types::F64 {
+    ctx.print_f64_func_id.ok_or(
+      "codegen: `puts` is only supported at the program's top level, not inside a function body",
+    )?
+  } else {
+    ctx.print_i64_func_id.ok_or(
+      "codegen: `puts` is only supported at the program's top level, not inside a function body",
+    )?
+  };
+  let print_ref = module.declare_func_in_func(target_id, builder.func);
   builder.ins().call(print_ref, &[val]);
   Ok(())
 }
 
-/// Emits one statement. `vars` is threaded flat (no block scoping —
-/// matches `emerald-sema`'s equally flat environment, see plan
-/// 07's Implementation Notes); `loop_stack`'s top is `break`/`next`'s
+/// Emits one statement. `vars`/`local_classes` are threaded flat (no
+/// block scoping — matches `emerald-sema`'s equally flat environment, see
+/// plan 07's Implementation Notes); `loop_stack`'s top is `break`/`next`'s
 /// target. Returns `true` if the statement emitted a block terminator
 /// (`return`/the loop-jump for `break`/`next`) — callers must not emit
 /// further instructions into the current block afterward.
-#[allow(clippy::too_many_arguments)]
 fn build_stmt(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   stmt: &Stmt,
   vars: &mut HashMap<String, Variable>,
-  user_func_ids: &HashMap<String, FuncId>,
-  print_func_id: Option<FuncId>,
+  local_classes: &mut HashMap<String, String>,
   loop_stack: &mut Vec<LoopTargets>,
+  ctx: &Ctx,
 ) -> Result<bool, String> {
   match stmt {
-    Stmt::Let { name, value, .. } => {
-      let v = build_expr(builder, module, value, vars, user_func_ids)?;
+    Stmt::Let { name, ty, value } => {
+      let v = build_expr(builder, module, value, vars, local_classes, ctx)?;
+      if ctx.classes.contains_key(ty.as_str()) {
+        local_classes.insert(name.clone(), ty.clone());
+      }
       if let Some(existing) = vars.get(name) {
         builder.def_var(*existing, v);
       } else {
-        let var = builder.declare_var(types::I64);
+        let var = builder.declare_var(cranelift_type(ty));
         builder.def_var(var, v);
         vars.insert(name.clone(), var);
       }
       Ok(false)
     }
+    Stmt::SetField { name, value } => {
+      let (self_var, fields) = ctx
+        .self_ctx
+        .ok_or_else(|| format!("codegen: `@{name} = ...` used outside of a method body"))?;
+      let field = *fields
+        .get(name)
+        .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?;
+      let v = build_expr(builder, module, value, vars, local_classes, ctx)?;
+      let self_ptr = builder.use_var(self_var);
+      builder
+        .ins()
+        .store(MemFlagsData::new(), v, self_ptr, field.offset);
+      Ok(false)
+    }
     Stmt::Expr(Expr::Call(name, args)) if name == "puts" && args.len() == 1 => {
-      build_puts(
-        builder,
-        module,
-        &args[0],
-        vars,
-        user_func_ids,
-        print_func_id,
-      )?;
+      build_puts(builder, module, &args[0], vars, local_classes, ctx)?;
       Ok(false)
     }
     Stmt::Expr(e) => {
-      build_expr(builder, module, e, vars, user_func_ids)?;
+      build_expr(builder, module, e, vars, local_classes, ctx)?;
       Ok(false)
     }
     Stmt::Return(Some(e)) => {
-      let v = build_expr(builder, module, e, vars, user_func_ids)?;
+      let v = build_expr(builder, module, e, vars, local_classes, ctx)?;
       builder.ins().return_(&[v]);
       Ok(true)
     }
@@ -247,7 +407,7 @@ fn build_stmt(
       then_branch,
       else_branch,
     } => {
-      let cond_val = build_expr(builder, module, cond, vars, user_func_ids)?;
+      let cond_val = build_expr(builder, module, cond, vars, local_classes, ctx)?;
       let then_blk = builder.create_block();
       let merge_blk = builder.create_block();
       let else_target_blk = if else_branch.is_some() {
@@ -267,9 +427,9 @@ fn build_stmt(
         module,
         then_branch,
         vars,
-        user_func_ids,
-        print_func_id,
+        local_classes,
         loop_stack,
+        ctx,
       )?;
       if !then_terminated {
         builder.ins().jump(merge_blk, &[]);
@@ -283,9 +443,9 @@ fn build_stmt(
           module,
           else_branch,
           vars,
-          user_func_ids,
-          print_func_id,
+          local_classes,
           loop_stack,
+          ctx,
         )?;
         if !else_terminated {
           builder.ins().jump(merge_blk, &[]);
@@ -304,7 +464,7 @@ fn build_stmt(
       builder.ins().jump(header_blk, &[]);
 
       builder.switch_to_block(header_blk);
-      let cond_val = build_expr(builder, module, cond, vars, user_func_ids)?;
+      let cond_val = build_expr(builder, module, cond, vars, local_classes, ctx)?;
       builder.ins().brif(cond_val, body_blk, &[], exit_blk, &[]);
       // header_blk isn't sealed yet — the loop body's back-edge (below) is
       // a predecessor that doesn't exist until after the body is built.
@@ -315,15 +475,8 @@ fn build_stmt(
         header: header_blk,
         exit: exit_blk,
       });
-      let body_terminated = build_block(
-        builder,
-        module,
-        body,
-        vars,
-        user_func_ids,
-        print_func_id,
-        loop_stack,
-      )?;
+      let body_terminated =
+        build_block(builder, module, body, vars, local_classes, loop_stack, ctx)?;
       loop_stack.pop();
       if !body_terminated {
         builder.ins().jump(header_blk, &[]);
@@ -342,26 +495,17 @@ fn build_stmt(
 /// anything syntactically after `return`/`break`/`next` in the same list
 /// is unreachable and must not be emitted into an already-terminated
 /// Cranelift block.
-#[allow(clippy::too_many_arguments)]
 fn build_block(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   stmts: &[Stmt],
   vars: &mut HashMap<String, Variable>,
-  user_func_ids: &HashMap<String, FuncId>,
-  print_func_id: Option<FuncId>,
+  local_classes: &mut HashMap<String, String>,
   loop_stack: &mut Vec<LoopTargets>,
+  ctx: &Ctx,
 ) -> Result<bool, String> {
   for stmt in stmts {
-    let terminated = build_stmt(
-      builder,
-      module,
-      stmt,
-      vars,
-      user_func_ids,
-      print_func_id,
-      loop_stack,
-    )?;
+    let terminated = build_stmt(builder, module, stmt, vars, local_classes, loop_stack, ctx)?;
     if terminated {
       return Ok(true);
     }
@@ -369,19 +513,18 @@ fn build_block(
   Ok(false)
 }
 
-/// Builds a function's `Vec<Stmt>` body, honoring Ruby-style implicit
-/// return: if the body doesn't already end in an explicit terminator
-/// (`return`/`break`/`next`), the last statement — if a bare `Stmt::Expr`
-/// — has its value returned, matching `emerald-sema`'s implicit-return
-/// check in `check_function_body`.
-#[allow(clippy::too_many_arguments)]
+/// Builds a function/method's `Vec<Stmt>` body, honoring Ruby-style
+/// implicit return: if the body doesn't already end in an explicit
+/// terminator (`return`/`break`/`next`), the last statement — if a bare
+/// `Stmt::Expr` — has its value returned, matching `emerald-sema`'s
+/// implicit-return check.
 fn build_function_body(
   builder: &mut FunctionBuilder,
   module: &mut ObjectModule,
   body: &[Stmt],
   vars: &mut HashMap<String, Variable>,
-  user_func_ids: &HashMap<String, FuncId>,
-  print_func_id: Option<FuncId>,
+  local_classes: &mut HashMap<String, String>,
+  gen_ctx: &Ctx,
 ) -> Result<(), String> {
   let mut loop_stack = Vec::new();
   let Some((last, init)) = body.split_last() else {
@@ -394,9 +537,9 @@ fn build_function_body(
     module,
     init,
     vars,
-    user_func_ids,
-    print_func_id,
+    local_classes,
     &mut loop_stack,
+    gen_ctx,
   )?;
   if terminated {
     return Ok(());
@@ -404,19 +547,27 @@ fn build_function_body(
 
   match last {
     Stmt::Expr(e) => {
-      let v = build_expr(builder, module, e, vars, user_func_ids)?;
+      let v = build_expr(builder, module, e, vars, local_classes, gen_ctx)?;
       builder.ins().return_(&[v]);
     }
     other => {
-      build_stmt(
+      let terminated = build_stmt(
         builder,
         module,
         other,
         vars,
-        user_func_ids,
-        print_func_id,
+        local_classes,
         &mut loop_stack,
+        gen_ctx,
       )?;
+      // A Void-returning body whose last statement isn't a value-
+      // producing Stmt::Expr (e.g. `initialize`'s trailing `@y = y`)
+      // needs an explicit empty `return` — nothing else would ever
+      // terminate the block, and Cranelift requires every block to end
+      // in a terminator.
+      if !terminated && builder.func.signature.returns.is_empty() {
+        builder.ins().return_(&[]);
+      }
     }
   }
   Ok(())
@@ -428,14 +579,18 @@ fn define_user_function(
   func_ctx: &mut FunctionBuilderContext,
   f: &AstFunction,
   id: FuncId,
-  user_func_ids: &HashMap<String, FuncId>,
+  gen_ctx: &Ctx,
 ) -> Result<(), String> {
   ctx.func.signature.params.clear();
   ctx.func.signature.returns.clear();
-  for _ in &f.params {
-    ctx.func.signature.params.push(AbiParam::new(types::I64));
+  for p in &f.params {
+    ctx
+      .func
+      .signature
+      .params
+      .push(AbiParam::new(cranelift_type(&p.ty)));
   }
-  ctx.func.signature.returns.push(AbiParam::new(types::I64));
+  push_return_type(&mut ctx.func.signature.returns, &f.return_type);
 
   let frontend_config = module.target_config();
   {
@@ -446,11 +601,15 @@ fn define_user_function(
     builder.seal_block(block);
 
     let mut vars: HashMap<String, Variable> = HashMap::new();
+    let mut local_classes: HashMap<String, String> = HashMap::new();
     for (i, p) in f.params.iter().enumerate() {
       let param_val = builder.block_params(block)[i];
-      let var = builder.declare_var(types::I64);
+      let var = builder.declare_var(cranelift_type(&p.ty));
       builder.def_var(var, param_val);
       vars.insert(p.name.clone(), var);
+      if gen_ctx.classes.contains_key(p.ty.as_str()) {
+        local_classes.insert(p.name.clone(), p.ty.clone());
+      }
     }
 
     build_function_body(
@@ -458,11 +617,77 @@ fn define_user_function(
       module,
       &f.body,
       &mut vars,
-      user_func_ids,
-      // `puts` is only wired up for the top-level `main` body (matching
-      // examples/hello.em's shape); a `puts` call inside a user function
-      // returns a descriptive `Err` via `build_puts`, not a panic.
-      None,
+      &mut local_classes,
+      gen_ctx,
+    )?;
+    builder.finalize(frontend_config);
+  }
+
+  module.define_function(id, ctx).map_err(|e| e.to_string())?;
+  module.clear_context(ctx);
+  Ok(())
+}
+
+/// Compiles one class method as `{ClassName}_{methodName}`, taking an
+/// implicit leading `self: i64` pointer parameter ahead of the method's
+/// own declared parameters. `self_fields` (the class's field layout) is
+/// threaded through `gen_ctx.self_ctx` for the method body's `@field`
+/// reads/writes.
+fn define_method(
+  module: &mut ObjectModule,
+  ctx: &mut cranelift::codegen::Context,
+  func_ctx: &mut FunctionBuilderContext,
+  m: &AstFunction,
+  id: FuncId,
+  self_fields: &HashMap<String, FieldInfo>,
+  gen_ctx: &Ctx,
+) -> Result<(), String> {
+  ctx.func.signature.params.clear();
+  ctx.func.signature.returns.clear();
+  ctx.func.signature.params.push(AbiParam::new(types::I64)); // self
+  for p in &m.params {
+    ctx
+      .func
+      .signature
+      .params
+      .push(AbiParam::new(cranelift_type(&p.ty)));
+  }
+  push_return_type(&mut ctx.func.signature.returns, &m.return_type);
+
+  let frontend_config = module.target_config();
+  {
+    let mut builder = FunctionBuilder::new(&mut ctx.func, func_ctx);
+    let block = builder.create_block();
+    builder.append_block_params_for_function_params(block);
+    builder.switch_to_block(block);
+    builder.seal_block(block);
+
+    let self_var = builder.declare_var(types::I64);
+    builder.def_var(self_var, builder.block_params(block)[0]);
+
+    let mut vars: HashMap<String, Variable> = HashMap::new();
+    let mut local_classes: HashMap<String, String> = HashMap::new();
+    for (i, p) in m.params.iter().enumerate() {
+      let param_val = builder.block_params(block)[i + 1];
+      let var = builder.declare_var(cranelift_type(&p.ty));
+      builder.def_var(var, param_val);
+      vars.insert(p.name.clone(), var);
+      if gen_ctx.classes.contains_key(p.ty.as_str()) {
+        local_classes.insert(p.name.clone(), p.ty.clone());
+      }
+    }
+
+    let method_ctx = Ctx {
+      self_ctx: Some((self_var, self_fields)),
+      ..*gen_ctx
+    };
+    build_function_body(
+      &mut builder,
+      module,
+      &m.body,
+      &mut vars,
+      &mut local_classes,
+      &method_ctx,
     )?;
     builder.finalize(frontend_config);
   }
@@ -477,8 +702,7 @@ fn define_main(
   ctx: &mut cranelift::codegen::Context,
   func_ctx: &mut FunctionBuilderContext,
   program: &Program,
-  user_func_ids: &HashMap<String, FuncId>,
-  print_func_id: Option<FuncId>,
+  gen_ctx: &Ctx,
 ) -> Result<(), String> {
   ctx.func.signature.params.clear();
   ctx.func.signature.returns.clear();
@@ -496,6 +720,7 @@ fn define_main(
     builder.seal_block(block);
 
     let mut vars: HashMap<String, Variable> = HashMap::new();
+    let mut local_classes: HashMap<String, String> = HashMap::new();
     let mut loop_stack = Vec::new();
 
     let top_stmts: Vec<Stmt> = program
@@ -515,9 +740,9 @@ fn define_main(
       module,
       &top_stmts,
       &mut vars,
-      user_func_ids,
-      print_func_id,
+      &mut local_classes,
       &mut loop_stack,
+      gen_ctx,
     )?;
 
     if !terminated {
@@ -535,10 +760,12 @@ fn define_main(
 }
 
 /// Compiles a type-checked `Program` to a native object file at `out_path`.
-/// One exported function per `Item::Function`, plus a `main` (`extern "C"
-/// fn() -> i32`) that evaluates the top-level `puts` call statement via
-/// the imported `emerald_print_i64` runtime symbol (see
-/// `runtime/emerald_runtime.c`) and returns 0.
+/// One exported function per `Item::Function`, `{Class}_{method}` per
+/// class method (plan 08), plus a `main` (`extern "C" fn() -> i32`) that
+/// evaluates the top-level statements (including the `puts` call
+/// statement) via the imported `emerald_print_i64`/`emerald_print_f64`/
+/// `emerald_alloc` runtime symbols (see `runtime/emerald_runtime.c`) and
+/// returns 0.
 pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
   let isa = host_isa()?;
   let obj_builder = ObjectBuilder::new(
@@ -549,26 +776,73 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   .map_err(|e| e.to_string())?;
   let mut module = ObjectModule::new(obj_builder);
 
-  let mut print_sig = module.make_signature();
-  print_sig.params.push(AbiParam::new(types::I64));
-  let print_func_id = module
-    .declare_function("emerald_print_i64", Linkage::Import, &print_sig)
+  let mut print_i64_sig = module.make_signature();
+  print_i64_sig.params.push(AbiParam::new(types::I64));
+  let print_i64_func_id = module
+    .declare_function("emerald_print_i64", Linkage::Import, &print_i64_sig)
     .map_err(|e| e.to_string())?;
+
+  let mut print_f64_sig = module.make_signature();
+  print_f64_sig.params.push(AbiParam::new(types::F64));
+  let print_f64_func_id = module
+    .declare_function("emerald_print_f64", Linkage::Import, &print_f64_sig)
+    .map_err(|e| e.to_string())?;
+
+  let mut alloc_sig = module.make_signature();
+  alloc_sig.params.push(AbiParam::new(types::I64));
+  alloc_sig.returns.push(AbiParam::new(types::I64));
+  let alloc_func_id = module
+    .declare_function("emerald_alloc", Linkage::Import, &alloc_sig)
+    .map_err(|e| e.to_string())?;
+
+  // Class layouts (field offsets/types) — computed once, independent of
+  // declaration order between classes (plan 08 doesn't support classes
+  // referencing each other's fields yet, so no ordering dependency here).
+  let mut classes: HashMap<String, ClassLayout> = HashMap::new();
+  for item in &program.items {
+    if let Item::Class(c) = item {
+      classes.insert(c.name.clone(), build_class_layout(c));
+    }
+  }
 
   let mut user_func_ids: HashMap<String, FuncId> = HashMap::new();
   for item in &program.items {
     if let Item::Function(f) = item {
       let mut sig = module.make_signature();
-      for _ in &f.params {
-        sig.params.push(AbiParam::new(types::I64));
+      for p in &f.params {
+        sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
       }
-      sig.returns.push(AbiParam::new(types::I64));
+      push_return_type(&mut sig.returns, &f.return_type);
       let id = module
         .declare_function(&f.name, Linkage::Export, &sig)
         .map_err(|e| e.to_string())?;
       user_func_ids.insert(f.name.clone(), id);
     }
+    if let Item::Class(c) = item {
+      for m in &c.methods {
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // self
+        for p in &m.params {
+          sig.params.push(AbiParam::new(cranelift_type(&p.ty)));
+        }
+        push_return_type(&mut sig.returns, &m.return_type);
+        let mangled = format!("{}_{}", c.name, m.name);
+        let id = module
+          .declare_function(&mangled, Linkage::Export, &sig)
+          .map_err(|e| e.to_string())?;
+        user_func_ids.insert(mangled, id);
+      }
+    }
   }
+
+  let gen_ctx = Ctx {
+    user_func_ids: &user_func_ids,
+    classes: &classes,
+    print_i64_func_id: Some(print_i64_func_id),
+    print_f64_func_id: Some(print_f64_func_id),
+    alloc_func_id,
+    self_ctx: None,
+  };
 
   let mut ctx = module.make_context();
   let mut func_ctx = FunctionBuilderContext::new();
@@ -576,18 +850,27 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   for item in &program.items {
     if let Item::Function(f) = item {
       let id = *user_func_ids.get(&f.name).unwrap();
-      define_user_function(&mut module, &mut ctx, &mut func_ctx, f, id, &user_func_ids)?;
+      define_user_function(&mut module, &mut ctx, &mut func_ctx, f, id, &gen_ctx)?;
+    }
+    if let Item::Class(c) = item {
+      let layout = classes.get(&c.name).unwrap();
+      for m in &c.methods {
+        let mangled = format!("{}_{}", c.name, m.name);
+        let id = *user_func_ids.get(&mangled).unwrap();
+        define_method(
+          &mut module,
+          &mut ctx,
+          &mut func_ctx,
+          m,
+          id,
+          &layout.fields,
+          &gen_ctx,
+        )?;
+      }
     }
   }
 
-  define_main(
-    &mut module,
-    &mut ctx,
-    &mut func_ctx,
-    program,
-    &user_func_ids,
-    Some(print_func_id),
-  )?;
+  define_main(&mut module, &mut ctx, &mut func_ctx, program, &gen_ctx)?;
 
   let object = module.finish();
   let bytes = object.emit().map_err(|e| e.to_string())?;
@@ -684,6 +967,16 @@ mod aot_tests {
     // loop runs at all.
     let src = "total: Int64 = 0\ni: Int64 = 1\nwhile i < 4\n  if i == 2\n    break\n  end\n  total: Int64 = total + i\n  i: Int64 = i + 1\nend\nputs total\n";
     assert_eq!(compile_link_run(src), "1\n");
+  }
+
+  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+
+  #[test]
+  fn inception_point_example_linked_and_run_prints_5() {
+    // 2.0 + 3.0 = 5.0; emerald_print_f64 uses "%g", which renders a whole
+    // number without a trailing ".0" — pinned from the real observed
+    // output, not guessed (plan 08's leaf-codegen-class AC1).
+    assert_eq!(compile_link_run(POINT_EXAMPLE), "5\n");
   }
 
   #[test]

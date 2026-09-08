@@ -5,15 +5,18 @@
 //! don't carry spans) — diagnostics are function/call-scoped text.
 //! Line/column-precise diagnostics are `13 diagnostics`'s job.
 
-use emerald_parser::{Expr, Function, Item, Program, Stmt};
+use emerald_parser::{ClassDef, Expr, Function, Item, Program, Stmt};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
   Int64,
+  Float64,
   String,
   Boolean,
   Void,
+  /// An instance of a user-defined class, named by its declaration.
+  Class(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,57 +32,91 @@ impl Diagnostic {
   }
 }
 
-/// Resolves a type name against `spec/TYPE_SYSTEM.md`'s primitives. Errors
-/// on any unrecognized name rather than silently accepting it.
-pub fn resolve_type_name(name: &str) -> Result<Type, Diagnostic> {
-  match name {
-    "Int64" => Ok(Type::Int64),
-    "String" => Ok(Type::String),
-    "Void" => Ok(Type::Void),
-    "Boolean" => Ok(Type::Boolean),
-    other => Err(Diagnostic::new(format!("unknown type `{other}`"))),
-  }
-}
-
 #[derive(Debug, Clone)]
 struct FunctionSig {
   params: Vec<Type>,
   return_type: Type,
 }
 
-fn function_signature(f: &Function) -> Result<FunctionSig, Diagnostic> {
+#[derive(Debug, Clone)]
+struct ClassInfo {
+  fields: HashMap<String, Type>,
+  methods: HashMap<String, FunctionSig>,
+}
+
+/// Resolves a type name against `spec/TYPE_SYSTEM.md`'s primitives, then
+/// against declared classes. Errors on any unrecognized name rather than
+/// silently accepting it.
+fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type, Diagnostic> {
+  match name {
+    "Int64" => Ok(Type::Int64),
+    "Float64" => Ok(Type::Float64),
+    "String" => Ok(Type::String),
+    "Void" => Ok(Type::Void),
+    "Boolean" => Ok(Type::Boolean),
+    other if classes.contains_key(other) => Ok(Type::Class(other.to_string())),
+    other => Err(Diagnostic::new(format!("unknown type `{other}`"))),
+  }
+}
+
+fn function_signature(
+  f: &Function,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<FunctionSig, Diagnostic> {
   let params = f
     .params
     .iter()
-    .map(|p| resolve_type_name(&p.ty))
+    .map(|p| resolve_type(&p.ty, classes))
     .collect::<Result<Vec<_>, _>>()?;
-  let return_type = resolve_type_name(&f.return_type)?;
+  let return_type = resolve_type(&f.return_type, classes)?;
   Ok(FunctionSig {
     params,
     return_type,
   })
 }
 
+/// Builds one class's field/method tables. `classes` must already contain
+/// an entry for every class name this class's fields/methods reference
+/// (including, trivially, itself — see `check_program`'s two-pass
+/// registration).
+fn class_info(c: &ClassDef, classes: &HashMap<String, ClassInfo>) -> Result<ClassInfo, Diagnostic> {
+  let mut fields = HashMap::new();
+  for f in &c.fields {
+    fields.insert(f.name.clone(), resolve_type(&f.ty, classes)?);
+  }
+  let mut methods = HashMap::new();
+  for m in &c.methods {
+    methods.insert(m.name.clone(), function_signature(m, classes)?);
+  }
+  Ok(ClassInfo { fields, methods })
+}
+
+/// `self_fields` is `Some(&class.fields)` while checking a method body,
+/// `None` everywhere else — gates `@field` legality (plan 08 AC4).
+#[allow(clippy::too_many_arguments)]
 fn infer_expr_type(
   expr: &Expr,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
 ) -> Result<Type, Diagnostic> {
   match expr {
     Expr::Ident(name) => env
       .get(name)
-      .copied()
+      .cloned()
       .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"))),
     Expr::Int(_) => Ok(Type::Int64),
+    Expr::Float(_) => Ok(Type::Float64),
     Expr::Add(lhs, rhs) => {
-      let lt = infer_expr_type(lhs, env, sigs)?;
-      let rt = infer_expr_type(rhs, env, sigs)?;
+      let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+      let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
       if lt != rt {
         return Err(Diagnostic::new(format!(
           "type mismatch: `+` requires both operands to have the same type, found {lt:?} and {rt:?}"
         )));
       }
-      if lt != Type::Int64 {
+      if lt != Type::Int64 && lt != Type::Float64 {
         return Err(Diagnostic::new(format!(
           "type `{lt:?}` does not support `+`"
         )));
@@ -87,8 +124,8 @@ fn infer_expr_type(
       Ok(lt)
     }
     Expr::Compare(lhs, op, rhs) => {
-      let lt = infer_expr_type(lhs, env, sigs)?;
-      let rt = infer_expr_type(rhs, env, sigs)?;
+      let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+      let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
       if lt != rt {
         return Err(Diagnostic::new(format!(
           "type mismatch: `{op:?}` requires both operands to have the same type, found {lt:?} and {rt:?}"
@@ -96,46 +133,132 @@ fn infer_expr_type(
       }
       Ok(Type::Boolean)
     }
+    // `puts` is a compiler intrinsic, not an overloaded function (locks
+    // spec/SEMANTICS.md §3's "no overloading in v1") — it accepts exactly
+    // one Int64 or Float64 argument, checked here directly rather than via
+    // a `FunctionSig` in `sigs` (see plan 08's Decision log).
+    Expr::Call(name, args) if name == "puts" => {
+      if args.len() != 1 {
+        return Err(Diagnostic::new(format!(
+          "`puts` expects 1 argument, found {}",
+          args.len()
+        )));
+      }
+      let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields)?;
+      if arg_ty != Type::Int64 && arg_ty != Type::Float64 {
+        return Err(Diagnostic::new(format!(
+          "`puts` does not support type {arg_ty:?}"
+        )));
+      }
+      Ok(Type::Void)
+    }
     Expr::Call(name, args) => {
       let sig = sigs
         .get(name)
         .ok_or_else(|| Diagnostic::new(format!("undefined function `{name}`")))?;
-      if args.len() != sig.params.len() {
-        return Err(Diagnostic::new(format!(
-          "function `{name}` expects {} argument(s), found {}",
-          sig.params.len(),
-          args.len()
-        )));
-      }
-      for (i, (arg, expected)) in args.iter().zip(&sig.params).enumerate() {
-        let actual = infer_expr_type(arg, env, sigs)?;
-        if actual != *expected {
+      check_args(name, args, &sig.params, env, sigs, classes, self_fields)?;
+      Ok(sig.return_type.clone())
+    }
+    Expr::New(class_name, args) => {
+      let info = classes
+        .get(class_name)
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`")))?;
+      match info.methods.get("initialize") {
+        Some(sig) => check_args(
+          "initialize",
+          args,
+          &sig.params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+        )?,
+        None if args.is_empty() => {}
+        None => {
           return Err(Diagnostic::new(format!(
-            "argument {} to `{name}` has type {actual:?}, expected {expected:?}",
-            i + 1
+            "`{class_name}.new` called with {} argument(s), but `{class_name}` declares no `initialize`",
+            args.len()
           )));
         }
       }
-      Ok(sig.return_type)
+      Ok(Type::Class(class_name.clone()))
+    }
+    Expr::MethodCall(recv, method, args) => {
+      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields)?;
+      let Type::Class(class_name) = &recv_ty else {
+        return Err(Diagnostic::new(format!(
+          "method call `.{method}` on non-class type {recv_ty:?}"
+        )));
+      };
+      let info = classes.get(class_name).ok_or_else(|| {
+        Diagnostic::new(format!("internal error: unregistered class `{class_name}`"))
+      })?;
+      let sig = info
+        .methods
+        .get(method)
+        .ok_or_else(|| Diagnostic::new(format!("class `{class_name}` has no method `{method}`")))?;
+      check_args(method, args, &sig.params, env, sigs, classes, self_fields)?;
+      Ok(sig.return_type.clone())
+    }
+    Expr::InstanceVar(name) => {
+      let fields = self_fields
+        .ok_or_else(|| Diagnostic::new(format!("`@{name}` used outside of a method body")))?;
+      fields
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`")))
     }
   }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_args(
+  name: &str,
+  args: &[Expr],
+  expected: &[Type],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<(), Diagnostic> {
+  if args.len() != expected.len() {
+    return Err(Diagnostic::new(format!(
+      "`{name}` expects {} argument(s), found {}",
+      expected.len(),
+      args.len()
+    )));
+  }
+  for (i, (arg, expected_ty)) in args.iter().zip(expected).enumerate() {
+    let actual = infer_expr_type(arg, env, sigs, classes, self_fields)?;
+    if actual != *expected_ty {
+      return Err(Diagnostic::new(format!(
+        "argument {} to `{name}` has type {actual:?}, expected {expected_ty:?}",
+        i + 1
+      )));
+    }
+  }
+  Ok(())
 }
 
 /// Type-checks one statement, threading a mutable local-variable
 /// environment and the enclosing function's declared return type (used to
 /// check every `return <expr>`, not just a trailing one). `in_loop` gates
-/// `break`/`next` legality.
+/// `break`/`next` legality. `self_fields` is `Some` only inside a method
+/// body (see `infer_expr_type`).
+#[allow(clippy::too_many_arguments)]
 fn check_stmt(
   stmt: &Stmt,
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
-  return_type: Type,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  return_type: &Type,
   in_loop: bool,
 ) -> Result<(), Diagnostic> {
   match stmt {
     Stmt::Let { name, ty, value } => {
-      let declared = resolve_type_name(ty)?;
-      let actual = infer_expr_type(value, env, sigs)?;
+      let declared = resolve_type(ty, classes)?;
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
       if actual != declared {
         return Err(Diagnostic::new(format!(
           "type mismatch in `{name}: {ty} = ...`: declared type {declared:?}, value has type {actual:?}"
@@ -144,35 +267,66 @@ fn check_stmt(
       env.insert(name.clone(), declared);
       Ok(())
     }
+    Stmt::SetField { name, value } => {
+      let fields = self_fields
+        .ok_or_else(|| Diagnostic::new(format!("`@{name} = ...` used outside of a method body")))?;
+      let declared = fields
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`")))?;
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+      if actual != declared {
+        return Err(Diagnostic::new(format!(
+          "type mismatch in `@{name} = ...`: field declared {declared:?}, value has type {actual:?}"
+        )));
+      }
+      Ok(())
+    }
     Stmt::If {
       cond,
       then_branch,
       else_branch,
     } => {
-      let cond_ty = infer_expr_type(cond, env, sigs)?;
+      let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields)?;
       if cond_ty != Type::Boolean {
         return Err(Diagnostic::new(format!(
           "`if` condition must be Boolean, found {cond_ty:?} (no truthy/falsy coercion — spec/GRAMMAR.md §5)"
         )));
       }
-      check_block(then_branch, env, sigs, return_type, in_loop)?;
+      check_block(
+        then_branch,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        return_type,
+        in_loop,
+      )?;
       if let Some(else_b) = else_branch {
-        check_block(else_b, env, sigs, return_type, in_loop)?;
+        check_block(
+          else_b,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          return_type,
+          in_loop,
+        )?;
       }
       Ok(())
     }
     Stmt::While { cond, body } => {
-      let cond_ty = infer_expr_type(cond, env, sigs)?;
+      let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields)?;
       if cond_ty != Type::Boolean {
         return Err(Diagnostic::new(format!(
           "`while` condition must be Boolean, found {cond_ty:?}"
         )));
       }
-      check_block(body, env, sigs, return_type, true)
+      check_block(body, env, sigs, classes, self_fields, return_type, true)
     }
     Stmt::Return(Some(e)) => {
-      let t = infer_expr_type(e, env, sigs)?;
-      if t != return_type {
+      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      if t != *return_type {
         return Err(Diagnostic::new(format!(
           "type mismatch: `return` value has type {t:?} but the enclosing function declares {return_type:?}"
         )));
@@ -192,19 +346,45 @@ fn check_stmt(
       }
       Ok(())
     }
-    Stmt::Expr(e) => infer_expr_type(e, env, sigs).map(|_| ()),
+    Stmt::Expr(e) => infer_expr_type(e, env, sigs, classes, self_fields).map(|_| ()),
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_block(
   stmts: &[Stmt],
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
-  return_type: Type,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  return_type: &Type,
   in_loop: bool,
 ) -> Result<(), Diagnostic> {
   for stmt in stmts {
-    check_stmt(stmt, env, sigs, return_type, in_loop)?;
+    check_stmt(stmt, env, sigs, classes, self_fields, return_type, in_loop)?;
+  }
+  Ok(())
+}
+
+/// Checks the final-statement implicit-return rule shared by free
+/// functions and methods (Ruby-style: a body whose last statement is a
+/// bare expression returns that expression's value).
+fn check_implicit_return(
+  body: &[Stmt],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  declared_return: &Type,
+  owner_name: &str,
+) -> Result<(), Diagnostic> {
+  if let Some(Stmt::Expr(e)) = body.last() {
+    let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+    if t != *declared_return {
+      return Err(Diagnostic::new(format!(
+        "type mismatch in `{owner_name}`: body has type {t:?} but declared return type is {declared_return:?}"
+      )));
+    }
   }
   Ok(())
 }
@@ -212,54 +392,103 @@ fn check_block(
 fn check_function_body(
   f: &Function,
   sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
 ) -> Result<(), Diagnostic> {
   let mut env = HashMap::new();
   for p in &f.params {
-    env.insert(p.name.clone(), resolve_type_name(&p.ty)?);
+    env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
   }
-  let declared_return = resolve_type_name(&f.return_type)?;
-  check_block(&f.body, &mut env, sigs, declared_return, false)?;
-
-  // Implicit-return check: a function whose body's last statement is a
-  // bare expression returns that expression's value (Ruby-style implicit
-  // return), matching inception §17's `add` example. Every explicit
-  // `return` was already checked against `declared_return` in check_stmt
-  // above, regardless of position.
-  if let Some(Stmt::Expr(e)) = f.body.last() {
-    let t = infer_expr_type(e, &env, sigs)?;
-    if t != declared_return {
-      return Err(Diagnostic::new(format!(
-        "type mismatch in function `{}`: body has type {t:?} but declared return type is {declared_return:?}",
-        f.name
-      )));
-    }
-  }
-  Ok(())
+  let declared_return = resolve_type(&f.return_type, classes)?;
+  check_block(
+    &f.body,
+    &mut env,
+    sigs,
+    classes,
+    None,
+    &declared_return,
+    false,
+  )?;
+  check_implicit_return(
+    &f.body,
+    &env,
+    sigs,
+    classes,
+    None,
+    &declared_return,
+    &f.name,
+  )
 }
 
-fn builtin_signatures() -> HashMap<String, FunctionSig> {
-  let mut sigs = HashMap::new();
-  sigs.insert(
-    "puts".to_string(),
-    FunctionSig {
-      params: vec![Type::Int64],
-      return_type: Type::Void,
-    },
-  );
-  sigs
+fn check_method_body(
+  class_name: &str,
+  m: &Function,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  fields: &HashMap<String, Type>,
+) -> Result<(), Diagnostic> {
+  let mut env = HashMap::new();
+  for p in &m.params {
+    env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
+  }
+  let declared_return = resolve_type(&m.return_type, classes)?;
+  check_block(
+    &m.body,
+    &mut env,
+    sigs,
+    classes,
+    Some(fields),
+    &declared_return,
+    false,
+  )?;
+  check_implicit_return(
+    &m.body,
+    &env,
+    sigs,
+    classes,
+    Some(fields),
+    &declared_return,
+    &format!("{class_name}#{}", m.name),
+  )
 }
 
-/// Type-checks a full program: builds a function-signature table (name
-/// resolution) then checks every function body and top-level call
-/// expression. Two-pass so a top-level call to a function defined later
-/// in the same `Item*` list still resolves.
+/// Type-checks a full program: registers classes (two sub-passes — names
+/// first so field/method types can reference class names, then full
+/// field/method tables) and free-function signatures, then checks every
+/// function body, every class's method bodies, and every top-level
+/// statement. `puts` is handled directly in `infer_expr_type`, not
+/// registered here (see plan 08's Decision log) — free functions are
+/// enough two-pass ordering for a top-level call to a function defined
+/// later in the same `Item*` list to still resolve.
 pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
-  let mut sigs = builtin_signatures();
   let mut diags = Vec::new();
 
+  let mut classes: HashMap<String, ClassInfo> = HashMap::new();
+  for item in &program.items {
+    if let Item::Class(c) = item {
+      classes.insert(
+        c.name.clone(),
+        ClassInfo {
+          fields: HashMap::new(),
+          methods: HashMap::new(),
+        },
+      );
+    }
+  }
+  for item in &program.items {
+    if let Item::Class(c) = item {
+      match class_info(c, &classes) {
+        Ok(info) => {
+          classes.insert(c.name.clone(), info);
+        }
+        Err(d) => diags.push(d),
+      }
+    }
+  }
+
+  let mut sigs: HashMap<String, FunctionSig> = HashMap::new();
   for item in &program.items {
     if let Item::Function(f) = item {
-      match function_signature(f) {
+      match function_signature(f, &classes) {
         Ok(sig) => {
           sigs.insert(f.name.clone(), sig);
         }
@@ -268,21 +497,32 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     }
   }
 
+  // Declared once, outside the loop: top-level statements share one
+  // environment across the whole program in order (`x: Int64 = 10` then
+  // `if x > 5 ...` needs `x` visible in a later Item::Stmt).
   let mut top_env: HashMap<String, Type> = HashMap::new();
   for item in &program.items {
     match item {
       Item::Function(f) => {
-        if let Err(d) = check_function_body(f, &sigs) {
+        if let Err(d) = check_function_body(f, &sigs, &classes) {
           diags.push(d);
         }
       }
-      // Top-level statements share one environment across the whole
-      // program in order (`x: Int64 = 10` then `if x > 5 ...` needs `x`
-      // visible) and have no enclosing function return type — Void is a
-      // safe sentinel since a bare `return` at top level is not exercised
-      // by this milestone.
+      Item::Class(c) => {
+        let Some(info) = classes.get(&c.name) else {
+          continue;
+        };
+        for m in &c.methods {
+          if let Err(d) = check_method_body(&c.name, m, &sigs, &classes, &info.fields) {
+            diags.push(d);
+          }
+        }
+      }
+      // No enclosing function return type (Void is a safe sentinel — a
+      // bare `return` at top level is not exercised by this milestone),
+      // and never inside a method (`self_fields: None`).
       Item::Stmt(s) => {
-        if let Err(d) = check_stmt(s, &mut top_env, &sigs, Type::Void, false) {
+        if let Err(d) = check_stmt(s, &mut top_env, &sigs, &classes, None, &Type::Void, false) {
           diags.push(d);
         }
       }
@@ -379,5 +619,54 @@ mod tests {
     let src = "x: Int64 = 0\n\nwhile x < 3\n  x: Int64 = x + 1\n  break\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+
+  #[test]
+  fn accepts_inception_point_example() {
+    let program = emerald_parser::parse(POINT_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_field_assignment_type_mismatch() {
+    let src =
+      "class Point\n  x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = 1\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject Int64 assigned to a Float64 field");
+    let msg = &errs[0].message;
+    assert!(
+      msg.contains("Float64") && msg.contains("Int64"),
+      "diagnostic should name both types: {msg}"
+    );
+  }
+
+  #[test]
+  fn rejects_instance_var_outside_method_body() {
+    let src = "puts @x\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject @x outside a method body");
+    assert!(errs[0].message.contains("outside of a method body"));
+  }
+
+  #[test]
+  fn rejects_undeclared_method_call() {
+    let src = "class Point\n  x: Float64\nend\n\np: Point = Point.new()\nputs p.missing\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a call to an undeclared method");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("has no method `missing`"))
+    );
+  }
+
+  #[test]
+  fn rejects_method_call_on_non_class_receiver() {
+    let src = "x: Int64 = 5\nputs x.sum\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject .sum on an Int64 receiver");
+    assert!(errs.iter().any(|d| d.message.contains("non-class type")));
   }
 }

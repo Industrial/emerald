@@ -1,4 +1,4 @@
-use crate::ast::{CompareOp, Expr, Function, Item, Param, Program, Stmt};
+use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, Param, Program, Stmt};
 
 grammar;
 
@@ -13,16 +13,33 @@ pub Program: Program = {
 
 Item: Item = {
   <f:FuncDef> => Item::Function(f),
+  <c:ClassDef> => Item::Class(c),
   <s:Stmt> => Item::Stmt(s),
 };
 
+// A class body's field declarations reuse the `Param` rule directly
+// (`x: Float64` is structurally identical whether it's a field or a
+// parameter) — fields and methods have disjoint FIRST sets (`Ident` vs
+// `"def"`), so `Param*` followed by `FuncDef*` is unambiguous.
+ClassDef: ClassDef = {
+  "class" <name:Ident> <fields:Param*> <methods:FuncDef*> "end" => ClassDef { name, fields, methods }
+};
+
 FuncDef: Function = {
-  "def" <name:Ident> "(" <params:Params> ")" "->" <return_type:Ident> <body:Stmt*> "end" => Function {
+  "def" <name:Ident> <params:ParenParams> "->" <return_type:Ident> <body:Stmt*> "end" => Function {
     name,
     params,
     return_type,
     body,
   }
+};
+
+// Parens are optional for zero-arg methods (`def sum -> Float64`,
+// inception §17's Point example) — Ruby allows omitting an empty
+// parameter list entirely.
+ParenParams: Vec<Param> = {
+  "(" <params:Params> ")" => params,
+  => Vec::new(),
 };
 
 // `puts` is a reserved keyword, not a generic identifier — see plan 07's
@@ -44,6 +61,10 @@ Stmt: Stmt = {
   "break" => Stmt::Break,
   "next" => Stmt::Next,
   "puts" <arg:Expr> => Stmt::Expr(Expr::Call("puts".to_string(), vec![arg])),
+  // `@name = value` — instance-variable write. `InstanceVarTok` is its own
+  // terminal (starts with `@`), disjoint from `Ident`'s FIRST set, so this
+  // doesn't compete with the `Let` alternative above.
+  <name:InstanceVarTok> "=" <value:Expr> => Stmt::SetField { name, value },
   <e:Expr> => Stmt::Expr(e),
 };
 
@@ -73,7 +94,16 @@ AddExpr: Expr = {
 
 CallExpr: Expr = {
   <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
+  // `new` is a reserved keyword (see plan 08's Decision log): LALRPOP
+  // tokenizes the literal `"new"` distinctly from the generic `Ident`
+  // regex wherever it appears verbatim, so this and the bare
+  // `recv "." Ident` alternative below never compete for the same
+  // lookahead token.
+  <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
+  <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
+  <name:InstanceVarTok> => Expr::InstanceVar(name),
   <name:Ident> => Expr::Ident(name),
 };
 
@@ -101,4 +131,11 @@ Param: Param = {
 
 Num: i64 = <s:r"[0-9]+"> => s.parse().unwrap();
 
+// No exponent notation, no bare-trailing-dot forms — matches only what
+// `2.0`/`3.0` need (plan 08's Implementation Notes).
+FloatLit: f64 = <s:r"[0-9]+\.[0-9]+"> => s.parse().unwrap();
+
 Ident: String = <s:r"[A-Za-z_][A-Za-z0-9_]*"> => s.to_string();
+
+// `@name` — strips the leading `@` in the action.
+InstanceVarTok: String = <s:r"@[A-Za-z_][A-Za-z0-9_]*"> => s[1..].to_string();
