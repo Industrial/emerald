@@ -68,6 +68,20 @@ Stmt: Stmt = {
   "break" => Stmt::Break,
   "next" => Stmt::Next,
   "puts" <arg:Expr> => Stmt::Expr(Expr::Call("puts".to_string(), vec![arg])),
+  // Same "always requires a value" shape as `return` above, same reason
+  // (no bare `<e:Expr?>` — genuinely LALR(1)-ambiguous with no
+  // significant newlines).
+  "raise" <e:Expr> => Stmt::Raise(e),
+  // A single typed handler (plan 11's Decision log — no `ensure`, no
+  // multiple `rescue` clauses yet). `"rescue"` can't start a `Stmt`, so
+  // `body`'s `Stmt*` unambiguously stops there, the same way `"end"`/
+  // `"else"` already terminate other `Stmt*` blocks.
+  "begin" <body:Stmt*> "rescue" <rescue_type:Ident> "=>" <rescue_var:Ident> <rescue_body:Stmt*> "end" => Stmt::Begin {
+    body,
+    rescue_type,
+    rescue_var,
+    rescue_body,
+  },
   // Assignment to an instance variable (`@x = value`) or an array index
   // (`arr[i] = value`). Both are just `Expr` on the left — `CallExpr`'s
   // left-recursive indexing rule (below) already parses `arr[i]`

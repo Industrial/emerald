@@ -84,6 +84,19 @@ pub enum Stmt {
   Break,
   Next,
   Expr(Expr),
+  /// `raise <expr>` — `expr` must evaluate to a class instance (plan
+  /// `11`'s Decision log: in practice always a direct `ClassName.new(args)`
+  /// call, the only shape codegen supports).
+  Raise(Expr),
+  /// `begin body rescue Type => e rescue_body end` — a single typed
+  /// handler (plan `11`'s Decision log: no `ensure`, no multiple
+  /// `rescue` clauses, no bare catch-all yet).
+  Begin {
+    body: Vec<Stmt>,
+    rescue_type: String,
+    rescue_var: String,
+    rescue_body: Vec<Stmt>,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq)]

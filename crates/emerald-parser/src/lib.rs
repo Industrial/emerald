@@ -397,4 +397,58 @@ mod tests {
       )
     );
   }
+
+  #[test]
+  fn parses_raise() {
+    let src = "raise MyError.new(99)\n";
+    let program = parse(src).expect("raise should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Raise(Expr::New(
+        "MyError".into(),
+        vec![Expr::Int(99)]
+      )))
+    );
+  }
+
+  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
+
+  #[test]
+  fn parses_begin_rescue() {
+    let program = parse(EXCEPTION_EXAMPLE).expect("exception example should parse");
+    assert_eq!(program.items.len(), 3);
+
+    let Item::Stmt(Stmt::Begin {
+      body,
+      rescue_type,
+      rescue_var,
+      rescue_body,
+    }) = &program.items[2]
+    else {
+      panic!(
+        "expected item 2 to be a begin/rescue statement, got {:?}",
+        program.items[2]
+      );
+    };
+    assert_eq!(rescue_type, "MyError");
+    assert_eq!(rescue_var, "e");
+    assert_eq!(
+      body,
+      &vec![Stmt::Expr(Expr::Call(
+        "puts".into(),
+        vec![Expr::Call("risky".into(), vec![Expr::Int(999)])]
+      ))]
+    );
+    assert_eq!(
+      rescue_body,
+      &vec![Stmt::Expr(Expr::Call(
+        "puts".into(),
+        vec![Expr::MethodCall(
+          Box::new(Expr::Ident("e".into())),
+          "code".into(),
+          vec![]
+        )]
+      ))]
+    );
+  }
 }

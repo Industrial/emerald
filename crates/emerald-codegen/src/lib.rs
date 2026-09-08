@@ -254,6 +254,21 @@ fn collect_idents_in_stmt(
     Stmt::Return(Some(e)) => collect_idents_in_expr(e, referenced),
     Stmt::Return(None) | Stmt::Break | Stmt::Next => {}
     Stmt::Expr(e) => collect_idents_in_expr(e, referenced),
+    Stmt::Raise(e) => collect_idents_in_expr(e, referenced),
+    Stmt::Begin {
+      body,
+      rescue_var,
+      rescue_body,
+      ..
+    } => {
+      for s in body {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+      bound.insert(rescue_var.clone());
+      for s in rescue_body {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+    }
   }
 }
 
@@ -286,10 +301,10 @@ fn free_vars_in_lambda(params: &[Param], body: &[Stmt]) -> Vec<String> {
 /// or a name from inside another lambda/function), this is always
 /// available by the time a lambda referencing it is scanned, regardless
 /// of which one is declared first in source order.
-fn collect_lambda_infos(
-  program: &Program,
-  module: &mut ObjectModule,
-) -> Result<(HashMap<String, LambdaInfo>, HashMap<String, FuncId>), String> {
+type LambdaCollectionResult =
+  Result<(HashMap<String, LambdaInfo>, HashMap<String, FuncId>), String>;
+
+fn collect_lambda_infos(program: &Program, module: &mut ObjectModule) -> LambdaCollectionResult {
   let mut top_level_types: HashMap<String, String> = HashMap::new();
   for item in &program.items {
     if let Item::Stmt(Stmt::Let { name, ty, .. }) = item {
@@ -350,6 +365,25 @@ fn collect_lambda_infos(
   Ok((lambda_infos, lambda_func_ids))
 }
 
+/// The `setjmp`/longjmp-based exception runtime's imported functions
+/// (plan 11's Decision log — NOT true native unwinding; see
+/// `runtime/emerald_runtime.c`'s own comment for the full rationale).
+/// `setjmp` itself has to be a bare imported libc function, called
+/// *directly* by generated code (`build_begin`) rather than wrapped in a
+/// runtime helper — `longjmp` must target a `setjmp` call site in a
+/// still-live stack frame, which a wrapper function would violate.
+#[derive(Clone, Copy)]
+struct ExceptionRuntimeFuncs {
+  setjmp: FuncId,
+  push_handler: FuncId,
+  handler_jmpbuf: FuncId,
+  pop_handler: FuncId,
+  free_handler: FuncId,
+  handler_tag: FuncId,
+  handler_exception_ptr: FuncId,
+  raise: FuncId,
+}
+
 /// Context that's fixed for the duration of compiling one function/method
 /// body — bundled to keep `build_expr`/`build_stmt`'s own parameter lists
 /// from growing without bound as plans 07/08 added control flow and
@@ -370,6 +404,13 @@ struct Ctx<'a> {
   /// allocation at the `Let` site and the loads inside the lambda's own
   /// body (see `build_lambda_let`/`define_lambda`).
   lambda_infos: &'a HashMap<String, LambdaInfo>,
+  /// `{class name} -> a stable integer tag (declaration order)` — plan
+  /// 11's `rescue` matching mechanism, standing in for RTTI/a class-name
+  /// string constant (see plan 11's Decision log: no inheritance exists
+  /// in this compiler yet, so exact-tag equality is fully correct, not a
+  /// shortcut).
+  class_tags: &'a HashMap<String, i64>,
+  exc_funcs: ExceptionRuntimeFuncs,
 }
 
 fn host_isa() -> Result<std::sync::Arc<dyn cranelift::codegen::isa::TargetIsa>, String> {
@@ -1114,7 +1155,206 @@ fn build_stmt(
       builder.seal_block(exit_blk);
       Ok(false)
     }
+    Stmt::Raise(e) => build_raise(
+      builder,
+      module,
+      e,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
+    Stmt::Begin {
+      body,
+      rescue_type,
+      rescue_var,
+      rescue_body,
+    } => build_begin(
+      builder,
+      module,
+      body,
+      rescue_type,
+      rescue_var,
+      rescue_body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ctx,
+    ),
   }
+}
+
+/// `raise <expr>` — `expr` must be a direct `ClassName.new(args)` call
+/// (plan 11's Decision log), built exactly like an ordinary `Expr::New`
+/// (reusing `build_expr`'s own handling, not reimplemented here), then
+/// handed to `emerald_raise` with the class's compile-time-known tag.
+fn build_raise(
+  builder: &mut FunctionBuilder,
+  module: &mut ObjectModule,
+  e: &Expr,
+  vars: &HashMap<String, Variable>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, String>,
+  ctx: &Ctx,
+) -> Result<bool, String> {
+  let Expr::New(class_name, _) = e else {
+    return Err(
+      "codegen: `raise` only supports a direct `ClassName.new(args)` expression".to_string(),
+    );
+  };
+  let tag = *ctx
+    .class_tags
+    .get(class_name)
+    .ok_or_else(|| format!("codegen: unknown class `{class_name}` in `raise`"))?;
+  let exc_ptr = build_expr(
+    builder,
+    module,
+    e,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let tag_val = builder.ins().iconst(types::I64, tag);
+  let raise_ref = module.declare_func_in_func(ctx.exc_funcs.raise, builder.func);
+  builder.ins().call(raise_ref, &[tag_val, exc_ptr]);
+  // `emerald_raise` never returns to this call site in practice (it
+  // longjmps to a handler, or exits the process on an uncaught
+  // exception) — Cranelift still requires the block to end in an
+  // explicit terminator, so this marks it unreachable.
+  builder
+    .ins()
+    .trap(cranelift::codegen::ir::TrapCode::user(1).unwrap());
+  Ok(true)
+}
+
+/// `begin body rescue Type => e rescue_body end`. Pushes a handler,
+/// calls `setjmp` *directly* (see `ExceptionRuntimeFuncs`'s doc comment
+/// for why it can't be wrapped), and branches on the result: zero means
+/// this is the normal first pass through (run `body`), nonzero means a
+/// `longjmp` landed here (an exception was raised somewhere inside
+/// `body`) — the landing pad then compares the caught class tag against
+/// `rescue_type`'s, binding `rescue_var` and running `rescue_body` on a
+/// match, or re-raising to the next-outer handler otherwise.
+#[allow(clippy::too_many_arguments)]
+fn build_begin(
+  builder: &mut FunctionBuilder,
+  module: &mut ObjectModule,
+  body: &[Stmt],
+  rescue_type: &str,
+  rescue_var: &str,
+  rescue_body: &[Stmt],
+  vars: &mut HashMap<String, Variable>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, String>,
+  loop_stack: &mut Vec<LoopTargets>,
+  ctx: &Ctx,
+) -> Result<bool, String> {
+  let rescue_tag = *ctx
+    .class_tags
+    .get(rescue_type)
+    .ok_or_else(|| format!("codegen: unknown class `{rescue_type}` in `rescue`"))?;
+
+  let push_ref = module.declare_func_in_func(ctx.exc_funcs.push_handler, builder.func);
+  let push_call = builder.ins().call(push_ref, &[]);
+  let handler_ptr = builder.inst_results(push_call)[0];
+
+  let jmpbuf_ref = module.declare_func_in_func(ctx.exc_funcs.handler_jmpbuf, builder.func);
+  let jmpbuf_call = builder.ins().call(jmpbuf_ref, &[handler_ptr]);
+  let jmpbuf_ptr = builder.inst_results(jmpbuf_call)[0];
+
+  let setjmp_ref = module.declare_func_in_func(ctx.exc_funcs.setjmp, builder.func);
+  let setjmp_call = builder.ins().call(setjmp_ref, &[jmpbuf_ptr]);
+  let setjmp_result = builder.inst_results(setjmp_call)[0];
+
+  let try_blk = builder.create_block();
+  let rescue_blk = builder.create_block();
+  let merge_blk = builder.create_block();
+  let is_first_pass = builder.ins().icmp_imm_s(IntCC::Equal, setjmp_result, 0);
+  builder
+    .ins()
+    .brif(is_first_pass, try_blk, &[], rescue_blk, &[]);
+
+  builder.switch_to_block(try_blk);
+  builder.seal_block(try_blk);
+  let try_terminated = build_block(
+    builder,
+    module,
+    body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ctx,
+  )?;
+  if !try_terminated {
+    let pop_ref = module.declare_func_in_func(ctx.exc_funcs.pop_handler, builder.func);
+    builder.ins().call(pop_ref, &[]);
+    builder.ins().jump(merge_blk, &[]);
+  }
+
+  builder.switch_to_block(rescue_blk);
+  builder.seal_block(rescue_blk);
+  let tag_ref = module.declare_func_in_func(ctx.exc_funcs.handler_tag, builder.func);
+  let tag_call = builder.ins().call(tag_ref, &[handler_ptr]);
+  let caught_tag = builder.inst_results(tag_call)[0];
+  let expected_tag = builder.ins().iconst(types::I64, rescue_tag);
+  let tag_matches = builder.ins().icmp(IntCC::Equal, caught_tag, expected_tag);
+
+  let match_blk = builder.create_block();
+  let mismatch_blk = builder.create_block();
+  builder
+    .ins()
+    .brif(tag_matches, match_blk, &[], mismatch_blk, &[]);
+
+  // Caught, but it isn't this `rescue`'s type — free this handler (its
+  // job is done) and propagate to the next-outer one.
+  builder.switch_to_block(mismatch_blk);
+  builder.seal_block(mismatch_blk);
+  let exc_ptr_ref = module.declare_func_in_func(ctx.exc_funcs.handler_exception_ptr, builder.func);
+  let exc_ptr_call = builder.ins().call(exc_ptr_ref, &[handler_ptr]);
+  let mismatch_exc_ptr = builder.inst_results(exc_ptr_call)[0];
+  let free_ref = module.declare_func_in_func(ctx.exc_funcs.free_handler, builder.func);
+  builder.ins().call(free_ref, &[handler_ptr]);
+  let reraise_ref = module.declare_func_in_func(ctx.exc_funcs.raise, builder.func);
+  builder
+    .ins()
+    .call(reraise_ref, &[caught_tag, mismatch_exc_ptr]);
+  builder
+    .ins()
+    .trap(cranelift::codegen::ir::TrapCode::user(1).unwrap());
+
+  builder.switch_to_block(match_blk);
+  builder.seal_block(match_blk);
+  let exc_ptr_ref2 = module.declare_func_in_func(ctx.exc_funcs.handler_exception_ptr, builder.func);
+  let exc_ptr_call2 = builder.ins().call(exc_ptr_ref2, &[handler_ptr]);
+  let match_exc_ptr = builder.inst_results(exc_ptr_call2)[0];
+  let free_ref2 = module.declare_func_in_func(ctx.exc_funcs.free_handler, builder.func);
+  builder.ins().call(free_ref2, &[handler_ptr]);
+
+  let rescue_var_slot = builder.declare_var(types::I64);
+  builder.def_var(rescue_var_slot, match_exc_ptr);
+  vars.insert(rescue_var.to_string(), rescue_var_slot);
+  local_classes.insert(rescue_var.to_string(), rescue_type.to_string());
+
+  let rescue_terminated = build_block(
+    builder,
+    module,
+    rescue_body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ctx,
+  )?;
+  if !rescue_terminated {
+    builder.ins().jump(merge_blk, &[]);
+  }
+
+  builder.switch_to_block(merge_blk);
+  builder.seal_block(merge_blk);
+  Ok(false)
 }
 
 /// Emits a straight-line sequence of statements. Stops early (without
@@ -1512,6 +1752,87 @@ fn define_main(
   Ok(())
 }
 
+/// Declares the plan 11 exception runtime's imports — `setjmp` straight
+/// from libc, plus `runtime/emerald_runtime.c`'s handler-stack helpers.
+fn declare_exception_runtime_funcs(
+  module: &mut ObjectModule,
+) -> Result<ExceptionRuntimeFuncs, String> {
+  let mut setjmp_sig = module.make_signature();
+  setjmp_sig.params.push(AbiParam::new(types::I64));
+  setjmp_sig.returns.push(AbiParam::new(types::I32));
+  let setjmp = module
+    .declare_function("setjmp", Linkage::Import, &setjmp_sig)
+    .map_err(|e| e.to_string())?;
+
+  let mut push_handler_sig = module.make_signature();
+  push_handler_sig.returns.push(AbiParam::new(types::I64));
+  let push_handler = module
+    .declare_function("emerald_push_handler", Linkage::Import, &push_handler_sig)
+    .map_err(|e| e.to_string())?;
+
+  let mut handler_jmpbuf_sig = module.make_signature();
+  handler_jmpbuf_sig.params.push(AbiParam::new(types::I64));
+  handler_jmpbuf_sig.returns.push(AbiParam::new(types::I64));
+  let handler_jmpbuf = module
+    .declare_function(
+      "emerald_handler_jmpbuf",
+      Linkage::Import,
+      &handler_jmpbuf_sig,
+    )
+    .map_err(|e| e.to_string())?;
+
+  let pop_handler_sig = module.make_signature();
+  let pop_handler = module
+    .declare_function("emerald_pop_handler", Linkage::Import, &pop_handler_sig)
+    .map_err(|e| e.to_string())?;
+
+  let mut free_handler_sig = module.make_signature();
+  free_handler_sig.params.push(AbiParam::new(types::I64));
+  let free_handler = module
+    .declare_function("emerald_free_handler", Linkage::Import, &free_handler_sig)
+    .map_err(|e| e.to_string())?;
+
+  let mut handler_tag_sig = module.make_signature();
+  handler_tag_sig.params.push(AbiParam::new(types::I64));
+  handler_tag_sig.returns.push(AbiParam::new(types::I64));
+  let handler_tag = module
+    .declare_function("emerald_handler_tag", Linkage::Import, &handler_tag_sig)
+    .map_err(|e| e.to_string())?;
+
+  let mut handler_exception_ptr_sig = module.make_signature();
+  handler_exception_ptr_sig
+    .params
+    .push(AbiParam::new(types::I64));
+  handler_exception_ptr_sig
+    .returns
+    .push(AbiParam::new(types::I64));
+  let handler_exception_ptr = module
+    .declare_function(
+      "emerald_handler_exception_ptr",
+      Linkage::Import,
+      &handler_exception_ptr_sig,
+    )
+    .map_err(|e| e.to_string())?;
+
+  let mut raise_sig = module.make_signature();
+  raise_sig.params.push(AbiParam::new(types::I64));
+  raise_sig.params.push(AbiParam::new(types::I64));
+  let raise = module
+    .declare_function("emerald_raise", Linkage::Import, &raise_sig)
+    .map_err(|e| e.to_string())?;
+
+  Ok(ExceptionRuntimeFuncs {
+    setjmp,
+    push_handler,
+    handler_jmpbuf,
+    pop_handler,
+    free_handler,
+    handler_tag,
+    handler_exception_ptr,
+    raise,
+  })
+}
+
 /// Compiles a type-checked `Program` to a native object file at `out_path`.
 /// One exported function per `Item::Function`, `{Class}_{method}` per
 /// class method (plan 08), plus a `main` (`extern "C" fn() -> i32`) that
@@ -1551,12 +1872,19 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   // Class layouts (field offsets/types) — computed once, independent of
   // declaration order between classes (plan 08 doesn't support classes
   // referencing each other's fields yet, so no ordering dependency here).
+  // `class_tags` (plan 11) is built in the same pass: a stable integer
+  // identity per class, standing in for RTTI in `rescue` matching (see
+  // `Ctx::class_tags`'s doc comment).
   let mut classes: HashMap<String, ClassLayout> = HashMap::new();
+  let mut class_tags: HashMap<String, i64> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
       classes.insert(c.name.clone(), build_class_layout(c));
+      class_tags.insert(c.name.clone(), class_tags.len() as i64);
     }
   }
+
+  let exc_funcs = declare_exception_runtime_funcs(&mut module)?;
 
   let mut user_func_ids: HashMap<String, FuncId> = HashMap::new();
   for item in &program.items {
@@ -1599,6 +1927,8 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     self_ctx: None,
     lambda_func_ids: &lambda_func_ids,
     lambda_infos: &lambda_infos,
+    class_tags: &class_tags,
+    exc_funcs,
   };
 
   let mut ctx = module.make_context();
@@ -1809,6 +2139,27 @@ mod aot_tests {
     // size doesn't assume at least one capture exists.
     let src = "add_one: Proc = ->(y: Int64) -> Int64 { y + 1 }\nputs add_one.call(41)\n";
     assert_eq!(compile_link_run(src), "42\n");
+  }
+
+  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
+
+  #[test]
+  fn plan_11_exceptions_example_linked_and_run() {
+    // Plan 11's own worked example: `risky(999)` raises `MyError.new(99)`,
+    // the setjmp/longjmp handler stack unwinds back to `begin`'s site, the
+    // caught exception's tag matches `rescue MyError`, `e` binds to the
+    // raised instance, and `e.code` reads 99 back out through its
+    // accessor method — real executed proof, not simulated (plan 11 AC1).
+    assert_eq!(compile_link_run(EXCEPTION_EXAMPLE), "99\n");
+  }
+
+  #[test]
+  fn no_exception_raised_skips_rescue_entirely() {
+    // The "happy path": when `risky` doesn't raise, `begin`'s body value
+    // flows through normally and `rescue_body` never runs — proves the
+    // setjmp first-pass branch (not just the longjmp landing pad) works.
+    let src = "def risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nclass MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nbegin\n  puts risky(5)\nrescue MyError => e\n  puts 0\nend\n";
+    assert_eq!(compile_link_run(src), "5\n");
   }
 
   #[test]

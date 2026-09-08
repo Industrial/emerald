@@ -535,7 +535,69 @@ fn check_stmt(
       Ok(())
     }
     Stmt::Expr(e) => infer_expr_type(e, env, sigs, classes, self_fields).map(|_| ()),
+    Stmt::Raise(e) => {
+      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      if !matches!(t, Type::Class(_)) {
+        return Err(Diagnostic::new(format!(
+          "`raise` requires a class instance, found {t:?}"
+        )));
+      }
+      Ok(())
+    }
+    Stmt::Begin {
+      body,
+      rescue_type,
+      rescue_var,
+      rescue_body,
+    } => check_begin(
+      body,
+      rescue_type,
+      rescue_var,
+      rescue_body,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+    ),
   }
+}
+
+/// `begin body rescue Type => e rescue_body end`. Flat scoping, same as
+/// everything else in this compiler (plan 07's Decision log) —
+/// `rescue_var` joins the same environment an `if`/`while` body's `Let`s
+/// already flow into, not a fresh scope.
+#[allow(clippy::too_many_arguments)]
+fn check_begin(
+  body: &[Stmt],
+  rescue_type: &str,
+  rescue_var: &str,
+  rescue_body: &[Stmt],
+  env: &mut HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  return_type: &Type,
+  in_loop: bool,
+) -> Result<(), Diagnostic> {
+  check_block(body, env, sigs, classes, self_fields, return_type, in_loop)?;
+  let rescue_ty = resolve_type(rescue_type, classes)?;
+  if !matches!(rescue_ty, Type::Class(_)) {
+    return Err(Diagnostic::new(format!(
+      "`rescue {rescue_type}` must name a class, found {rescue_ty:?}"
+    )));
+  }
+  env.insert(rescue_var.to_string(), rescue_ty);
+  check_block(
+    rescue_body,
+    env,
+    sigs,
+    classes,
+    self_fields,
+    return_type,
+    in_loop,
+  )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -952,5 +1014,33 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject .call on a non-Proc receiver");
     assert!(errs[0].message.contains("non-Proc type"));
+  }
+
+  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
+
+  #[test]
+  fn accepts_raise_and_rescue() {
+    let program = emerald_parser::parse(EXCEPTION_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_raise_of_non_class_value() {
+    let src = "raise 5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject raising a non-class value");
+    assert!(
+      errs[0]
+        .message
+        .contains("`raise` requires a class instance")
+    );
+  }
+
+  #[test]
+  fn rejects_rescue_naming_a_non_class_type() {
+    let src = "begin\n  puts 1\nrescue Int64 => e\n  puts e\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject `rescue Int64`");
+    assert!(errs[0].message.contains("must name a class"));
   }
 }
