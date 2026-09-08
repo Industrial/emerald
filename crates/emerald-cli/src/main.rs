@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use std::process::{self, Command};
 
 enum CliError {
-  Parse(ParseError),
+  /// Plan 26: `emerald_parser::parse_named` reports every top-level
+  /// `Item` boundary's syntax error in one pass, not just the first.
+  Parse(Vec<ParseError>),
   Sema(Vec<emerald_sema::Diagnostic>),
   Codegen(String),
   Link(String),
@@ -106,8 +108,14 @@ fn main() {
       // `ParseError` implements `miette::Diagnostic` (plan 13) — its
       // `{:?}` rendering, via miette's `fancy`-feature graphical
       // handler, is the source-snippet-and-caret display, not a bare
-      // one-line message.
-      CliError::Parse(e) => eprintln!("{:?}", miette::Report::new(e)),
+      // one-line message. Plan 26: one report per recovered error, not
+      // just the first — still exits non-zero once, after printing all
+      // of them.
+      CliError::Parse(errs) => {
+        for e in errs {
+          eprintln!("{:?}", miette::Report::new(e));
+        }
+      }
       CliError::Sema(diags) => {
         for d in &diags {
           eprintln!("error: {}", d.message);

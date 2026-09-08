@@ -1,7 +1,13 @@
 use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
 use crate::ast::decode_string_lit;
 
-grammar;
+// Plan 26: a grammar-level parameter, threaded as an extra argument
+// into every generated parser entry point (`ProgramParser::parse`
+// included) — this is how LALRPOP's `!` error-recovery mechanism
+// actually surfaces recovered errors to the caller (each `!`
+// alternative below implicitly pushes its `ErrorRecovery` here; see
+// `Item`'s own `! => Item::Error` production).
+grammar(errors: &mut Vec<lalrpop_util::ErrorRecovery<usize, lalrpop_util::lexer::Token<'input>, String>>);
 
 // LALRPOP's `=>?` fallible actions default to a `&'static str` user-error
 // type; the assignment-target check below wants an interpolated message
@@ -29,11 +35,19 @@ pub Program: Program = {
   <items:Item*> => Program { items }
 };
 
+// Plan 26: `!` is LALRPOP's own built-in error-recovery marker — on a
+// syntax error here, it skips tokens (panic-mode) until it can
+// resynchronize at the start of the next `Item`, recording an
+// `ErrorRecovery` instead of aborting the whole parse. Scoped to this
+// top-level boundary only, not inside any `Stmt*` list (a function
+// body, an `if`/`while` block, etc.) — see the Decision log for why a
+// narrower first cut is the right one.
 Item: Item = {
   <f:FuncDef> => Item::Function(f),
   <c:ClassDef> => Item::Class(c),
   <m:ModuleDef> => Item::Module(m),
   <s:Stmt> => Item::Stmt(s),
+  ! => { errors.push(<>); Item::Error },
 };
 
 // A class body's field declarations reuse the `Param` rule directly

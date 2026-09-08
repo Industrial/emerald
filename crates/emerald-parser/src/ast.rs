@@ -201,6 +201,15 @@ pub enum Item {
   Class(ClassDef),
   Module(ModuleDef),
   Stmt(Stmt),
+  /// A top-level construct LALRPOP's `!` error-recovery mechanism
+  /// resynchronized past (plan 26's Decision log) — a real parse error
+  /// was recorded for it. Never appears in a `Program` `parse`/
+  /// `parse_named` actually returns `Ok(_)` for: the moment any
+  /// `Item::Error` (or any other recovered error) exists, the whole
+  /// call returns `Err(Vec<ParseError>)` instead. `emerald-sema`/
+  /// `emerald-codegen` never see this variant — their match arms for
+  /// it are `unreachable!()`, not a defensive `Err`.
+  Error,
 }
 
 /// A full Emerald source file — inception §17's milestone unit.

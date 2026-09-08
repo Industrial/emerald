@@ -1136,6 +1136,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           diags.push(d);
         }
       }
+      // Plan 26's Decision log: `emerald_parser::parse`/`parse_named`
+      // returns `Ok(program)` only when zero errors were recovered —
+      // `program.items` then contains no `Item::Error` by construction,
+      // so `check_program` never actually receives one.
+      Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
     }
   }
 

@@ -2947,6 +2947,10 @@ fn declare_user_functions<'ctx>(
         }
       }
       Item::Stmt(_) => {}
+      // Plan 26: `emerald_parser::parse`/`parse_named` only ever
+      // returns `Ok(program)` with zero recovered errors, meaning no
+      // `Item::Error` in `program.items` — codegen never receives one.
+      Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
     }
   }
   let _ = classes; // kept in the signature for symmetry with the define pass
@@ -3154,6 +3158,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
         }
       }
       Item::Stmt(_) => {}
+      Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
     }
   }
 

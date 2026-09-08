@@ -57,17 +57,49 @@ fn to_parse_error<T: std::fmt::Display>(
   }
 }
 
+/// Plan 26's Decision log: a fixed, disclosed robustness bound —
+/// panic-mode recovery on a badly malformed file can cascade into a
+/// flood of low-quality secondary errors, so this cap exists purely to
+/// bound worst-case output, not because any real fixture needs it.
+const MAX_RECOVERED_ERRORS: usize = 50;
+
 /// Same as [`parse`], but names the source (shown in the rendered
 /// diagnostic's snippet header) as `name` instead of the generic
 /// `"<source>"` placeholder — `emerald-cli` uses this with the real file
 /// path it read `src` from.
-pub fn parse_named(src: &str, name: &str) -> Result<Program, ParseError> {
-  grammar::grammar::ProgramParser::new()
-    .parse(src)
-    .map_err(|e| to_parse_error(e, name, src))
+///
+/// Returns every top-level `Item` boundary's syntax error in one pass
+/// (plan 26), not just the first — LALRPOP's own `!` error-recovery
+/// marker on the `Item` production (`grammar.lalrpop`) resynchronizes
+/// at the next top-level construct instead of aborting the whole parse.
+/// `Ok(program)` is returned only when *zero* errors were recovered
+/// (`program.items` then contains no `Item::Error` either, by
+/// construction) — the moment one or more exist, this returns
+/// `Err(Vec<ParseError>)` instead, exactly the same all-or-nothing
+/// shape `parse_named` had before this plan, just now potentially
+/// carrying more than one error.
+pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
+  let mut recovered = Vec::new();
+  let result = grammar::grammar::ProgramParser::new().parse(&mut recovered, src);
+  let mut errors: Vec<ParseError> = recovered
+    .into_iter()
+    .map(|e| to_parse_error(e.error, name, src))
+    .collect();
+  match result {
+    Ok(program) if errors.is_empty() => Ok(program),
+    Ok(_) => {
+      errors.truncate(MAX_RECOVERED_ERRORS);
+      Err(errors)
+    }
+    Err(e) => {
+      errors.push(to_parse_error(e, name, src));
+      errors.truncate(MAX_RECOVERED_ERRORS);
+      Err(errors)
+    }
+  }
 }
 
-pub fn parse(src: &str) -> Result<Program, ParseError> {
+pub fn parse(src: &str) -> Result<Program, Vec<ParseError>> {
   parse_named(src, "<source>")
 }
 
@@ -111,9 +143,13 @@ mod tests {
   #[test]
   fn missing_end_errors() {
     let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b";
-    let err = parse(src).unwrap_err();
-    eprintln!("LALRPOP ERROR: {err}");
-    assert!(!err.to_string().is_empty());
+    // Plan 26: `errs.len()` is 1 here — a syntax error inside a
+    // function body (not at a top-level `Item` boundary) still
+    // hard-stops the whole parse, unchanged by top-level recovery.
+    let errs = parse(src).unwrap_err();
+    assert_eq!(errs.len(), 1);
+    eprintln!("LALRPOP ERROR: {}", errs[0]);
+    assert!(!errs[0].to_string().is_empty());
   }
 
   #[test]
@@ -122,7 +158,9 @@ mod tests {
     // token's *actual* byte offset, verified against the source
     // string's own position, not merely asserted to exist.
     let src = "x: Int64 = +\n";
-    let err = parse(src).expect_err("`+` alone is not a valid Expr");
+    let mut errs = parse(src).expect_err("`+` alone is not a valid Expr");
+    assert_eq!(errs.len(), 1);
+    let err = errs.remove(0);
     let expected_offset = src.find('+').unwrap();
     assert_eq!(err.span.offset(), expected_offset);
     // `ParseError` must satisfy `miette::Diagnostic` for `emerald-cli`
@@ -894,6 +932,34 @@ mod tests {
       panic!("expected a case statement, got {:?}", program.items[0]);
     };
     assert_eq!(*else_body, None);
+  }
+
+  // Plan 26 (parser error recovery).
+
+  const TWO_BROKEN_LETS: &str = "x: Int64 = +\ny: Int64 = +\n";
+
+  #[test]
+  fn reports_two_independent_top_level_syntax_errors_in_one_pass() {
+    let errs = parse(TWO_BROKEN_LETS).expect_err("both lets are malformed");
+    assert_eq!(
+      errs.len(),
+      2,
+      "expected exactly two recovered errors, got {errs:?}"
+    );
+    let first_plus = TWO_BROKEN_LETS.find('+').unwrap();
+    let second_plus = TWO_BROKEN_LETS.rfind('+').unwrap();
+    assert_eq!(errs[0].span.offset(), first_plus);
+    assert_eq!(errs[1].span.offset(), second_plus);
+  }
+
+  #[test]
+  fn error_recovery_does_not_alter_single_error_case() {
+    // Regression guard for the plan 26 acceptance criteria: a source with
+    // exactly one malformed construct inside an otherwise well-formed
+    // function body must still report exactly one error, not more.
+    let errs = parse("def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nx: Int64 = +\n")
+      .expect_err("the second statement is malformed");
+    assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
   }
 
   #[test]
