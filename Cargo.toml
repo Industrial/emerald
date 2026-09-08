@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/app",
   "crates/emerald-lexer",
   "crates/emerald-parser",
   "crates/emerald-codegen",
