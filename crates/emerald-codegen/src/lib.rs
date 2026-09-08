@@ -133,23 +133,97 @@ struct ClassLayout {
   size: u64,
 }
 
-fn build_class_layout(c: &ClassDef) -> ClassLayout {
+/// Codegen independently re-derives the class hierarchy from the raw
+/// `Program`/`ClassDef` list (plan 32's Decision log — this backend has
+/// no typed IR / no shared sema→codegen data structure anywhere, a
+/// standing architectural fact since plan 06). Walks `name`'s
+/// `superclass` chain via `class_defs`, root-to-leaf. Mirrors
+/// `emerald-sema`'s own `resolve_chain` (same cycle-detection
+/// discipline), but returns a plain `Err(String)` — sema already
+/// rejects a cyclic/undefined chain before codegen runs in the normal
+/// pipeline; this defends a direct, sema-bypassing codegen call the
+/// same way every other function here does.
+fn resolve_class_chain(
+  name: &str,
+  class_defs: &HashMap<String, &ClassDef>,
+) -> Result<Vec<String>, String> {
+  let mut chain = Vec::new();
+  let mut visited = HashSet::new();
+  let mut current = name.to_string();
+  loop {
+    if !visited.insert(current.clone()) {
+      return Err(format!(
+        "codegen: cyclic inheritance detected involving class `{current}`"
+      ));
+    }
+    let c = class_defs
+      .get(current.as_str())
+      .ok_or_else(|| format!("codegen: undefined class `{current}`"))?;
+    chain.push(current.clone());
+    match &c.superclass {
+      Some(parent) => current = parent.clone(),
+      None => break,
+    }
+  }
+  chain.reverse();
+  Ok(chain)
+}
+
+/// Ancestor fields first, in ancestor-to-descendant chain order, then
+/// `name`'s own fields appended (plan 32's Decision log) — the
+/// load-bearing invariant that makes an inherited method's compiled
+/// field offsets (e.g. `Animal_initialize` writing `@age` at offset 0)
+/// still correct when invoked on a `Dog` instance, since `Dog`'s
+/// layout is required to agree with `Animal`'s for every field
+/// `Animal` itself declares.
+fn build_class_layout(
+  name: &str,
+  class_defs: &HashMap<String, &ClassDef>,
+) -> Result<ClassLayout, String> {
+  let chain = resolve_class_chain(name, class_defs)?;
   let mut fields = HashMap::new();
   let mut offset = 0u64;
-  for f in &c.fields {
-    fields.insert(
-      f.name.clone(),
-      FieldInfo {
-        offset,
-        kind: value_kind_for_type(&f.ty),
-      },
-    );
-    offset += 8;
+  for class_name in &chain {
+    let c = class_defs[class_name.as_str()];
+    for f in &c.fields {
+      fields.insert(
+        f.name.clone(),
+        FieldInfo {
+          offset,
+          kind: value_kind_for_type(&f.ty),
+        },
+      );
+      offset += 8;
+    }
   }
-  ClassLayout {
+  Ok(ClassLayout {
     fields,
     size: offset,
+  })
+}
+
+/// `{class name} -> {method name} -> defining class name}` for every
+/// declared class (plan 32's Decision log) — root-to-leaf overlay, same
+/// walk `build_class_layout` does for fields: a method not overridden
+/// by `name` itself resolves to whichever ancestor actually declares
+/// it; an override (a same-named method `name` also declares) replaces
+/// it, since the chain walk reaches `name` last.
+fn build_method_owners(
+  class_defs: &HashMap<String, &ClassDef>,
+) -> Result<HashMap<String, HashMap<String, String>>, String> {
+  let mut result = HashMap::new();
+  for name in class_defs.keys() {
+    let chain = resolve_class_chain(name, class_defs)?;
+    let mut owners: HashMap<String, String> = HashMap::new();
+    for class_name in &chain {
+      let c = class_defs[class_name.as_str()];
+      for m in &c.methods {
+        owners.insert(m.name.clone(), class_name.clone());
+      }
+    }
+    result.insert(name.clone(), owners);
   }
+  Ok(result)
 }
 
 /// A lambda literal's captured-variable layout — the closure-conversion
@@ -583,10 +657,18 @@ struct Ctx<'a, 'ctx> {
   lambda_func_ids: &'a HashMap<String, (FunctionValue<'ctx>, ValKind)>,
   lambda_infos: &'a HashMap<String, LambdaInfo>,
   /// `{class name} -> a stable integer tag (declaration order)` —
-  /// `rescue`'s matching mechanism, standing in for RTTI (no
-  /// inheritance exists in this compiler, so exact-tag equality is
-  /// fully correct, not a shortcut).
+  /// `rescue`'s matching mechanism, standing in for RTTI. Still
+  /// exact-tag equality even after plan 32 added inheritance —
+  /// upgrading `rescue` to subtype-aware matching is real, disclosed
+  /// future work (plan 32's Decision log), not implemented here.
   class_tags: &'a HashMap<String, i64>,
+  /// `{class name} -> {method name} -> defining class name}` (plan 32's
+  /// Decision log) — resolves which ancestor's compiled `{Class}_
+  /// {method}` symbol a call actually targets, since only the class
+  /// that *declares* a method gets an LLVM function generated for it
+  /// (`d.age` on a `Dog` that never declares `age` must call
+  /// `Animal_age`, since `Dog_age` was never compiled).
+  method_owners: &'a HashMap<String, HashMap<String, String>>,
   exc_funcs: ExceptionRuntimeFuncs<'ctx>,
   /// Names of every top-level `module` — `build_method_call` checks
   /// this before anything else to route `Name.method(args)` to the
@@ -1266,8 +1348,15 @@ fn build_expr<'ctx>(
         .map_err(|e| e.to_string())?;
       let ptr = call_result(alloc_call)?.into_pointer_value();
 
-      let init_key = format!("{class_name}_initialize");
-      if let Some(&(init_fv, _)) = ctx.user_func_ids.get(&init_key) {
+      // Plan 32: `initialize` resolves through `method_owners` too — a
+      // subclass that doesn't declare its own `initialize` inherits the
+      // nearest ancestor's, same as any other method.
+      let init_key = ctx
+        .method_owners
+        .get(class_name.as_str())
+        .and_then(|owners| owners.get("initialize"))
+        .map(|owner| format!("{owner}_initialize"));
+      if let Some(&(init_fv, _)) = init_key.as_deref().and_then(|k| ctx.user_func_ids.get(k)) {
         let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![ptr.into()];
         for a in args {
           let (v, _) = build_expr(
@@ -1521,7 +1610,16 @@ fn build_method_call<'ctx>(
     let class_name = local_classes.get(recv_name).ok_or_else(|| {
       format!("codegen: cannot determine the class of `{recv_name}` for `.{method}`")
     })?;
-    let key = format!("{class_name}_{method}");
+    // Plan 32: resolve which ancestor actually *declares* `method` —
+    // only the defining class has a compiled `{Class}_{method}` symbol
+    // (`d.age` on a `Dog` that never declares `age` must call
+    // `Animal_age`; `Dog_age` was never generated).
+    let defining_class = ctx
+      .method_owners
+      .get(class_name.as_str())
+      .and_then(|owners| owners.get(method))
+      .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
+    let key = format!("{defining_class}_{method}");
     *ctx
       .user_func_ids
       .get(&key)
@@ -3492,18 +3590,28 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   );
   let exc_funcs = declare_exception_runtime_funcs(&context, &module);
 
-  // Class layouts (field offsets/kinds) and a stable per-class integer
-  // tag (declaration order) for `rescue` matching — computed once,
-  // independent of declaration order between classes (no class
-  // references another's fields yet, so no ordering dependency here).
+  // Plan 32: raw `ClassDef`s keyed by name, so `build_class_layout`/
+  // `build_method_owners` can walk any class's inheritance chain by
+  // name lookup alone — independent of `program.items`' order.
+  let mut class_defs: HashMap<String, &ClassDef> = HashMap::new();
+  for item in &program.items {
+    if let Item::Class(c) = item {
+      class_defs.insert(c.name.clone(), c);
+    }
+  }
+
+  // Class layouts (field offsets/kinds, now chain-flattened — ancestor
+  // fields first, see `build_class_layout`) and a stable per-class
+  // integer tag (declaration order) for `rescue` matching.
   let mut classes: HashMap<String, ClassLayout> = HashMap::new();
   let mut class_tags: HashMap<String, i64> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
-      classes.insert(c.name.clone(), build_class_layout(c));
+      classes.insert(c.name.clone(), build_class_layout(&c.name, &class_defs)?);
       class_tags.insert(c.name.clone(), class_tags.len() as i64);
     }
   }
+  let method_owners = build_method_owners(&class_defs)?;
 
   let module_names: HashSet<String> = program
     .items
@@ -3531,6 +3639,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     lambda_func_ids: &lambda_func_ids,
     lambda_infos: &lambda_infos,
     class_tags: &class_tags,
+    method_owners: &method_owners,
     exc_funcs,
     module_names: &module_names,
     alloc_zeroed,
@@ -4170,5 +4279,27 @@ mod tests {
   fn plan_31_worked_example_linked_and_run() {
     let src = "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n\na: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
     assert_eq!(compile_link_run(src), "10\n2\n1\n");
+  }
+
+  // Plan 32 (class inheritance).
+
+  const INHERITANCE_EXAMPLE: &str = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\n\n  def describe -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\n\n  def describe -> Int64\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
+
+  #[test]
+  fn inheritance_example_linked_and_run() {
+    // Real executed proof inherited-field layout, inherited-method
+    // resolution (`d.age` — Dog never declares `age`), and override
+    // (`d.describe` — Dog's own wins and reads both the inherited
+    // `@age` and Dog's own `@breed_code`) all work together without
+    // corrupting each other's memory.
+    assert_eq!(compile_link_run(INHERITANCE_EXAMPLE), "5\n3\n103\n");
+  }
+
+  #[test]
+  fn class_with_no_superclass_still_compiles_and_runs_unchanged() {
+    // Regression: an ordinary, non-inheriting class must behave exactly
+    // as before this plan.
+    let src = "class Counter\n  n: Int64\n\n  def initialize(n: Int64) -> Void\n    @n = n\n  end\n\n  def value -> Int64\n    @n\n  end\nend\n\nc: Counter = Counter.new(7)\nputs c.value\n";
+    assert_eq!(compile_link_run(src), "7\n");
   }
 }

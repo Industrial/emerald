@@ -55,7 +55,15 @@ Item: Item = {
 // parameter) — fields and methods have disjoint FIRST sets (`Ident` vs
 // `"def"`), so `Param*` followed by `FuncDef*` is unambiguous.
 ClassDef: ClassDef = {
-  "class" <name:Ident> <fields:Param*> <methods:FuncDef*> "end" => ClassDef { name, fields, methods }
+  "class" <name:Ident> <superclass:SuperclassClause?> <fields:Param*> <methods:FuncDef*> "end" => ClassDef { name, superclass, fields, methods }
+};
+
+// `class Dog < Animal` (plan 32's Decision log). Reuses the already-
+// declared `"<"` terminal (`CompareOp`'s less-than) — distinct enough
+// from `Ident`/`"def"`/`"end"` (the only tokens that can otherwise
+// follow a class name) that there's no FIRST-set overlap to disambiguate.
+SuperclassClause: String = {
+  "<" <s:Ident> => s,
 };
 
 // Namespace-only (plan 12's Decision log) — no fields, just methods.

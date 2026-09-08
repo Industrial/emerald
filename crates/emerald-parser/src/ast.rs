@@ -219,10 +219,15 @@ pub struct Function {
 
 /// A class declaration: fields (reusing `Param`'s `{name, ty}` shape —
 /// structurally identical to a parameter declaration) and methods
-/// (ordinary `Function`s, including `initialize`).
+/// (ordinary `Function`s, including `initialize`). `superclass` is
+/// `class Dog < Animal`'s `Animal` (plan 32's Decision log) — single
+/// inheritance only, no `include`/`extend` mixin composition, no real
+/// dynamic dispatch (every call still resolves by the receiver's
+/// *declared* class, same as before this plan).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDef {
   pub name: String,
+  pub superclass: Option<String>,
   pub fields: Vec<Param>,
   pub methods: Vec<Function>,
 }

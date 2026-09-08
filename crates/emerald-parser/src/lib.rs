@@ -1006,6 +1006,34 @@ mod tests {
     parse(src).expect("plan 31's worked example must parse cleanly");
   }
 
+  // Plan 32 (class inheritance).
+
+  #[test]
+  fn class_with_no_superclass_parses_with_none() {
+    let src = "class Counter\n  n: Int64\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a ClassDef");
+    };
+    assert_eq!(c.superclass, None);
+  }
+
+  #[test]
+  fn class_with_superclass_parses_the_name() {
+    let src = "class Dog < Animal\n  breed_code: Int64\nend\n";
+    let program = parse(src).unwrap();
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a ClassDef");
+    };
+    assert_eq!(c.superclass, Some("Animal".to_string()));
+  }
+
+  #[test]
+  fn plan_32_worked_example_parses() {
+    let src = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\n\n  def describe -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\n\n  def describe -> Int64\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
+    parse(src).expect("plan 32's worked example must parse cleanly");
+  }
+
   // Plan 30 (for-in iteration).
 
   #[test]

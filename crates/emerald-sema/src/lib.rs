@@ -6,7 +6,7 @@
 //! Line/column-precise diagnostics are `13 diagnostics`'s job.
 
 use emerald_parser::{ClassDef, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
@@ -63,9 +63,18 @@ struct FunctionSig {
 /// §10.4 — no instance state to hold them).
 #[derive(Debug, Clone)]
 struct ClassInfo {
+  /// Flattened — includes every ancestor's fields too (plan 32's
+  /// Decision log), not just this class's own declaration.
   fields: HashMap<String, Type>,
+  /// Flattened the same way — an inherited-but-not-overridden method
+  /// resolves here to its defining ancestor's signature; an override
+  /// replaces it.
   methods: HashMap<String, FunctionSig>,
   is_module: bool,
+  /// `class Dog < Animal`'s `Animal` — `None` for a module (modules
+  /// never inherit) or a class with no `<` clause. This is the class's
+  /// OWN declared superclass, not a flattened chain.
+  superclass: Option<String>,
 }
 
 /// Resolves a type name against `spec/TYPE_SYSTEM.md`'s primitives, then
@@ -133,30 +142,113 @@ fn function_signature(
   })
 }
 
-/// Builds one class's field/method tables. `classes` must already contain
-/// an entry for every class name this class's fields/methods reference
-/// (including, trivially, itself — see `check_program`'s two-pass
-/// registration).
-fn class_info(c: &ClassDef, classes: &HashMap<String, ClassInfo>) -> Result<ClassInfo, Diagnostic> {
-  let mut fields = HashMap::new();
-  for f in &c.fields {
-    fields.insert(f.name.clone(), resolve_type(&f.ty, classes)?);
+/// Walks `name`'s `superclass` chain via `classes`'s already-registered
+/// `superclass` links (plan 32's Decision log) — this only needs pass
+/// 1's stub registration (names + `superclass`, not yet flattened
+/// fields/methods) since it just follows the chain of names. Returns
+/// root-to-leaf order (the ultimate ancestor first, `name` itself
+/// last). Errors by name on a cycle (a visited-set catches it the
+/// moment any name reappears while walking up) or an undefined/module
+/// ancestor name, rather than looping or panicking.
+fn resolve_chain(
+  name: &str,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Vec<String>, Diagnostic> {
+  let mut chain = Vec::new();
+  let mut visited = HashSet::new();
+  let mut current = name.to_string();
+  loop {
+    if !visited.insert(current.clone()) {
+      return Err(Diagnostic::new(format!(
+        "cyclic inheritance detected involving class `{current}`"
+      )));
+    }
+    let info = classes
+      .get(&current)
+      .ok_or_else(|| Diagnostic::new(format!("undefined class `{current}`")))?;
+    if info.is_module {
+      return Err(Diagnostic::new(format!(
+        "cannot inherit from module `{current}` — modules are namespaces, not instantiable"
+      )));
+    }
+    chain.push(current.clone());
+    match &info.superclass {
+      Some(parent) => current = parent.clone(),
+      None => break,
+    }
   }
-  let mut methods = HashMap::new();
-  for m in &c.methods {
-    methods.insert(m.name.clone(), function_signature(m, classes)?);
+  chain.reverse();
+  Ok(chain)
+}
+
+/// Builds one class's FLATTENED field/method tables (plan 32's
+/// Decision log) — walks `name`'s chain root-to-leaf via `class_defs`
+/// (the raw `ClassDef`s, keyed by name; independent of processing
+/// order, since every lookup here goes straight to the source
+/// declaration rather than a previously-computed `ClassInfo`), merging
+/// each ancestor's own fields (erroring on a name already declared by
+/// an earlier ancestor) and methods (an existing same-named entry is a
+/// real override, checked for an exact signature match before being
+/// replaced) in turn. `classes` (pass 1's stub registration) is only
+/// used for name resolution (`resolve_type`/`function_signature`), the
+/// same role it already played for a class with no superclass.
+fn build_flattened_class_info(
+  name: &str,
+  class_defs: &HashMap<String, &ClassDef>,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<ClassInfo, Diagnostic> {
+  let chain = resolve_chain(name, classes)?;
+  let mut fields: HashMap<String, Type> = HashMap::new();
+  let mut field_owner: HashMap<String, String> = HashMap::new();
+  let mut methods: HashMap<String, FunctionSig> = HashMap::new();
+  for class_name in &chain {
+    let c = class_defs
+      .get(class_name.as_str())
+      .expect("every name in a resolved chain came from a registered ClassDef");
+    for f in &c.fields {
+      if let Some(owner) = field_owner.get(&f.name) {
+        return Err(Diagnostic::new(format!(
+          "field `{}` already declared in superclass `{owner}`",
+          f.name
+        )));
+      }
+      fields.insert(f.name.clone(), resolve_type(&f.ty, classes)?);
+      field_owner.insert(f.name.clone(), class_name.clone());
+    }
+    for m in &c.methods {
+      let sig = function_signature(m, classes)?;
+      // `initialize` is exempt from the invariant-signature override
+      // check: every class's constructor is inherently class-specific
+      // (this plan's own worked example has `Dog::initialize` take an
+      // extra `breed_code` param `Animal::initialize` doesn't) — it's
+      // not really "overriding" a shared method the way `describe` is,
+      // it's each class's own independent construction signature.
+      if m.name != "initialize" {
+        if let Some(existing) = methods.get(&m.name) {
+          if existing.params != sig.params || existing.return_type != sig.return_type {
+            return Err(Diagnostic::new(format!(
+              "method `{}` override in `{class_name}` has a different signature than the method it overrides: expected {:?} -> {:?}, found {:?} -> {:?}",
+              m.name, existing.params, existing.return_type, sig.params, sig.return_type
+            )));
+          }
+        }
+      }
+      methods.insert(m.name.clone(), sig);
+    }
   }
   Ok(ClassInfo {
     fields,
     methods,
     is_module: false,
+    superclass: class_defs[name].superclass.clone(),
   })
 }
 
 /// A module's method table — built via the exact same `function_signature`
 /// every free function's signature already goes through (plan 12's
 /// Decision log: a module method type-checks like a free function,
-/// because it is one, just namespaced). Always empty `fields`.
+/// because it is one, just namespaced). Always empty `fields`, never a
+/// `superclass` (modules don't inherit).
 fn module_info(
   m: &ModuleDef,
   classes: &HashMap<String, ClassInfo>,
@@ -169,6 +261,7 @@ fn module_info(
     fields: HashMap::new(),
     methods,
     is_module: true,
+    superclass: None,
   })
 }
 
@@ -1170,14 +1263,21 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // can reference any other class/module name regardless of declaration
   // order), then full field/method tables.
   let mut classes: HashMap<String, ClassInfo> = HashMap::new();
+  // Plan 32: raw `ClassDef`s keyed by name, so `build_flattened_class_info`
+  // can look up any ancestor's own field/method declarations directly —
+  // independent of `program.items`' order, unlike a scheme that only
+  // ever has each *previously computed* `ClassInfo` to work from.
+  let mut class_defs: HashMap<String, &ClassDef> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
+      class_defs.insert(c.name.clone(), c);
       classes.insert(
         c.name.clone(),
         ClassInfo {
           fields: HashMap::new(),
           methods: HashMap::new(),
           is_module: false,
+          superclass: c.superclass.clone(),
         },
       );
     }
@@ -1188,13 +1288,14 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           fields: HashMap::new(),
           methods: HashMap::new(),
           is_module: true,
+          superclass: None,
         },
       );
     }
   }
   for item in &program.items {
     if let Item::Class(c) = item {
-      match class_info(c, &classes) {
+      match build_flattened_class_info(&c.name, &class_defs, &classes) {
         Ok(info) => {
           classes.insert(c.name.clone(), info);
         }
@@ -1888,5 +1989,49 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject an undefined multi-assign target");
     assert!(errs[0].message.contains("undefined variable"));
+  }
+
+  // Plan 32 (class inheritance).
+
+  const INHERITANCE_EXAMPLE: &str = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\n\n  def describe -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\n\n  def describe -> Int64\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
+
+  #[test]
+  fn accepts_inheritance_example() {
+    let program = emerald_parser::parse(INHERITANCE_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_cyclic_inheritance() {
+    let src = "class A < B\n  x: Int64\nend\n\nclass B < A\n  y: Int64\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject cyclic inheritance");
+    assert!(errs.iter().any(|e| e.message.contains("cyclic")));
+  }
+
+  #[test]
+  fn rejects_field_redeclared_from_ancestor() {
+    let src = "class Animal\n  age: Int64\nend\n\nclass Dog < Animal\n  age: Int64\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject a subclass redeclaring an ancestor's field");
+    assert!(errs[0].message.contains("age") && errs[0].message.contains("Animal"));
+  }
+
+  #[test]
+  fn rejects_override_with_mismatched_signature() {
+    let src = "class Animal\n  def speak(volume: Int64) -> Int64\n    volume\n  end\nend\n\nclass Dog < Animal\n  def speak(volume: Float64) -> Int64\n    1\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject an override with a mismatched signature");
+    assert!(errs[0].message.contains("speak"));
+  }
+
+  #[test]
+  fn rejects_undeclared_superclass() {
+    let src = "class Dog < NotAClass\n  x: Int64\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject an undeclared superclass");
+    assert!(errs[0].message.contains("NotAClass"));
   }
 }
