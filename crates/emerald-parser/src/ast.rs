@@ -100,6 +100,18 @@ pub enum Expr {
   /// a reuse of `Expr::New`, since `Array` is a reserved keyword, not a
   /// class name in the class registry.
   ArrayNew(Box<Expr>),
+  /// `a & b` (plan 28's Decision log) — `Int64`-only bitwise AND.
+  BitAnd(Box<Expr>, Box<Expr>),
+  /// `a | b` — `Int64`-only bitwise OR.
+  BitOr(Box<Expr>, Box<Expr>),
+  /// `a ^ b` — `Int64`-only bitwise XOR.
+  BitXor(Box<Expr>, Box<Expr>),
+  /// `~a` — `Int64`-only bitwise NOT.
+  BitNot(Box<Expr>),
+  /// `a << b` — `Int64`-only left shift.
+  Shl(Box<Expr>, Box<Expr>),
+  /// `a >> b` — `Int64`-only arithmetic (signed) right shift.
+  Shr(Box<Expr>, Box<Expr>),
 }
 
 /// One statement in a block (a function body or the program's top level).

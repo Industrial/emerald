@@ -188,11 +188,16 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
     | Expr::Rem(l, r)
     | Expr::And(l, r)
     | Expr::Or(l, r)
+    | Expr::BitAnd(l, r)
+    | Expr::BitOr(l, r)
+    | Expr::BitXor(l, r)
+    | Expr::Shl(l, r)
+    | Expr::Shr(l, r)
     | Expr::Index(l, r) => {
       collect_idents_in_expr(l, out);
       collect_idents_in_expr(r, out);
     }
-    Expr::Neg(e) | Expr::Not(e) => collect_idents_in_expr(e, out),
+    Expr::Neg(e) | Expr::Not(e) | Expr::BitNot(e) => collect_idents_in_expr(e, out),
     Expr::Compare(l, _, r) => {
       collect_idents_in_expr(l, out);
       collect_idents_in_expr(r, out);
@@ -631,6 +636,69 @@ fn build_numeric_binop<'ctx>(
   }
 }
 
+/// `&`/`|`/`^`/`<<`/`>>` (plan 28): Int64-only — sema has already
+/// rejected any non-Int64 operand by the time codegen sees these nodes,
+/// so unlike `build_numeric_binop` there's no Float64 branch to dispatch
+/// on; the operand-kind check here is still real (not a panic) for any
+/// caller that reaches codegen without going through sema first (the
+/// same defensive standard every prior codegen plan holds to).
+#[allow(clippy::too_many_arguments)]
+fn build_bitwise_binop<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  op_symbol: &str,
+  lhs: &Expr,
+  rhs: &Expr,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+  int_op: IntBinOp<'ctx>,
+  name: &str,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (l, lk) = build_expr(
+    context,
+    builder,
+    lhs,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let (r, rk) = build_expr(
+    context,
+    builder,
+    rhs,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if lk != ValKind::Int64 || rk != ValKind::Int64 {
+    return Err(format!(
+      "codegen: `{op_symbol}` operands must both be Int64"
+    ));
+  }
+  let v =
+    int_op(builder, l.into_int_value(), r.into_int_value(), name).map_err(|e| e.to_string())?;
+  Ok((v.into(), ValKind::Int64))
+}
+
+/// `>>` on a signed `Int64` always wants arithmetic (sign-preserving)
+/// shift — `sshr`, not `ushr` (plan 28's Decision log). `Builder::
+/// build_right_shift` takes a `sign_extend` flag `IntBinOp`'s fn-pointer
+/// shape has no room for, so this bakes `true` in and matches
+/// `IntBinOp`'s shape directly, the same trick `build_numeric_binop`'s
+/// callers already use for `Builder::build_int_sub`/etc.
+fn build_sshr<'ctx>(
+  builder: &Builder<'ctx>,
+  lhs: IntValue<'ctx>,
+  rhs: IntValue<'ctx>,
+  name: &str,
+) -> Result<IntValue<'ctx>, inkwell::builder::BuilderError> {
+  builder.build_right_shift(lhs, rhs, true, name)
+}
+
 /// `&&`/`||` (plan 18): real short-circuit branching, the same
 /// `append_basic_block`/`build_conditional_branch`/merge shape
 /// `Stmt::If` already uses — not an eager, unconditionally-evaluated
@@ -939,6 +1007,89 @@ fn build_expr<'ctx>(
       local_array_elem_types,
       ctx,
     ),
+    Expr::BitAnd(lhs, rhs) => build_bitwise_binop(
+      context,
+      builder,
+      "&",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_and,
+      "andtmp",
+    ),
+    Expr::BitOr(lhs, rhs) => build_bitwise_binop(
+      context,
+      builder,
+      "|",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_or,
+      "ortmp",
+    ),
+    Expr::BitXor(lhs, rhs) => build_bitwise_binop(
+      context,
+      builder,
+      "^",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_xor,
+      "xortmp",
+    ),
+    Expr::Shl(lhs, rhs) => build_bitwise_binop(
+      context,
+      builder,
+      "<<",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      Builder::build_left_shift,
+      "shltmp",
+    ),
+    Expr::Shr(lhs, rhs) => build_bitwise_binop(
+      context,
+      builder,
+      ">>",
+      lhs,
+      rhs,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+      build_sshr,
+      "shrtmp",
+    ),
+    Expr::BitNot(e) => {
+      let (v, k) = build_expr(
+        context,
+        builder,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if k != ValKind::Int64 {
+        return Err("codegen: `~` requires an Int64 operand".to_string());
+      }
+      let n = builder
+        .build_not(v.into_int_value(), "bitnottmp")
+        .map_err(|e| e.to_string())?;
+      Ok((n.into(), ValKind::Int64))
+    }
     Expr::Compare(lhs, op, rhs) => {
       let (l, lk) = build_expr(
         context,
@@ -3596,5 +3747,41 @@ mod tests {
     let src =
       "n: Int64 = 3\narr: Array[Int64] = Array.new(n)\narr[0] = 7\nputs arr[0]\nputs arr[1]\n";
     assert_eq!(compile_link_run(src), "7\n0\n");
+  }
+
+  // Plan 28 (bitwise operators).
+
+  const BITWISE_EXAMPLE: &str = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\ndef has_flag(flags: Int64, flag: Int64) -> Boolean\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ)\n  puts 1\nend\nif has_flag(perms, EXEC)\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
+
+  #[test]
+  fn bitwise_example_linked_and_run() {
+    assert_eq!(compile_link_run(BITWISE_EXAMPLE), "3\n1\n1\n-1\n16\n16\n");
+  }
+
+  #[test]
+  fn shift_setting_the_sign_bit_prints_correct_two_s_complement_value() {
+    // AC2: `1 << 63` sets Int64's sign bit — a real proof `ishl`'s bit
+    // pattern and the runtime's signed-print path agree, not garbage.
+    let src = "puts 1 << 63\n";
+    assert_eq!(compile_link_run(src), "-9223372036854775808\n");
+  }
+
+  #[test]
+  fn bitwise_operator_on_non_int64_operand_errors_not_panics() {
+    // Same defensive-`Err`-not-panic standard as every prior codegen
+    // plan (see `unsupported_operator_shapes_error_not_panic` above) —
+    // codegen itself rejects a Float64 operand even though sema (leaf
+    // 2) already would have caught it first in the normal pipeline.
+    let program = Program {
+      items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
+        "puts".into(),
+        vec![Expr::BitAnd(
+          Box::new(Expr::Float(1.5)),
+          Box::new(Expr::Int(1)),
+        )],
+      )))],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_bitand_float_should_not_exist.o");
+    assert!(compile_to_object(&program, &out).is_err());
   }
 }

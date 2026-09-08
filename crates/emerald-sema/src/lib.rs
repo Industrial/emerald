@@ -226,6 +226,34 @@ fn check_boolean_binop(
   Ok(Type::Boolean)
 }
 
+/// `&`/`|`/`^`/`<<`/`>>` (plan 28's Decision log): `Int64`-only, unlike
+/// `check_numeric_binop`'s `Int64`-or-`Float64` — bitwise operators have
+/// no `Float64` semantics in this language.
+#[allow(clippy::too_many_arguments)]
+fn check_bitwise_binop(
+  op: &str,
+  lhs: &Expr,
+  rhs: &Expr,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<Type, Diagnostic> {
+  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+  if lt != Type::Int64 {
+    return Err(Diagnostic::new(format!(
+      "`{op}` requires an Int64 left operand, found {lt:?}"
+    )));
+  }
+  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+  if rt != Type::Int64 {
+    return Err(Diagnostic::new(format!(
+      "`{op}` requires an Int64 right operand, found {rt:?}"
+    )));
+  }
+  Ok(Type::Int64)
+}
+
 /// `self_fields` is `Some(&class.fields)` while checking a method body,
 /// `None` everywhere else — gates `@field` legality (plan 08 AC4).
 #[allow(clippy::too_many_arguments)]
@@ -288,6 +316,21 @@ fn infer_expr_type(
     }
     Expr::And(lhs, rhs) => check_boolean_binop("&&", lhs, rhs, env, sigs, classes, self_fields),
     Expr::Or(lhs, rhs) => check_boolean_binop("||", lhs, rhs, env, sigs, classes, self_fields),
+    // Plan 28: Int64-only bitwise operators.
+    Expr::BitAnd(lhs, rhs) => check_bitwise_binop("&", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::BitOr(lhs, rhs) => check_bitwise_binop("|", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::BitXor(lhs, rhs) => check_bitwise_binop("^", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Shl(lhs, rhs) => check_bitwise_binop("<<", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Shr(lhs, rhs) => check_bitwise_binop(">>", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::BitNot(e) => {
+      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      if t != Type::Int64 {
+        return Err(Diagnostic::new(format!(
+          "`~` requires an Int64 operand, found {t:?}"
+        )));
+      }
+      Ok(Type::Int64)
+    }
     Expr::Compare(lhs, op, rhs) => {
       let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
@@ -1628,5 +1671,40 @@ mod tests {
     let errs =
       check_program(&program).expect_err("must reject Array.new assigned to a non-Array type");
     assert!(errs[0].message.contains("Array.new"));
+  }
+
+  // Plan 28 (bitwise operators).
+
+  const BITWISE_EXAMPLE: &str = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\ndef has_flag(flags: Int64, flag: Int64) -> Boolean\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ)\n  puts 1\nend\nif has_flag(perms, EXEC)\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
+
+  #[test]
+  fn accepts_bitwise_example() {
+    let program = emerald_parser::parse(BITWISE_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_float64_bit_and_operand() {
+    let src = "puts 2.0 & 1\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject Float64 & Int64");
+    assert!(errs[0].message.contains("&"));
+    assert!(errs[0].message.contains("Int64") || errs[0].message.contains("Float64"));
+  }
+
+  #[test]
+  fn rejects_float64_bit_not_operand() {
+    let src = "puts ~2.5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject `~2.5`");
+    assert!(errs[0].message.contains("~"));
+    assert!(errs[0].message.contains("Float64"));
+  }
+
+  #[test]
+  fn bitwise_operators_type_check_as_int64() {
+    let src = "a: Int64 = 1 << 2\nb: Int64 = 1 & 2\nc: Int64 = ~1\nputs a\nputs b\nputs c\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 }

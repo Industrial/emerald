@@ -181,8 +181,28 @@ StmtAndExpr: Expr = {
   StmtCompareExpr,
 };
 
+// Plan 28: mirrors `BitOrExpr`/`BitAndExpr`/`ShiftExpr` below, one tier
+// each, for the same Stmt-initial reason every other tier here is
+// mirrored (see the block comment above `StmtExpr`).
 StmtCompareExpr: Expr = {
-  <lhs:StmtAddExpr> <op:CompareOp> <rhs:AddExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+  <lhs:StmtBitOrExpr> <op:CompareOp> <rhs:BitOrExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+  StmtBitOrExpr,
+};
+
+StmtBitOrExpr: Expr = {
+  <lhs:StmtBitOrExpr> "|" <rhs:BitAndExpr> => Expr::BitOr(Box::new(lhs), Box::new(rhs)),
+  <lhs:StmtBitOrExpr> "^" <rhs:BitAndExpr> => Expr::BitXor(Box::new(lhs), Box::new(rhs)),
+  StmtBitAndExpr,
+};
+
+StmtBitAndExpr: Expr = {
+  <lhs:StmtBitAndExpr> "&" <rhs:ShiftExpr> => Expr::BitAnd(Box::new(lhs), Box::new(rhs)),
+  StmtShiftExpr,
+};
+
+StmtShiftExpr: Expr = {
+  <lhs:StmtShiftExpr> "<<" <rhs:AddExpr> => Expr::Shl(Box::new(lhs), Box::new(rhs)),
+  <lhs:StmtShiftExpr> ">>" <rhs:AddExpr> => Expr::Shr(Box::new(lhs), Box::new(rhs)),
   StmtAddExpr,
 };
 
@@ -309,7 +329,29 @@ AndExpr: Expr = {
 };
 
 CompareExpr: Expr = {
-  <lhs:AddExpr> <op:CompareOp> <rhs:AddExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+  <lhs:BitOrExpr> <op:CompareOp> <rhs:BitOrExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+  BitOrExpr,
+};
+
+// Plan 28: three new tiers between `AddExpr` and `CompareExpr` — Ruby's
+// real precedence table, tightest to loosest, `<<`/`>>` > `&` > `|`/`^`
+// (see this plan's Decision log for why `|`/`^` share one tier: Ruby
+// really does give them equal precedence, unlike plan 18's relational/
+// equality merge, which was a real simplification).
+BitOrExpr: Expr = {
+  <lhs:BitOrExpr> "|" <rhs:BitAndExpr> => Expr::BitOr(Box::new(lhs), Box::new(rhs)),
+  <lhs:BitOrExpr> "^" <rhs:BitAndExpr> => Expr::BitXor(Box::new(lhs), Box::new(rhs)),
+  BitAndExpr,
+};
+
+BitAndExpr: Expr = {
+  <lhs:BitAndExpr> "&" <rhs:ShiftExpr> => Expr::BitAnd(Box::new(lhs), Box::new(rhs)),
+  ShiftExpr,
+};
+
+ShiftExpr: Expr = {
+  <lhs:ShiftExpr> "<<" <rhs:AddExpr> => Expr::Shl(Box::new(lhs), Box::new(rhs)),
+  <lhs:ShiftExpr> ">>" <rhs:AddExpr> => Expr::Shr(Box::new(lhs), Box::new(rhs)),
   AddExpr,
 };
 
@@ -342,6 +384,9 @@ MulExpr: Expr = {
 UnaryExpr: Expr = {
   "-" <e:UnaryExpr> => Expr::Neg(Box::new(e)),
   "!" <e:UnaryExpr> => Expr::Not(Box::new(e)),
+  // Plan 28: `~` joins `-`/`!` at this tier, additively — same shape,
+  // no restructuring (see the Decision log).
+  "~" <e:UnaryExpr> => Expr::BitNot(Box::new(e)),
   CallExpr,
 };
 

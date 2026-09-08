@@ -934,6 +934,94 @@ mod tests {
     assert_eq!(*else_body, None);
   }
 
+  // Plan 28 (bitwise operators).
+
+  #[test]
+  fn bit_and_binds_tighter_than_bit_or() {
+    let src = "x: Int64 = 1 | 2 & 3\n";
+    let program = parse(src).unwrap();
+    let Stmt::Let { value, .. } = as_let(&program) else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      *value,
+      Expr::BitOr(
+        Box::new(Expr::Int(1)),
+        Box::new(Expr::BitAnd(Box::new(Expr::Int(2)), Box::new(Expr::Int(3)))),
+      )
+    );
+  }
+
+  #[test]
+  fn shift_binds_tighter_than_bit_and() {
+    let src = "x: Int64 = 1 << 2 & 3\n";
+    let program = parse(src).unwrap();
+    let Stmt::Let { value, .. } = as_let(&program) else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      *value,
+      Expr::BitAnd(
+        Box::new(Expr::Shl(Box::new(Expr::Int(1)), Box::new(Expr::Int(2)))),
+        Box::new(Expr::Int(3)),
+      )
+    );
+  }
+
+  #[test]
+  fn bit_and_binds_tighter_than_compare() {
+    let src = "x: Boolean = flags & flag == flag\n";
+    let program = parse(src).unwrap();
+    let Stmt::Let { value, .. } = as_let(&program) else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      *value,
+      Expr::Compare(
+        Box::new(Expr::BitAnd(
+          Box::new(Expr::Ident("flags".to_string())),
+          Box::new(Expr::Ident("flag".to_string())),
+        )),
+        CompareOp::Eq,
+        Box::new(Expr::Ident("flag".to_string())),
+      )
+    );
+  }
+
+  #[test]
+  fn bit_not_binds_as_tight_as_neg() {
+    let src = "x: Int64 = ~0\ny: Int64 = ~x + 1\n";
+    let program = parse(src).unwrap();
+    assert_eq!(program.items.len(), 2);
+    let Item::Stmt(Stmt::Let { value: v0, .. }) = &program.items[0] else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(*v0, Expr::BitNot(Box::new(Expr::Int(0))));
+    let Item::Stmt(Stmt::Let { value: v1, .. }) = &program.items[1] else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      *v1,
+      Expr::Add(
+        Box::new(Expr::BitNot(Box::new(Expr::Ident("x".to_string())))),
+        Box::new(Expr::Int(1)),
+      )
+    );
+  }
+
+  fn as_let(program: &Program) -> &Stmt {
+    match &program.items[0] {
+      Item::Stmt(s @ Stmt::Let { .. }) => s,
+      other => panic!("expected a Let statement, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn plan_28_worked_example_parses() {
+    let src = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\ndef has_flag(flags: Int64, flag: Int64) -> Boolean\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ)\n  puts 1\nend\nif has_flag(perms, EXEC)\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
+    parse(src).expect("plan 28's worked example must parse cleanly");
+  }
+
   // Plan 26 (parser error recovery).
 
   const TWO_BROKEN_LETS: &str = "x: Int64 = +\ny: Int64 = +\n";
