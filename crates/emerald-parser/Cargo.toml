@@ -1,0 +1,11 @@
+[package]
+name = "emerald-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lalrpop-util = { version = "0.22", features = ["lexer"] }
+
+[build-dependencies]
+lalrpop = "0.22"

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/app"]
+members = [
+  "crates/app",
+  "crates/emerald-lexer",
+  "crates/emerald-parser",
+  "crates/emerald-codegen",
+]
 
 # Single version and shared metadata for all workspace crates (inherit with version.workspace = true).
 [workspace.package]
