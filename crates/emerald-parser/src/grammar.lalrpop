@@ -210,13 +210,38 @@ StmtCallExpr: Expr = {
 StmtPrimaryExpr: Expr = {
   <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
+  "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
   <recv:Ident> "." <method:Ident> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
   <s:StringLitTok> => Expr::StringLit(s),
+  "true" => Expr::Bool(true),
+  "false" => Expr::Bool(false),
+  "nil" => Expr::Nil,
+  "{" <pairs:HashPairs> "}" => Expr::HashLit(pairs),
   <name:InstanceVarTok> => Expr::InstanceVar(name),
   <name:Ident> => Expr::Ident(name),
+};
+
+// Plan 25: `{k1 => v1, k2 => v2, ...}` — reuses `"=>"` (already a
+// terminal, from `rescue Type => e`). Always closed by a known `"}"`
+// right after (like `Args`' own `)`/`]` delimiters), so the ordinary
+// left-recursive-with-trailing-optional shape is safe here — no
+// `CaseValues`-style ambiguity, since nothing after `HashPairs` is ever
+// `Stmt*`. Zero pairs (`{}`) is grammar-legal; sema rejects it (same
+// "no element type to infer" reasoning plan 09 already applies to `[]`).
+HashPairs: Vec<(Expr, Expr)> = {
+  <mut v:(<HashPair> ",")*> <last:HashPair?> => {
+    match last {
+      None => v,
+      Some(p) => { v.push(p); v }
+    }
+  }
+};
+
+HashPair: (Expr, Expr) = {
+  <k:Expr> "=>" <v:Expr> => (k, v)
 };
 
 ElseClause: Vec<Stmt> = {
@@ -329,14 +354,18 @@ PrimaryExpr: Expr = {
   // `recv "." Ident` alternative below never compete for the same
   // lookahead token.
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
+  "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
   <recv:Ident> "." <method:Ident> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   "[" <elements:Args> "]" => Expr::ArrayLit(elements),
   // `->(params) -> ReturnType { body }` — plan 10's lambda literal.
-  // `{`/`}` are brand-new terminals (nothing else in this grammar uses
-  // braces), and `"->"` doesn't start any other `PrimaryExpr`
-  // alternative, so this can't collide with the FuncDef-return-arrow
-  // usage of `"->"` or anything else.
+  // `"->"` doesn't start any other `PrimaryExpr` alternative, so this
+  // can't collide with the FuncDef-return-arrow usage of `"->"` or
+  // anything else. `{`/`}` are no longer this grammar's only brace use
+  // (plan 25's `HashPairs` below is the other) — this production's `{`
+  // only ever appears after `"->" "(" ... ")" "->" TypeName` is already
+  // consumed, never as `PrimaryExpr`'s own first token, so it's in a
+  // disjoint parser state from `HashPairs`' leading `"{"`.
   "->" "(" <params:Params> ")" "->" <return_type:TypeName> "{" <body:Stmt*> "}" => Expr::Lambda {
     params,
     return_type,
@@ -345,6 +374,10 @@ PrimaryExpr: Expr = {
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
   <s:StringLitTok> => Expr::StringLit(s),
+  "true" => Expr::Bool(true),
+  "false" => Expr::Bool(false),
+  "nil" => Expr::Nil,
+  "{" <pairs:HashPairs> "}" => Expr::HashLit(pairs),
   <name:InstanceVarTok> => Expr::InstanceVar(name),
   <name:Ident> => Expr::Ident(name),
 };
@@ -388,9 +421,16 @@ Param: Param = {
 // annotation — `Type::Proc`'s actual signature is recovered sema-side
 // from the `Expr::Lambda` it's bound to, not from this string (plan 10's
 // Decision log — no `Proc[(Int64) -> Int64]` compound grammar).
+// `Hash` is reserved the same way `Array` is (plan 25) — `K`/`V` stay
+// plain `Ident`s, same `Int64`-key-only restriction this plan's
+// Decision log applies at the sema level; the grammar itself doesn't
+// need to enforce that narrowing (it's just a name here, same as
+// `Array[Elem]`'s own compound-string convention, plan 09's Decision
+// log).
 TypeName: String = {
   <name:Ident> => name,
   "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
+  "Hash" "[" <k:Ident> "," <v:Ident> "]" => format!("Hash[{k}, {v}]"),
   "Proc" => "Proc".to_string(),
 };
 

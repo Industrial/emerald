@@ -55,6 +55,10 @@ enum ValKind {
   Str,
   Void,
   Bool,
+  /// Plan 25 — deliberately narrow (no `T?` nullable-type system): a
+  /// fixed `i64` sentinel (always `0`), real storage/param/return kind,
+  /// never compared against anything but another `Nil`.
+  Nil,
 }
 
 fn value_kind_for_type(ty: &str) -> ValKind {
@@ -70,6 +74,13 @@ fn value_kind_for_type(ty: &str) -> ValKind {
     // Plan 19: `String` is a real, declarable type too — kept distinct
     // from the generic `Ptr` bucket (see `ValKind`'s doc comment).
     "String" => ValKind::Str,
+    "Nil" => ValKind::Nil,
+    // `Hash[K, V]` (plan 25) shares the generic `Ptr` bucket — unlike
+    // `Array[Elem]`, indexing it needs a key type too, which the
+    // side-table `local_classes` (repurposed to hold `"Hash[K, V]"`
+    // strings alongside class names — see `build_index`) already
+    // carries without needing a whole new parameter threaded through
+    // every codegen function in this file.
     _ => ValKind::Ptr,
   }
 }
@@ -80,7 +91,7 @@ fn value_kind_for_type(ty: &str) -> ValKind {
 /// `make_fn_type`), not a user-input-dependent case.
 fn local_llvm_type<'ctx>(context: &'ctx Context, kind: ValKind) -> BasicTypeEnum<'ctx> {
   match kind {
-    ValKind::Int64 => context.i64_type().into(),
+    ValKind::Int64 | ValKind::Nil => context.i64_type().into(),
     ValKind::Float64 => context.f64_type().into(),
     ValKind::Ptr | ValKind::Str => context.ptr_type(AddressSpace::default()).into(),
     ValKind::Bool => context.bool_type().into(),
@@ -99,7 +110,7 @@ fn make_fn_type<'ctx>(
     .collect();
   match ret_kind {
     ValKind::Void => context.void_type().fn_type(&param_types, false),
-    ValKind::Int64 => context.i64_type().fn_type(&param_types, false),
+    ValKind::Int64 | ValKind::Nil => context.i64_type().fn_type(&param_types, false),
     ValKind::Float64 => context.f64_type().fn_type(&param_types, false),
     ValKind::Ptr | ValKind::Str => context
       .ptr_type(AddressSpace::default())
@@ -160,7 +171,16 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
     | Expr::Float(_)
     | Expr::StringLit(_)
     | Expr::InstanceVar(_)
-    | Expr::Lambda { .. } => {}
+    | Expr::Lambda { .. }
+    | Expr::Bool(_)
+    | Expr::Nil => {}
+    Expr::ArrayNew(size) => collect_idents_in_expr(size, out),
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        collect_idents_in_expr(k, out);
+        collect_idents_in_expr(v, out);
+      }
+    }
     Expr::Add(l, r)
     | Expr::Sub(l, r)
     | Expr::Mul(l, r)
@@ -527,6 +547,10 @@ struct Ctx<'a, 'ctx> {
   /// module's `{Name}_{method}` function directly, with no receiver
   /// value at all (modules have no fields/self, unlike classes/Procs).
   module_names: &'a HashSet<String>,
+  /// Plan 25's `Array.new(size)` (`calloc`-backed, unlike `alloc`'s
+  /// bare `malloc`) and `Hash[K, V]` key-not-found abort helper.
+  alloc_zeroed: FunctionValue<'ctx>,
+  hash_key_not_found: FunctionValue<'ctx>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -988,6 +1012,25 @@ fn build_expr<'ctx>(
             "codegen: `{op:?}` is not supported on String — only `==`/`!=` are (no lexicographic ordering is defined)"
           ));
         }
+        // Plan 25: `Nil == Nil`/`Nil != Nil` — trivial (both operands
+        // are always the same fixed `i64` sentinel) but real: a genuine
+        // `icmp`, not hand-folded to a constant, so it flows through
+        // the same generic machinery every other comparison does.
+        (ValKind::Nil, ValKind::Nil) if matches!(op, CompareOp::Eq | CompareOp::Ne) => {
+          let pred = if matches!(op, CompareOp::Eq) {
+            IntPredicate::EQ
+          } else {
+            IntPredicate::NE
+          };
+          builder
+            .build_int_compare(pred, l.into_int_value(), r.into_int_value(), "nilcmptmp")
+            .map_err(|e| e.to_string())?
+        }
+        (ValKind::Nil, ValKind::Nil) => {
+          return Err(format!(
+            "codegen: `{op:?}` is not supported on Nil — only `==`/`!=` are"
+          ));
+        }
         _ => return Err("codegen: comparison operands must both be Int64 or both Float64".into()),
       };
       Ok((cmp.into(), ValKind::Bool))
@@ -1104,7 +1147,89 @@ fn build_expr<'ctx>(
     Expr::Lambda { .. } => {
       Err("codegen: lambda literals are only supported as a top-level `Let`'s value".to_string())
     }
+    // Plan 25 (stdlib expansion).
+    Expr::Bool(b) => Ok((
+      context.bool_type().const_int(u64::from(*b), false).into(),
+      ValKind::Bool,
+    )),
+    Expr::Nil => Ok((context.i64_type().const_int(0, false).into(), ValKind::Nil)),
+    Expr::HashLit(pairs) => {
+      let ptr = build_hash_lit(
+        context,
+        builder,
+        pairs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      Ok((ptr.into(), ValKind::Ptr))
+    }
+    // `Array.new(size)`'s element type is only known from the enclosing
+    // `Let`'s declared annotation — `build_stmt`'s dedicated `Let`
+    // guard arm handles the one position this is actually reachable
+    // from; reached from anywhere else, it's an unsupported shape.
+    Expr::ArrayNew(_) => {
+      Err("codegen: `Array.new(...)` may only appear as a top-level `Let`'s value".to_string())
+    }
   }
+}
+
+/// `{k1 => v1, k2 => v2, ...}` (plan 25's Decision log): allocates
+/// `8 + n*16` bytes via `emerald_alloc` — an `i64` pair-count header
+/// (so `build_hash_lookup`'s linear scan knows when to stop) followed
+/// by `n` flat `(key, value)` pairs, 8 bytes each.
+#[allow(clippy::too_many_arguments)]
+fn build_hash_lit<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  pairs: &[(Expr, Expr)],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+  let byte_size = context
+    .i64_type()
+    .const_int(8 + pairs.len() as u64 * 16, false);
+  let call = builder
+    .build_call(ctx.alloc, &[byte_size.into()], "hashlit")
+    .map_err(|e| e.to_string())?;
+  let ptr = call_result(call)?.into_pointer_value();
+
+  let count = context.i64_type().const_int(pairs.len() as u64, false);
+  builder.build_store(ptr, count).map_err(|e| e.to_string())?;
+
+  for (i, (k, v)) in pairs.iter().enumerate() {
+    let (kv, _) = build_expr(
+      context,
+      builder,
+      k,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let key_ptr = field_ptr(context, builder, ptr, 8 + i as u64 * 16)?;
+    builder
+      .build_store(key_ptr, kv)
+      .map_err(|e| e.to_string())?;
+
+    let (vv, _) = build_expr(
+      context,
+      builder,
+      v,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let value_ptr = field_ptr(context, builder, ptr, 8 + i as u64 * 16 + 8)?;
+    builder
+      .build_store(value_ptr, vv)
+      .map_err(|e| e.to_string())?;
+  }
+  Ok(ptr)
 }
 
 /// Extracts a call instruction's return value, erroring (not panicking)
@@ -1280,9 +1405,129 @@ fn build_array_lit<'ctx>(
   Ok(ptr)
 }
 
-/// `arr[i]`. Same "plain local-variable" restriction as `MethodCall`'s
-/// receiver — the element kind comes from `local_array_elem_types`,
-/// keyed by the array's own local name.
+/// `"Hash[K, V]"` -> `(K's kind, V's kind)` — the same compound-string
+/// convention `emerald-sema`'s `resolve_type` uses, parsed here too
+/// since codegen keeps its own independent side-table (plan 25's
+/// Decision log on `local_classes` doubling for this).
+fn parse_hash_type(s: &str) -> Option<(ValKind, ValKind)> {
+  let inner = s.strip_prefix("Hash[")?.strip_suffix(']')?;
+  let (k, v) = inner.split_once(", ")?;
+  Some((value_kind_for_type(k), value_kind_for_type(v)))
+}
+
+/// Linear-scans a `Hash[K, V]`'s `[count:i64][(key,value) pairs]`
+/// buffer (plan 25's Decision log — a flat, `O(n)` representation, not
+/// a real hash table) for a matching key, returning a pointer to that
+/// pair's value slot. No match calls `emerald_hash_key_not_found`
+/// (never returns) and marks the fallthrough unreachable — a real,
+/// disclosed runtime abort, not silent undefined behavior.
+fn build_hash_lookup<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  base_ptr: PointerValue<'ctx>,
+  key_val: IntValue<'ctx>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+  let func = builder
+    .get_insert_block()
+    .ok_or("codegen: internal error — no current block")?
+    .get_parent()
+    .ok_or("codegen: internal error — block has no parent function")?;
+
+  let i64_ty = context.i64_type();
+  let count = builder
+    .build_load(i64_ty, base_ptr, "hashcount")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+
+  let idx_ptr = builder
+    .build_alloca(i64_ty, "hashidx")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(idx_ptr, i64_ty.const_int(0, false))
+    .map_err(|e| e.to_string())?;
+
+  let header_blk = context.append_basic_block(func, "hash.header");
+  let body_blk = context.append_basic_block(func, "hash.body");
+  let next_blk = context.append_basic_block(func, "hash.next");
+  let found_blk = context.append_basic_block(func, "hash.found");
+  let notfound_blk = context.append_basic_block(func, "hash.notfound");
+
+  builder
+    .build_unconditional_branch(header_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(header_blk);
+  let i = builder
+    .build_load(i64_ty, idx_ptr, "i")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+  let cond = builder
+    .build_int_compare(IntPredicate::SLT, i, count, "hashcond")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_conditional_branch(cond, body_blk, notfound_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(body_blk);
+  let sixteen = i64_ty.const_int(16, false);
+  let eight = i64_ty.const_int(8, false);
+  let pair_off = builder
+    .build_int_mul(i, sixteen, "pairoff")
+    .map_err(|e| e.to_string())?;
+  let key_off = builder
+    .build_int_add(pair_off, eight, "keyoff")
+    .map_err(|e| e.to_string())?;
+  let key_ptr = unsafe {
+    builder
+      .build_in_bounds_gep(context.i8_type(), base_ptr, &[key_off], "keyptr")
+      .map_err(|e| e.to_string())?
+  };
+  let pair_key = builder
+    .build_load(i64_ty, key_ptr, "pairkey")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+  let matches = builder
+    .build_int_compare(IntPredicate::EQ, pair_key, key_val, "keymatch")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_conditional_branch(matches, found_blk, next_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(next_blk);
+  let one = i64_ty.const_int(1, false);
+  let i_next = builder
+    .build_int_add(i, one, "inext")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(idx_ptr, i_next)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(header_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(notfound_blk);
+  builder
+    .build_call(ctx.hash_key_not_found, &[], "keynotfound")
+    .map_err(|e| e.to_string())?;
+  builder.build_unreachable().map_err(|e| e.to_string())?;
+
+  builder.position_at_end(found_blk);
+  let value_off = builder
+    .build_int_add(key_off, eight, "valoff")
+    .map_err(|e| e.to_string())?;
+  let value_ptr = unsafe {
+    builder
+      .build_in_bounds_gep(context.i8_type(), base_ptr, &[value_off], "valptr")
+      .map_err(|e| e.to_string())?
+  };
+  Ok(value_ptr)
+}
+
+/// `arr[i]` / `h[k]`. Same "plain local-variable" restriction as
+/// `MethodCall`'s receiver — dispatches on which side-table knows
+/// `arr_name`: `local_array_elem_types` (an `Array`) or `local_classes`
+/// holding a `"Hash[K, V]"` string (plan 25's Decision log).
 #[allow(clippy::too_many_arguments)]
 fn build_index<'ctx>(
   context: &'ctx Context,
@@ -1296,12 +1541,9 @@ fn build_index<'ctx>(
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
   let Expr::Ident(arr_name) = array else {
     return Err(
-      "codegen: array indexing is only supported on a plain local-variable array".to_string(),
+      "codegen: indexing is only supported on a plain local-variable receiver".to_string(),
     );
   };
-  let elem_kind = *local_array_elem_types.get(arr_name).ok_or_else(|| {
-    format!("codegen: cannot determine the element type of `{arr_name}` for indexing")
-  })?;
   let (base, _) = build_expr(
     context,
     builder,
@@ -1320,27 +1562,51 @@ fn build_index<'ctx>(
     local_array_elem_types,
     ctx,
   )?;
-  if idx_kind != ValKind::Int64 {
-    return Err("codegen: array index must be Int64".to_string());
+  if let Some(&elem_kind) = local_array_elem_types.get(arr_name) {
+    if idx_kind != ValKind::Int64 {
+      return Err("codegen: array index must be Int64".to_string());
+    }
+    let elem_llvm_ty = local_llvm_type(context, elem_kind);
+    let elem_ptr = unsafe {
+      builder
+        .build_in_bounds_gep(
+          elem_llvm_ty,
+          base.into_pointer_value(),
+          &[idx.into_int_value()],
+          "elemptr",
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let loaded = builder
+      .build_load(elem_llvm_ty, elem_ptr, "elemval")
+      .map_err(|e| e.to_string())?;
+    return Ok((loaded, elem_kind));
   }
-  let elem_llvm_ty = local_llvm_type(context, elem_kind);
-  let elem_ptr = unsafe {
-    builder
-      .build_in_bounds_gep(
-        elem_llvm_ty,
-        base.into_pointer_value(),
-        &[idx.into_int_value()],
-        "elemptr",
-      )
-      .map_err(|e| e.to_string())?
-  };
-  let loaded = builder
-    .build_load(elem_llvm_ty, elem_ptr, "elemval")
-    .map_err(|e| e.to_string())?;
-  Ok((loaded, elem_kind))
+  if let Some((key_kind, value_kind)) = local_classes.get(arr_name).and_then(|s| parse_hash_type(s))
+  {
+    if idx_kind != key_kind {
+      return Err(format!("codegen: Hash key must be {key_kind:?}"));
+    }
+    let value_ptr = build_hash_lookup(
+      context,
+      builder,
+      base.into_pointer_value(),
+      idx.into_int_value(),
+      ctx,
+    )?;
+    let value_llvm_ty = local_llvm_type(context, value_kind);
+    let loaded = builder
+      .build_load(value_llvm_ty, value_ptr, "hashval")
+      .map_err(|e| e.to_string())?;
+    return Ok((loaded, value_kind));
+  }
+  Err(format!(
+    "codegen: cannot determine the element type of `{arr_name}` for indexing"
+  ))
 }
 
-/// `arr[i] = value`. Same restriction as `build_index`'s read side.
+/// `arr[i] = value` / `h[k] = value`. Same dispatch as `build_index`'s
+/// read side.
 #[allow(clippy::too_many_arguments)]
 fn build_set_index<'ctx>(
   context: &'ctx Context,
@@ -1355,12 +1621,10 @@ fn build_set_index<'ctx>(
 ) -> Result<bool, String> {
   let Expr::Ident(arr_name) = array else {
     return Err(
-      "codegen: array assignment is only supported on a plain local-variable array".to_string(),
+      "codegen: indexed assignment is only supported on a plain local-variable receiver"
+        .to_string(),
     );
   };
-  let elem_kind = *local_array_elem_types.get(arr_name).ok_or_else(|| {
-    format!("codegen: cannot determine the element type of `{arr_name}` for indexing")
-  })?;
   let (base, _) = build_expr(
     context,
     builder,
@@ -1379,33 +1643,65 @@ fn build_set_index<'ctx>(
     local_array_elem_types,
     ctx,
   )?;
-  if idx_kind != ValKind::Int64 {
-    return Err("codegen: array index must be Int64".to_string());
-  }
-  let (v, _) = build_expr(
-    context,
-    builder,
-    value,
-    vars,
-    local_classes,
-    local_array_elem_types,
-    ctx,
-  )?;
-  let elem_llvm_ty = local_llvm_type(context, elem_kind);
-  let elem_ptr = unsafe {
+  if let Some(&elem_kind) = local_array_elem_types.get(arr_name) {
+    if idx_kind != ValKind::Int64 {
+      return Err("codegen: array index must be Int64".to_string());
+    }
+    let (v, _) = build_expr(
+      context,
+      builder,
+      value,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let elem_llvm_ty = local_llvm_type(context, elem_kind);
+    let elem_ptr = unsafe {
+      builder
+        .build_in_bounds_gep(
+          elem_llvm_ty,
+          base.into_pointer_value(),
+          &[idx.into_int_value()],
+          "elemptr",
+        )
+        .map_err(|e| e.to_string())?
+    };
     builder
-      .build_in_bounds_gep(
-        elem_llvm_ty,
-        base.into_pointer_value(),
-        &[idx.into_int_value()],
-        "elemptr",
-      )
-      .map_err(|e| e.to_string())?
-  };
-  builder
-    .build_store(elem_ptr, v)
-    .map_err(|e| e.to_string())?;
-  Ok(false)
+      .build_store(elem_ptr, v)
+      .map_err(|e| e.to_string())?;
+    return Ok(false);
+  }
+  if let Some((key_kind, _value_kind)) =
+    local_classes.get(arr_name).and_then(|s| parse_hash_type(s))
+  {
+    if idx_kind != key_kind {
+      return Err(format!("codegen: Hash key must be {key_kind:?}"));
+    }
+    let (v, _) = build_expr(
+      context,
+      builder,
+      value,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let value_ptr = build_hash_lookup(
+      context,
+      builder,
+      base.into_pointer_value(),
+      idx.into_int_value(),
+      ctx,
+    )?;
+    builder
+      .build_store(value_ptr, v)
+      .map_err(|e| e.to_string())?;
+    return Ok(false);
+  }
+  Err(format!(
+    "codegen: cannot determine the element type of `{arr_name}` for indexing"
+  ))
 }
 
 /// `puts <inner>` — a call-site-polymorphic intrinsic (not an
@@ -1513,6 +1809,49 @@ fn build_stmt<'ctx>(
       build_lambda_let(context, builder, name, vars, ctx)?;
       Ok(false)
     }
+    // `Array.new(size)`'s element type comes from this `Let`'s own
+    // declared annotation (plan 25's Decision log) — special-cased the
+    // same way `Proc` is above, since `build_expr` alone has no
+    // declared-type context to draw on.
+    Stmt::Let {
+      name,
+      ty,
+      value: Expr::ArrayNew(size),
+    } => {
+      let elem_name = ty
+        .strip_prefix("Array[")
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| {
+          format!("codegen: `{name}: {ty} = Array.new(...)` — declared type is not an Array")
+        })?;
+      let elem_kind = value_kind_for_type(elem_name);
+      let (size_val, size_kind) = build_expr(
+        context,
+        builder,
+        size,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if size_kind != ValKind::Int64 {
+        return Err("codegen: `Array.new` size must be Int64".to_string());
+      }
+      let elem_size = context.i64_type().const_int(8, false);
+      let byte_size = builder
+        .build_int_mul(size_val.into_int_value(), elem_size, "arraynewbytes")
+        .map_err(|e| e.to_string())?;
+      let call = builder
+        .build_call(ctx.alloc_zeroed, &[byte_size.into()], "arraynew")
+        .map_err(|e| e.to_string())?;
+      let ptr = call_result(call)?;
+      local_array_elem_types.insert(name.clone(), elem_kind);
+      let (dst, _) = *vars
+        .get(name)
+        .expect("pre-allocated by prealloc_lets for every reachable Let");
+      builder.build_store(dst, ptr).map_err(|e| e.to_string())?;
+      Ok(false)
+    }
     Stmt::Let { name, ty, value } => {
       let (v, _) = build_expr(
         context,
@@ -1528,6 +1867,14 @@ fn build_stmt<'ctx>(
       }
       if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
         local_array_elem_types.insert(name.clone(), value_kind_for_type(elem_name));
+      }
+      // Plan 25: `local_classes` doubles as the side-table for
+      // `"Hash[K, V]"` locals too (see `value_kind_for_type`'s doc
+      // comment) — `build_index`/`build_set_index` check for this
+      // prefix to route to hash-lookup codegen instead of array
+      // indexing.
+      if ty.starts_with("Hash[") {
+        local_classes.insert(name.clone(), ty.clone());
       }
       let (ptr, _) = *vars
         .get(name)
@@ -2702,6 +3049,17 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 25 (stdlib expansion).
+  let alloc_zeroed = module.add_function(
+    "emerald_alloc_zeroed",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let hash_key_not_found = module.add_function(
+    "emerald_hash_key_not_found",
+    void_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
   let exc_funcs = declare_exception_runtime_funcs(&context, &module);
 
   // Class layouts (field offsets/kinds) and a stable per-class integer
@@ -2745,6 +3103,8 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     class_tags: &class_tags,
     exc_funcs,
     module_names: &module_names,
+    alloc_zeroed,
+    hash_key_not_found,
   };
 
   for item in &program.items {
@@ -3155,5 +3515,81 @@ mod tests {
     // AC3: no diagnostic, no crash — matches `if` with no `else`.
     let src = "n: Int64 = 7\ncase n\nwhen 1\n  puts 1\nend\nputs 42\n";
     assert_eq!(compile_link_run(src), "42\n");
+  }
+
+  // Plan 25 (stdlib expansion).
+
+  const BOOL_EXAMPLE: &str = "def check(flag: Boolean) -> Int64\n  if flag\n    return 1\n  end\n  return 0\nend\n\nputs check(true)\nputs check(false)\n";
+
+  #[test]
+  fn bool_literal_example_linked_and_run() {
+    assert_eq!(compile_link_run(BOOL_EXAMPLE), "1\n0\n");
+  }
+
+  const NIL_EXAMPLE: &str = "def check_nil(x: Nil) -> Int64\n  if x == nil\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
+
+  #[test]
+  fn nil_literal_example_linked_and_run() {
+    assert_eq!(compile_link_run(NIL_EXAMPLE), "1\n");
+  }
+
+  const HASH_EXAMPLE: &str =
+    "h: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nputs h[2]\nh[2] = 99\nputs h[2]\n";
+
+  #[test]
+  fn hash_literal_get_and_set_linked_and_run() {
+    assert_eq!(compile_link_run(HASH_EXAMPLE), "20\n99\n");
+  }
+
+  #[test]
+  fn hash_missing_key_aborts_at_runtime() {
+    let src = "h: Hash[Int64, Int64] = {1 => 10}\nputs h[99]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!(
+      "{}_{:?}_hashmiss",
+      std::process::id(),
+      std::thread::current().id()
+    );
+    let obj_path = dir.join(format!("emerald_codegen_aot_{unique}.o"));
+    let bin_path = dir.join(format!("emerald_codegen_aot_bin_{unique}"));
+    compile_to_object(&program, &obj_path).expect("should compile to object file");
+    let status = Command::new("cc")
+      .arg("-no-pie")
+      .arg(&obj_path)
+      .arg(runtime_path())
+      .arg("-o")
+      .arg(&bin_path)
+      .status()
+      .expect("failed to invoke cc");
+    assert!(status.success(), "linking should succeed");
+    let output = Command::new(&bin_path)
+      .output()
+      .expect("failed to run compiled binary");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&bin_path).ok();
+    assert!(
+      !output.status.success(),
+      "a missing Hash key should abort, not exit 0"
+    );
+    assert!(
+      String::from_utf8_lossy(&output.stderr).contains("Hash key not found"),
+      "stderr should report the abort reason, got {:?}",
+      output.stderr
+    );
+  }
+
+  const ARRAY_NEW_EXAMPLE: &str = "arr: Array[Int64] = Array.new(5)\nputs arr[0]\ni: Int64 = 0\nwhile i < 5\n  arr[i] = i\n  i: Int64 = i + 1\nend\nputs arr[3]\n";
+
+  #[test]
+  fn array_new_zero_filled_and_writable_linked_and_run() {
+    assert_eq!(compile_link_run(ARRAY_NEW_EXAMPLE), "0\n3\n");
+  }
+
+  #[test]
+  fn array_new_accepts_runtime_computed_size() {
+    let src =
+      "n: Int64 = 3\narr: Array[Int64] = Array.new(n)\narr[0] = 7\nputs arr[0]\nputs arr[1]\n";
+    assert_eq!(compile_link_run(src), "7\n0\n");
   }
 }

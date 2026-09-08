@@ -812,6 +812,80 @@ mod tests {
     assert!(else_body.is_some());
   }
 
+  // Plan 25 (stdlib expansion).
+
+  #[test]
+  fn parses_bool_and_nil_literals() {
+    let program = parse("puts true\nputs false\nputs nil\n")
+      .expect("should parse")
+      .items;
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, a1))) = &program[0] else {
+      panic!("expected a puts call, got {:?}", program[0]);
+    };
+    assert_eq!(a1[0], Expr::Bool(true));
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, a2))) = &program[1] else {
+      panic!("expected a puts call, got {:?}", program[1]);
+    };
+    assert_eq!(a2[0], Expr::Bool(false));
+    let Item::Stmt(Stmt::Expr(Expr::Call(_, a3))) = &program[2] else {
+      panic!("expected a puts call, got {:?}", program[2]);
+    };
+    assert_eq!(a3[0], Expr::Nil);
+  }
+
+  #[test]
+  fn parses_hash_literal_and_indexing() {
+    let src = "h: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nputs h[2]\nh[2] = 99\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[0] else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
+    assert_eq!(name, "h");
+    assert_eq!(ty, "Hash[Int64, Int64]");
+    assert_eq!(
+      *value,
+      Expr::HashLit(vec![
+        (Expr::Int(1), Expr::Int(10)),
+        (Expr::Int(2), Expr::Int(20)),
+        (Expr::Int(3), Expr::Int(30)),
+      ])
+    );
+    assert_eq!(
+      program.items[2],
+      Item::Stmt(Stmt::SetIndex {
+        array: Expr::Ident("h".into()),
+        index: Expr::Int(2),
+        value: Expr::Int(99),
+      })
+    );
+  }
+
+  #[test]
+  fn parses_array_new() {
+    let program = parse("arr: Array[Int64] = Array.new(5)\n").expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Let {
+        name: "arr".into(),
+        ty: "Array[Int64]".into(),
+        value: Expr::ArrayNew(Box::new(Expr::Int(5))),
+      })
+    );
+  }
+
+  #[test]
+  fn parses_array_new_with_runtime_size() {
+    let program = parse("n: Int64 = 5\narr: Array[Int64] = Array.new(n)\n").expect("should parse");
+    assert_eq!(
+      program.items[1],
+      Item::Stmt(Stmt::Let {
+        name: "arr".into(),
+        ty: "Array[Int64]".into(),
+        value: Expr::ArrayNew(Box::new(Expr::Ident("n".into()))),
+      })
+    );
+  }
+
   #[test]
   fn case_with_no_else_parses() {
     let src = "case n\nwhen 1\n  puts 1\nend\n";

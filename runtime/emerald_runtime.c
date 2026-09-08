@@ -25,6 +25,24 @@ void *emerald_alloc(long long size) {
   return malloc((size_t) size);
 }
 
+/* `Array.new(size)` (plan 25's Decision log) — `calloc`-backed so the
+ * buffer is genuinely zero-filled, unlike `emerald_alloc`'s bare
+ * `malloc`. No length tracking, matching `emerald_alloc`'s own
+ * no-bounds-info contract. */
+void *emerald_alloc_zeroed(long long size) {
+  return calloc((size_t) size, 1);
+}
+
+/* `Hash[K, V]` indexed read/write with no matching key (plan 25's
+ * Decision log): a real, disclosed runtime abort — not silently
+ * undefined behavior the way out-of-bounds `Array` access is (plan 09)
+ * — since the linear-scan lookup that finds this case is code this
+ * runtime fully controls, unlike raw pointer arithmetic. */
+void emerald_hash_key_not_found(void) {
+  fprintf(stderr, "uncaught error: Hash key not found\n");
+  exit(1);
+}
+
 /* Plan 19 (string literals). `String` is a bare pointer to a
  * null-terminated UTF-8 buffer (spec/TYPE_SYSTEM.md §9) — no length
  * header — specifically so these three helpers can reuse ordinary libc

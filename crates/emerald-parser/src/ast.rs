@@ -87,6 +87,19 @@ pub enum Expr {
     return_type: String,
     body: Vec<Stmt>,
   },
+  /// `true`/`false` (plan 25's Decision log) — a real `Boolean` value,
+  /// not just `Compare`'s byproduct.
+  Bool(bool),
+  /// `nil` (plan 25's Decision log — deliberately narrow: no `T?`
+  /// nullable-type system, just a bare `Nil`-typed value).
+  Nil,
+  /// `{k1 => v1, k2 => v2, ...}` (plan 25's Decision log) — `Int64`
+  /// keys only, no `Symbol`-keyed `{a: 1}` shorthand.
+  HashLit(Vec<(Expr, Expr)>),
+  /// `Array.new(size)` (plan 25's Decision log) — a dedicated node, not
+  /// a reuse of `Expr::New`, since `Array` is a reserved keyword, not a
+  /// class name in the class registry.
+  ArrayNew(Box<Expr>),
 }
 
 /// One statement in a block (a function body or the program's top level).

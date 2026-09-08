@@ -15,11 +15,18 @@ pub enum Type {
   String,
   Boolean,
   Void,
+  /// Plan 25's Decision log: deliberately narrow — no `T?` nullable-type
+  /// system, just a bare, standalone type a `nil` literal produces.
+  Nil,
   /// An instance of a user-defined class, named by its declaration.
   Class(String),
   /// A packed, contiguous array of a single element type
   /// (`spec/TYPE_SYSTEM.md` §8) — named `Array[Elem]` at the source level.
   Array(Box<Type>),
+  /// A key/value container, named `Hash[K, V]` at the source level
+  /// (plan 25's Decision log: `Int64` keys only, a flat linear-scan
+  /// representation in codegen — not a real hash table).
+  Hash(Box<Type>, Box<Type>),
   /// A closure's parameter types and return type. Unlike `Type::Class`,
   /// which is just a name backed by a separate `ClassInfo` registry,
   /// there's no such registry for lambdas — the signature has to travel
@@ -71,6 +78,7 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "String" => Ok(Type::String),
     "Void" => Ok(Type::Void),
     "Boolean" => Ok(Type::Boolean),
+    "Nil" => Ok(Type::Nil),
     // Modules are namespaces, not types (plan 12's Decision log) — a
     // module name is excluded here so `x: MathUtils = ...` correctly
     // falls through to the `unknown type` error below, not `Type::Class`.
@@ -84,6 +92,19 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
       let elem_name = &other["Array[".len()..other.len() - 1];
       let elem_ty = resolve_type(elem_name, classes)?;
       Ok(Type::Array(Box::new(elem_ty)))
+    }
+    // `"Hash[K, V]"` — same compound-string convention as `Array[Elem]`
+    // above; the grammar's `HashPair` production always formats it with
+    // exactly `", "` between `K` and `V` (`grammar.lalrpop`'s `TypeName`
+    // rule), so a single `", "` split is unambiguous here.
+    other if other.starts_with("Hash[") && other.ends_with(']') => {
+      let inner = &other["Hash[".len()..other.len() - 1];
+      let (k_name, v_name) = inner
+        .split_once(", ")
+        .ok_or_else(|| Diagnostic::new(format!("malformed Hash type annotation `{other}`")))?;
+      let k_ty = resolve_type(k_name, classes)?;
+      let v_ty = resolve_type(v_name, classes)?;
+      Ok(Type::Hash(Box::new(k_ty), Box::new(v_ty)))
     }
     // A bare `Proc` annotation carries no signature (see `Type::Proc`'s
     // doc comment) — this opaque placeholder is only ever reached outside
@@ -393,27 +414,104 @@ fn infer_expr_type(
     // `[]` has no element type to infer — `Array[T]`'s declared `T`
     // on the enclosing `Let` isn't visible from here.
     Expr::ArrayLit(elements) => infer_array_lit_type(elements, env, sigs, classes, self_fields),
+    // Plan 25: `Hash`'s get/set reuse `Expr::Index`/`Stmt::SetIndex`
+    // (see the Decision log) — a `Type::Hash(_, _)` arm sits alongside
+    // the existing `Type::Array(_)` one rather than a parallel indexing
+    // mechanism.
     Expr::Index(array, index) => {
       let array_ty = infer_expr_type(array, env, sigs, classes, self_fields)?;
-      let Type::Array(elem_ty) = array_ty else {
-        return Err(Diagnostic::new(format!(
-          "`[...]` indexing requires an Array, found {array_ty:?}"
-        )));
-      };
       let index_ty = infer_expr_type(index, env, sigs, classes, self_fields)?;
-      if index_ty != Type::Int64 {
-        return Err(Diagnostic::new(format!(
-          "array index must be Int64, found {index_ty:?}"
-        )));
+      match array_ty {
+        Type::Array(elem_ty) => {
+          if index_ty != Type::Int64 {
+            return Err(Diagnostic::new(format!(
+              "array index must be Int64, found {index_ty:?}"
+            )));
+          }
+          Ok(*elem_ty)
+        }
+        Type::Hash(key_ty, value_ty) => {
+          if index_ty != *key_ty {
+            return Err(Diagnostic::new(format!(
+              "Hash key must be {key_ty:?}, found {index_ty:?}"
+            )));
+          }
+          Ok(*value_ty)
+        }
+        other => Err(Diagnostic::new(format!(
+          "`[...]` indexing requires an Array or a Hash, found {other:?}"
+        ))),
       }
-      Ok(*elem_ty)
     }
     Expr::Lambda {
       params,
       return_type,
       body,
     } => infer_lambda_type(params, return_type, body, env, sigs, classes),
+    // Plan 25: a real `Boolean` value, not just `Compare`'s byproduct.
+    Expr::Bool(_) => Ok(Type::Boolean),
+    // Plan 25: deliberately narrow — see `Type::Nil`'s doc comment.
+    Expr::Nil => Ok(Type::Nil),
+    // A `{}` empty literal has no key/value type to infer — same
+    // reasoning `infer_array_lit_type` already applies to `[]` (plan
+    // 09's Decision log), applied here for the second container kind.
+    Expr::HashLit(pairs) => infer_hash_lit_type(pairs, env, sigs, classes, self_fields),
+    Expr::ArrayNew(size) => {
+      let size_ty = infer_expr_type(size, env, sigs, classes, self_fields)?;
+      if size_ty != Type::Int64 {
+        return Err(Diagnostic::new(format!(
+          "`Array.new` size must be Int64, found {size_ty:?}"
+        )));
+      }
+      // `Array.new(size)`'s element type comes from the enclosing
+      // `Let`'s declared annotation (plan 25's Decision log — the same
+      // source plan 09 already uses for an array literal's element
+      // type) — `check_stmt`'s `Let` case special-cases this the same
+      // way it already special-cases `Proc`, since `infer_expr_type`
+      // alone has no declared-type context to draw on here.
+      Err(Diagnostic::new(
+        "`Array.new(...)` may only appear as a top-level `Let`'s value, where its element type is known from the declared annotation",
+      ))
+    }
   }
+}
+
+/// All key/value pairs of a hash literal must share one key type and
+/// one value type (independently — a mixed-key-type *or*
+/// mixed-value-type literal is rejected), and — since there's no
+/// structured type annotation on the literal itself to fall back on —
+/// the literal can't be empty (mirrors `infer_array_lit_type` exactly).
+fn infer_hash_lit_type(
+  pairs: &[(Expr, Expr)],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<Type, Diagnostic> {
+  let Some(((first_k, first_v), rest)) = pairs.split_first() else {
+    return Err(Diagnostic::new(
+      "empty hash literals are not supported — the key/value types can't be inferred",
+    ));
+  };
+  let key_ty = infer_expr_type(first_k, env, sigs, classes, self_fields)?;
+  let value_ty = infer_expr_type(first_v, env, sigs, classes, self_fields)?;
+  for (i, (k, v)) in rest.iter().enumerate() {
+    let kt = infer_expr_type(k, env, sigs, classes, self_fields)?;
+    if kt != key_ty {
+      return Err(Diagnostic::new(format!(
+        "hash literal pair {} has key type {kt:?}, expected {key_ty:?} (all keys must share one type)",
+        i + 2
+      )));
+    }
+    let vt = infer_expr_type(v, env, sigs, classes, self_fields)?;
+    if vt != value_ty {
+      return Err(Diagnostic::new(format!(
+        "hash literal pair {} has value type {vt:?}, expected {value_ty:?} (all values must share one type)",
+        i + 2
+      )));
+    }
+  }
+  Ok(Type::Hash(Box::new(key_ty), Box::new(value_ty)))
 }
 
 /// A lambda body is checked exactly like a function body — the outer
@@ -527,21 +625,25 @@ fn check_set_index(
   self_fields: Option<&HashMap<String, Type>>,
 ) -> Result<(), Diagnostic> {
   let array_ty = infer_expr_type(array, env, sigs, classes, self_fields)?;
-  let Type::Array(elem_ty) = array_ty else {
-    return Err(Diagnostic::new(format!(
-      "`[...] = ...` indexing requires an Array, found {array_ty:?}"
-    )));
-  };
   let index_ty = infer_expr_type(index, env, sigs, classes, self_fields)?;
-  if index_ty != Type::Int64 {
+  let (container, elem_ty, index_expected) = match array_ty {
+    Type::Array(elem_ty) => ("array", *elem_ty, Type::Int64),
+    Type::Hash(key_ty, value_ty) => ("Hash", *value_ty, *key_ty),
+    other => {
+      return Err(Diagnostic::new(format!(
+        "`[...] = ...` indexing requires an Array or a Hash, found {other:?}"
+      )));
+    }
+  };
+  if index_ty != index_expected {
     return Err(Diagnostic::new(format!(
-      "array index must be Int64, found {index_ty:?}"
+      "{container} index must be {index_expected:?}, found {index_ty:?}"
     )));
   }
   let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
-  if actual != *elem_ty {
+  if actual != elem_ty {
     return Err(Diagnostic::new(format!(
-      "type mismatch in array assignment: element type is {elem_ty:?}, value has type {actual:?}"
+      "type mismatch in {container} assignment: element type is {elem_ty:?}, value has type {actual:?}"
     )));
   }
   Ok(())
@@ -576,6 +678,30 @@ fn check_stmt(
         )));
       }
       env.insert(name.clone(), actual);
+      Ok(())
+    }
+    // `Array.new(size)`'s element type comes from the enclosing `Let`'s
+    // own declared annotation (plan 25's Decision log) — special-cased
+    // the same way `Proc` is above, since `infer_expr_type` alone has
+    // no declared-type context available to it.
+    Stmt::Let {
+      name,
+      ty,
+      value: Expr::ArrayNew(size),
+    } => {
+      let declared = resolve_type(ty, classes)?;
+      if !matches!(declared, Type::Array(_)) {
+        return Err(Diagnostic::new(format!(
+          "type mismatch in `{name}: {ty} = Array.new(...)`: `Array.new` produces an Array, not {declared:?}"
+        )));
+      }
+      let size_ty = infer_expr_type(size, env, sigs, classes, self_fields)?;
+      if size_ty != Type::Int64 {
+        return Err(Diagnostic::new(format!(
+          "`Array.new` size must be Int64, found {size_ty:?}"
+        )));
+      }
+      env.insert(name.clone(), declared);
       Ok(())
     }
     Stmt::Let { name, ty, value } => {
@@ -1433,5 +1559,69 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a Float64 scrutinee");
     assert!(errs[0].message.contains("Int64"));
+  }
+
+  // Plan 25 (stdlib expansion).
+
+  #[test]
+  fn accepts_bool_literal_example() {
+    let src = "def check(flag: Boolean) -> Int64\n  if flag\n    return 1\n  end\n  return 0\nend\n\nputs check(true)\nputs check(false)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_nil_literal_example() {
+    let src = "def check_nil(x: Nil) -> Int64\n  if x == nil\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_nil_assigned_to_non_nil_type() {
+    let src = "x: Int64 = nil\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject `x: Int64 = nil`");
+    assert!(errs[0].message.contains("Int64") && errs[0].message.contains("Nil"));
+  }
+
+  #[test]
+  fn accepts_hash_literal_get_and_set() {
+    let src =
+      "h: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nputs h[2]\nh[2] = 99\nputs h[2]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_empty_hash_literal() {
+    let src = "h: Hash[Int64, Int64] = {}\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject an empty hash literal");
+    assert!(errs[0].message.contains("empty hash literals"));
+  }
+
+  #[test]
+  fn rejects_mixed_value_type_hash_literal() {
+    let src = "h: Hash[Int64, Int64] = {1 => 10, 2 => 2.0}\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a mixed value-type hash literal");
+    assert!(errs[0].message.contains("value type"));
+  }
+
+  #[test]
+  fn accepts_array_new_with_literal_and_runtime_size() {
+    let src = "arr: Array[Int64] = Array.new(5)\nn: Int64 = 5\narr2: Array[Int64] = Array.new(n)\nputs arr[0]\nputs arr2[0]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_array_new_size_mismatch_with_declared_type() {
+    let src = "arr: Int64 = Array.new(5)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject Array.new assigned to a non-Array type");
+    assert!(errs[0].message.contains("Array.new"));
   }
 }
