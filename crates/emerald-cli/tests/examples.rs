@@ -18,7 +18,7 @@ fn compile_and_run(example: &str) -> String {
     std::process::id()
   ));
 
-  let status = Command::new(env!("CARGO_BIN_EXE_emerald-cli"))
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
     .arg(&source)
     .arg("-o")
     .arg(&output)

@@ -1,0 +1,4 @@
+[package]
+name = "mathutils"
+version = "0.1.0"
+entry = "lib.em"

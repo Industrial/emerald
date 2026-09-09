@@ -11,10 +11,25 @@
 //! `match { Ok/Err }` blocks. No capability DI, no async — see plan
 //! 14's Decision log for why that's the right amount of the crate to
 //! use here, not more.
+//!
+//! Plan 46 adds `new`/`build`/`run` subcommand dispatch on top of this
+//! same pipeline (`manifest`/`deps`/`lockfile`/`require` modules); the
+//! legacy bare `emerald <source.em> [-o <output>]` invocation (no
+//! `emerald.toml` involved) keeps working unchanged for any other
+//! `args[1]`.
 
+mod deps;
+mod lockfile;
+mod manifest;
+mod require;
+
+use deps::DepsError;
 use emerald_parser::{ParseError, Program};
 use id_effect::{Effect, run_blocking};
-use std::path::PathBuf;
+use lockfile::Lockfile;
+use manifest::{DependencySpec, Manifest, ManifestError};
+use require::RequireError;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 enum CliError {
@@ -24,6 +39,29 @@ enum CliError {
   Sema(Vec<emerald_sema::Diagnostic>),
   Codegen(String),
   Link(String),
+  Manifest(ManifestError),
+  Deps(DepsError),
+  Require(RequireError),
+}
+
+fn report_error(e: CliError) {
+  match e {
+    CliError::Parse(errs) => {
+      for e in errs {
+        eprintln!("{:?}", miette::Report::new(e));
+      }
+    }
+    CliError::Sema(diags) => {
+      for d in &diags {
+        eprintln!("error: {}", d.message);
+      }
+    }
+    CliError::Codegen(e) => eprintln!("codegen error: {e}"),
+    CliError::Link(e) => eprintln!("error: {e}"),
+    CliError::Manifest(e) => eprintln!("error: {e}"),
+    CliError::Deps(e) => eprintln!("error: {e}"),
+    CliError::Require(e) => eprintln!("error: {e}"),
+  }
 }
 
 fn parse_stage(source: String, name: String) -> Effect<Program, CliError, ()> {
@@ -90,10 +128,38 @@ fn link_stage(obj_path: PathBuf, output_path: PathBuf) -> Effect<(), CliError, (
   })
 }
 
+/// Splices `entry_path`'s own `require`s in place (plan 23's design,
+/// resolved by `require.rs` since `emerald-driver`'s `resolve_program`
+/// doesn't exist yet) instead of a plain single-file parse — this is
+/// the only difference between the manifest-driven `build`/`run`
+/// pipeline and the legacy single-file one.
+fn require_stage(entry_path: PathBuf) -> Effect<Program, CliError, ()> {
+  Effect::new(move |_env: &mut ()| require::resolve_program(&entry_path).map_err(CliError::Require))
+}
+
 fn main() {
   let args: Vec<String> = std::env::args().collect();
+  match args.get(1).map(String::as_str) {
+    Some("new") => cmd_new(&args),
+    Some("build") => {
+      cmd_build();
+    }
+    Some("run") => cmd_run(),
+    Some("update") => {
+      eprintln!(
+        "error: `emerald update` is not supported yet — edit the dependency's \
+         path/git/rev in emerald.toml and rebuild to re-resolve it (see plan \
+         46's Decision log)."
+      );
+      process::exit(1);
+    }
+    _ => run_legacy(&args),
+  }
+}
+
+fn run_legacy(args: &[String]) {
   let Some(source_path) = args.get(1) else {
-    eprintln!("usage: emerald-cli <source.em> [-o <output>]");
+    eprintln!("usage: emerald <source.em> [-o <output>]  |  emerald new/build/run <name>");
     process::exit(2);
   };
 
@@ -117,26 +183,108 @@ fn main() {
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
 
   if let Err(e) = run_blocking(pipeline, ()) {
-    match e {
-      // `ParseError` implements `miette::Diagnostic` (plan 13) — its
-      // `{:?}` rendering, via miette's `fancy`-feature graphical
-      // handler, is the source-snippet-and-caret display, not a bare
-      // one-line message. Plan 26: one report per recovered error, not
-      // just the first — still exits non-zero once, after printing all
-      // of them.
-      CliError::Parse(errs) => {
-        for e in errs {
-          eprintln!("{:?}", miette::Report::new(e));
-        }
-      }
-      CliError::Sema(diags) => {
-        for d in &diags {
-          eprintln!("error: {}", d.message);
-        }
-      }
-      CliError::Codegen(e) => eprintln!("codegen error: {e}"),
-      CliError::Link(e) => eprintln!("error: {e}"),
-    }
+    report_error(e);
     process::exit(1);
   }
+}
+
+fn cmd_new(args: &[String]) {
+  let Some(name) = args.get(2) else {
+    eprintln!("usage: emerald new <name>");
+    process::exit(2);
+  };
+  let dir = PathBuf::from(name);
+  if let Err(e) = std::fs::create_dir_all(&dir) {
+    eprintln!("error: cannot create `{}`: {e}", dir.display());
+    process::exit(1);
+  }
+  let manifest_toml =
+    format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"main.em\"\n");
+  let main_em = format!("puts \"Hello from {name}!\"\n");
+  if let Err(e) = std::fs::write(dir.join("emerald.toml"), manifest_toml) {
+    eprintln!(
+      "error: cannot write `{}`: {e}",
+      dir.join("emerald.toml").display()
+    );
+    process::exit(1);
+  }
+  if let Err(e) = std::fs::write(dir.join("main.em"), main_em) {
+    eprintln!(
+      "error: cannot write `{}`: {e}",
+      dir.join("main.em").display()
+    );
+    process::exit(1);
+  }
+  println!("     Created package `{name}` at ./{name}");
+}
+
+fn load_manifest_or_exit(dir: &Path) -> Manifest {
+  match Manifest::load(dir) {
+    Ok(m) => m,
+    Err(e) => {
+      report_error(CliError::Manifest(e));
+      eprintln!(
+        "hint: `emerald build`/`emerald run` require an `emerald.toml` \
+         in the current directory (see `emerald new`)."
+      );
+      process::exit(1);
+    }
+  }
+}
+
+/// Resolves the manifest, its dependencies, and its `require`s, then
+/// runs the same check -> codegen -> link pipeline the legacy path
+/// uses. Returns the path to the linked binary — never returns on
+/// failure (matches `run_legacy`'s own exit-on-error shape).
+fn cmd_build() -> PathBuf {
+  let cwd = std::env::current_dir().unwrap_or_else(|e| {
+    eprintln!("error: cannot read current directory: {e}");
+    process::exit(1);
+  });
+  let manifest = load_manifest_or_exit(&cwd);
+
+  for (name, spec) in &manifest.dependencies {
+    let desc = match spec {
+      DependencySpec::Path { path } => format!("path {path}"),
+      DependencySpec::Git { git, rev } => format!("git {git} rev {rev}"),
+    };
+    println!("   Resolving {name} ({desc})");
+  }
+  let existing_lock = Lockfile::load(&cwd);
+  if let Err(e) = deps::resolve_or_reuse(&cwd, &manifest, existing_lock.as_ref()) {
+    report_error(CliError::Deps(e));
+    process::exit(1);
+  }
+
+  println!(
+    "   Compiling {} v{} ({})",
+    manifest.package.name, manifest.package.version, manifest.package.entry
+  );
+
+  let entry_path = cwd.join(&manifest.package.entry);
+  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let output_path = cwd.join(&manifest.package.name);
+  let output_path_for_link = output_path.clone();
+
+  let pipeline = require_stage(entry_path)
+    .flat_map(check_stage)
+    .flat_map(move |program| codegen_stage(program, obj_path))
+    .flat_map(move |obj_path| link_stage(obj_path, output_path_for_link));
+
+  if let Err(e) = run_blocking(pipeline, ()) {
+    report_error(e);
+    process::exit(1);
+  }
+
+  println!("    Finished build: ./{}", manifest.package.name);
+  output_path
+}
+
+fn cmd_run() {
+  let output_path = cmd_build();
+  let status = Command::new(&output_path).status().unwrap_or_else(|e| {
+    eprintln!("error: failed to run `{}`: {e}", output_path.display());
+    process::exit(1);
+  });
+  process::exit(status.code().unwrap_or(1));
 }

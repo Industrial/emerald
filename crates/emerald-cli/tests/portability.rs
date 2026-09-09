@@ -19,7 +19,7 @@ fn copied_alone_binary_links_and_runs_with_no_repo_access() {
   std::fs::create_dir_all(&scratch).expect("failed to create scratch dir");
 
   let binary_copy = scratch.join("emerald-cli");
-  std::fs::copy(env!("CARGO_BIN_EXE_emerald-cli"), &binary_copy)
+  std::fs::copy(env!("CARGO_BIN_EXE_emerald"), &binary_copy)
     .expect("failed to copy the emerald-cli binary into the scratch dir");
   #[cfg(unix)]
   {

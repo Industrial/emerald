@@ -31,7 +31,7 @@ struct Measurement {
 
 fn compile_emerald(src: &Path, out: &Path) -> Duration {
   let start = Instant::now();
-  let status = Command::new(env!("CARGO_BIN_EXE_emerald-cli"))
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
     .arg(src)
     .arg("-o")
     .arg(out)

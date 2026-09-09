@@ -14,7 +14,7 @@ fn compiles_and_runs_hello_em_printing_42() {
   let source = workspace_root().join("examples/hello.em");
   let output = std::env::temp_dir().join(format!("emerald_hello_{}", std::process::id()));
 
-  let status = Command::new(env!("CARGO_BIN_EXE_emerald-cli"))
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
     .arg(&source)
     .arg("-o")
     .arg(&output)
@@ -46,7 +46,7 @@ fn rejects_type_mismatch_with_nonzero_exit_and_stderr_diagnostic() {
   .unwrap();
   let output_path = dir.join(format!("emerald_bad_out_{}", std::process::id()));
 
-  let output = Command::new(env!("CARGO_BIN_EXE_emerald-cli"))
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
     .arg(&src_path)
     .arg("-o")
     .arg(&output_path)
@@ -80,7 +80,7 @@ fn parse_error_renders_a_miette_source_snippet_with_a_caret() {
   std::fs::write(&src_path, "x: Int64 = +\n").unwrap();
   let output_path = dir.join(format!("emerald_parse_bad_out_{}", std::process::id()));
 
-  let output = Command::new(env!("CARGO_BIN_EXE_emerald-cli"))
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
     .arg(&src_path)
     .arg("-o")
     .arg(&output_path)
