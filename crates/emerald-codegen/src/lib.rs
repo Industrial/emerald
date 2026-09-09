@@ -12981,7 +12981,16 @@ fn declare_lambda_functions<'ctx>(
 /// `__lambda_{name}` per top-level `Proc` `Let`, plus a `main`
 /// (`extern "C" fn() -> i32`) that evaluates the top-level statements.
 pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, None, None, None, None, None)
+  compile_to_object_impl(
+    program,
+    out_path,
+    None,
+    None,
+    None,
+    None,
+    None,
+    CodegenTarget::Native,
+  )
 }
 
 /// Plan 61's Decision log: identical to `compile_to_object`, except
@@ -12994,7 +13003,16 @@ pub fn compile_to_object_with_comptime_step_limit(
   out_path: &Path,
   limit: u64,
 ) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, None, None, None, None, Some(limit))
+  compile_to_object_impl(
+    program,
+    out_path,
+    None,
+    None,
+    None,
+    None,
+    Some(limit),
+    CodegenTarget::Native,
+  )
 }
 
 /// Plan 50's `leaf-escape-instrumentation-and-report`: identical to
@@ -13007,7 +13025,16 @@ pub fn compile_to_object_with_stats(
   out_path: &Path,
 ) -> Result<EscapeStats, String> {
   let stats = RefCell::new(EscapeStats::default());
-  compile_to_object_impl(program, out_path, None, None, Some(&stats), None, None)?;
+  compile_to_object_impl(
+    program,
+    out_path,
+    None,
+    None,
+    Some(&stats),
+    None,
+    None,
+    CodegenTarget::Native,
+  )?;
   Ok(stats.into_inner())
 }
 
@@ -13022,7 +13049,16 @@ fn compile_to_object_ir_text_for_test(
   out_path: &Path,
 ) -> Result<String, String> {
   let ir_text = RefCell::new(String::new());
-  compile_to_object_impl(program, out_path, None, None, None, Some(&ir_text), None)?;
+  compile_to_object_impl(
+    program,
+    out_path,
+    None,
+    None,
+    None,
+    Some(&ir_text),
+    None,
+    CodegenTarget::Native,
+  )?;
   Ok(ir_text.into_inner())
 }
 
@@ -13060,6 +13096,7 @@ pub fn compile_to_object_scoped(
     None,
     None,
     None,
+    CodegenTarget::Native,
   )
 }
 
@@ -13085,6 +13122,59 @@ pub fn compile_to_object_with_debug_info(
   file_name: &str,
   comptime_step_limit: Option<u64>,
 ) -> Result<(), String> {
+  compile_to_object_with_target(
+    program,
+    out_path,
+    source,
+    file_name,
+    comptime_step_limit,
+    CodegenTarget::Native,
+  )
+}
+
+/// Plan 64's `leaf-target-triple-and-selection`: the `source_info`-free
+/// counterpart to `compile_to_object_with_target`, for `emerald-driver`'s
+/// `codegen_stage`'s own `source_info: None` branch (`compile_program`/
+/// `compile_program_with_libs` — the `require`-spliced, project-mode
+/// `emerald build` path, which has no single coherent source string —
+/// see `compile_to_object`/`compile_to_object_with_comptime_step_limit`'s
+/// own identical `None` shape above, now widened with a real `target`
+/// too).
+pub fn compile_to_object_with_comptime_step_limit_and_target(
+  program: &Program,
+  out_path: &Path,
+  comptime_step_limit: Option<u64>,
+  target: CodegenTarget,
+) -> Result<(), String> {
+  compile_to_object_impl(
+    program,
+    out_path,
+    None,
+    None,
+    None,
+    None,
+    comptime_step_limit,
+    target,
+  )
+}
+
+/// Plan 64's `leaf-target-triple-and-selection`: identical to
+/// `compile_to_object_with_debug_info`, except `target` selects the
+/// real target machine `compile_to_object_impl` builds — the one
+/// entry point `emerald-driver`'s own ordinary `codegen_stage` (the
+/// ordinary `emerald build`/`emerald <file>` CLI path, which always
+/// supplies real source text) needs to actually reach `--target
+/// wasm32-wasi` through, mirroring exactly how `comptime_step_limit`
+/// widened this same function rather than adding a third variant
+/// (plan 61's Decision log, cited verbatim above).
+pub fn compile_to_object_with_target(
+  program: &Program,
+  out_path: &Path,
+  source: &str,
+  file_name: &str,
+  comptime_step_limit: Option<u64>,
+  target: CodegenTarget,
+) -> Result<(), String> {
   compile_to_object_impl(
     program,
     out_path,
@@ -13093,9 +13183,26 @@ pub fn compile_to_object_with_debug_info(
     None,
     None,
     comptime_step_limit,
+    target,
   )
 }
 
+/// Plan 64's `leaf-target-triple-and-selection` — the one real,
+/// verified (this session, against this workspace's real LLVM 21
+/// build) hardcoded-native-target seam in this whole file (Decision
+/// log): every other function here emits ordinary, target-agnostic
+/// LLVM IR through `inkwell`'s `Builder` API. `Native` is every
+/// pre-`plan-64` caller's implicit, unchanged behavior; `Wasm32Wasi`
+/// is this plan's own addition, real WASI preview 1 support — no
+/// preview 2/component-model support is in scope (Decision log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodegenTarget {
+  #[default]
+  Native,
+  Wasm32Wasi,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compile_to_object_impl(
   program: &Program,
   out_path: &Path,
@@ -13128,6 +13235,10 @@ fn compile_to_object_impl(
   // limit` is built, so this function's behavior is unchanged for every
   // caller that doesn't pass `Some`.
   comptime_step_limit: Option<u64>,
+  // Plan 64's Decision log: `CodegenTarget::Native` for every pre-plan-64
+  // caller — no behavior change; only `compile_to_object_with_target`
+  // (this plan's own new entry point) ever passes `Wasm32Wasi`.
+  target: CodegenTarget,
 ) -> Result<(), String> {
   // Plan 47's Decision log: a `test "..." do ... end` block only ever
   // compiles through `compile_test_harness` (`emerald test`) — reaching
@@ -13152,14 +13263,37 @@ fn compile_to_object_impl(
   let owned_program = Program { items };
   let program = &owned_program;
 
-  Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
-  let triple = TargetMachine::get_default_triple();
-  let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
-  let target_machine = target
+  // Plan 64's `leaf-target-triple-and-selection` — the one seam this
+  // whole file has (Decision log). `Native` keeps the pre-plan-64
+  // four calls byte-for-byte; `Wasm32Wasi` cross-compiles instead of
+  // querying the host at all — there is no "host CPU" for a genuinely
+  // cross target (WASM has no `-mcpu`-equivalent concept LLVM's
+  // WebAssembly backend consults the way x86 consults `-march`, so
+  // both name/features strings are simply empty, not queried).
+  let (triple, cpu_name, cpu_features) = match target {
+    CodegenTarget::Native => {
+      Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
+      (
+        TargetMachine::get_default_triple(),
+        TargetMachine::get_host_cpu_name().to_string(),
+        TargetMachine::get_host_cpu_features().to_string(),
+      )
+    }
+    CodegenTarget::Wasm32Wasi => {
+      Target::initialize_webassembly(&InitializationConfig::default());
+      (
+        inkwell::targets::TargetTriple::create("wasm32-wasi"),
+        String::new(),
+        String::new(),
+      )
+    }
+  };
+  let llvm_target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
+  let target_machine = llvm_target
     .create_target_machine(
       &triple,
-      &TargetMachine::get_host_cpu_name().to_string(),
-      &TargetMachine::get_host_cpu_features().to_string(),
+      &cpu_name,
+      &cpu_features,
       OptimizationLevel::Aggressive,
       RelocMode::Default,
       CodeModel::Default,
@@ -14853,6 +14987,40 @@ mod tests {
     )
     .expect("benchmarks/sum/sum.em should exist");
     assert_eq!(compile_link_run(&src), "49999995000000\n");
+  }
+
+  // Plan 64's `leaf-target-triple-and-selection` AC4: a real `.o` file
+  // `file(1)` itself identifies as a WebAssembly object — not merely
+  // "no error returned" from `compile_to_object_with_target`.
+  #[test]
+  fn sum_benchmark_compiled_for_wasm32_wasi_produces_a_real_webassembly_object() {
+    let src = std::fs::read_to_string(
+      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/sum/sum.em"),
+    )
+    .expect("benchmarks/sum/sum.em should exist");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let dir = fresh_temp_dir("sum_wasm32_wasi");
+    let out_path = dir.join("sum.o");
+    compile_to_object_with_target(
+      &program,
+      &out_path,
+      &src,
+      "sum.em",
+      None,
+      CodegenTarget::Wasm32Wasi,
+    )
+    .expect("should compile a wasm32-wasi object file");
+    let output = std::process::Command::new("file")
+      .arg(&out_path)
+      .output()
+      .expect("failed to run `file`");
+    let description = String::from_utf8_lossy(&output.stdout);
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+      description.to_lowercase().contains("wasm")
+        || description.to_lowercase().contains("webassembly"),
+      "expected `file` to report a WebAssembly object, got: {description}"
+    );
   }
 
   #[test]

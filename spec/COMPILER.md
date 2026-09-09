@@ -187,6 +187,81 @@ Evidence: `crates/emerald-codegen/src/lib.rs` (17 passing tests);
 
 ---
 
+## Codegen targets
+
+### 2026-09-09 addendum (`64 wasm-codegen-target`): `wasm32-wasi` as a second, selectable target
+
+`emerald build --target wasm32-wasi` reuses the same AST-to-LLVM-IR
+codegen path `crates/emerald-codegen/src/lib.rs` already builds for
+the native target — `Target::initialize_webassembly`/`TargetTriple::
+create("wasm32-wasi")` replace the four native-only calls
+(`compile_to_object_impl`) that were the one real hardcoded-target seam
+in the whole file (verified this session: LLVM 21's own build here has
+`WebAssembly` in `llvm-config --targets-built`, and `inkwell` 0.10
+exposes `Target::initialize_webassembly`). No AST node, grammar
+production, or sema check changed — this is purely a second selectable
+target machine plus the runtime/link seams below it.
+
+| | `x86_64-unknown-linux-gnu` (default) | `wasm32-wasi` (`--target wasm32-wasi`) |
+|---|---|---|
+| Concurrency | Real OS threads — a fixed pool of `EMERALD_WORKERS` (or `nproc`) `pthread`-spawned workers pulling actor messages off a shared runnable queue (plan 55). | Sequential only. WASI preview 1 has no `pthread_create` — `M` is 1 and cannot be otherwise (harder than plan 55's own `EMERALD_WORKERS=1`, which still spawns one real thread). `emerald_worker_pool_drain_and_join` becomes the sequential mailbox-drain loop itself; per-actor FIFO ordering is preserved, "multiple actors run literally simultaneously" is not. `EMERALD_WORKERS` is accepted and silently ignored — a real, documented no-op. |
+| FFI | Arbitrary `extern "C"` linking against a named library (`emerald.toml`'s `[ffi] link = [...]`, plan 59). | None. WASI's sandboxing model exposes only the fixed `wasi_snapshot_preview1` import set — no `dlopen`, no linking against a native `.so`/`.a` that assumes syscalls beyond that set. Remote/distributed actors (plan 60's `.register`/`.remote`, real sockets) are in the same unsupported category — a real, disclosed gap this plan's own text did not originally account for (plan 60 landed after this plan's initial Decision log was written; corrected here). |
+| Required external tooling | `cc` (already required for every native build). | A WASI-capable cross-compiler (`CC_wasm32_wasip1`, resolved the same way at both `crates/emerald-driver/build.rs`'s runtime-archive cross-compile time and `link`'s own link-time invocation) plus [`wasmtime`](https://wasmtime.dev/) to actually execute a compiled `.wasm` module — `emerald run --target wasm32-wasi` is explicitly rejected (a `.wasm` module is not a directly-launchable native binary) rather than failing with a confusing native-launcher error. |
+| Output | Bare executable (`./<name>`). | `<name>.wasm`. |
+
+**Declined, explicitly** (plan 64's own Decision log, restated here per
+its own `leaf-spec-and-restrictions-doc`):
+- **The WASM threads proposal / `SharedArrayBuffer`-style
+  multi-threading** (`wasm32-wasip1-threads` or preview 2's
+  equivalent) — a real fix to the "M=1" ceiling above, but a
+  substantial, separate project (a threads-enabled wasi-libc,
+  atomics-enabled codegen, a full runtime concurrency re-audit for
+  shared-linear-memory aliasing hazards), not a small extension of the
+  sequential fallback this plan built.
+- **Arbitrary C-library FFI under `wasm32-wasi`** — a preemptive scope
+  boundary for whichever future plan adds general C-library linking:
+  it must not extend to this target, for the sandboxing reason stated
+  in the table above, not an arbitrary restriction.
+
+**A real, disclosed verification gap, stated plainly rather than
+silently assumed away:** this workspace's own `devenv shell` (verified
+this session) has no WASI toolchain (`wasi-sdk`/`WASI_SDK_PATH`) and no
+`wasmtime` installed, and `devenv.nix` was deliberately **not** modified
+to add either — an untested new Nix package fetch inside this
+already-long session risked breaking the shared dev shell this whole
+session's own tooling (`lean-ctx`, `roam-code`, `maestro`, every prior
+plan's own verification) depends on, a blast radius judged not worth
+the reward. What IS real and verified this session: LLVM genuinely
+emits a valid `wasm32-wasi` object file for `benchmarks/sum/sum.em`
+with zero codegen changes beyond target selection (`crates/
+emerald-codegen/src/lib.rs`'s `sum_benchmark_compiled_for_wasm32_wasi_
+produces_a_real_webassembly_object` test, confirmed via `file(1)`
+reporting a genuine WebAssembly object); the CLI/driver plumbing
+(`--target` flag, `.wasm` output extension, `emerald run` rejection,
+unrecognized-target rejection) is real and tested end-to-end
+(`crates/emerald-cli/tests/target_flag.rs`); the runtime C port
+(`runtime/emerald_runtime.c`'s `__wasi__`-guarded sequential worker
+pool) is written and the **native** branch is confirmed byte-for-byte
+regression-free (`cargo test --workspace`), but the `wasm32-wasip1`
+branch has never actually been compiled against a real WASI toolchain
+in this session — a real, open item for whichever future session has
+one available, not a claim of proven correctness. `crates/
+emerald-driver/tests/wasm_target.rs`'s own full compile-and-run proof
+is written and gated correctly (verified skip-not-fail, confirmed this
+session — `wasmtime` is genuinely absent here) but has never actually
+executed its `wasmtime run` branch for the same reason.
+
+Evidence: `crates/emerald-codegen/src/lib.rs` (`CodegenTarget`,
+`compile_to_object_with_target`); `crates/emerald-driver/src/lib.rs`
+(`compile_with_target`, `compile_program_with_libs_and_target`,
+`link_with_libs_and_target`); `crates/emerald-driver/build.rs` (gated
+`wasm32-wasip1` cross-compile); `runtime/emerald_runtime.c`
+(`__wasi__`-guarded sections); `crates/emerald-cli/tests/target_flag.rs`;
+`crates/emerald-driver/tests/wasm_target.rs`;
+`history/2026-09-09T142000Z-plan-64-wasm-codegen-target.md`.
+
+---
+
 ## Cross-references
 
 - Grammar-file location and content: [`GRAMMAR.md`](./GRAMMAR.md),

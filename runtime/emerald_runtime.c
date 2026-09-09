@@ -17,9 +17,83 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-/* Plan 55 (scheduler and message passing). */
+/* Plan 55 (scheduler and message passing). Plan 64's Decision log:
+ * `wasm32-wasip1` (clang predefines `__wasi__` for this target) ships
+ * no `pthread_create` at all — there is exactly one execution context,
+ * so `<pthread.h>`/`<unistd.h>` aren't included at all under this
+ * target; every `pthread_*` type/call this file uses elsewhere
+ * (`EmeraldActorHeader.mailbox_mutex`/`EmeraldActorRef.send_mutex`'s
+ * own field declarations included — see that struct's own doc comment
+ * for why codegen never needs to know either struct's real `sizeof`,
+ * which is exactly what makes substituting a trivial placeholder type
+ * here safe) gets a real, inert, single-execution-context-safe no-op
+ * shim instead — never a real lock, since nothing else can ever be
+ * running concurrently to contend with. `emerald_worker_pool_start`/
+ * `emerald_worker_pool_drain_and_join` (further below, both `#ifdef
+ * __wasi__`-guarded to genuinely different bodies, not just this
+ * shim) are the two functions that actually need DIFFERENT logic, not
+ * merely a no-op-safe stand-in — everywhere else in this file, the
+ * existing pthread-call sites are byte-for-byte unchanged and simply
+ * compile against these inert stand-ins instead. */
+#ifndef __wasi__
 #include <pthread.h>
 #include <unistd.h>
+#else
+typedef int pthread_mutex_t;
+typedef int pthread_cond_t;
+typedef int pthread_t;
+#define PTHREAD_MUTEX_INITIALIZER 0
+#define PTHREAD_COND_INITIALIZER 0
+static inline int pthread_mutex_init(pthread_mutex_t *m, const void *attr) {
+  (void) m;
+  (void) attr;
+  return 0;
+}
+static inline int pthread_mutex_lock(pthread_mutex_t *m) {
+  (void) m;
+  return 0;
+}
+static inline int pthread_mutex_unlock(pthread_mutex_t *m) {
+  (void) m;
+  return 0;
+}
+static inline int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
+  /* Never actually called under `__wasi__` — `emerald_worker_pool_
+   * drain_and_join`'s own WASI branch never blocks on a condvar (see
+   * its doc comment) — kept only so any other, unguarded call site
+   * elsewhere in this file still compiles rather than needing its own
+   * `#ifdef`. */
+  (void) c;
+  (void) m;
+  return 0;
+}
+static inline int pthread_cond_signal(pthread_cond_t *c) {
+  (void) c;
+  return 0;
+}
+static inline int pthread_cond_broadcast(pthread_cond_t *c) {
+  (void) c;
+  return 0;
+}
+static inline int pthread_create(pthread_t *t, const void *attr, void *(*start)(void *),
+                                  void *arg) {
+  /* No execution context to spawn onto — a real, disclosed failure
+   * (`errno`-free; this shim's only caller left unguarded anywhere in
+   * this file is plan 60's own remote-actor networking code, which is
+   * not a supported combination under `wasm32-wasi` — see `spec/
+   * COMPILER.md`'s own per-target restrictions table). */
+  (void) t;
+  (void) attr;
+  (void) start;
+  (void) arg;
+  return -1;
+}
+static inline int pthread_join(pthread_t t, void **ret) {
+  (void) t;
+  (void) ret;
+  return -1;
+}
+#endif
 /* Plan 60 (distributed, location-transparent actors) — verified this
  * session: plan 45's real file has no socket primitive of any kind. */
 #include <arpa/inet.h>
@@ -791,6 +865,7 @@ void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
   }
 }
 
+#ifndef __wasi__
 static void *emerald_worker_main(void *arg) {
   (void) arg;
   for (;;) {
@@ -871,12 +946,14 @@ static void *emerald_worker_main(void *arg) {
   }
   return NULL;
 }
+#endif /* !__wasi__ */
 
 /* Spawns `EMERALD_WORKERS` (when set and `> 0`) or
  * `sysconf(_SC_NPROCESSORS_ONLN)` worker threads. A no-op if already
  * started — generated `main` calls this exactly once, at its very
  * start, but this stays idempotent rather than relying on that being
  * the only caller forever. */
+#ifndef __wasi__
 void emerald_worker_pool_start(void) {
   if (emerald_pool_started) {
     return;
@@ -901,6 +978,17 @@ void emerald_worker_pool_start(void) {
   }
   emerald_pool_started = 1;
 }
+#else
+/* Plan 64's Decision log: `wasm32-wasi` has exactly one execution
+ * context — `M` is 1 and cannot be otherwise, a harder ceiling than
+ * `EMERALD_WORKERS=1` (which still spawns one real pthread; there is
+ * none to spawn here at all). `EMERALD_WORKERS` is accepted-and-
+ * ignored under this target (AC3) — a real, documented no-op, not a
+ * silently-misleading knob. */
+void emerald_worker_pool_start(void) {
+  emerald_pool_started = 1;
+}
+#endif
 
 /* Generated `main`'s implicit barrier, emitted as the last thing before
  * its own `ret` (see the plan's own Decision log for why this is
@@ -918,6 +1006,7 @@ void emerald_worker_pool_start(void) {
 static int emerald_network_active;
 static pthread_t emerald_accept_thread;
 
+#ifndef __wasi__
 void emerald_worker_pool_drain_and_join(void) {
   pthread_mutex_lock(&emerald_runnable_mutex);
   while (emerald_outstanding_messages > 0) {
@@ -951,6 +1040,70 @@ void emerald_worker_pool_drain_and_join(void) {
   emerald_pool_started = 0;
   emerald_pool_shutdown = 0;
 }
+#else
+/* Plan 64's `leaf-wasi-runtime-and-sequential-actors`: no worker was
+ * ever spawned (`emerald_worker_pool_start`'s own WASI branch), so
+ * nothing else is ever going to pop `emerald_runnable_head` — this
+ * function IS the drain loop here, not a wait for someone else's.
+ * Pops the next runnable actor, runs every message currently in its
+ * mailbox to completion (the identical per-actor-FIFO body `emerald_
+ * worker_main`'s own drain loop uses natively, inlined here since that
+ * function doesn't exist under this target at all), re-checks whether
+ * more actors became runnable as a SIDE EFFECT of running those
+ * messages (a message's own trampoline can itself send to a THIRD
+ * actor, which `emerald_actor_enqueue` appends to this same runnable
+ * list — this loop keeps draining until that list is genuinely empty,
+ * not just "was empty when this function was first called"), and
+ * returns once it is. Real per-actor FIFO ordering is preserved
+ * (mailbox order is never reordered); only "multiple actors run
+ * literally simultaneously" stops holding — plan 64's Decision log's
+ * own stated scope. Plan 60's remote/distributed-actor networking
+ * extension (the native branch's `emerald_network_active` check,
+ * immediately above) has no counterpart here — `.register()`/`.
+ * remote()` are not a supported combination under `wasm32-wasi` (no
+ * real thread to `accept()` on; see `spec/COMPILER.md`'s own
+ * per-target restrictions table), so this branch never needs to
+ * consult `emerald_network_active` at all. */
+void emerald_worker_pool_drain_and_join(void) {
+  while (emerald_runnable_head != NULL) {
+    EmeraldActorHeader *header = emerald_runnable_head;
+    emerald_runnable_head = header->next_runnable;
+    if (emerald_runnable_head == NULL) {
+      emerald_runnable_tail = NULL;
+    }
+    header->next_runnable = NULL;
+
+    for (;;) {
+      if (header->terminated) {
+        EmeraldMessage *dead = header->mailbox_head;
+        header->mailbox_head = NULL;
+        header->mailbox_tail = NULL;
+        header->scheduled = 0;
+        while (dead != NULL) {
+          EmeraldMessage *next = dead->next;
+          free(dead);
+          emerald_outstanding_messages--;
+          dead = next;
+        }
+        break;
+      }
+      EmeraldMessage *msg = header->mailbox_head;
+      if (msg == NULL) {
+        header->scheduled = 0;
+        break;
+      }
+      header->mailbox_head = msg->next;
+      if (header->mailbox_head == NULL) {
+        header->mailbox_tail = NULL;
+      }
+      msg->trampoline(header->self, msg->argv);
+      free(msg);
+      emerald_outstanding_messages--;
+    }
+  }
+  emerald_pool_started = 0;
+}
+#endif
 
 /* Observability only (plan 55's `leaf-worked-concurrency-proof`'s own
  * best-effort, disclosed-probabilistic evidence) — never consulted by

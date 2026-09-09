@@ -33,6 +33,13 @@ use cache::{CacheKey, CacheReporter, QueryCache, raw_hash};
 // second dependency edge.
 pub use emerald_sema::{ClassSymbol, FunctionSymbol, SymbolTable};
 
+// Plan 64's `leaf-cli-target-flag-and-linking`: the identical
+// re-export boundary immediately above, for the same reason —
+// `emerald-cli` names `CodegenTarget` (its own `--target` flag's
+// value type) without a second dependency edge straight onto
+// `emerald-codegen`.
+pub use emerald_codegen::CodegenTarget;
+
 #[derive(Debug)]
 pub enum DriverError {
   /// Plan 26: `emerald_parser::parse_named` reports every top-level
@@ -110,21 +117,44 @@ fn codegen_stage(
   source_info: Option<(String, String)>,
   comptime_step_limit: Option<u64>,
 ) -> Effect<PathBuf, DriverError, ()> {
+  codegen_stage_with_target(
+    program,
+    obj_path,
+    source_info,
+    comptime_step_limit,
+    emerald_codegen::CodegenTarget::Native,
+  )
+}
+
+/// Plan 64's `leaf-target-triple-and-selection`/`leaf-cli-target-flag-
+/// and-linking`: `codegen_stage`'s own generalized sibling — every
+/// pre-plan-64 caller keeps going through `codegen_stage` above
+/// (`CodegenTarget::Native`, unchanged behavior); only `compile_
+/// program_with_target`/`compile_with_target` (this plan's own new
+/// entry points) ever pass `Wasm32Wasi`.
+fn codegen_stage_with_target(
+  program: Program,
+  obj_path: PathBuf,
+  source_info: Option<(String, String)>,
+  comptime_step_limit: Option<u64>,
+  target: emerald_codegen::CodegenTarget,
+) -> Effect<PathBuf, DriverError, ()> {
   Effect::new(move |_env: &mut ()| {
     let result = match &source_info {
-      Some((source, name)) => emerald_codegen::compile_to_object_with_debug_info(
+      Some((source, name)) => emerald_codegen::compile_to_object_with_target(
         &program,
         &obj_path,
         source,
         name,
         comptime_step_limit,
+        target,
       ),
-      None => match comptime_step_limit {
-        Some(limit) => {
-          emerald_codegen::compile_to_object_with_comptime_step_limit(&program, &obj_path, limit)
-        }
-        None => emerald_codegen::compile_to_object(&program, &obj_path),
-      },
+      None => emerald_codegen::compile_to_object_with_comptime_step_limit_and_target(
+        &program,
+        &obj_path,
+        comptime_step_limit,
+        target,
+      ),
     };
     result.map(|()| obj_path).map_err(DriverError::Codegen)
   })
@@ -161,6 +191,17 @@ fn obj_file_name(prefix: &str) -> String {
 /// user's compiled program: the runtime archive travels inside the
 /// binary itself.
 static RUNTIME_ARCHIVE: &[u8] = include_bytes!(env!("EMERALD_RUNTIME_ARCHIVE"));
+
+/// Plan 64's `leaf-wasi-runtime-and-sequential-actors`: `build.rs`
+/// always embeds SOMETHING here — a real, `wasm32-wasip1`-compiled
+/// archive when a WASI-capable compiler was configured at *this
+/// crate's own* build time (`CC_wasm32_wasip1`), or a real, empty
+/// (`.is_empty()`) placeholder otherwise (never a build failure just
+/// because nobody asked for WASM support — see `build.rs`'s own doc
+/// comment). `link_with_libs_and_target`'s `Wasm32Wasi` branch checks
+/// for exactly that emptiness before ever invoking a linker.
+static RUNTIME_ARCHIVE_WASM32_WASI: &[u8] =
+  include_bytes!(env!("EMERALD_RUNTIME_ARCHIVE_WASM32_WASI"));
 
 /// -no-pie: `emerald-codegen` emits non-PIC code (see its `host_isa`),
 /// so the executable must not be a PIE either — otherwise `ld` warns
@@ -211,6 +252,98 @@ fn build_link_args(
   args.push("-o".into());
   args.push(output_path.as_os_str().to_os_string());
   args
+}
+
+/// Plan 64's `leaf-cli-target-flag-and-linking`: `build_link_args`'s
+/// own `wasm32-wasi` counterpart — the same argument shape, minus
+/// `-no-pie` (an ELF/PIC-specific flag with no WASM equivalent; WASM
+/// has no position-independent-executable concept to disable).
+fn build_link_args_wasm32_wasi(
+  obj_path: &Path,
+  runtime_archive_path: &Path,
+  output_path: &Path,
+  extra_libs: &[String],
+) -> Vec<std::ffi::OsString> {
+  let mut args: Vec<std::ffi::OsString> = vec![
+    obj_path.as_os_str().to_os_string(),
+    runtime_archive_path.as_os_str().to_os_string(),
+  ];
+  for lib in extra_libs {
+    args.push(format!("-l{lib}").into());
+  }
+  args.push("-o".into());
+  args.push(output_path.as_os_str().to_os_string());
+  args
+}
+
+/// Plan 64's `leaf-cli-target-flag-and-linking`: `link_with_libs`'s own
+/// target-dispatched sibling — `Native` delegates unchanged; `Wasm32Wasi`
+/// invokes the WASI-capable compiler resolved the same way `build.rs`
+/// resolves one to cross-compile the runtime archive (`CC_wasm32_wasip1`),
+/// against `RUNTIME_ARCHIVE_WASM32_WASI` instead of the native archive.
+/// A missing WASI toolchain (this workspace's own `devenv shell`,
+/// verified this session — see `build.rs`'s own doc comment) is a real,
+/// named `DriverError::Link`, not a confusing linker-not-found failure
+/// or a silent fallback to native.
+pub fn link_with_libs_and_target(
+  obj_path: PathBuf,
+  output_path: PathBuf,
+  extra_libs: &[String],
+  target: emerald_codegen::CodegenTarget,
+) -> Result<(), DriverError> {
+  match target {
+    emerald_codegen::CodegenTarget::Native => link_with_libs(obj_path, output_path, extra_libs),
+    emerald_codegen::CodegenTarget::Wasm32Wasi => {
+      if RUNTIME_ARCHIVE_WASM32_WASI.is_empty() {
+        std::fs::remove_file(&obj_path).ok();
+        return Err(DriverError::Link(
+          "no WASI toolchain was configured when this `emerald` binary was built — \
+           `--target wasm32-wasi` is unavailable (see spec/COMPILER.md's per-target \
+           restrictions table)"
+            .to_string(),
+        ));
+      }
+      let Ok(cc) = std::env::var("CC_wasm32_wasip1") else {
+        std::fs::remove_file(&obj_path).ok();
+        return Err(DriverError::Link(
+          "no WASI-capable compiler configured (CC_wasm32_wasip1) — cannot link a \
+           wasm32-wasi build"
+            .to_string(),
+        ));
+      };
+      let runtime_archive_path = std::env::temp_dir().join(format!(
+        "libemerald_runtime_wasm32_wasi_{}.a",
+        process::id()
+      ));
+      if let Err(e) = std::fs::write(&runtime_archive_path, RUNTIME_ARCHIVE_WASM32_WASI) {
+        std::fs::remove_file(&obj_path).ok();
+        return Err(DriverError::Link(format!(
+          "failed to extract the embedded wasm32-wasi runtime archive: {e}"
+        )));
+      }
+      let args =
+        build_link_args_wasm32_wasi(&obj_path, &runtime_archive_path, &output_path, extra_libs);
+      let link_result = Command::new(&cc).args(&args).status();
+      std::fs::remove_file(&obj_path).ok();
+      std::fs::remove_file(&runtime_archive_path).ok();
+      match link_result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(DriverError::Link("linking failed".to_string())),
+        Err(e) => Err(DriverError::Link(format!("failed to invoke {cc}: {e}"))),
+      }
+    }
+  }
+}
+
+fn link_stage_with_target(
+  obj_path: PathBuf,
+  output_path: PathBuf,
+  extra_libs: Vec<String>,
+  target: emerald_codegen::CodegenTarget,
+) -> Effect<(), DriverError, ()> {
+  Effect::new(move |_env: &mut ()| {
+    link_with_libs_and_target(obj_path.clone(), output_path.clone(), &extra_libs, target)
+  })
 }
 
 /// Plan 48: `link_stage`'s own body, factored into a plain function so
@@ -278,6 +411,29 @@ pub fn compile(source: &str, name: &str, output_path: &Path) -> Result<(), Drive
     .flat_map(check_stage)
     .flat_map(move |program| codegen_stage(program, obj_path, source_info, None))
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
+  run_blocking(pipeline, ())
+}
+
+/// Plan 64's `leaf-cli-target-flag-and-linking`: identical to
+/// `compile`, except `target` selects the real target machine and
+/// linker/runtime-archive pair — `emerald-cli`'s own `--target
+/// wasm32-wasi` flag's real, end-to-end entry point for the legacy
+/// single-file (`emerald <file>.em`) path.
+pub fn compile_with_target(
+  source: &str,
+  name: &str,
+  output_path: &Path,
+  target: emerald_codegen::CodegenTarget,
+) -> Result<(), DriverError> {
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
+  let output_path = output_path.to_path_buf();
+  let source_info = Some((source.to_string(), name.to_string()));
+  let pipeline = parse_stage(source.to_string(), name.to_string())
+    .flat_map(check_stage)
+    .flat_map(move |program| {
+      codegen_stage_with_target(program, obj_path, source_info, None, target)
+    })
+    .flat_map(move |obj_path| link_stage_with_target(obj_path, output_path, Vec::new(), target));
   run_blocking(pipeline, ())
 }
 
@@ -374,6 +530,28 @@ pub fn compile_program_with_libs(
   let pipeline = check_stage(program)
     .flat_map(move |program| codegen_stage(program, obj_path, None, None))
     .flat_map(move |obj_path| link_stage_with_libs(obj_path, output_path, extra_libs));
+  run_blocking(pipeline, ())
+}
+
+/// Plan 64's `leaf-cli-target-flag-and-linking`: identical to
+/// `compile_program_with_libs`, except `target` selects the real
+/// target machine and linker/runtime-archive pair — `emerald-cli`'s
+/// own `cmd_build`'s real entry point for `emerald build --target
+/// wasm32-wasi` (project mode, a `require`-spliced `Program` with no
+/// single coherent source string, hence `codegen_stage_with_target`'s
+/// own `source_info: None` branch).
+pub fn compile_program_with_libs_and_target(
+  program: Program,
+  output_path: &Path,
+  extra_libs: &[String],
+  target: emerald_codegen::CodegenTarget,
+) -> Result<(), DriverError> {
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
+  let output_path = output_path.to_path_buf();
+  let extra_libs = extra_libs.to_vec();
+  let pipeline = check_stage(program)
+    .flat_map(move |program| codegen_stage_with_target(program, obj_path, None, None, target))
+    .flat_map(move |obj_path| link_stage_with_target(obj_path, output_path, extra_libs, target));
   run_blocking(pipeline, ())
 }
 

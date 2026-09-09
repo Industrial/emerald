@@ -40,4 +40,35 @@ fn main() {
     "cargo:rustc-env=EMERALD_RUNTIME_ARCHIVE={}",
     archive_path.display()
   );
+
+  // Plan 64's `leaf-wasi-runtime-and-sequential-actors`: a second,
+  // gated cross-compile of the SAME runtime source for `wasm32-wasip1`
+  // — attempted only when a WASI-capable compiler is actually
+  // configured via `CC_wasm32_wasip1` (the same underscored env-var
+  // spelling the `cc` crate's own documented cross-compilation
+  // convention reads for a `.target("wasm32-wasip1")` build). Building
+  // this crate on a machine with no WASI toolchain at all (this
+  // workspace's own `devenv shell`, verified this session — no
+  // `wasi-sdk`/`WASI_SDK_PATH`/`wasmtime` present) must never fail
+  // `cargo build -p emerald-driver` just because nobody asked for WASM
+  // support — a real, empty placeholder archive is written instead,
+  // and `link_with_libs`'s own `Wasm32Wasi` branch (`src/lib.rs`)
+  // checks for exactly this emptiness at run time, returning a real,
+  // named `DriverError::Link("no WASI toolchain configured...")`
+  // rather than trying to link a garbage/empty archive.
+  println!("cargo:rerun-if-env-changed=CC_wasm32_wasip1");
+  let wasm_archive_path = std::path::Path::new(&out_dir).join("libemerald_runtime_wasm32_wasi.a");
+  if std::env::var("CC_wasm32_wasip1").is_ok() {
+    cc::Build::new()
+      .file(&runtime_src)
+      .target("wasm32-wasip1")
+      .opt_level(2)
+      .compile("emerald_runtime_wasm32_wasi");
+  } else {
+    std::fs::write(&wasm_archive_path, []).expect("should write an empty WASI-archive placeholder");
+  }
+  println!(
+    "cargo:rustc-env=EMERALD_RUNTIME_ARCHIVE_WASM32_WASI={}",
+    wasm_archive_path.display()
+  );
 }

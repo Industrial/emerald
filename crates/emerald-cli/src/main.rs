@@ -189,6 +189,29 @@ fn comptime_step_limit_requested(args: &[String]) -> Option<u64> {
   })
 }
 
+/// Plan 64's `leaf-cli-target-flag-and-linking`: `--target wasm32-wasi`
+/// (or `--target=wasm32-wasi`) — a real, strictly additive/opt-in flag
+/// exactly like `--verbose-cache`/`--jobs`/`--comptime-step-limit=N`
+/// above. `Ok(None)` (no flag) means `CodegenTarget::Native`, every
+/// pre-plan-64 invocation's unchanged behavior; `Err(value)` is a real,
+/// reported CLI error for anything other than the two supported
+/// spellings (AC3) — never a silent fallback to native.
+fn target_requested(args: &[String]) -> Result<Option<emerald_driver::CodegenTarget>, String> {
+  let raw = args
+    .iter()
+    .position(|a| a == "--target")
+    .and_then(|i| args.get(i + 1).map(String::as_str))
+    .or_else(|| args.iter().find_map(|a| a.strip_prefix("--target=")));
+  match raw {
+    None => Ok(None),
+    Some("wasm32-wasi") => Ok(Some(emerald_driver::CodegenTarget::Wasm32Wasi)),
+    Some(other) => Err(format!(
+      "unrecognized --target value `{other}` — supported targets: wasm32-wasi (native is the \
+       default, no flag needed)"
+    )),
+  }
+}
+
 /// Plan 49: the source path is the first positional (non-flag) argument
 /// — `emerald --jobs 2 main.em -o main` (the plan's own worked-example
 /// invocation) puts a flag *before* the source path, so this can no
@@ -199,9 +222,9 @@ fn find_source_path(args: &[String]) -> Option<&String> {
   let mut i = 1;
   while i < args.len() {
     match args[i].as_str() {
-      "-o" | "--jobs" => i += 2,
+      "-o" | "--jobs" | "--target" => i += 2,
       "--verbose-cache" | "--emit=escape-report" => i += 1,
-      a if a.starts_with("--comptime-step-limit=") => i += 1,
+      a if a.starts_with("--comptime-step-limit=") || a.starts_with("--target=") => i += 1,
       _ => return Some(&args[i]),
     }
   }
@@ -222,6 +245,30 @@ fn run_legacy(args: &[String]) {
     .and_then(|i| args.get(i + 1))
     .map(PathBuf::from)
     .unwrap_or_else(|| PathBuf::from("a.out"));
+
+  // Plan 64's `leaf-cli-target-flag-and-linking`: `--target` is
+  // validated before any other flag is even inspected (AC3 — an
+  // unrecognized value is a real, reported error regardless of what
+  // else was passed), and, when it names `wasm32-wasi`, handled as its
+  // own complete compile+link+exit cycle — real, disclosed scope
+  // narrowing, the same posture `--emit=escape-report` immediately
+  // below already takes toward `--jobs`/`--verbose-cache`.
+  let target = target_requested(args).unwrap_or_else(|msg| {
+    eprintln!("error: {msg}");
+    process::exit(2);
+  });
+  if let Some(target) = target {
+    let source = std::fs::read_to_string(source_path).unwrap_or_else(|e| {
+      eprintln!("error: cannot read `{source_path}`: {e}");
+      process::exit(1);
+    });
+    if let Err(e) = emerald_driver::compile_with_target(&source, source_path, &output_path, target)
+    {
+      report_driver_error(e, Some((source_path, &source)));
+      process::exit(1);
+    }
+    return;
+  }
 
   // Plan 50: `--emit=escape-report` — strictly additive/opt-in,
   // checked ahead of `--jobs`/`--verbose-cache` and handled as its own
@@ -398,22 +445,46 @@ fn cmd_build(args: &[String]) -> PathBuf {
     process::exit(1);
   });
 
-  let output_path = cwd.join(&manifest.package.name);
-  let result = if verbose_cache_requested(args) {
-    let cache = emerald_driver::cache::QueryCache::new(cache_root());
-    let reporter = emerald_driver::cache::VerboseReporter;
-    let key = cache.key_for_many(&hashes.iter().map(|(_, h)| *h).collect::<Vec<_>>());
-    emerald_driver::compile_program_cached_with_libs(
+  // Plan 64's `leaf-cli-target-flag-and-linking`: `--target` validated
+  // the same way `run_legacy`'s own copy is (AC3) — an unrecognized
+  // value is a real, reported error, never a silent fallback to
+  // native. `Wasm32Wasi`'s own output path gains a `.wasm` extension
+  // (AC2 — `wasmtime run app.wasm` vs. this plan's own `./app` worked
+  // proof), the conventional extension for a WASM module.
+  let target = target_requested(args).unwrap_or_else(|msg| {
+    eprintln!("error: {msg}");
+    process::exit(2);
+  });
+  let output_path = match target {
+    Some(emerald_driver::CodegenTarget::Wasm32Wasi) => {
+      cwd.join(format!("{}.wasm", manifest.package.name))
+    }
+    _ => cwd.join(&manifest.package.name),
+  };
+  let result = match (target, verbose_cache_requested(args)) {
+    (Some(target), _) => emerald_driver::compile_program_with_libs_and_target(
       program,
-      key,
-      &manifest.package.entry,
       &output_path,
-      &cache,
-      &reporter,
       &manifest.ffi.link,
-    )
-  } else {
-    emerald_driver::compile_program_with_libs(program, &output_path, &manifest.ffi.link)
+      target,
+    ),
+    (None, true) => {
+      let cache = emerald_driver::cache::QueryCache::new(cache_root());
+      let reporter = emerald_driver::cache::VerboseReporter;
+      let key = cache.key_for_many(&hashes.iter().map(|(_, h)| *h).collect::<Vec<_>>());
+      emerald_driver::compile_program_cached_with_libs(
+        program,
+        key,
+        &manifest.package.entry,
+        &output_path,
+        &cache,
+        &reporter,
+        &manifest.ffi.link,
+      )
+    }
+    (None, false) => {
+      emerald_driver::compile_program_with_libs(program, &output_path, &manifest.ffi.link)
+    }
   };
   if let Err(e) = result {
     // No single coherent source string exists for a `require`-spliced
@@ -423,11 +494,29 @@ fn cmd_build(args: &[String]) -> PathBuf {
     process::exit(1);
   }
 
-  println!("    Finished build: ./{}", manifest.package.name);
+  println!(
+    "    Finished build: ./{}",
+    output_path
+      .file_name()
+      .map(|f| f.to_string_lossy().to_string())
+      .unwrap_or_else(|| manifest.package.name.clone())
+  );
   output_path
 }
 
 fn cmd_run(args: &[String]) {
+  // Plan 64's `leaf-cli-target-flag-and-linking` AC4: a `.wasm` module
+  // is not a directly-executable native binary — `Command::new` below
+  // would otherwise fail with a confusing native-launcher error (e.g.
+  // "Exec format error"), not a clear, named rejection.
+  if let Ok(Some(emerald_driver::CodegenTarget::Wasm32Wasi)) = target_requested(args) {
+    eprintln!(
+      "error: `emerald run --target wasm32-wasi` is not supported — a compiled `.wasm` module \
+       needs a WASI host (e.g. `wasmtime run`) to execute, not a direct native launch. Use \
+       `emerald build --target wasm32-wasi` and run the result under `wasmtime` instead."
+    );
+    process::exit(2);
+  }
   let output_path = cmd_build(args);
   let status = Command::new(&output_path).status().unwrap_or_else(|e| {
     eprintln!("error: failed to run `{}`: {e}", output_path.display());
