@@ -100,6 +100,48 @@ fn link_stage(obj_path: PathBuf, output_path: PathBuf) -> Effect<(), DriverError
   Effect::new(move |_env: &mut ()| link(obj_path.clone(), output_path.clone()))
 }
 
+/// Plan 59: `link_stage`'s own generalized sibling — threads
+/// `extra_libs` (`emerald.toml`'s `[ffi] link = [...]` table) through
+/// to `link_with_libs`. `extra_libs` is owned (not `&[String]`) purely
+/// because an `Effect` closure must be `'static`, the same reason
+/// `obj_path`/`output_path` are already moved into it above.
+fn link_stage_with_libs(
+  obj_path: PathBuf,
+  output_path: PathBuf,
+  extra_libs: Vec<String>,
+) -> Effect<(), DriverError, ()> {
+  Effect::new(move |_env: &mut ()| {
+    link_with_libs(obj_path.clone(), output_path.clone(), &extra_libs)
+  })
+}
+
+/// Plan 59: the real, pure argument-list builder behind `link_with_
+/// libs`'s own `Command` — factored out so a test can assert the exact
+/// argument vector directly (AC2/AC3) without needing `cc`/a real
+/// library actually installed on the machine running the gate. One
+/// `-l<name>` per `extra_libs` entry, positioned after the object/
+/// runtime-archive arguments and before `-o` — ordinary `cc`/`ld`
+/// link-order convention (a library must be listed after the objects
+/// that reference its symbols).
+fn build_link_args(
+  obj_path: &Path,
+  runtime_archive_path: &Path,
+  output_path: &Path,
+  extra_libs: &[String],
+) -> Vec<std::ffi::OsString> {
+  let mut args: Vec<std::ffi::OsString> = vec![
+    "-no-pie".into(),
+    obj_path.as_os_str().to_os_string(),
+    runtime_archive_path.as_os_str().to_os_string(),
+  ];
+  for lib in extra_libs {
+    args.push(format!("-l{lib}").into());
+  }
+  args.push("-o".into());
+  args.push(output_path.as_os_str().to_os_string());
+  args
+}
+
 /// Plan 48: `link_stage`'s own body, factored into a plain function so
 /// the new `*_cached` entry points (which don't build an `Effect`
 /// pipeline for their already-cached parse/check/codegen stages) can
@@ -108,7 +150,27 @@ fn link_stage(obj_path: PathBuf, output_path: PathBuf) -> Effect<(), DriverError
 /// the plan's own Decision log: caching `cc` would need its own key
 /// surface and artifact store for a stage that's a small fraction of
 /// total build time compared to LLVM codegen).
+///
+/// Plan 59: now itself a thin wrapper over `link_with_libs` with
+/// `extra_libs: &[]` — produces byte-for-byte the same `Command`
+/// argument list it always has (`build_link_args`'s own regression
+/// test), so every pre-existing call site is unchanged by construction.
 fn link(obj_path: PathBuf, output_path: PathBuf) -> Result<(), DriverError> {
+  link_with_libs(obj_path, output_path, &[])
+}
+
+/// Plan 59's Decision log: the literal generalization `link` above
+/// wraps — one `-l<name>` linker argument per `extra_libs` entry
+/// (`emerald.toml`'s `[ffi] link = [...]` table), letting a real
+/// `unsafe extern "C" { ... }` declaration that needs a named
+/// third-party C library actually resolve at link time instead of
+/// failing with an unresolved-symbol error and no way in `emerald.toml`
+/// to fix it.
+pub fn link_with_libs(
+  obj_path: PathBuf,
+  output_path: PathBuf,
+  extra_libs: &[String],
+) -> Result<(), DriverError> {
   let runtime_archive_path =
     std::env::temp_dir().join(format!("libemerald_runtime_{}.a", process::id()));
   if let Err(e) = std::fs::write(&runtime_archive_path, RUNTIME_ARCHIVE) {
@@ -117,13 +179,8 @@ fn link(obj_path: PathBuf, output_path: PathBuf) -> Result<(), DriverError> {
       "failed to extract the embedded runtime archive: {e}"
     )));
   }
-  let link_result = Command::new("cc")
-    .arg("-no-pie")
-    .arg(&obj_path)
-    .arg(&runtime_archive_path)
-    .arg("-o")
-    .arg(&output_path)
-    .status();
+  let args = build_link_args(&obj_path, &runtime_archive_path, &output_path, extra_libs);
+  let link_result = Command::new("cc").args(&args).status();
   std::fs::remove_file(&obj_path).ok();
   std::fs::remove_file(&runtime_archive_path).ok();
   match link_result {
@@ -211,6 +268,24 @@ pub fn compile_program(program: Program, output_path: &Path) -> Result<(), Drive
   run_blocking(pipeline, ())
 }
 
+/// Plan 59: `compile_program`'s own generalized sibling — threads
+/// `extra_libs` (`emerald.toml`'s `[ffi] link = [...]` table) through
+/// to the link stage. `emerald-cli`'s `cmd_build` (already loads the
+/// manifest) calls this instead of `compile_program` directly.
+pub fn compile_program_with_libs(
+  program: Program,
+  output_path: &Path,
+  extra_libs: &[String],
+) -> Result<(), DriverError> {
+  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let output_path = output_path.to_path_buf();
+  let extra_libs = extra_libs.to_vec();
+  let pipeline = check_stage(program)
+    .flat_map(move |program| codegen_stage(program, obj_path, None))
+    .flat_map(move |obj_path| link_stage_with_libs(obj_path, output_path, extra_libs));
+  run_blocking(pipeline, ())
+}
+
 // Plan 48's `leaf-query-cache-core`/`leaf-require-graph-cache-keys`:
 // cached siblings of `check`/`compile`/`compile_program` above. Every
 // one of `check`/`compile`/`compile_program` is left completely
@@ -284,6 +359,30 @@ pub fn compile_program_cached(
     .codegen_query(key, &program, &obj_path, label, reporter)
     .map_err(DriverError::Codegen)?;
   link(obj_path, output_path.to_path_buf())
+}
+
+/// Plan 59: `compile_program_cached`'s own generalized sibling —
+/// threads `extra_libs` through to `link_with_libs` instead of `link`.
+/// `emerald-cli`'s `cmd_build` calls this instead when `--verbose-
+/// cache`/`--history-cache` is passed.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_program_cached_with_libs(
+  program: Program,
+  key: CacheKey,
+  label: &str,
+  output_path: &Path,
+  cache: &QueryCache,
+  reporter: &dyn CacheReporter,
+  extra_libs: &[String],
+) -> Result<(), DriverError> {
+  cache
+    .type_check_query(key, &program, label, reporter)
+    .map_err(DriverError::Sema)?;
+  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  cache
+    .codegen_query(key, &program, &obj_path, label, reporter)
+    .map_err(DriverError::Codegen)?;
+  link_with_libs(obj_path, output_path.to_path_buf(), extra_libs)
 }
 
 /// Plan 50's `leaf-escape-instrumentation-and-report`: identical to
@@ -385,5 +484,44 @@ mod tests {
       symbols(source, "bad.em"),
       Err(DriverError::Parse(_))
     ));
+  }
+
+  // Plan 59 (C FFI) — `leaf-manifest-linking`.
+
+  #[test]
+  fn build_link_args_with_no_extra_libs_is_byte_for_byte_the_original_five_argument_list() {
+    let obj = Path::new("/tmp/x.o");
+    let archive = Path::new("/tmp/libemerald_runtime.a");
+    let out = Path::new("/tmp/out");
+    let args = build_link_args(obj, archive, out, &[]);
+    assert_eq!(
+      args,
+      vec![
+        std::ffi::OsString::from("-no-pie"),
+        std::ffi::OsString::from("/tmp/x.o"),
+        std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
+        std::ffi::OsString::from("-o"),
+        std::ffi::OsString::from("/tmp/out"),
+      ]
+    );
+  }
+
+  #[test]
+  fn build_link_args_with_extra_libs_inserts_l_flags_after_the_objects_and_before_o() {
+    let obj = Path::new("/tmp/x.o");
+    let archive = Path::new("/tmp/libemerald_runtime.a");
+    let out = Path::new("/tmp/out");
+    let args = build_link_args(obj, archive, out, &["sqlite3".to_string()]);
+    assert_eq!(
+      args,
+      vec![
+        std::ffi::OsString::from("-no-pie"),
+        std::ffi::OsString::from("/tmp/x.o"),
+        std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
+        std::ffi::OsString::from("-lsqlite3"),
+        std::ffi::OsString::from("-o"),
+        std::ffi::OsString::from("/tmp/out"),
+      ]
+    );
   }
 }

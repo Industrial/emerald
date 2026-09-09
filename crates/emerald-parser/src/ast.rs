@@ -567,6 +567,32 @@ pub struct ClassDef {
   pub type_params: Vec<TypeParam>,
 }
 
+/// One `fn <name>(<params>): <ReturnType>` declaration inside an
+/// `unsafe extern "C" { ... }` block (plan 59's Decision log). Reuses
+/// `Param`'s `{name, ty}` shape verbatim for params, the same reuse
+/// `ClassDef`/`InterfaceDef` already make — but deliberately `:` rather
+/// than `def`'s `->` (grammar-level, not just the mandatory `unsafe`
+/// prefix) so an extern declaration is visually distinct from an
+/// ordinary function signature at a glance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternFn {
+  pub name: String,
+  pub params: Vec<Param>,
+  pub return_type: String,
+}
+
+/// `unsafe extern "C" { fn ... ... }` (plan 59's Decision log) — `abi`
+/// is the decoded string literal (`"C"`), checked against exactly that
+/// value by `emerald-sema` (the explicit C++ decline), not restricted
+/// at the grammar level (a bare string literal, not a reserved keyword
+/// set, so a bad ABI is a real sema diagnostic naming it, not a parse
+/// error).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternBlock {
+  pub abi: String,
+  pub fns: Vec<ExternFn>,
+}
+
 /// A namespace-only module (plan `12`'s Decision log — `SEMANTICS.md`
 /// §10 explicitly removes `include`/`extend` mixin composition): a flat
 /// collection of methods, called as `ModuleName.method(args)`. No
@@ -633,6 +659,10 @@ pub enum Item {
   /// general, user-declarable grammar production, not a fourth
   /// hardcoded builtin the way `Array`/`Hash`/`Proc` are.
   Interface(InterfaceDef),
+  /// `unsafe extern "C" { ... }` (plan 59's Decision log) — the one
+  /// deliberate, explicitly-fenced escape from this compiler's
+  /// otherwise-total static safety.
+  Extern(ExternBlock),
   Stmt(Spanned<Stmt>),
   /// `require <path>` (plan 23's Decision log) — a bare, unquoted,
   /// `/`-separated path (no string-literal syntax dependency), always

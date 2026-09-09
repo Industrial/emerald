@@ -1,6 +1,7 @@
 use crate::ast::{
-  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function,
-  InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, TypeParam,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, ExternBlock,
+  ExternFn, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned,
+  Stmt, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -53,6 +54,7 @@ Item: Item = {
   <m:ModuleDef> => Item::Module(m),
   <i:InterfaceDef> => Item::Interface(i),
   <e:EnumDef> => Item::Enum(e),
+  <x:ExternBlockDef> => Item::Extern(x),
   <s:Stmt> => Item::Stmt(s),
   // Plan 23: reachable only here, at the top-level `Item` rule — never
   // from `Stmt`/`Stmt*`, so `require` inside a function/`if`/`while`
@@ -183,6 +185,30 @@ FuncDef: Function = {
 InterfaceDef: InterfaceDef = {
   "interface" <name:Ident> "def" <method_name:Ident> "(" <params:Params> ")" "->" <return_type:TypeName> "end" => {
     InterfaceDef { name, method_name, params, return_type }
+  }
+};
+
+// `unsafe extern "C" { fn llabs(x: Int64): Int64 ... }` (plan 59's
+// Decision log) — `unsafe` is mandatory at the grammar level, not a
+// sema convention: a bare `extern "C" { ... }` with no `unsafe` is a
+// real parse error, the same "unforgeable structural fence" reasoning
+// `TypeParamClause`'s bound requirement documents elsewhere. `abi` is
+// decoded via the same `StringLitTok` production `test`'s own
+// description string already uses — a plain string literal, not a
+// reserved keyword set (checked against exactly `"C"` by
+// `emerald-sema`, not restricted here).
+ExternBlockDef: ExternBlock = {
+  "unsafe" "extern" <abi:StringLitTok> "{" <fns:ExternFnDecl*> "}" => ExternBlock { abi, fns },
+};
+
+// Deliberately `":"` rather than `FuncDef`'s own `"->"` (Decision log)
+// — visually distinct from an ordinary function signature at a glance,
+// on top of the mandatory `unsafe extern` prefix. Reuses the existing,
+// shared `Params`/`Param` production verbatim, the same reuse
+// `ClassField`/`InterfaceDef` already make.
+ExternFnDecl: ExternFn = {
+  "fn" <name:Ident> "(" <params:Params> ")" ":" <return_type:TypeName> => {
+    ExternFn { name, params, return_type }
   }
 };
 

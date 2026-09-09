@@ -119,6 +119,20 @@ pub enum Type {
   /// block parameter, one per key/value slot, with exactly two
   /// accessors, `.key`/`.value`.
   Pair(Box<Type>, Box<Type>),
+  /// A raw C string pointer (plan 59's Decision log) — a deliberately
+  /// inert reference type: no `String` method (`.upcase`, `.length`,
+  /// ...) dispatches on it at all. Never source-constructible directly;
+  /// the only two ways to obtain or shed one are `s.to_cstring()`
+  /// (`String -> CString`) and `String.from_cstring(ptr)`
+  /// (`CString -> String?`), both real compiler-known intrinsics (plan
+  /// 45's own dispatch mechanism), never an ordinary function/method.
+  /// Nameable as an ordinary `Let`/field/param annotation too (`c:
+  /// CString = ...`) — "deliberately inert" means no METHOD dispatches
+  /// on it, not that it's unnameable; the real FFI trust boundary stays
+  /// confined to `unsafe extern "C" { ... }` declarations and the two
+  /// intrinsics above, which are the only ways to ever *produce* or
+  /// *consume* one.
+  CString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +281,13 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "Boolean" => Ok(Type::Boolean),
     "Nil" => Ok(Type::Nil),
     "Symbol" => Ok(Type::Symbol),
+    // Plan 59's Decision log: a `CString` value needs an ordinary
+    // annotation position too (an intermediate `c: CString = s.
+    // to_cstring()` local, an extern fn's own `CString`-typed
+    // parameter) — "deliberately inert" (`Type::CString`'s own doc
+    // comment) means no METHOD dispatches on it, not that it can't be
+    // named.
+    "CString" => Ok(Type::CString),
     // Plan 43's Decision log: checked before every other compound-string
     // case below (`Array[Elem]?`/`Hash[K, V]?` recurse cleanly through
     // this) — scoped to reference types only (`Class`/`String`/`Array`/
@@ -681,7 +702,7 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<String> {
           collect_typenames_in_stmt(s, &mut out);
         }
       }
-      Item::Enum(_) | Item::Interface(_) | Item::Require(_) | Item::Error => {}
+      Item::Enum(_) | Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
     }
   }
   out
@@ -1027,6 +1048,39 @@ fn resolve_return_type(
   resolve_type(name, classes)
 }
 
+/// Plan 59's Decision log: an `unsafe extern "C" { ... }` fn's own
+/// param/return type allow-list — `{Int64, Float64, String, CString}`
+/// for a parameter, plus `Void` for a return type. Narrower than the
+/// real `Type` enum's own surface on purpose (no `Class`/`Array`/
+/// `Hash`/`Symbol`/`Tuple`/`Boolean`/...): a C ABI has no idea what any
+/// of those Emerald-internal representations mean, and — per the
+/// Decision log's own verified finding — the real `Type` enum has no
+/// fixed-width integer narrower than `Int64` to marshal into at all.
+/// `is_return_position` gates `Void`, legal only as a return type,
+/// never a parameter type (mirroring `ret_kind_for_type`/
+/// `value_kind_for_type`'s own return-vs-param asymmetry elsewhere in
+/// this codebase).
+fn resolve_extern_type(name: &str, is_return_position: bool) -> Result<Type, Diagnostic> {
+  match name {
+    "Int64" => Ok(Type::Int64),
+    "Float64" => Ok(Type::Float64),
+    "String" => Ok(Type::String),
+    "CString" => Ok(Type::CString),
+    "Void" if is_return_position => Ok(Type::Void),
+    other => Err(Diagnostic::new(
+      format!(
+        "`{other}` is not a supported extern \"C\" type — only Int64, Float64, String, CString{} are marshalable across the FFI boundary",
+        if is_return_position {
+          ", and Void (return only)"
+        } else {
+          ""
+        }
+      ),
+      (0, 0),
+    )),
+  }
+}
+
 /// Plan 43's Decision log: replaces the raw `actual != declared`
 /// equality check at every assignability check-site in this file —
 /// exact-equality for every non-nullable `declared` (so every
@@ -1340,6 +1394,10 @@ fn string_intrinsic_signature(method: &str) -> Option<(Vec<Type>, Type)> {
     // 45's Decision log); neither is useful without the other.
     "split" => Some((vec![Type::String], Type::Array(Box::new(Type::String)))),
     "split_count" => Some((vec![Type::String], Type::Int64)),
+    // Plan 59's Decision log: the cheaper, total (never-nil) direction
+    // — an Emerald `String` is already guaranteed non-null, NUL-
+    // terminated, real UTF-8, so nothing needs checking going out.
+    "to_cstring" => Some((vec![], Type::CString)),
     _ => None,
   }
 }
@@ -2422,6 +2480,32 @@ fn infer_expr_type(
         gctx,
       )?;
       Ok(ret)
+    }
+    // Plan 59's Decision log: `String.from_cstring(ptr)` — the same
+    // reserved-namespace static-call shape as `File` immediately above,
+    // for the same reason (`String` is never a real `ModuleDef`).
+    // `String?` reuses plan 43's real, already-shipped `Type::
+    // Nullable(Box<Type>)` — a C function's real `NULL` return is
+    // exactly what a nullable reference type is for.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "String") =>
+    {
+      if method != "from_cstring" {
+        return Err(Diagnostic::new(
+          format!("String has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(
+        method,
+        args,
+        &[Type::CString],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Nullable(Box::new(Type::String)))
     }
     // `Name.method(args)` on a module (plan 12) dispatches straight to
     // its method table — checked *before* the `.call`/`Type::Proc` arm
@@ -5065,6 +5149,9 @@ fn check_block_call_sites(
         }
       }
       Item::Error => {}
+      // Plan 59: an extern declaration has no body of its own — no
+      // block-attaching call sites to scan.
+      Item::Extern(_) => {}
     }
   }
   diags
@@ -5802,6 +5889,58 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     }
   }
 
+  // Plan 59: an `unsafe extern "C" { ... }` fn registers into this SAME
+  // `sigs` registry `function_signature()` populates for ordinary `def`
+  // functions (Decision log) — no new call-expression AST is needed;
+  // `llabs(x)`-style calls resolve through the existing `Expr::Call`
+  // path unchanged. Also checked here: the block's own ABI literal
+  // (only exactly `"C"` is supported — the explicit C++ decline).
+  for item in &program.items {
+    let Item::Extern(block) = item else { continue };
+    if block.abi != "C" {
+      diags.push(Diagnostic::new(
+        format!(
+          "unsupported extern ABI `\"{}\"` — only `\"C\"` is supported",
+          block.abi
+        ),
+        (0, 0),
+      ));
+      continue;
+    }
+    for f in &block.fns {
+      let params: Result<Vec<Type>, Diagnostic> = f
+        .params
+        .iter()
+        .map(|p| resolve_extern_type(&p.ty, false))
+        .collect();
+      let params = match params {
+        Ok(p) => p,
+        Err(d) => {
+          diags.push(d);
+          continue;
+        }
+      };
+      let return_type = match resolve_extern_type(&f.return_type, true) {
+        Ok(t) => t,
+        Err(d) => {
+          diags.push(d);
+          continue;
+        }
+      };
+      sigs.insert(
+        f.name.clone(),
+        FunctionSig {
+          params,
+          return_type,
+          block_param: None,
+          param_names: f.params.iter().map(|p| p.name.clone()).collect(),
+          defaults: vec![None; f.params.len()],
+          splat_elem: None,
+        },
+      );
+    }
+  }
+
   let gctx = GenericsCtx {
     interfaces: &interfaces,
     generic_sigs: &generic_sigs,
@@ -5949,6 +6088,10 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // `program.items` then contains no `Item::Error` by construction,
       // so `check_program` never actually receives one.
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
+      // Plan 59: registered into `sigs` above, already validated
+      // (ABI, param/return type allow-list) at registration time — no
+      // body of its own to check.
+      Item::Extern(_) => {}
     }
   }
 
@@ -8380,5 +8523,77 @@ end
     let src = "class Point\n  x: Int64\n  y: Int64\nend\n\nclass Stack[T]\n  top: T\nend\n\np: Point = Point.new()\ns: Stack[Int64] = Stack.new()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 59 (C FFI).
+
+  #[test]
+  fn extern_c_fns_register_and_type_check_calls_against_their_declared_signature() {
+    let src = "unsafe extern \"C\" {\n  fn llabs(x: Int64): Int64\n  fn strlen(s: String): Int64\n}\n\nx: Int64 = llabs(-42)\nn: Int64 = strlen(\"hello\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn extern_fn_with_an_unsupported_parameter_type_is_rejected_naming_the_type() {
+    let src = "unsafe extern \"C\" {\n  fn f(x: Boolean): Int64\n}\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Boolean is not a marshalable extern type");
+    assert!(
+      errs.iter().any(|d| d.message.contains("Boolean")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn extern_fn_with_an_unsupported_class_return_type_is_rejected() {
+    let src = "class Foo\nend\n\nunsafe extern \"C\" {\n  fn f(): Foo\n}\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("a user Class is not a marshalable extern type");
+    assert!(errs.iter().any(|d| d.message.contains("Foo")), "{errs:?}");
+  }
+
+  #[test]
+  fn extern_fn_with_an_unsupported_array_parameter_type_is_rejected() {
+    let src = "unsafe extern \"C\" {\n  fn f(x: Array[Int64]): Int64\n}\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Array[_] is not a marshalable extern type");
+    assert!(
+      errs.iter().any(|d| d.message.contains("Array[Int64]")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn an_extern_block_with_a_non_c_abi_is_rejected() {
+    let src = "unsafe extern \"C++\" {\n  fn f(): Int64\n}\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("only \"C\" is a supported extern ABI");
+    assert!(errs.iter().any(|d| d.message.contains("C++")), "{errs:?}");
+  }
+
+  #[test]
+  fn string_to_cstring_type_checks_to_cstring() {
+    let src = "s: String = \"hello\"\nc: CString = s.to_cstring()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn string_from_cstring_type_checks_to_nullable_string_and_rejects_a_direct_method_call() {
+    let src = "unsafe extern \"C\" {\n  fn f(): CString\n}\n\nr: String? = String.from_cstring(f())\nputs r.length\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a direct method call on the un-narrowed String? result must be rejected");
+    assert!(!errs.is_empty(), "{errs:?}");
+  }
+
+  #[test]
+  fn string_from_cstring_called_on_a_non_cstring_argument_is_a_real_diagnostic() {
+    let src = "puts String.from_cstring(42)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("String.from_cstring on a bare Int64 must be rejected");
+    assert!(!errs.is_empty(), "{errs:?}");
   }
 }

@@ -20,10 +20,24 @@ pub enum DependencySpec {
   Git { git: String, rev: String },
 }
 
+/// `[ffi] link = ["sqlite3", "m"]` (plan 59's Decision log) — one
+/// `-l<name>` linker argument per entry, built at link time, not stored
+/// pre-prefixed (`"sqlite3"`, not `"-lsqlite3"` — matching Cargo's own
+/// `cargo:rustc-link-lib` naming convention). `Default` (empty `link`)
+/// is what every `emerald.toml` written before this plan parses to,
+/// via `#[serde(default)]` on both `Manifest`/`RawManifest`, the exact
+/// precedent `RawManifest.dependencies` already establishes.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct FfiSpec {
+  #[serde(default)]
+  pub link: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
   pub package: PackageMeta,
   pub dependencies: BTreeMap<String, DependencySpec>,
+  pub ffi: FfiSpec,
 }
 
 #[derive(Debug)]
@@ -56,6 +70,8 @@ struct RawManifest {
   package: RawPackageMeta,
   #[serde(default)]
   dependencies: BTreeMap<String, RawDependencySpec>,
+  #[serde(default)]
+  ffi: FfiSpec,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +132,7 @@ impl Manifest {
           .unwrap_or_else(|| default_entry.to_string()),
       },
       dependencies,
+      ffi: raw.ffi,
     })
   }
 }
@@ -252,6 +269,46 @@ mathutils = {}
       Manifest::load(&dir),
       Err(ManifestError::InvalidDependency(name)) if name == "mathutils"
     ));
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // Plan 59 (C FFI).
+
+  #[test]
+  fn parses_an_ffi_link_table() {
+    let dir = fresh_dir("ffi-link");
+    write_manifest(
+      &dir,
+      r#"
+[package]
+name = "app"
+version = "0.1.0"
+
+[ffi]
+link = ["sqlite3", "m"]
+"#,
+    );
+    let manifest = Manifest::load(&dir).unwrap();
+    assert_eq!(
+      manifest.ffi.link,
+      vec!["sqlite3".to_string(), "m".to_string()]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn a_manifest_with_no_ffi_table_at_all_parses_to_an_empty_link_list() {
+    let dir = fresh_dir("no-ffi");
+    write_manifest(
+      &dir,
+      r#"
+[package]
+name = "app"
+version = "0.1.0"
+"#,
+    );
+    let manifest = Manifest::load(&dir).unwrap();
+    assert_eq!(manifest.ffi.link, Vec::<String>::new());
     std::fs::remove_dir_all(&dir).ok();
   }
 }

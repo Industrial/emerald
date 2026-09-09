@@ -382,16 +382,17 @@ fn cmd_build(args: &[String]) -> PathBuf {
     let cache = emerald_driver::cache::QueryCache::new(cache_root());
     let reporter = emerald_driver::cache::VerboseReporter;
     let key = cache.key_for_many(&hashes.iter().map(|(_, h)| *h).collect::<Vec<_>>());
-    emerald_driver::compile_program_cached(
+    emerald_driver::compile_program_cached_with_libs(
       program,
       key,
       &manifest.package.entry,
       &output_path,
       &cache,
       &reporter,
+      &manifest.ffi.link,
     )
   } else {
-    emerald_driver::compile_program(program, &output_path)
+    emerald_driver::compile_program_with_libs(program, &output_path, &manifest.ffi.link)
   };
   if let Err(e) = result {
     // No single coherent source string exists for a `require`-spliced

@@ -19,9 +19,9 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function,
-  InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
-  TypeParam,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, ExternBlock,
+  ExternFn, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
+  StringPart, TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -122,7 +122,7 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
           rewrite_stmts(&mut m.body, name, source);
         }
       }
-      Item::Interface(_) | Item::Require(_) | Item::Error | Item::Enum(_) => {}
+      Item::Interface(_) | Item::Require(_) | Item::Error | Item::Enum(_) | Item::Extern(_) => {}
       Item::Stmt(s) => rewrite_stmt(s, name, source),
       Item::Test { body, .. } => rewrite_stmts(body, name, source),
     }
@@ -3143,5 +3143,34 @@ mod tests {
         ..
       })
     ));
+  }
+
+  // Plan 59 (C FFI).
+
+  #[test]
+  fn unsafe_extern_c_block_parses_into_an_extern_item_with_both_fns_populated() {
+    let src =
+      "unsafe extern \"C\" {\n  fn llabs(x: Int64): Int64\n  fn strlen(s: String): Int64\n}\n";
+    let program = parse(src).expect("should parse");
+    let Item::Extern(block) = &program.items[0] else {
+      panic!("expected Item::Extern, got {:?}", program.items[0]);
+    };
+    assert_eq!(block.abi, "C");
+    assert_eq!(block.fns.len(), 2);
+    assert_eq!(block.fns[0].name, "llabs");
+    assert_eq!(block.fns[0].params[0].name, "x");
+    assert_eq!(block.fns[0].params[0].ty, "Int64");
+    assert_eq!(block.fns[0].return_type, "Int64");
+    assert_eq!(block.fns[1].name, "strlen");
+    assert_eq!(block.fns[1].params[0].ty, "String");
+  }
+
+  #[test]
+  fn extern_c_block_without_the_leading_unsafe_keyword_is_a_real_parse_error() {
+    let src = "extern \"C\" {\n  fn llabs(x: Int64): Int64\n}\n";
+    assert!(
+      parse(src).is_err(),
+      "`unsafe` is a mandatory, grammar-level marker, not a sema-optional one"
+    );
   }
 }

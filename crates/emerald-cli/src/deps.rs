@@ -312,6 +312,7 @@ mod tests {
         entry: "main.em".into(),
       },
       dependencies: deps,
+      ffi: crate::manifest::FfiSpec::default(),
     }
   }
 

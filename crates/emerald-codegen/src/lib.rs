@@ -100,6 +100,21 @@ fn value_kind_for_type(ty: &str) -> ValKind {
     "String" => ValKind::Str,
     "Nil" => ValKind::Nil,
     "Symbol" => ValKind::Symbol,
+    // Plan 59's Decision log: `CString` is stored identically to
+    // `String` — a bare pointer, no new runtime representation.
+    "CString" => ValKind::Str,
+    // Plan 43 already stores a nullable reference type as the SAME bare
+    // `ptr` as its non-null form (its own Decision log: "both are
+    // backed by an LLVM `ptr`... a spare bit pattern to spend on
+    // nilness for free") — `String?` is the one case that actually
+    // diverges from the general `_ => ValKind::Ptr` catch-all below
+    // (every other nullable — a class, `Array[_]`, `Hash[_,_]` — was
+    // already `ValKind::Ptr` even in its non-null form, so stripping
+    // `?` changes nothing for them). Found and fixed this session:
+    // `puts` on a `||=`-narrowed `String?` local previously stored as
+    // the wrong `ValKind` (the generic `Ptr` bucket, not `Str`),
+    // rejected by `puts`'s own Int64/Float64/String-only dispatch.
+    "String?" => ValKind::Str,
     // `Hash[K, V]` (plan 25) shares the generic `Ptr` bucket — unlike
     // `Array[Elem]`, indexing it needs a key type too, which the
     // side-table `local_classes` (repurposed to hold `"Hash[K, V]"`
@@ -703,7 +718,7 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<String> {
           collect_typenames_in_stmt(s, &mut out);
         }
       }
-      Item::Enum(_) | Item::Interface(_) | Item::Require(_) | Item::Error => {}
+      Item::Enum(_) | Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
     }
   }
   out
@@ -1534,7 +1549,7 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
           }
         }
       }
-      Item::Interface(_) | Item::Require(_) | Item::Error => {}
+      Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
     }
   }
   table
@@ -5107,6 +5122,35 @@ fn build_method_call<'ctx>(
     };
   }
 
+  // Plan 59's Decision log: `String.from_cstring(ptr)` — the same
+  // reserved-namespace static-call shape as `File` immediately above,
+  // for the same reason (`String` is never a real `ModuleDef`). A pure
+  // type-level relabeling with zero emitted instructions beyond
+  // whatever already produced the argument's own pointer value — the
+  // Decision log's null-representation convergence with plan 43's
+  // `String?` (both a real C `NULL` and Emerald's own nil-nullable
+  // representation are bit-for-bit the same `ptr` value).
+  if recv_name == "String" {
+    if method != "from_cstring" {
+      return Err(format!(
+        "codegen: unsupported String static method `{method}`"
+      ));
+    }
+    let arg = args
+      .first()
+      .ok_or_else(|| "codegen: `String.from_cstring` expects 1 argument".to_string())?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    return Ok((v, ValKind::Str));
+  }
+
   // Plan 45's Decision log: dispatched by checking `vars.get(recv_name)`'s
   // stored `ValKind` for `Str`, before falling through to `local_classes`'
   // class-name lookup below (which errors with "cannot determine the
@@ -5123,6 +5167,15 @@ fn build_method_call<'ctx>(
       local_array_elem_types,
       ctx,
     )?;
+    // Plan 59's Decision log: `s.to_cstring()` — a pure type-level
+    // relabeling with zero emitted instructions beyond whatever already
+    // produced `recv_val` (`String`/`CString` share the identical bare-
+    // pointer `ValKind::Str` representation — see `Type::CString`'s own
+    // doc comment). Checked before the runtime-call dispatch below,
+    // which every OTHER String intrinsic still goes through.
+    if method == "to_cstring" {
+      return Ok((recv_val, ValKind::Str));
+    }
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
     for a in args {
       let (v, _) = build_expr(
@@ -10887,6 +10940,10 @@ fn declare_user_functions<'ctx>(
       // returns `Ok(program)` with zero recovered errors, meaning no
       // `Item::Error` in `program.items` — codegen never receives one.
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
+      // Plan 59: declared in its own dedicated pass in `compile_to_
+      // object_impl` (inserted straight into `user_func_ids`, the
+      // return value of this function) — not here.
+      Item::Extern(_) => {}
     }
   }
   // Plan 58: each monomorphized generic-class instantiation's methods,
@@ -11458,6 +11515,37 @@ fn compile_to_object_impl(
       }
     }
   }
+  // Plan 59: each `ExternFn` synthesizes a minimal `AstFunction` stand-in
+  // (empty body, no splat/defaults/block_param — matching this plan's
+  // own "plain positional calls only" scope) purely so `build_call_arg_
+  // vals`'s existing `ctx.func_defs` lookup (needed for its splat/
+  // default-argument handling) works completely unmodified for an
+  // extern call site too, with no second, parallel arg-building path.
+  // Kept alive for the rest of this function, exactly like
+  // `actor_class_defs`.
+  let extern_fn_defs: Vec<AstFunction> = program
+    .items
+    .iter()
+    .flat_map(|item| match item {
+      Item::Extern(block) => block
+        .fns
+        .iter()
+        .map(|f| AstFunction {
+          name: f.name.clone(),
+          params: f.params.clone(),
+          return_type: f.return_type.clone(),
+          body: Vec::new(),
+          block_param: None,
+          splat_param: None,
+          type_params: Vec::new(),
+        })
+        .collect::<Vec<_>>(),
+      _ => Vec::new(),
+    })
+    .collect();
+  for f in &extern_fn_defs {
+    func_defs.insert(f.name.clone(), f);
+  }
 
   let module_names: HashSet<String> = program
     .items
@@ -11493,6 +11581,31 @@ fn compile_to_object_impl(
       let mangled = mangled_generic_symbol(fn_name, concrete_class);
       let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
       user_func_ids.insert(mangled, (fv, ret_kind));
+    }
+  }
+
+  // Plan 59's Decision log: the literal generalization of the runtime's
+  // own hardcoded `module.add_function(name, ..., Some(Linkage::
+  // External))` declarations just below (e.g. `emerald_alloc`) to an
+  // arbitrary, user-named, source-declared symbol — inserted directly
+  // into the SAME `user_func_ids` table `Expr::Call`'s existing lookup
+  // (`build_call_expr`) already consults, rather than a second,
+  // parallel table needing its own fallback lookup at every call site.
+  // Sema's own registration-time pass (`resolve_extern_type`) already
+  // validated every param/return type against the FFI allow-list, so
+  // `value_kind_for_type` here never sees anything it can't marshal.
+  for item in &program.items {
+    let Item::Extern(block) = item else { continue };
+    for f in &block.fns {
+      let ret_kind = value_kind_for_type(&f.return_type);
+      let param_kinds: Vec<ValKind> = f
+        .params
+        .iter()
+        .map(|p| value_kind_for_type(&p.ty))
+        .collect();
+      let fn_ty = make_fn_type(&context, &param_kinds, &ret_kind);
+      let fv = module.add_function(&f.name, fn_ty, Some(Linkage::External));
+      user_func_ids.insert(f.name.clone(), (fv, ret_kind));
     }
   }
 
@@ -11729,6 +11842,9 @@ fn compile_to_object_impl(
       // Plan 52: pure data — no function body to compile.
       Item::Enum(_) => {}
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
+      // Plan 59: a real, external symbol declared elsewhere (this
+      // pass's own declare step) — no Emerald-side body to compile.
+      Item::Extern(_) => {}
     }
   }
 
@@ -11907,7 +12023,7 @@ fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
       // Plan 52: pure data — no `assert`/`assert_eq` site can appear
       // inside an `Item::Enum`.
       Item::Enum(_) => {}
-      Item::Interface(_) | Item::Require(_) | Item::Error => {}
+      Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
     }
   }
   rewrote
@@ -14482,6 +14598,22 @@ int main(void) {
       compile_link_run(GENERIC_CLASSES_EXAMPLE),
       "30\n20\nsecond\nfirst\n"
     );
+  }
+
+  // Plan 59 (C FFI).
+
+  // The plan's own worked proof verbatim — three real libc functions,
+  // zero third-party libraries, deterministic on any target: `llabs`
+  // proves a scalar `Int64` round-trip with zero marshaling code,
+  // `strlen` proves an Emerald `String` passed directly to a real C
+  // function with zero conversion, and `strstr`'s two calls prove
+  // `CString`/`String.from_cstring` on both the found and the real-
+  // `NULL` (not-found) path, defaulted through plan 43's own `||=`.
+  const FFI_EXAMPLE: &str = "unsafe extern \"C\" {\n  fn llabs(x: Int64): Int64\n  fn strlen(s: String): Int64\n  fn strstr(haystack: String, needle: String): CString\n}\n\nx: Int64 = llabs(-42)\nputs x\n\nn: Int64 = strlen(\"hello\")\nputs n\n\nfound: String? = String.from_cstring(strstr(\"hello world\", \"world\"))\nfound ||= \"not found\"\nputs found\n\nmissing: String? = String.from_cstring(strstr(\"hello world\", \"xyz\"))\nmissing ||= \"not found\"\nputs missing\n";
+
+  #[test]
+  fn c_ffi_worked_example_compiled_linked_and_run_prints_the_expected_four_lines() {
+    assert_eq!(compile_link_run(FFI_EXAMPLE), "42\n5\nworld\nnot found\n");
   }
 
   #[test]
