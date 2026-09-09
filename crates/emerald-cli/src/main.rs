@@ -48,27 +48,40 @@ fn codegen_stage(program: Program, obj_path: PathBuf) -> Effect<PathBuf, CliErro
   })
 }
 
-/// Dev-time runtime location: this repo's `runtime/emerald_runtime.c`,
-/// found relative to this crate's manifest dir. A real install would
-/// bundle a compiled runtime object/archive instead — noted as
-/// follow-up packaging work, not solved here.
-///
+/// Plan 27: the compiled runtime archive's real bytes, embedded into
+/// this binary at *compile* time (`build.rs` compiles `runtime/
+/// emerald_runtime.c` via the `cc` crate and points
+/// `EMERALD_RUNTIME_ARCHIVE` at the resulting `.a`) — not a path
+/// looked up at runtime. This is what makes a shipped `emerald-cli`
+/// binary, copied alone with no access to this repo's checkout, still
+/// able to link a user's compiled program: the runtime archive travels
+/// inside the binary itself.
+static RUNTIME_ARCHIVE: &[u8] = include_bytes!(env!("EMERALD_RUNTIME_ARCHIVE"));
+
 /// -no-pie: `emerald-codegen` emits non-PIC code (see its `host_isa`),
 /// so the executable must not be a PIE either — otherwise `ld` warns
 /// about (harmless but avoidable) DT_TEXTREL relocations. The object
-/// file is removed once linking is attempted, success or failure.
+/// file and the extracted runtime archive are both removed once
+/// linking is attempted, success or failure.
 fn link_stage(obj_path: PathBuf, output_path: PathBuf) -> Effect<(), CliError, ()> {
   Effect::new(move |_env: &mut ()| {
-    let runtime_path =
-      PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/emerald_runtime.c");
+    let runtime_archive_path =
+      std::env::temp_dir().join(format!("libemerald_runtime_{}.a", process::id()));
+    if let Err(e) = std::fs::write(&runtime_archive_path, RUNTIME_ARCHIVE) {
+      std::fs::remove_file(&obj_path).ok();
+      return Err(CliError::Link(format!(
+        "failed to extract the embedded runtime archive: {e}"
+      )));
+    }
     let link_result = Command::new("cc")
       .arg("-no-pie")
       .arg(&obj_path)
-      .arg(&runtime_path)
+      .arg(&runtime_archive_path)
       .arg("-o")
       .arg(&output_path)
       .status();
     std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&runtime_archive_path).ok();
     match link_result {
       Ok(status) if status.success() => Ok(()),
       Ok(_) => Err(CliError::Link("linking failed".to_string())),

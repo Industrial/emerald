@@ -13,3 +13,17 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "CC-BY-SA-4.0"
+
+# Plan 27: cargo-dist 0.32.0 release config. `emerald-cli` is the only
+# binary this workspace ships today (`emerald-lsp`/`emerald-mcp` don't
+# exist yet — plan 17); `x86_64-unknown-linux-gnu` is the only target
+# actually verified in this sandbox (see RELEASING.md and plan 27's own
+# Decision log for why macOS/Windows are explicitly deferred, not
+# silently assumed to work). `cargo-dist` itself is not installed in
+# this sandbox, so `.github/workflows/release.yml` has not been
+# generated from this config — see RELEASING.md for that disclosed gap.
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell"]
+targets = ["x86_64-unknown-linux-gnu"]
