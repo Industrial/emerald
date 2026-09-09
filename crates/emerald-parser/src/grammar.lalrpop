@@ -1,6 +1,6 @@
 use crate::ast::{
-  CaseArm, ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
-  RescueClause, Spanned, Stmt, TypeParam,
+  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function, InterfaceDef,
+  Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -51,6 +51,7 @@ Item: Item = {
   <c:ClassDef> => Item::Class(c),
   <m:ModuleDef> => Item::Module(m),
   <i:InterfaceDef> => Item::Interface(i),
+  <e:EnumDef> => Item::Enum(e),
   <s:Stmt> => Item::Stmt(s),
   // Plan 23: reachable only here, at the top-level `Item` rule — never
   // from `Stmt`/`Stmt*`, so `require` inside a function/`if`/`while`
@@ -156,6 +157,46 @@ FuncDef: Function = {
 InterfaceDef: InterfaceDef = {
   "interface" <name:Ident> "def" <method_name:Ident> "(" <params:Params> ")" "->" <return_type:TypeName> "end" => {
     InterfaceDef { name, method_name, params, return_type }
+  }
+};
+
+// `enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64,
+// Float64)` (plan 52's Decision log) — a one-line declaration, no
+// trailing `end`, the same "no block needed" shape `Stmt::Let` already
+// has. `enum` is reserved the same LALR(1) way `class`/`module`/
+// `interface` already are.
+EnumDef: EnumDef = {
+  "enum" <name:Ident> "=" <variants:EnumVariants> => EnumDef { name, variants },
+};
+
+// Mandatory-first-element, right-recursive on "|" — the same
+// `CaseValues`/`MultiAssignNames`/`YieldArgs` idiom this grammar
+// already uses for a separator-delimited list with no closing
+// bracket to make left recursion safe.
+EnumVariants: Vec<EnumVariant> = {
+  <v:EnumVariant> => vec![v],
+  <v:EnumVariant> "|" <rest:EnumVariants> => {
+    let mut vs = vec![v];
+    vs.extend(rest);
+    vs
+  },
+};
+
+// At least one payload field, required unconditionally — no bare,
+// nullary tag variants in this plan (Decision log).
+EnumVariant: EnumVariant = {
+  <name:Ident> "(" <fields:TypeNameList> ")" => EnumVariant { name, fields },
+};
+
+// Left-recursive, trailing-comma list of `TypeName` — safe left
+// recursion since it's always closed by a known `")"`, the same
+// reasoning `Args`/`Params` already rely on.
+TypeNameList: Vec<String> = {
+  <mut v:(<TypeName> ",")*> <last:TypeName?> => {
+    match last {
+      None => v,
+      Some(t) => { v.push(t); v }
+    }
   }
 };
 
@@ -782,8 +823,26 @@ CaseValues: Vec<Spanned<Expr>> = {
   },
 };
 
+// Plan 52's Decision log: the `Variant` alternative is disambiguated
+// from the pre-existing `CaseValues` alternative by the very first
+// token after `"when"` (`Num` vs. `Ident`) — no FIRST-set overlap.
 CaseArm: CaseArm = {
-  "when" <values:CaseValues> <body:Stmt*> => (values, body)
+  "when" <values:CaseValues> <body:Stmt*> => (CasePattern::Values(values), body),
+  "when" <name:Ident> "(" <bindings:BindingNames> ")" <body:Stmt*> => {
+    (CasePattern::Variant { name, bindings }, body)
+  },
+};
+
+// Left-recursive, trailing-comma list of plain `Ident`s — a pattern
+// binding is never itself a nested pattern (Decision log). Safe left
+// recursion, always closed by a known `")"`.
+BindingNames: Vec<String> = {
+  <mut v:(<Ident> ",")*> <last:Ident?> => {
+    match last {
+      None => v,
+      Some(n) => { v.push(n); v }
+    }
+  }
 };
 
 // Plan 38: a typed clause binds `var` at `class_name`'s type; a bare

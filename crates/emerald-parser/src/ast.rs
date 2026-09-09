@@ -323,6 +323,11 @@ pub enum Stmt {
   /// Each arm's `Vec<Expr>` holds one or more `when` values; the arm
   /// matches if the scrutinee equals *any* of them. First matching arm
   /// wins, source order, matching Ruby's own semantics.
+  /// Plan 52's Decision log: `arms` now carries a `CasePattern` per arm
+  /// instead of a bare `Vec<Spanned<Expr>>` — `Values` is this
+  /// statement's original Int64-value-match shape, unchanged behavior,
+  /// just wrapped; `Variant` is this plan's addition (a closed-enum
+  /// tag match with per-arm-scoped bindings).
   Case {
     scrutinee: Spanned<Expr>,
     arms: Vec<CaseArm>,
@@ -391,10 +396,21 @@ pub enum Stmt {
   },
 }
 
-/// One `when v1, v2, ... body` arm of a `Stmt::Case` (plan 22's
-/// Decision log — named to keep `arms`' field type out of clippy's
-/// `type_complexity` lint, not a new AST concept).
-pub type CaseArm = (Vec<Spanned<Expr>>, Vec<Spanned<Stmt>>);
+/// One `when ... body` arm of a `Stmt::Case` (plan 22's Decision log —
+/// named to keep `arms`' field type out of clippy's `type_complexity`
+/// lint, not a new AST concept).
+pub type CaseArm = (CasePattern, Vec<Spanned<Stmt>>);
+
+/// Plan 52's Decision log: `Values` is plan 20's original `when v1, v2,
+/// ...` shape (Int64-only value-match), wrapped unchanged; `Variant` is
+/// this plan's `when VariantName(b1, b2, ...)` closed-enum tag match —
+/// `bindings` are plain identifiers only (no nested pattern), scoped to
+/// this arm's own body alone, never the surrounding flat `env`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CasePattern {
+  Values(Vec<Spanned<Expr>>),
+  Variant { name: String, bindings: Vec<String> },
+}
 
 /// One `rescue` clause of a `Stmt::Begin` (plan 38's Decision log).
 /// `class_name: None` is a bare `rescue => e` catch-all — matches
@@ -495,6 +511,29 @@ pub struct ModuleDef {
   pub methods: Vec<Function>,
 }
 
+/// `Circle(Float64)` inside `enum Shape = Circle(Float64) | ...` (plan
+/// 52's Decision log) — `fields` are raw `TypeName` strings, the same
+/// string-based type-annotation convention `Param.ty` already uses,
+/// deferring resolution to sema like every other type annotation in
+/// this AST. At least one field is required — no bare, nullary tag
+/// variants in this plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+  pub name: String,
+  pub fields: Vec<String>,
+}
+
+/// `enum Shape = Circle(Float64) | Square(Float64) | ...` (plan 52's
+/// Decision log) — a CLOSED set of variants, fixed at declaration: no
+/// grammar path reopens an already-declared enum from another file,
+/// the deliberate opposite of `ClassDef`'s open, extensible hierarchy.
+/// Pure data — no method bodies, no `implements`, no superclass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+  pub name: String,
+  pub variants: Vec<EnumVariant>,
+}
+
 /// A single top-level construct: a function definition, a class
 /// definition, a module definition, or a top-level statement (e.g.
 /// `x: Int64 = 10`, `if x > 5 ... end`, `puts x`).
@@ -503,6 +542,8 @@ pub enum Item {
   Function(Function),
   Class(ClassDef),
   Module(ModuleDef),
+  /// `enum Shape = Circle(Float64) | ...` (plan 52's Decision log).
+  Enum(EnumDef),
   /// `interface Comparable ... end` (plan 41's Decision log) — a
   /// general, user-declarable grammar production, not a fourth
   /// hardcoded builtin the way `Array`/`Hash`/`Proc` are.

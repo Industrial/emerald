@@ -13,8 +13,8 @@
 //! `Spanned<T>` doc comment for why that's the cheaper edit.
 
 use emerald_parser::{
-  CaseArm, ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause,
-  Spanned, Stmt, StringPart,
+  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, Expr, Function, Item, ModuleDef, Param,
+  Program, RescueClause, Spanned, Stmt, StringPart,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -80,6 +80,10 @@ pub enum Type {
   /// only `resolve_return_type` (`function_signature`'s own return-type
   /// resolution) ever produces this.
   Tuple(Vec<Type>),
+  /// An instance of a user-declared `enum` (plan 52's Decision log) — a
+  /// CLOSED set of variants, named by the enum's own declaration, the
+  /// deliberate opposite of `Type::Class`'s open, extensible hierarchy.
+  Enum(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +157,20 @@ struct ClassInfo {
   /// (the grammar's `ImplementsClause?` is only reachable from
   /// `ClassDef`).
   implements: Option<String>,
+  /// Plan 52's Decision log: `Some(variants)` only for an `enum`
+  /// registered into this SAME table — `[(variant_name, field_types)]`
+  /// in declaration order. `fields`/`methods` stay empty and
+  /// `is_module`/`superclass`/`implements` stay their defaults for an
+  /// enum entry. A real, disclosed adaptation from the plan's own
+  /// literal text (a separate `EnumInfo` registry): `classes` is
+  /// already threaded through every function in this file that needs
+  /// type resolution or `Expr::Call` dispatch — reusing it here (the
+  /// same "modules share this table" precedent plan 12 already
+  /// established) avoids a second new parameter cascading through
+  /// dozens of already-large signatures for zero functional
+  /// difference. `resolve_type` checks this field before falling
+  /// through to its ordinary `Type::Class` branch.
+  enum_variants: Option<Vec<(String, Vec<Type>)>>,
 }
 
 /// One `interface`'s single required method, kept as raw, unresolved
@@ -231,6 +249,17 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
         )),
       }
     }
+    // Plan 52's Decision log: checked before the ordinary `Type::Class`
+    // branch below — an enum shares the same `classes` registry
+    // (Decision log's disclosed adaptation) but must resolve to
+    // `Type::Enum`, never `Type::Class`.
+    other
+      if classes
+        .get(other)
+        .is_some_and(|c| c.enum_variants.is_some()) =>
+    {
+      Ok(Type::Enum(other.to_string()))
+    }
     // Modules are namespaces, not types (plan 12's Decision log) — a
     // module name is excluded here so `x: MathUtils = ...` correctly
     // falls through to the `unknown type` error below, not `Type::Class`.
@@ -267,6 +296,27 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "Proc" => Ok(Type::Proc(Vec::new(), Box::new(Type::Void))),
     other => Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0))),
   }
+}
+
+/// Plan 52's Decision log: a flat, single-namespace variant-owner
+/// lookup — the same "which registry does this bare name belong to"
+/// cascade `resolve_type` already uses for primitives / classes /
+/// `Array[...]` / `Hash[...]`, applied to `Expr::Call`'s construction-
+/// site check instead of a type annotation. Iterates every enum
+/// currently registered in `classes` (an entry's `enum_variants` is
+/// `Some` only for an actual enum, per the Decision log's disclosed
+/// "enums share the classes table" adaptation) for a variant named
+/// `name`. Registration-time collision checks in `check_program`
+/// guarantee at most one enum ever owns a given variant name.
+fn find_variant(name: &str, classes: &HashMap<String, ClassInfo>) -> Option<(String, Vec<Type>)> {
+  for (enum_name, info) in classes {
+    if let Some(variants) = &info.enum_variants {
+      if let Some((_, field_types)) = variants.iter().find(|(vn, _)| vn == name) {
+        return Some((enum_name.clone(), field_types.clone()));
+      }
+    }
+  }
+  None
 }
 
 /// Splits `s` on top-level `,` only — a nested `Array[...]`/`Hash[...]`/
@@ -487,6 +537,7 @@ fn build_flattened_class_info(
     is_module: false,
     superclass: class_defs[name].superclass.clone(),
     implements: class_defs[name].implements.clone(),
+    enum_variants: None,
   })
 }
 
@@ -509,6 +560,7 @@ fn module_info(
     is_module: true,
     superclass: None,
     implements: None,
+    enum_variants: None,
   })
 }
 
@@ -1073,6 +1125,28 @@ fn infer_expr_type(
       } else {
         resolve_type(&g.return_type_raw, classes)
       }
+    }
+    // Plan 52's Decision log: `Circle(2.0)` parses as an ordinary
+    // `Expr::Call` (no new grammar production — the parser can't tell
+    // "call a function" from "construct a variant" apart at all) — a
+    // hit against the variant-owner lookup, checked before the
+    // ordinary function-signature lookup below, resolves it as
+    // construction instead. Registration-time collision checks in
+    // `check_program` already guarantee a name is never both a
+    // declared variant and a declared function.
+    Expr::Call(name, args) if find_variant(name, classes).is_some() => {
+      let (enum_name, field_types) = find_variant(name, classes).unwrap();
+      check_args(
+        name,
+        args,
+        &field_types,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Enum(enum_name.to_string()))
     }
     Expr::Call(name, args) => {
       let sig = sigs
@@ -2483,13 +2557,112 @@ fn check_case(
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields, gctx)?;
+  // Plan 52's Decision log: the first bounded, fully-known-at-compile-
+  // time domain a `case` scrutinee has ever had — real exhaustiveness
+  // checking over the enum's own closed variant set.
+  if let Type::Enum(enum_name) = &scrutinee_ty {
+    let variants = classes
+      .get(enum_name)
+      .and_then(|c| c.enum_variants.as_ref())
+      .expect("Type::Enum is only ever constructed for a registered enum");
+    let mut matched: HashSet<String> = HashSet::new();
+    for (pattern, body) in arms {
+      let CasePattern::Variant { name, bindings } = pattern else {
+        return Err(Diagnostic::new(
+          format!("case over an enum `{enum_name}` scrutinee cannot use a value pattern"),
+          scrutinee.span,
+        ));
+      };
+      let Some((_, field_types)) = variants.iter().find(|(vn, _)| vn == name) else {
+        return Err(Diagnostic::new(
+          format!("`{name}` is not a variant of enum `{enum_name}`"),
+          scrutinee.span,
+        ));
+      };
+      if !matched.insert(name.clone()) {
+        return Err(Diagnostic::new(
+          format!("`case` over `{enum_name}` matches variant `{name}` more than once"),
+          scrutinee.span,
+        ));
+      }
+      if bindings.len() != field_types.len() {
+        return Err(Diagnostic::new(
+          format!(
+            "pattern `{name}` expects {} binding(s), found {}",
+            field_types.len(),
+            bindings.len()
+          ),
+          scrutinee.span,
+        ));
+      }
+      // Plan 52's Decision log: a real, disclosed departure from this
+      // compiler's standing flat-scoping convention — each arm's
+      // bindings type-check against a *cloned* extension of `env`,
+      // discarded once this arm's body is checked, so a binding never
+      // leaks into a later arm, the `else` body, or a statement after
+      // the `case` ends.
+      let mut arm_env = env.clone();
+      for (bname, bty) in bindings.iter().zip(field_types.iter()) {
+        arm_env.insert(bname.clone(), bty.clone());
+      }
+      check_block(
+        body,
+        &mut arm_env,
+        sigs,
+        classes,
+        self_fields,
+        return_type,
+        in_loop,
+        in_rescue,
+        yields_allowed,
+        gctx,
+      )?;
+    }
+    if else_body.is_none() {
+      let missing: Vec<&str> = variants
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| !matched.contains(*n))
+        .collect();
+      if !missing.is_empty() {
+        return Err(Diagnostic::new(
+          format!(
+            "`case` over `{enum_name}` does not cover variant `{}`",
+            missing.join("`, `")
+          ),
+          scrutinee.span,
+        ));
+      }
+    }
+    if let Some(else_b) = else_body {
+      check_block(
+        else_b,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        return_type,
+        in_loop,
+        in_rescue,
+        yields_allowed,
+        gctx,
+      )?;
+    }
+    return Ok(());
+  }
   if scrutinee_ty != Type::Int64 {
     return Err(Diagnostic::new(
-      format!("`case` scrutinee must be Int64, found {scrutinee_ty:?}"),
+      format!("`case` scrutinee must be Int64 or an enum type, found {scrutinee_ty:?}"),
       scrutinee.span,
     ));
   }
-  for (values, body) in arms {
+  for (pattern, body) in arms {
+    let CasePattern::Values(values) = pattern else {
+      return Err(Diagnostic::new(
+        "case over an Int64 scrutinee cannot use a variant pattern",
+        scrutinee.span,
+      ));
+    };
     for v in values {
       let value_ty = infer_expr_type(v, env, sigs, classes, self_fields, gctx)?;
       if value_ty != Type::Int64 {
@@ -2842,6 +3015,9 @@ fn check_block_call_sites(
       Item::Test { body, .. } => {
         scan_block_call_sites(body, sigs, classes, func_defs, gctx, &mut diags)
       }
+      // Plan 52: an enum is pure data — no method bodies, no block
+      // call sites of any kind.
+      Item::Enum(_) => {}
       Item::Error => {}
     }
   }
@@ -3172,6 +3348,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           is_module: false,
           superclass: c.superclass.clone(),
           implements: c.implements.clone(),
+          enum_variants: None,
         },
       );
     }
@@ -3184,6 +3361,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           is_module: true,
           superclass: None,
           implements: None,
+          enum_variants: None,
         },
       );
     }
@@ -3284,6 +3462,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           is_module: false,
           superclass: c.superclass.clone(),
           implements: c.implements.clone(),
+          enum_variants: None,
         },
       );
     }
@@ -3296,8 +3475,86 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           is_module: true,
           superclass: None,
           implements: None,
+          enum_variants: None,
         },
       );
+    }
+  }
+  // Plan 52: enums register into the SAME `classes` table (Decision
+  // log's disclosed adaptation) — a first pass inserts every enum's
+  // name with a placeholder (empty) variant list, so a variant field
+  // naming another enum resolves regardless of declaration order, then
+  // a second pass resolves each variant's real field types now that
+  // every class/module/enum NAME is known. Rejected at registration
+  // time, before any case/construction is checked: a name colliding
+  // with an already-registered class/module/enum, and a variant name
+  // colliding with a variant already seen in ANY enum registered so
+  // far (a flat, single namespace, the same discipline `resolve_type`
+  // already enforces between class and module names).
+  let mut enum_defs: Vec<&EnumDef> = Vec::new();
+  let mut seen_variant_names: HashSet<String> = HashSet::new();
+  for item in &program.items {
+    if let Item::Enum(e) = item {
+      if classes.contains_key(&e.name) {
+        diags.push(Diagnostic::new(
+          format!(
+            "`{}` is already declared as a class, module, or enum",
+            e.name
+          ),
+          (0, 0),
+        ));
+        continue;
+      }
+      let mut ok = true;
+      for v in &e.variants {
+        if !seen_variant_names.insert(v.name.clone()) {
+          diags.push(Diagnostic::new(
+            format!(
+              "variant `{}` of enum `{}` collides with a variant already declared elsewhere",
+              v.name, e.name
+            ),
+            (0, 0),
+          ));
+          ok = false;
+        }
+      }
+      if !ok {
+        continue;
+      }
+      classes.insert(
+        e.name.clone(),
+        ClassInfo {
+          fields: HashMap::new(),
+          methods: HashMap::new(),
+          is_module: false,
+          superclass: None,
+          implements: None,
+          enum_variants: Some(Vec::new()),
+        },
+      );
+      enum_defs.push(e);
+    }
+  }
+  for e in &enum_defs {
+    let mut resolved_variants = Vec::new();
+    let mut ok = true;
+    for v in &e.variants {
+      let mut field_types = Vec::new();
+      for f in &v.fields {
+        match resolve_type(f, &classes) {
+          Ok(t) => field_types.push(t),
+          Err(d) => {
+            diags.push(d);
+            ok = false;
+          }
+        }
+      }
+      resolved_variants.push((v.name.clone(), field_types));
+    }
+    if ok {
+      if let Some(info) = classes.get_mut(&e.name) {
+        info.enum_variants = Some(resolved_variants);
+      }
     }
   }
   for item in &program.items {
@@ -3397,6 +3654,26 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     generic_sigs: &generic_sigs,
   };
 
+  // Plan 52: the other half of the registration-time collision check —
+  // a variant name colliding with a declared function is only
+  // detectable now that `sigs`/`generic_sigs` are both built. Enum-vs-
+  // class/module and variant-vs-variant collisions were already
+  // rejected earlier, before this point, so `classes` here reflects
+  // only successfully-registered enums.
+  for info in classes.values() {
+    let Some(variants) = &info.enum_variants else {
+      continue;
+    };
+    for (variant_name, _) in variants {
+      if sigs.contains_key(variant_name) || generic_sigs.contains_key(variant_name) {
+        diags.push(Diagnostic::new(
+          format!("variant `{variant_name}` collides with a declared function of the same name"),
+          (0, 0),
+        ));
+      }
+    }
+  }
+
   // Declared once, outside the loop: top-level statements share one
   // environment across the whole program in order (`x: Int64 = 10` then
   // `if x > 5 ...` needs `x` visible in a later Item::Stmt).
@@ -3486,6 +3763,9 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           diags.push(d);
         }
       }
+      // Plan 52: an enum has no body of its own to check beyond the
+      // registration-time checks already performed above.
+      Item::Enum(_) => {}
       // Plan 26's Decision log: `emerald_parser::parse`/`parse_named`
       // returns `Ok(program)` only when zero errors were recovered —
       // `program.items` then contains no `Item::Error` by construction,
@@ -5162,5 +5442,134 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject break outside a loop");
     assert_eq!(errs[0].span, (0, "break".len()));
+  }
+
+  // Plan 52 (algebraic data types and exhaustive pattern matching).
+
+  const SHAPE_ENUM_WORKED_EXAMPLE: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase square\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase rect\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n";
+
+  #[test]
+  fn accepts_the_shape_worked_example() {
+    let program = emerald_parser::parse(SHAPE_ENUM_WORKED_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_case_missing_a_variant_naming_it_specifically() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = s\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a non-exhaustive case");
+    assert!(
+      errs.iter().any(|d| d.message.contains("Rectangle")),
+      "expected a diagnostic naming Rectangle specifically: {errs:?}"
+    );
+    assert!(
+      !errs
+        .iter()
+        .any(|d| d.message.to_lowercase().contains("non-exhaustive")),
+      "must not use a generic non-exhaustive message: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_an_unknown_variant_pattern() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = s\nwhen Rectangle(w, h)\n  area = w\nwhen Triangle(a, b, c)\n  area = a\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Triangle is not a variant of Shape");
+    assert!(
+      errs.iter().any(|d| d.message.contains("Triangle")),
+      "expected a diagnostic naming Triangle: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_duplicate_variant_arm() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Circle(r2)\n  area = r2\nwhen Square(s)\n  area = s\nwhen Rectangle(w, h)\n  area = w\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Circle matched twice");
+    assert!(
+      errs.iter().any(|d| d.message.contains("more than once")),
+      "expected a duplicate-arm diagnostic: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_an_arity_mismatched_pattern() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\narea: Float64 = 0.0\ncase rect\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = s\nwhen Rectangle(w)\n  area = w\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Rectangle needs two bindings, not one");
+    assert!(
+      errs.iter().any(|d| d.message.contains("expects 2 binding")),
+      "expected an arity diagnostic naming expected vs. actual: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_type_mismatched_construction() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(\"not a float\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Circle expects a Float64, not a String");
+    assert!(!errs.is_empty());
+  }
+
+  #[test]
+  fn rejects_a_pattern_binding_referenced_outside_its_own_arm() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = r\nwhen Rectangle(w, h)\n  area = w\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`r` is Circle's own binding, not visible inside the Square arm");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.to_lowercase().contains("undefined")),
+      "expected an undefined-variable diagnostic: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_pattern_binding_referenced_after_the_case_ends() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\ncase circle\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts s\nwhen Rectangle(w, h)\n  puts w\nend\nputs r\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`r` does not survive past its own arm");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.to_lowercase().contains("undefined")),
+      "expected an undefined-variable diagnostic: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_two_enums_declaring_the_same_variant_name() {
+    let src = "enum A = Empty(Int64)\nenum B = Empty(Int64)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Empty is declared by both A and B");
+    assert!(errs.iter().any(|d| d.message.contains("Empty")));
+  }
+
+  #[test]
+  fn rejects_a_variant_name_colliding_with_an_existing_function() {
+    let src =
+      "def Circle(x: Int64) -> Int64\n  x\nend\n\nenum Shape = Circle(Float64) | Square(Float64)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("variant Circle collides with the function Circle");
+    assert!(errs.iter().any(|d| d.message.contains("Circle")));
+  }
+
+  #[test]
+  fn rejects_variant_pattern_over_an_int64_scrutinee() {
+    let src = "n: Int64 = 1\ncase n\nwhen Circle(r)\n  puts r\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Int64 scrutinee can't use a variant pattern");
+    assert!(!errs.is_empty());
+  }
+
+  #[test]
+  fn rejects_value_pattern_over_an_enum_scrutinee() {
+    let src = "enum Shape = Circle(Float64)\n\ncircle: Shape = Circle(2.0)\ncase circle\nwhen 1\n  puts 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("enum scrutinee can't use a value pattern");
+    assert!(!errs.is_empty());
   }
 }

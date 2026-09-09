@@ -20,8 +20,8 @@
 //! change for well-typed Emerald programs.
 
 use emerald_parser::{
-  CaseArm, ClassDef, CompareOp, Expr, Function as AstFunction, Item, ModuleDef, Param, Program,
-  RescueClause, Spanned, Stmt, StringPart,
+  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, Expr, Function as AstFunction, Item,
+  ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
 };
 use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
@@ -231,6 +231,68 @@ struct FieldInfo {
 struct ClassLayout {
   fields: HashMap<String, FieldInfo>,
   size: u64,
+}
+
+/// Plan 52's Decision log: a tagged union — `[tag: i64][payload: 8 *
+/// max_fields bytes]`, generalizing the exact header+payload pattern
+/// `Hash[K,V]`'s own buffer (`build_hash_lit`) already established, one
+/// step further: a header field (the tag, replacing `Hash`'s count)
+/// followed by a byte region sized to the WIDEST variant's payload
+/// (replacing a fixed per-element stride), since unlike a `Hash`'s
+/// uniform pairs, an enum's variants can carry different field counts.
+struct EnumLayout {
+  /// `{variant name} -> its discriminant` — declaration-order index
+  /// (`Circle = 0`, `Square = 1`, ...).
+  variant_tags: HashMap<String, u64>,
+  /// `{variant name} -> its own field kinds, in declaration order}` —
+  /// every variant's fields live at the SAME byte offsets (`8 + i * 8`
+  /// for field `i`), typed per-variant at each access site, exactly
+  /// `field_ptr`/`load_field`'s existing byte-offset mechanism (never a
+  /// typed struct GEP, matching every other compound type in this
+  /// backend).
+  variant_fields: HashMap<String, Vec<ValKind>>,
+  size: u64,
+}
+
+/// Codegen's own independent re-derivation of one `EnumDef` (plan 32's
+/// "no shared sema→codegen structure" architecture, applied here the
+/// same way `build_class_layout` already applies it to `ClassDef`) —
+/// sema's own registration-time checks already guarantee this is only
+/// ever called with a well-formed, collision-free `EnumDef` by the time
+/// a real compile reaches this point.
+fn build_enum_layout(e: &EnumDef) -> EnumLayout {
+  let mut variant_tags = HashMap::new();
+  let mut variant_fields = HashMap::new();
+  let mut max_fields = 0usize;
+  for (i, v) in e.variants.iter().enumerate() {
+    variant_tags.insert(v.name.clone(), i as u64);
+    let kinds: Vec<ValKind> = v.fields.iter().map(|f| value_kind_for_type(f)).collect();
+    max_fields = max_fields.max(kinds.len());
+    variant_fields.insert(v.name.clone(), kinds);
+  }
+  EnumLayout {
+    variant_tags,
+    variant_fields,
+    size: 8 + 8 * max_fields as u64,
+  }
+}
+
+/// Codegen's own variant-owner lookup — mirrors `emerald-sema`'s
+/// identically-purposed `find_variant` (a real, disclosed duplication
+/// of bookkeeping between the two passes, matching this codebase's own
+/// established pattern — see `ClassInfo` vs. `ClassLayout`). Iterates
+/// every enum in `enums` for a variant tagged `name`, returning its
+/// owning enum's name and declaration-order tag.
+fn find_variant_layout<'a>(
+  name: &str,
+  enums: &'a HashMap<String, EnumLayout>,
+) -> Option<(&'a str, u64)> {
+  for (enum_name, layout) in enums {
+    if let Some(&tag) = layout.variant_tags.get(name) {
+      return Some((enum_name.as_str(), tag));
+    }
+  }
+  None
 }
 
 /// Plan 50's `leaf-escape-instrumentation-and-report`: how many
@@ -530,9 +592,24 @@ fn collect_idents_in_stmt(
       else_body,
     } => {
       collect_idents_in_expr(scrutinee, referenced);
-      for (values, body) in arms {
-        for v in values {
-          collect_idents_in_expr(v, referenced);
+      for (pattern, body) in arms {
+        match pattern {
+          CasePattern::Values(values) => {
+            for v in values {
+              collect_idents_in_expr(v, referenced);
+            }
+          }
+          // Plan 52: a pattern binding is bound (like a `Let`'s `name`),
+          // not referenced — scoped to this arm's own body only in
+          // sema, but this free-variable pass is deliberately
+          // conservative (whole-function `bound`, not per-arm), the
+          // same "over-approximate what's bound" posture every other
+          // binding site here already takes.
+          CasePattern::Variant { bindings, .. } => {
+            for b in bindings {
+              bound.insert(b.clone());
+            }
+          }
         }
         for s in body {
           collect_idents_in_stmt(s, referenced, bound);
@@ -749,9 +826,11 @@ fn collect_symbols_in_stmt(stmt: &Spanned<Stmt>, table: &mut HashMap<String, i64
       else_body,
     } => {
       collect_symbols_in_expr(scrutinee, table);
-      for (values, body) in arms {
-        for v in values {
-          collect_symbols_in_expr(v, table);
+      for (pattern, body) in arms {
+        if let CasePattern::Values(values) = pattern {
+          for v in values {
+            collect_symbols_in_expr(v, table);
+          }
         }
         for s in body {
           collect_symbols_in_stmt(s, table);
@@ -829,6 +908,9 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
           collect_symbols_in_stmt(s, &mut table);
         }
       }
+      // Plan 52: an enum's variant fields are raw `TypeName` strings —
+      // no `Symbol` literal appears anywhere in an `Item::Enum` itself.
+      Item::Enum(_) => {}
       Item::Interface(_) | Item::Require(_) | Item::Error => {}
     }
   }
@@ -1151,9 +1233,11 @@ fn collect_specializations_in_stmt(
       else_body,
     } => {
       collect_specializations_in_expr(scrutinee, generic_fns, local_classes, out);
-      for (values, body) in arms {
-        for v in values {
-          collect_specializations_in_expr(v, generic_fns, local_classes, out);
+      for (pattern, body) in arms {
+        if let CasePattern::Values(values) = pattern {
+          for v in values {
+            collect_specializations_in_expr(v, generic_fns, local_classes, out);
+          }
         }
         for s in body {
           collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
@@ -1539,9 +1623,14 @@ fn collect_referenced_idents(stmts: &[Spanned<Stmt>], out: &mut HashSet<String>)
         else_body,
       } => {
         mark_expr(&scrutinee.node, out);
-        for (values, body) in arms {
-          for v in values {
-            mark_expr(&v.node, out);
+        for (pattern, body) in arms {
+          // Plan 52: a pattern binding is a fresh declaration (like a
+          // `Let` name), not a reference — only `Values` patterns can
+          // contain an escape-candidate reference.
+          if let CasePattern::Values(values) = pattern {
+            for v in values {
+              mark_expr(&v.node, out);
+            }
           }
           collect_referenced_idents(body, out);
         }
@@ -1886,6 +1975,10 @@ struct LoopTargets<'ctx> {
 struct Ctx<'a, 'ctx> {
   user_func_ids: &'a HashMap<String, (FunctionValue<'ctx>, ValKind)>,
   classes: &'a HashMap<String, ClassLayout>,
+  /// Plan 52's Decision log: `{enum name} -> its tagged-union layout}`
+  /// — independently re-derived from the raw `Program`, alongside
+  /// `classes` above.
+  enums: &'a HashMap<String, EnumLayout>,
   print_i64: FunctionValue<'ctx>,
   print_f64: FunctionValue<'ctx>,
   alloc: FunctionValue<'ctx>,
@@ -3695,6 +3788,44 @@ fn build_call_expr<'ctx>(
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  // Plan 52's Decision log: `Circle(2.0)` reaches here exactly like an
+  // ordinary function call (no new grammar production — sema's own
+  // registration-time checks already guarantee a name is never both a
+  // declared variant and a declared function) — a hit against the
+  // variant-owner lookup, checked before the generic/ordinary
+  // function-call paths below, resolves it as construction instead:
+  // allocate `layout.size` bytes (the same `ctx.alloc` call
+  // `Expr::New` already uses), store the tag at offset 0 (mirroring
+  // `build_hash_lit`'s own count-header store), then each argument at
+  // `8 + i * 8`.
+  if let Some((enum_name, tag)) = find_variant_layout(name, ctx.enums) {
+    let layout = &ctx.enums[enum_name];
+    let size_val = context.i64_type().const_int(layout.size, false);
+    let alloc_call = builder
+      .build_call(ctx.alloc, &[size_val.into()], "enumlit")
+      .map_err(|e| e.to_string())?;
+    let ptr = call_result(alloc_call)?.into_pointer_value();
+    let tag_ptr = field_ptr(context, builder, ptr, 0)?;
+    builder
+      .build_store(tag_ptr, context.i64_type().const_int(tag, false))
+      .map_err(|e| e.to_string())?;
+    for (i, arg) in args.iter().enumerate() {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let value_ptr = field_ptr(context, builder, ptr, 8 + i as u64 * 8)?;
+      builder
+        .build_store(value_ptr, v)
+        .map_err(|e| e.to_string())?;
+    }
+    return Ok((ptr.into(), ValKind::Ptr));
+  }
   // Plan 41's Decision log: a generic function's bare name is never
   // registered in `user_func_ids` at all — its call sites resolve their
   // own concrete argument type the same way `collect_generic_
@@ -4961,7 +5092,10 @@ fn build_stmt<'a, 'ctx>(
       // class `Greeter`, exactly what `&.`'s dispatch (`build_method_
       // call`, reused by `build_safe_call`) needs to find.
       let bare_ty = ty.strip_suffix('?').unwrap_or(ty);
-      if ctx.classes.contains_key(bare_ty) {
+      // Plan 52: an enum-typed local carries its enum name the same
+      // way a class-typed local carries its class name — `build_case`
+      // consults this to detect an enum scrutinee.
+      if ctx.classes.contains_key(bare_ty) || ctx.enums.contains_key(bare_ty) {
         local_classes.insert(name.clone(), bare_ty.to_string());
       }
       if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
@@ -5792,6 +5926,35 @@ fn build_case<'a, 'ctx>(
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
+  // Plan 52's Decision log: an enum-typed scrutinee is detected via
+  // `local_classes` (only a plain `Expr::Ident` scrutinee can carry a
+  // known static type here — the same receiver restriction
+  // `build_method_call` already imposes elsewhere in this backend),
+  // checked BEFORE building the scrutinee expression, since it needs
+  // an entirely different comparison (a loaded tag, not a raw Int64
+  // value) than the Int64 path below.
+  if let Expr::Ident(name) = &scrutinee.node {
+    if let Some(layout) = local_classes.get(name).and_then(|tn| ctx.enums.get(tn)) {
+      return build_enum_case(
+        context,
+        builder,
+        func,
+        scrutinee,
+        layout,
+        arms,
+        else_body,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+      );
+    }
+  }
+
   let (scrut_val, scrut_kind) = build_expr(
     context,
     builder,
@@ -5808,7 +5971,13 @@ fn build_case<'a, 'ctx>(
 
   let merge_blk = context.append_basic_block(func, "case.merge");
 
-  for (values, body) in arms {
+  for (pattern, body) in arms {
+    let CasePattern::Values(values) = pattern else {
+      return Err(
+        "codegen: internal error — variant pattern over an Int64 scrutinee (sema should have rejected this)"
+          .to_string(),
+      );
+    };
     let arm_blk = context.append_basic_block(func, "case.arm");
     let next_check_blk = context.append_basic_block(func, "case.next");
 
@@ -5871,6 +6040,181 @@ fn build_case<'a, 'ctx>(
   }
 
   // Reached only when no arm matched.
+  if let Some(else_b) = else_body {
+    let terminated = build_block(
+      context,
+      builder,
+      func,
+      else_b,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ensure_stack,
+      retry_stack,
+      ret_kind,
+      ctx,
+    )?;
+    if !terminated {
+      builder
+        .build_unconditional_branch(merge_blk)
+        .map_err(|e| e.to_string())?;
+    }
+  } else {
+    builder
+      .build_unconditional_branch(merge_blk)
+      .map_err(|e| e.to_string())?;
+  }
+
+  builder.position_at_end(merge_blk);
+  Ok(false)
+}
+
+/// Plan 52's `leaf-codegen-tagged-union`: the enum half of `build_case`
+/// — loads the scrutinee's tag (mirroring `build_hash_lookup`'s
+/// existing header-field read), then for each `Variant` arm emits the
+/// same `icmp eq`/conditional-branch chain shape `build_case`'s own
+/// `Values` path already uses, now comparing against `layout.
+/// variant_tags`. Each arm's own bindings are inserted into `vars`
+/// only for the duration of building that arm's block — the prior
+/// entry (if any) is saved and restored (or removed) immediately
+/// after, so a stale pointer never lingers for a later arm or a
+/// statement after the `case` ends (the codegen half of plan 52's
+/// disclosed departure from this compiler's flat-scoping convention).
+#[allow(clippy::too_many_arguments)]
+fn build_enum_case<'a, 'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  scrutinee: &Spanned<Expr>,
+  layout: &EnumLayout,
+  arms: &'a [CaseArm],
+  else_body: &'a Option<Vec<Spanned<Stmt>>>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'a, 'ctx>,
+) -> Result<bool, String> {
+  let (scrut_val, _scrut_kind) = build_expr(
+    context,
+    builder,
+    scrutinee,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let ptr = scrut_val.into_pointer_value();
+  let tag_val = load_field(
+    context,
+    builder,
+    ptr,
+    FieldInfo {
+      offset: 0,
+      kind: ValKind::Int64,
+    },
+  )?
+  .into_int_value();
+
+  let merge_blk = context.append_basic_block(func, "case.merge");
+
+  for (pattern, body) in arms {
+    let CasePattern::Variant { name, bindings } = pattern else {
+      return Err(
+        "codegen: internal error — value pattern over an enum scrutinee (sema should have rejected this)"
+          .to_string(),
+      );
+    };
+    let tag = *layout.variant_tags.get(name).ok_or_else(|| {
+      format!("codegen: internal error — unknown variant `{name}` (sema should have rejected this)")
+    })?;
+    let field_kinds = layout.variant_fields.get(name).ok_or_else(|| {
+      format!("codegen: internal error — unknown variant `{name}` (sema should have rejected this)")
+    })?;
+
+    let arm_blk = context.append_basic_block(func, "case.arm");
+    let next_check_blk = context.append_basic_block(func, "case.next");
+
+    let tag_const = context.i64_type().const_int(tag, false);
+    let cond = builder
+      .build_int_compare(IntPredicate::EQ, tag_val, tag_const, "tageq")
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_conditional_branch(cond, arm_blk, next_check_blk)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(arm_blk);
+
+    let mut prior_vars: Vec<(String, Option<(PointerValue<'ctx>, ValKind)>)> = Vec::new();
+    for (i, bname) in bindings.iter().enumerate() {
+      let kind = field_kinds.get(i).ok_or_else(|| {
+        format!(
+          "codegen: internal error — pattern `{name}` binding count mismatch (sema should have rejected this)"
+        )
+      })?;
+      let loaded = load_field(
+        context,
+        builder,
+        ptr,
+        FieldInfo {
+          offset: 8 + i as u64 * 8,
+          kind: kind.clone(),
+        },
+      )?;
+      // A binding gets its own stack slot (the same `PointerValue`
+      // shape every other local this backend tracks in `vars`), never
+      // the tagged union's own field slot aliased directly — so
+      // `build_stmt`'s ordinary `Expr::Ident` read path works
+      // identically to any other local.
+      let alloca = builder
+        .build_alloca(local_llvm_type(context, kind), bname)
+        .map_err(|e| e.to_string())?;
+      builder
+        .build_store(alloca, loaded)
+        .map_err(|e| e.to_string())?;
+      prior_vars.push((bname.clone(), vars.get(bname).cloned()));
+      vars.insert(bname.clone(), (alloca, kind.clone()));
+    }
+
+    let terminated = build_block(
+      context,
+      builder,
+      func,
+      body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ensure_stack,
+      retry_stack,
+      ret_kind.clone(),
+      ctx,
+    )?;
+
+    for (bname, prior) in prior_vars {
+      match prior {
+        Some(p) => {
+          vars.insert(bname, p);
+        }
+        None => {
+          vars.remove(&bname);
+        }
+      }
+    }
+
+    if !terminated {
+      builder
+        .build_unconditional_branch(merge_blk)
+        .map_err(|e| e.to_string())?;
+    }
+
+    builder.position_at_end(next_check_blk);
+  }
+
   if let Some(else_b) = else_body {
     let terminated = build_block(
       context,
@@ -7007,6 +7351,9 @@ fn declare_user_functions<'ctx>(
       // prologue rejects any `Program` still containing an
       // `Item::Test` before this runs at all.
       Item::Test { .. } => {}
+      // Plan 52: pure data — no function body to declare an LLVM
+      // symbol for.
+      Item::Enum(_) => {}
       // Plan 26: `emerald_parser::parse`/`parse_named` only ever
       // returns `Ok(program)` with zero recovered errors, meaning no
       // `Item::Error` in `program.items` — codegen never receives one.
@@ -7431,6 +7778,19 @@ fn compile_to_object_impl(
   }
   let method_owners = build_method_owners(&class_defs)?;
 
+  // Plan 52: independently re-derived from the raw `Program`/`Item::
+  // Enum` list, the same "no shared sema→codegen structure"
+  // architecture `classes`/`class_tags` above already established
+  // (plan 32's Decision log) — sema's own registration-time checks
+  // already guarantee every enum name and variant name here is unique
+  // and collision-free before codegen ever runs.
+  let mut enums: HashMap<String, EnumLayout> = HashMap::new();
+  for item in &program.items {
+    if let Item::Enum(e) = item {
+      enums.insert(e.name.clone(), build_enum_layout(e));
+    }
+  }
+
   // Plan 44: see `Ctx::symbol_table`'s own doc comment — built once,
   // alongside `class_tags`, before any function body compiles.
   let symbol_table = collect_program_symbols(program);
@@ -7510,6 +7870,7 @@ fn compile_to_object_impl(
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
     classes: &classes,
+    enums: &enums,
     print_i64,
     print_f64,
     alloc,
@@ -7642,6 +8003,8 @@ fn compile_to_object_impl(
       // prologue rejects any `Program` still containing an
       // `Item::Test` before this runs at all.
       Item::Test { .. } => {}
+      // Plan 52: pure data — no function body to compile.
+      Item::Enum(_) => {}
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
     }
   }
@@ -7790,6 +8153,9 @@ fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
       }
       Item::Stmt(s) => desugar_asserts_in_stmt(s, &mut rewrote),
       Item::Test { body, .. } => desugar_asserts_in_stmts(body, &mut rewrote),
+      // Plan 52: pure data — no `assert`/`assert_eq` site can appear
+      // inside an `Item::Enum`.
+      Item::Enum(_) => {}
       Item::Interface(_) | Item::Require(_) | Item::Error => {}
     }
   }
@@ -9789,5 +10155,81 @@ mod tests {
     // is behavior-preserving — `compile_to_object` still compiles and
     // links a real program via its pre-existing, unmodified signature.
     assert_eq!(compile_link_run(DISTANCE_SQUARED_AND_MAKE_POINT), "25\n");
+  }
+
+  // Plan 52 (algebraic data types and exhaustive pattern matching).
+
+  const SHAPE_ENUM_WORKED_EXAMPLE_CODEGEN: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase square\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase rect\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n";
+
+  #[test]
+  fn shape_worked_example_compiled_linked_and_run_prints_three_correct_areas() {
+    // AC1: real, executed proof — tagged-union layout, construction,
+    // tag comparison, and per-variant field extraction all round-trip
+    // correctly for every one of the three variants without corrupting
+    // each other's memory. 3.14159 * 2 * 2 = 12.56636; 3 * 3 = 9;
+    // 4 * 5 = 20.
+    let output = compile_link_run(SHAPE_ENUM_WORKED_EXAMPLE_CODEGEN);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 3, "expected 3 printed lines, got: {output:?}");
+    assert!(lines[0].starts_with("12.566"), "circle area: {}", lines[0]);
+    assert_eq!(lines[1], "9");
+    assert_eq!(lines[2], "20");
+  }
+
+  #[test]
+  fn rectangle_two_field_extraction_does_not_alias_w_and_h() {
+    // AC2: a deliberate proof this leaf doesn't just exercise the
+    // single-field Circle/Square path — `w` and `h` (and the tag) must
+    // each land at their own distinct byte offset. If they aliased,
+    // `w * h` would compute `w * w` or `h * h` instead of the real
+    // product.
+    let src = "enum Shape = Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\ncase rect\nwhen Rectangle(w, h)\n  puts w\n  puts h\n  puts w * h\nend\n";
+    assert_eq!(compile_link_run(src), "4\n5\n20\n");
+  }
+
+  #[test]
+  fn a_pattern_bindings_vars_entry_does_not_survive_past_its_own_arm() {
+    // AC3: verified directly at the codegen level (not just inferred
+    // from the sema leaf's own AC7) — a program whose second arm reads
+    // a name only the FIRST arm binds. Sema would reject this before
+    // codegen ever runs (leaf-sema-enums AC7); this test bypasses sema
+    // entirely (parses directly, calls compile_to_object) to prove
+    // codegen's own `vars` map genuinely does not still resolve the
+    // first arm's binding while building the second arm's block.
+    let src = "enum Shape = Circle(Float64) | Square(Float64)\n\nsquare: Shape = Square(3.0)\ncase square\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts r\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("case_binding_scope");
+    let obj_path = dir.join("out.o");
+    let result = compile_to_object(&program, &obj_path);
+    assert!(
+      result.is_err(),
+      "codegen must not resolve `r` inside the Square arm — it was only ever bound by Circle's"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+      msg.contains("undefined variable `r`"),
+      "expected an undefined-variable error naming `r`, got: {msg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn case_over_a_non_int64_non_enum_scrutinee_errors_not_panics() {
+    // AC4: a malformed/unsupported shape (an enum-typed local's own
+    // type name not present in `ctx.enums` — reachable only by
+    // bypassing sema, which registration-time checks already prevent
+    // in the normal pipeline) returns a descriptive `Err`, not a
+    // panic. Constructed directly: a `String`-typed scrutinee, which
+    // is neither `Int64` nor any registered enum.
+    let src = "s: String = \"nope\"\ncase s\nwhen 1\n  puts 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("case_bad_scrutinee");
+    let obj_path = dir.join("out.o");
+    let result = compile_to_object(&program, &obj_path);
+    assert!(
+      result.is_err(),
+      "a String scrutinee must be rejected, not panic"
+    );
+    std::fs::remove_dir_all(&dir).ok();
   }
 }

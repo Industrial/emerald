@@ -19,8 +19,8 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  CaseArm, ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
-  RescueClause, Spanned, Stmt, StringPart, TypeParam,
+  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function, InterfaceDef,
+  Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart, TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -116,7 +116,7 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
           rewrite_stmts(&mut f.body, name, source);
         }
       }
-      Item::Interface(_) | Item::Require(_) | Item::Error => {}
+      Item::Interface(_) | Item::Require(_) | Item::Error | Item::Enum(_) => {}
       Item::Stmt(s) => rewrite_stmt(s, name, source),
       Item::Test { body, .. } => rewrite_stmts(body, name, source),
     }
@@ -188,9 +188,11 @@ fn rewrite_stmt(stmt: &mut Spanned<Stmt>, name: &str, source: &str) {
       else_body,
     } => {
       rewrite_expr(scrutinee, name, source);
-      for (values, body) in arms {
-        for v in values {
-          rewrite_expr(v, name, source);
+      for (pattern, body) in arms {
+        if let CasePattern::Values(values) = pattern {
+          for v in values {
+            rewrite_expr(v, name, source);
+          }
         }
         rewrite_stmts(body, name, source);
       }
@@ -1475,7 +1477,7 @@ mod tests {
     };
     assert_eq!(*scrutinee, Expr::Ident("n".into()));
     assert_eq!(arms.len(), 2);
-    assert_eq!(arms[0].0, vec![Expr::Int(1)]);
+    assert_eq!(arms[0].0, CasePattern::Values(vec![s(Expr::Int(1))]));
     assert_eq!(
       arms[0].1,
       vec![s(Stmt::Let {
@@ -1484,7 +1486,10 @@ mod tests {
         value: s(Expr::Int(10)),
       })]
     );
-    assert_eq!(arms[1].0, vec![Expr::Int(2), Expr::Int(3)]);
+    assert_eq!(
+      arms[1].0,
+      CasePattern::Values(vec![s(Expr::Int(2)), s(Expr::Int(3))])
+    );
     assert!(else_body.is_some());
   }
 
@@ -2766,5 +2771,96 @@ mod tests {
         Box::new(s(Expr::Ident("b".into())))
       ))))]
     );
+  }
+
+  // Plan 52 (algebraic data types and exhaustive pattern matching).
+
+  const SHAPE_ENUM_SRC: &str =
+    "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n";
+
+  #[test]
+  fn enum_declaration_parses_into_item_enum() {
+    let program = parse(SHAPE_ENUM_SRC).expect("should parse");
+    let Item::Enum(def) = &program.items[0] else {
+      panic!("expected an Item::Enum, got {:?}", program.items[0]);
+    };
+    assert_eq!(def.name, "Shape");
+    assert_eq!(
+      def.variants,
+      vec![
+        EnumVariant {
+          name: "Circle".into(),
+          fields: vec!["Float64".into()],
+        },
+        EnumVariant {
+          name: "Square".into(),
+          fields: vec!["Float64".into()],
+        },
+        EnumVariant {
+          name: "Rectangle".into(),
+          fields: vec!["Float64".into(), "Float64".into()],
+        },
+      ]
+    );
+  }
+
+  #[test]
+  fn case_over_variant_patterns_parses_arms_with_bindings_in_source_order() {
+    let src = "case circle\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts s\nwhen Rectangle(w, h)\n  puts w\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Case { arms, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a case statement, got {:?}", program.items[0]);
+    };
+    assert_eq!(arms.len(), 3);
+    assert_eq!(
+      arms[0].0,
+      CasePattern::Variant {
+        name: "Circle".into(),
+        bindings: vec!["r".into()],
+      }
+    );
+    assert_eq!(
+      arms[1].0,
+      CasePattern::Variant {
+        name: "Square".into(),
+        bindings: vec!["s".into()],
+      }
+    );
+    assert_eq!(
+      arms[2].0,
+      CasePattern::Variant {
+        name: "Rectangle".into(),
+        bindings: vec!["w".into(), "h".into()],
+      }
+    );
+  }
+
+  #[test]
+  fn variant_construction_parses_as_an_ordinary_call() {
+    // Decision log: no new grammar production for construction — the
+    // parser can't tell "call a function" from "construct a variant"
+    // apart at all; that's entirely sema's job. `Circle(2.0)` parses
+    // exactly like any other bare function call.
+    let program = parse("Circle(2.0)\n").expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(s(Stmt::Expr(s(Expr::Call(
+        "Circle".to_string(),
+        vec![s(Expr::Float(2.0))]
+      )))))
+    );
+  }
+
+  #[test]
+  fn plan_52_worked_example_parses_end_to_end() {
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\n\ncase circle\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts s\nwhen Rectangle(w, h)\n  puts w\nend\n";
+    let program = parse(src).expect("worked example should parse");
+    assert!(matches!(program.items[0], Item::Enum(_)));
+    assert!(matches!(program.items[1], Item::Stmt(_)));
+    assert!(matches!(program.items[2], Item::Stmt(_)));
   }
 }
