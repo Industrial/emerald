@@ -53,3 +53,33 @@ end
 puts classify(0)
 puts classify(5)
 puts classify(20)
+
+c: Int64 = 7
+if c == 1
+  puts 100
+elsif c == 7
+  puts 101
+else
+  puts 102
+end
+
+unless c == 1
+  puts 103
+end
+
+u: Int64 = 0
+until u == 2
+  puts u
+  u: Int64 = u + 1
+end
+
+for x in [5, 6, 7]
+  puts x
+end
+
+case c
+when 7
+  puts 200
+when 8
+  puts 201
+end

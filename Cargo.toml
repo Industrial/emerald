@@ -5,7 +5,10 @@ members = [
   "crates/emerald-parser",
   "crates/emerald-codegen",
   "crates/emerald-sema",
+  "crates/emerald-driver",
   "crates/emerald-cli",
+  "crates/emerald-lsp",
+  "crates/emerald-mcp",
 ]
 
 # Single version and shared metadata for all workspace crates (inherit with version.workspace = true).

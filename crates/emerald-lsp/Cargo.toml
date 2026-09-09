@@ -1,0 +1,16 @@
+[package]
+name = "emerald-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "emerald-lsp"
+path = "src/main.rs"
+
+[dependencies]
+emerald-driver = { path = "../emerald-driver" }
+lsp-server = "0.10"
+lsp-types = "0.97"
+miette = "7"
+serde_json = "1"

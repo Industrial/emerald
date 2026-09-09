@@ -1,17 +1,23 @@
-//! Plan 27's runtime-bundling fix: compiles `runtime/emerald_runtime.c`
-//! into a static archive at `emerald-cli`'s own build time (via the
-//! `cc` crate — the standard way to invoke a C compiler from a build
-//! script), so the *shipped binary* no longer needs this repo's
-//! `runtime/emerald_runtime.c` present at link-a-user's-program time.
+//! Plan 27's runtime-bundling fix, moved here unchanged from
+//! `emerald-cli` (plan 17's `leaf-driver-extraction`): compiles
+//! `runtime/emerald_runtime.c` into a static archive at this crate's
+//! own build time (via the `cc` crate), so the *shipped binary*
+//! (`emerald-cli`, or any future caller linking through this driver)
+//! no longer needs this repo's `runtime/emerald_runtime.c` present at
+//! link-a-user's-program time.
 //!
 //! Emitting the archive's on-disk `OUT_DIR` path alone would not
 //! actually fix portability — `OUT_DIR` lives inside this repo's own
 //! `target/` tree and doesn't exist once the binary is copied
 //! elsewhere. Instead this exposes the path via `EMERALD_RUNTIME_ARCHIVE`
-//! so `main.rs` can `include_bytes!` it: that embeds the archive's real
-//! bytes into the compiled `emerald-cli` binary itself, at compile
-//! time, which is what makes a copied-alone binary still able to link
-//! a user's program with no access to this checkout at all.
+//! so `lib.rs` can `include_bytes!` it: that embeds the archive's real
+//! bytes into the compiled binary itself, at compile time, which is
+//! what makes a copied-alone binary still able to link a user's
+//! program with no access to this checkout at all.
+//!
+//! `crates/emerald-driver` sits at the same depth under `crates/` as
+//! `crates/emerald-cli` did, so the relative path to `runtime/
+//! emerald_runtime.c` is unchanged.
 
 fn main() {
   let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo");

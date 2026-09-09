@@ -12,13 +12,13 @@ name = "emerald"
 path = "src/main.rs"
 
 [dependencies]
+# Plan 17's leaf-driver-extraction moved the parse/check/codegen/link
+# pipeline into emerald-driver; emerald-parser stays a direct
+# dependency only because require.rs (plan 46, authored after plan 17)
+# does its own multi-file parsing/splicing before handing a `Program`
+# to emerald_driver::compile_program.
 emerald-parser = { path = "../emerald-parser" }
-emerald-sema = { path = "../emerald-sema" }
-emerald-codegen = { path = "../emerald-codegen" }
+emerald-driver = { path = "../emerald-driver" }
 miette = { version = "7", features = ["fancy"] }
-id_effect = "0.4"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
-
-[build-dependencies]
-cc = "1"

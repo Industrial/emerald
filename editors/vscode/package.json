@@ -1,0 +1,52 @@
+{
+	"name": "emerald-lang",
+	"displayName": "Emerald Language",
+	"description": "Syntax highlighting and live diagnostics for Emerald (.em) via emerald-lsp.",
+	"version": "0.1.0",
+	"publisher": "emerald-lang",
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"categories": [
+		"Programming Languages"
+	],
+	"activationEvents": [
+		"onLanguage:emerald"
+	],
+	"main": "./extension.js",
+	"contributes": {
+		"languages": [
+			{
+				"id": "emerald",
+				"aliases": [
+					"Emerald",
+					"emerald"
+				],
+				"extensions": [
+					".em"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "emerald",
+				"scopeName": "source.emerald",
+				"path": "./syntaxes/emerald.tmLanguage.json"
+			}
+		],
+		"configuration": {
+			"title": "Emerald",
+			"properties": {
+				"emerald.serverPath": {
+					"type": "string",
+					"default": "emerald-lsp",
+					"description": "Path to the emerald-lsp binary. Defaults to `emerald-lsp` on PATH."
+				}
+			}
+		}
+	},
+	"dependencies": {
+		"vscode-languageclient": "^9.0.0"
+	}
+}

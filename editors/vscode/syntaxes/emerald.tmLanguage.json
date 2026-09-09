@@ -1,0 +1,112 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "Emerald",
+	"scopeName": "source.emerald",
+	"fileTypes": ["em"],
+	"patterns": [
+		{ "include": "#comments" },
+		{ "include": "#strings" },
+		{ "include": "#symbols" },
+		{ "include": "#instance-variables" },
+		{ "include": "#keywords" },
+		{ "include": "#constants" },
+		{ "include": "#types" },
+		{ "include": "#numbers" },
+		{ "include": "#brackets" },
+		{ "include": "#operators" },
+		{ "include": "#identifiers" }
+	],
+	"repository": {
+		"comments": {
+			"comment": "grammar.lalrpop's match block: r\"#[^\\n]*\" — a line comment, newline excluded.",
+			"patterns": [
+				{
+					"name": "comment.line.number-sign.emerald",
+					"match": "#.*$"
+				}
+			]
+		},
+		"strings": {
+			"comment": "grammar.lalrpop's StringLitTok: \"...\" with \\\" / \\n escapes; #{...} interpolation is a real, separate re-parse (crates/emerald-parser/src/interpolate.rs).",
+			"name": "string.quoted.double.emerald",
+			"begin": "\"",
+			"end": "\"",
+			"patterns": [
+				{
+					"name": "constant.character.escape.emerald",
+					"match": "\\\\[n\"]"
+				},
+				{
+					"name": "meta.embedded.line.emerald",
+					"begin": "#\\{",
+					"end": "\\}",
+					"beginCaptures": {
+						"0": { "name": "punctuation.section.embedded.begin.emerald" }
+					},
+					"endCaptures": {
+						"0": { "name": "punctuation.section.embedded.end.emerald" }
+					},
+					"patterns": [{ "include": "$self" }]
+				}
+			]
+		},
+		"symbols": {
+			"comment": "grammar.lalrpop's SymbolLitTok: :identifier, no space between ':' and the name.",
+			"name": "constant.other.symbol.emerald",
+			"match": ":[A-Za-z_][A-Za-z0-9_]*"
+		},
+		"instance-variables": {
+			"comment": "grammar.lalrpop's InstanceVarTok: @identifier.",
+			"name": "variable.other.readwrite.instance.emerald",
+			"match": "@[A-Za-z_][A-Za-z0-9_]*"
+		},
+		"keywords": {
+			"patterns": [
+				{
+					"name": "keyword.control.emerald",
+					"match": "\\b(if|else|elsif|unless|while|until|for|in|return|break|next|begin|rescue|ensure|retry|case|when|yield)\\b"
+				},
+				{
+					"name": "keyword.other.emerald",
+					"match": "\\b(class|module|def|end|interface|implements|require|read|new|puts|raise)\\b"
+				}
+			]
+		},
+		"constants": {
+			"name": "constant.language.emerald",
+			"match": "\\b(true|false|nil)\\b"
+		},
+		"types": {
+			"comment": "Array/Hash/Proc are real grammar.lalrpop terminals (TypeName); the rest are plain Ident tokens sema resolves as builtin type names, not grammar keywords — still given a distinct scope here since a TextMate grammar has no sema of its own to defer to.",
+			"name": "support.type.emerald",
+			"match": "\\b(Array|Hash|Proc|Int64|Float64|Bool|Boolean|String|Nil|Symbol|Void)\\b"
+		},
+		"numbers": {
+			"patterns": [
+				{
+					"comment": "grammar.lalrpop's FloatLit: [0-9]+\\.[0-9]+ — no exponent, no bare trailing dot.",
+					"name": "constant.numeric.float.emerald",
+					"match": "\\b[0-9]+\\.[0-9]+\\b"
+				},
+				{
+					"comment": "grammar.lalrpop's Num: [0-9]+",
+					"name": "constant.numeric.integer.emerald",
+					"match": "\\b[0-9]+\\b"
+				}
+			]
+		},
+		"brackets": {
+			"name": "punctuation.section.brackets.emerald",
+			"match": "[(){}\\[\\]]"
+		},
+		"operators": {
+			"comment": "Every literal operator/punctuation terminal in grammar.lalrpop, longest first so e.g. '<=>' wins over '<=' wins over '<'.",
+			"name": "keyword.operator.emerald",
+			"match": "(\\.\\.\\.|<=>|\\|\\|=|&&=|==|!=|>=|<=|&\\.|->|=>|\\+=|-=|\\*=|/=|%=|\\|\\||&&|<<|>>|\\.\\.|\\+|-|\\*|/|%|=|>|<|!|~|&|\\||\\^|\\?|\\.|,|:)"
+		},
+		"identifiers": {
+			"name": "variable.other.emerald",
+			"match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+		}
+	}
+}

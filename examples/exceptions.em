@@ -28,3 +28,19 @@ begin
 rescue MyError => e
   puts 0
 end
+
+attempts: Int64 = 0
+begin
+  attempts: Int64 = attempts + 1
+  if attempts < 2
+    raise MyError.new(1)
+  end
+  puts attempts
+rescue MyError => e
+  if attempts < 2
+    retry
+  end
+  puts 999
+ensure
+  puts 777
+end

@@ -42,7 +42,7 @@ fn compile_and_run(example: &str) -> String {
 fn control_flow_em_prints_expected_sequence() {
   assert_eq!(
     compile_and_run("control_flow.em"),
-    "1\n1\n1\n1\n1\n1\n0\n1\n3\n0\n1\n2\n"
+    "1\n1\n1\n1\n1\n1\n0\n1\n3\n0\n1\n2\n101\n103\n0\n1\n5\n6\n7\n200\n"
   );
 }
 
@@ -53,17 +53,20 @@ fn classes_em_prints_expected_sequence() {
 
 #[test]
 fn collections_em_prints_expected_sequence() {
-  assert_eq!(compile_and_run("collections.em"), "60\n99\n4\n");
+  assert_eq!(
+    compile_and_run("collections.em"),
+    "60\n99\n4\n10\n20\n1\n3\n4\n"
+  );
 }
 
 #[test]
 fn closures_em_prints_expected_sequence() {
-  assert_eq!(compile_and_run("closures.em"), "15\n42\n");
+  assert_eq!(compile_and_run("closures.em"), "15\n42\n0\n1\n2\n");
 }
 
 #[test]
 fn exceptions_em_prints_expected_sequence() {
-  assert_eq!(compile_and_run("exceptions.em"), "99\n5\n");
+  assert_eq!(compile_and_run("exceptions.em"), "99\n5\n2\n777\n");
 }
 
 #[test]

@@ -1,0 +1,14 @@
+[package]
+name = "emerald-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+emerald-parser = { path = "../emerald-parser" }
+emerald-sema = { path = "../emerald-sema" }
+emerald-codegen = { path = "../emerald-codegen" }
+id_effect = "0.4"
+
+[build-dependencies]
+cc = "1"

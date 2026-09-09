@@ -11,3 +11,23 @@ puts arr[1]
 
 floats: Array[Float64] = [1.5, 2.5]
 puts floats[0] + floats[1]
+
+h: Hash[Int64, Int64] = {1 => 10, 2 => 20}
+puts h[1]
+puts h[2]
+
+flag: Boolean = true
+other: Boolean = false
+if flag
+  puts 1
+end
+if other
+  puts 2
+else
+  puts 3
+end
+
+s: String? = nil
+if s == nil
+  puts 4
+end

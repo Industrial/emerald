@@ -1,22 +1,14 @@
-//! Emerald's command-line entry point (plan-of-plans row 06). Orchestrates
-//! parse -> type-check -> codegen -> link directly here rather than in a
-//! separate `emerald-driver` crate (see plan 06's Decision log: extracted
-//! when a second caller needs the same pipeline).
+//! Emerald's command-line entry point (plan-of-plans row 06).
+//! `emerald-driver` (plan 17's `leaf-driver-extraction`) now owns the
+//! parse -> type-check -> codegen -> link pipeline; this crate shrinks
+//! to CLI-only concerns — argument parsing, reading the source file,
+//! calling into the driver, and rendering the resulting `DriverError`.
 //!
-//! The pipeline is expressed as a chain of `id_effect::Effect` values
-//! (plan 14, inception §15's "compiler pipeline orchestration" use
-//! case) — each stage stays exactly the plain `Result`-returning
-//! function it already was; only the *sequencing* between stages is
-//! expressed through `Effect`/`.flat_map` instead of four repeated
-//! `match { Ok/Err }` blocks. No capability DI, no async — see plan
-//! 14's Decision log for why that's the right amount of the crate to
-//! use here, not more.
-//!
-//! Plan 46 adds `new`/`build`/`run` subcommand dispatch on top of this
-//! same pipeline (`manifest`/`deps`/`lockfile`/`require` modules); the
-//! legacy bare `emerald <source.em> [-o <output>]` invocation (no
-//! `emerald.toml` involved) keeps working unchanged for any other
-//! `args[1]`.
+//! `emerald new`/`build`/`run` subcommand dispatch (plan 46,
+//! `manifest`/`deps`/`lockfile`/`require` modules) sits on top of the
+//! same driver; the legacy bare `emerald <source.em> [-o <output>]`
+//! invocation (no `emerald.toml` involved) keeps working unchanged for
+//! any other `args[1]`.
 
 mod deps;
 mod lockfile;
@@ -24,8 +16,7 @@ mod manifest;
 mod require;
 
 use deps::DepsError;
-use emerald_parser::{ParseError, Program};
-use id_effect::{Effect, run_blocking};
+use emerald_driver::DriverError;
 use lockfile::Lockfile;
 use manifest::{DependencySpec, Manifest, ManifestError};
 use require::RequireError;
@@ -33,12 +24,6 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 enum CliError {
-  /// Plan 26: `emerald_parser::parse_named` reports every top-level
-  /// `Item` boundary's syntax error in one pass, not just the first.
-  Parse(Vec<ParseError>),
-  Sema(Vec<emerald_sema::Diagnostic>),
-  Codegen(String),
-  Link(String),
   Manifest(ManifestError),
   Deps(DepsError),
   Require(RequireError),
@@ -46,95 +31,33 @@ enum CliError {
 
 fn report_error(e: CliError) {
   match e {
-    CliError::Parse(errs) => {
-      for e in errs {
-        eprintln!("{:?}", miette::Report::new(e));
-      }
-    }
-    CliError::Sema(diags) => {
-      for d in &diags {
-        eprintln!("error: {}", d.message);
-      }
-    }
-    CliError::Codegen(e) => eprintln!("codegen error: {e}"),
-    CliError::Link(e) => eprintln!("error: {e}"),
     CliError::Manifest(e) => eprintln!("error: {e}"),
     CliError::Deps(e) => eprintln!("error: {e}"),
     CliError::Require(e) => eprintln!("error: {e}"),
   }
 }
 
-fn parse_stage(source: String, name: String) -> Effect<Program, CliError, ()> {
-  Effect::new(move |_env: &mut ()| {
-    emerald_parser::parse_named(&source, &name).map_err(CliError::Parse)
-  })
-}
-
-fn check_stage(program: Program) -> Effect<Program, CliError, ()> {
-  Effect::new(move |_env: &mut ()| {
-    emerald_sema::check_program(&program)
-      .map(|()| program)
-      .map_err(CliError::Sema)
-  })
-}
-
-fn codegen_stage(program: Program, obj_path: PathBuf) -> Effect<PathBuf, CliError, ()> {
-  Effect::new(move |_env: &mut ()| {
-    emerald_codegen::compile_to_object(&program, &obj_path)
-      .map(|()| obj_path)
-      .map_err(CliError::Codegen)
-  })
-}
-
-/// Plan 27: the compiled runtime archive's real bytes, embedded into
-/// this binary at *compile* time (`build.rs` compiles `runtime/
-/// emerald_runtime.c` via the `cc` crate and points
-/// `EMERALD_RUNTIME_ARCHIVE` at the resulting `.a`) — not a path
-/// looked up at runtime. This is what makes a shipped `emerald-cli`
-/// binary, copied alone with no access to this repo's checkout, still
-/// able to link a user's compiled program: the runtime archive travels
-/// inside the binary itself.
-static RUNTIME_ARCHIVE: &[u8] = include_bytes!(env!("EMERALD_RUNTIME_ARCHIVE"));
-
-/// -no-pie: `emerald-codegen` emits non-PIC code (see its `host_isa`),
-/// so the executable must not be a PIE either — otherwise `ld` warns
-/// about (harmless but avoidable) DT_TEXTREL relocations. The object
-/// file and the extracted runtime archive are both removed once
-/// linking is attempted, success or failure.
-fn link_stage(obj_path: PathBuf, output_path: PathBuf) -> Effect<(), CliError, ()> {
-  Effect::new(move |_env: &mut ()| {
-    let runtime_archive_path =
-      std::env::temp_dir().join(format!("libemerald_runtime_{}.a", process::id()));
-    if let Err(e) = std::fs::write(&runtime_archive_path, RUNTIME_ARCHIVE) {
-      std::fs::remove_file(&obj_path).ok();
-      return Err(CliError::Link(format!(
-        "failed to extract the embedded runtime archive: {e}"
-      )));
+fn report_driver_error(e: DriverError) {
+  match e {
+    // `ParseError` implements `miette::Diagnostic` (plan 13) — its
+    // `{:?}` rendering, via miette's `fancy`-feature graphical
+    // handler, is the source-snippet-and-caret display, not a bare
+    // one-line message. Plan 26: one report per recovered error, not
+    // just the first — still exits non-zero once, after printing all
+    // of them.
+    DriverError::Parse(errs) => {
+      for e in errs {
+        eprintln!("{:?}", miette::Report::new(e));
+      }
     }
-    let link_result = Command::new("cc")
-      .arg("-no-pie")
-      .arg(&obj_path)
-      .arg(&runtime_archive_path)
-      .arg("-o")
-      .arg(&output_path)
-      .status();
-    std::fs::remove_file(&obj_path).ok();
-    std::fs::remove_file(&runtime_archive_path).ok();
-    match link_result {
-      Ok(status) if status.success() => Ok(()),
-      Ok(_) => Err(CliError::Link("linking failed".to_string())),
-      Err(e) => Err(CliError::Link(format!("failed to invoke cc: {e}"))),
+    DriverError::Sema(diags) => {
+      for d in &diags {
+        eprintln!("error: {}", d.message);
+      }
     }
-  })
-}
-
-/// Splices `entry_path`'s own `require`s in place (plan 23's design,
-/// resolved by `require.rs` since `emerald-driver`'s `resolve_program`
-/// doesn't exist yet) instead of a plain single-file parse — this is
-/// the only difference between the manifest-driven `build`/`run`
-/// pipeline and the legacy single-file one.
-fn require_stage(entry_path: PathBuf) -> Effect<Program, CliError, ()> {
-  Effect::new(move |_env: &mut ()| require::resolve_program(&entry_path).map_err(CliError::Require))
+    DriverError::Codegen(e) => eprintln!("codegen error: {e}"),
+    DriverError::Link(e) => eprintln!("error: {e}"),
+  }
 }
 
 fn main() {
@@ -175,15 +98,8 @@ fn run_legacy(args: &[String]) {
     process::exit(1);
   });
 
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
-
-  let pipeline = parse_stage(source, source_path.clone())
-    .flat_map(check_stage)
-    .flat_map(move |program| codegen_stage(program, obj_path))
-    .flat_map(move |obj_path| link_stage(obj_path, output_path));
-
-  if let Err(e) = run_blocking(pipeline, ()) {
-    report_error(e);
+  if let Err(e) = emerald_driver::compile(&source, source_path, &output_path) {
+    report_driver_error(e);
     process::exit(1);
   }
 }
@@ -232,10 +148,12 @@ fn load_manifest_or_exit(dir: &Path) -> Manifest {
   }
 }
 
-/// Resolves the manifest, its dependencies, and its `require`s, then
-/// runs the same check -> codegen -> link pipeline the legacy path
-/// uses. Returns the path to the linked binary — never returns on
-/// failure (matches `run_legacy`'s own exit-on-error shape).
+/// Resolves the manifest, its dependencies, and its `require`s
+/// (`require.rs` — the multi-file splicing `emerald-driver` doesn't do
+/// itself, see its own doc comment), then hands the assembled
+/// `Program` to `emerald_driver::compile_program`. Returns the path to
+/// the linked binary — never returns on failure (matches
+/// `run_legacy`'s own exit-on-error shape).
 fn cmd_build() -> PathBuf {
   let cwd = std::env::current_dir().unwrap_or_else(|e| {
     eprintln!("error: cannot read current directory: {e}");
@@ -262,17 +180,14 @@ fn cmd_build() -> PathBuf {
   );
 
   let entry_path = cwd.join(&manifest.package.entry);
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let program = require::resolve_program(&entry_path).unwrap_or_else(|e| {
+    report_error(CliError::Require(e));
+    process::exit(1);
+  });
+
   let output_path = cwd.join(&manifest.package.name);
-  let output_path_for_link = output_path.clone();
-
-  let pipeline = require_stage(entry_path)
-    .flat_map(check_stage)
-    .flat_map(move |program| codegen_stage(program, obj_path))
-    .flat_map(move |obj_path| link_stage(obj_path, output_path_for_link));
-
-  if let Err(e) = run_blocking(pipeline, ()) {
-    report_error(e);
+  if let Err(e) = emerald_driver::compile_program(program, &output_path) {
+    report_driver_error(e);
     process::exit(1);
   }
 
