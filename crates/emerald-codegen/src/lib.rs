@@ -21,6 +21,7 @@
 
 use emerald_parser::{
   ClassDef, CompareOp, Expr, Function as AstFunction, Item, ModuleDef, Param, Program, Stmt,
+  StringPart,
 };
 use inkwell::AddressSpace;
 use inkwell::basic_block::BasicBlock;
@@ -290,6 +291,17 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
     Expr::ArrayLit(elements) => {
       for e in elements {
         collect_idents_in_expr(e, out);
+      }
+    }
+    // Plan 36: an interpolation's literal spans have no idents; each
+    // `#{...}` span's expression is a normal free-variable site (e.g. a
+    // lambda body interpolating a captured outer local must still
+    // capture it).
+    Expr::Interpolate(parts) => {
+      for part in parts {
+        if let StringPart::Expr(e) = part {
+          collect_idents_in_expr(e, out);
+        }
       }
     }
   }
@@ -659,6 +671,10 @@ struct Ctx<'a, 'ctx> {
   print_str: FunctionValue<'ctx>,
   string_concat: FunctionValue<'ctx>,
   string_eq: FunctionValue<'ctx>,
+  /// Plan 36's compiler-known interpolation stringifiers.
+  int64_to_string: FunctionValue<'ctx>,
+  float64_to_string: FunctionValue<'ctx>,
+  bool_to_string: FunctionValue<'ctx>,
   self_ctx: Option<(PointerValue<'ctx>, &'a HashMap<String, FieldInfo>)>,
   /// `{lambda's Let name} -> (its synthesized `__lambda_{name}` function,
   /// its declared return kind)`, for statically dispatching `.call`.
@@ -939,6 +955,92 @@ fn build_short_circuit<'ctx>(
   Ok((phi.as_basic_value(), ValKind::Bool))
 }
 
+/// Plan 36: string interpolation folds every part into one `char*` via
+/// repeated `ctx.string_concat` calls — a `Literal` part reuses
+/// `StringLit`'s own `build_global_string_ptr`; an `Expr` part is built
+/// normally then dispatched by its returned `ValKind` onto the matching
+/// compiler-known stringifier (sema already rejected any other kind,
+/// so anything else reaching here is an internal-error `Err`, not a
+/// user-facing one). `parts` is never empty — `interpolate.rs` only
+/// ever constructs `Expr::Interpolate` after pushing at least one
+/// `StringPart::Expr`.
+fn build_interpolate<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  parts: &[StringPart],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let mut acc: Option<PointerValue> = None;
+  for part in parts {
+    let part_ptr = match part {
+      StringPart::Literal(s) => {
+        let global = builder
+          .build_global_string_ptr(s, "strlit")
+          .map_err(|e| e.to_string())?;
+        global.as_pointer_value()
+      }
+      StringPart::Expr(e) => {
+        let (v, k) = build_expr(
+          context,
+          builder,
+          e,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        match k {
+          ValKind::Str => v.into_pointer_value(),
+          ValKind::Int64 => {
+            let call = builder
+              .build_call(ctx.int64_to_string, &[v.into()], "i64tostr")
+              .map_err(|e| e.to_string())?;
+            call_result(call)?.into_pointer_value()
+          }
+          ValKind::Float64 => {
+            let call = builder
+              .build_call(ctx.float64_to_string, &[v.into()], "f64tostr")
+              .map_err(|e| e.to_string())?;
+            call_result(call)?.into_pointer_value()
+          }
+          ValKind::Bool => {
+            let extended = builder
+              .build_int_z_extend(v.into_int_value(), context.i64_type(), "boolext")
+              .map_err(|e| e.to_string())?;
+            let call = builder
+              .build_call(ctx.bool_to_string, &[extended.into()], "booltostr")
+              .map_err(|e| e.to_string())?;
+            call_result(call)?.into_pointer_value()
+          }
+          other => {
+            return Err(format!(
+              "codegen: internal error — sema should have rejected interpolating a `{other:?}` value"
+            ));
+          }
+        }
+      }
+    };
+    acc = Some(match acc {
+      None => part_ptr,
+      Some(prev) => {
+        let call = builder
+          .build_call(
+            ctx.string_concat,
+            &[prev.into(), part_ptr.into()],
+            "interpconcat",
+          )
+          .map_err(|e| e.to_string())?;
+        call_result(call)?.into_pointer_value()
+      }
+    });
+  }
+  let result = acc.ok_or("codegen: internal error — empty string interpolation")?;
+  Ok((result.into(), ValKind::Str))
+}
+
 fn build_expr<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
@@ -976,6 +1078,16 @@ fn build_expr<'ctx>(
         .map_err(|e| e.to_string())?;
       Ok((global.as_pointer_value().into(), ValKind::Str))
     }
+    // Plan 36: string interpolation — see `build_interpolate` below.
+    Expr::Interpolate(parts) => build_interpolate(
+      context,
+      builder,
+      parts,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
     Expr::Add(lhs, rhs) => {
       let (l, lk) = build_expr(
         context,
@@ -3813,6 +3925,26 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 36 (string interpolation). `emerald_bool_to_string` takes a
+  // plain `long long`, not a C `_Bool`/`i1` — matches every other
+  // Int64-shaped runtime ABI boundary in this file, avoiding an i1-vs-C
+  // calling-convention question; codegen zero-extends the `i1` value
+  // before calling it (see `build_expr`'s `Expr::Interpolate` arm).
+  let int64_to_string = module.add_function(
+    "emerald_int64_to_string",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let float64_to_string = module.add_function(
+    "emerald_float64_to_string",
+    ptr_ty.fn_type(&[f64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bool_to_string = module.add_function(
+    "emerald_bool_to_string",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 25 (stdlib expansion).
   let alloc_zeroed = module.add_function(
     "emerald_alloc_zeroed",
@@ -3882,6 +4014,9 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     print_str,
     string_concat,
     string_eq,
+    int64_to_string,
+    float64_to_string,
+    bool_to_string,
     self_ctx: None,
     lambda_func_ids: &lambda_func_ids,
     lambda_infos: &lambda_infos,
@@ -4640,5 +4775,22 @@ mod tests {
     let result = compile_to_object(&program, &out);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("require"));
+  }
+
+  // Plan 36 (string interpolation and heredocs).
+
+  #[test]
+  fn string_interpolation_worked_example_linked_and_run() {
+    let src = "name: String = \"World\"\nage: Int64 = 30\nputs \"Hello, #{name}! You are #{age} years old.\"\n";
+    assert_eq!(
+      compile_link_run(src),
+      "Hello, World! You are 30 years old.\n"
+    );
+  }
+
+  #[test]
+  fn string_interpolation_of_bool_and_float_linked_and_run() {
+    let src = "puts \"#{true} and #{3.5}\"\n";
+    assert_eq!(compile_link_run(src), "true and 3.5\n");
   }
 }

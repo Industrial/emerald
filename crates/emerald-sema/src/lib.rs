@@ -5,7 +5,7 @@
 //! don't carry spans) — diagnostics are function/call-scoped text.
 //! Line/column-precise diagnostics are `13 diagnostics`'s job.
 
-use emerald_parser::{ClassDef, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
+use emerald_parser::{ClassDef, Expr, Function, Item, ModuleDef, Param, Program, Stmt, StringPart};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +373,28 @@ fn infer_expr_type(
     // Plan 19: a real `Type::String` value at last (the annotation
     // already resolved; nothing could ever produce one before this).
     Expr::StringLit(_) => Ok(Type::String),
+    // Plan 36: a compiler-known stringification set only — `Int64`,
+    // `Float64`, `String`, `Boolean` — not a generic, user-extensible
+    // `to_s`/`Display` protocol (Decision log: no interface/protocol
+    // mechanism exists yet to type-check "the receiver's declared type
+    // has a method named `to_s`" against arbitrary future classes).
+    // Always produces `Type::String` overall.
+    Expr::Interpolate(parts) => {
+      for part in parts {
+        if let StringPart::Expr(e) = part {
+          let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+          if !matches!(
+            t,
+            Type::Int64 | Type::Float64 | Type::String | Type::Boolean
+          ) {
+            return Err(Diagnostic::new(format!(
+              "type `{t:?}` cannot be interpolated into a string — only Int64, Float64, String, and Boolean are supported"
+            )));
+          }
+        }
+      }
+      Ok(Type::String)
+    }
     Expr::Add(lhs, rhs) => {
       let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
@@ -2498,5 +2520,23 @@ mod tests {
     let src = "require helpers\nputs 1\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 36 (string interpolation and heredocs).
+
+  #[test]
+  fn accepts_interpolation_of_all_compiler_known_types() {
+    let src = "s: String = \"a\"\nn: Int64 = 1\nf: Float64 = 2.5\nb: Boolean = true\nputs \"#{s} #{n} #{f} #{b}\"\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_interpolation_of_an_unsupported_type() {
+    let src = "arr: Array[Int64] = [1]\nputs \"#{arr}\"\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("must reject interpolating an Array — not a compiler-known stringifiable type");
+    assert!(errs[0].message.contains("cannot be interpolated"));
   }
 }

@@ -31,6 +31,14 @@ pub fn decode_string_lit(raw: &str) -> String {
   out
 }
 
+/// One piece of an interpolated string (plan 36's Decision log) — a
+/// run of literal text, or a `#{...}` span's already-parsed `Expr`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringPart {
+  Literal(String),
+  Expr(Box<Expr>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
   Lt,
@@ -55,6 +63,14 @@ pub enum Expr {
   /// (only `\"`/`\n` escapes are ever recognized by the lexer that
   /// produces this — see `grammar.lalrpop`'s `StringLitTok`).
   StringLit(String),
+  /// `"...#{expr}..."` (plan 36's Decision log) — a *compile-time*
+  /// parse, never a runtime `eval`: each `#{...}` span is re-parsed by
+  /// the same static expression grammar that parses the rest of the
+  /// program. Only ever constructed when the literal actually contains
+  /// at least one `#{...}` span — a plain string with none still
+  /// produces `Expr::StringLit`, unchanged, for zero codegen
+  /// regression on the overwhelmingly common case.
+  Interpolate(Vec<StringPart>),
   Add(Box<Expr>, Box<Expr>),
   Sub(Box<Expr>, Box<Expr>),
   Mul(Box<Expr>, Box<Expr>),

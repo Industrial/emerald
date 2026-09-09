@@ -1,5 +1,6 @@
 use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
 use crate::ast::decode_string_lit;
+use crate::interpolate;
 
 // Plan 26: a grammar-level parameter, threaded as an extra argument
 // into every generated parser entry point (`ProgramParser::parse`
@@ -427,7 +428,8 @@ StmtPrimaryExpr: Expr = {
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
-  <s:StringLitTok> => Expr::StringLit(s),
+  <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
+    .map_err(|error| lalrpop_util::ParseError::User { error }),
   "true" => Expr::Bool(true),
   "false" => Expr::Bool(false),
   "nil" => Expr::Nil,
@@ -528,7 +530,15 @@ CaseArm: (Vec<Expr>, Vec<Stmt>) = {
 // keeps sitting between `&&` and `+`/`-` rather than at the very top —
 // `spec/GRAMMAR.md` §4's aspirational full Ruby table has `&&`/`||`
 // looser than comparison, which this matches.
-Expr: Expr = {
+// Plan 36: `pub` — a second, independent LALRPOP entry point
+// (`ExprParser`) alongside the existing `pub Program` (`ProgramParser`)
+// this whole grammar has had since plan 01. `crates/emerald-parser/src/
+// interpolate.rs` re-enters this exact rule to parse each `#{...}`
+// span found inside a string literal — a real, compile-time-only
+// re-parse (never a runtime `eval`), reusing the same static grammar
+// that parses the rest of the program rather than inventing a second,
+// smaller one.
+pub Expr: Expr = {
   OrExpr,
 };
 
@@ -661,7 +671,8 @@ PrimaryExpr: Expr = {
   },
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
-  <s:StringLitTok> => Expr::StringLit(s),
+  <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
+    .map_err(|error| lalrpop_util::ParseError::User { error }),
   "true" => Expr::Bool(true),
   "false" => Expr::Bool(false),
   "nil" => Expr::Nil,

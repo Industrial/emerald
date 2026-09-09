@@ -12,7 +12,15 @@ mod grammar {
   lalrpop_util::lalrpop_mod!(pub grammar, "/grammar.rs");
 }
 
-pub use ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
+// Plan 36: string interpolation's `#{...}`-splitting logic — needs to
+// call back into `grammar`'s second, independent `pub Expr` entry
+// point, a real dependency `ast.rs` (a pure-data module, no dependency
+// on the generated parser) deliberately doesn't have.
+mod interpolate;
+
+pub use ast::{
+  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt, StringPart,
+};
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
 /// byte-offset location info (plan `13`) to render a real source
@@ -1099,6 +1107,53 @@ mod tests {
   fn plan_34_worked_example_parses() {
     let src = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
     parse(src).expect("plan 34's worked example must parse cleanly");
+  }
+
+  // Plan 36 (string interpolation and heredocs).
+
+  #[test]
+  fn interpolated_string_splits_into_parts() {
+    let src = "puts \"Hello, #{name}!\"\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::Call(
+        "puts".to_string(),
+        vec![Expr::Interpolate(vec![
+          StringPart::Literal("Hello, ".to_string()),
+          StringPart::Expr(Box::new(Expr::Ident("name".to_string()))),
+          StringPart::Literal("!".to_string()),
+        ])]
+      )))
+    );
+  }
+
+  #[test]
+  fn plain_string_with_no_interpolation_still_parses_as_string_lit() {
+    let src = "puts \"hello\"\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::Call(
+        "puts".to_string(),
+        vec![Expr::StringLit("hello".to_string())]
+      )))
+    );
+  }
+
+  #[test]
+  fn nested_hash_literal_inside_interpolation_parses_via_brace_depth_scan() {
+    let src = "puts \"#{ {1 => 2}[1] }\"\n";
+    parse(src).expect("brace-depth scan must not cut the span short at the hash literal's own `}`");
+  }
+
+  #[test]
+  fn unterminated_interpolation_is_a_real_parse_error() {
+    let src = "puts \"unterminated #{name\"\n";
+    assert!(
+      parse(src).is_err(),
+      "an unterminated `#{{` must be a real parse error, not a silent truncation"
+    );
   }
 
   // Plan 23 (multi-file compilation).

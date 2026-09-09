@@ -74,6 +74,34 @@ long long emerald_string_eq(const char *a, const char *b) {
   return strcmp(a, b) == 0 ? 1 : 0;
 }
 
+/* Plan 36 (string interpolation) — the compiler-known stringification
+ * set: `Int64`, `Float64`, `Boolean`. Each allocates via `emerald_alloc`
+ * (same no-free contract as `emerald_string_concat`), sized generously
+ * for the format used (`%lld` can print at most 20 digits + sign + NUL;
+ * `%g` at most a handful more). `%g` matches `emerald_print_f64`'s own
+ * format exactly, so an interpolated Float64 renders identically to a
+ * directly-`puts`ed one. */
+char *emerald_int64_to_string(long long n) {
+  char *out = emerald_alloc(32);
+  snprintf(out, 32, "%lld", n);
+  return out;
+}
+
+char *emerald_float64_to_string(double n) {
+  char *out = emerald_alloc(48);
+  snprintf(out, 48, "%g", n);
+  return out;
+}
+
+/* No allocation needed — `Boolean`/`ValKind::Bool` values need no heap
+ * representation anywhere else in this compiler either; a pointer to a
+ * static constant is safe to return and reuse indefinitely. */
+char *emerald_bool_to_string(long long b) {
+  static char true_str[] = "true";
+  static char false_str[] = "false";
+  return b != 0 ? true_str : false_str;
+}
+
 /* `raise`/`begin...rescue...end` (plan 11) — a setjmp/longjmp handler
  * stack, NOT true native (DWARF-unwind + personality-function) exceptions
  * (see plan 11's Decision log for why: real unwind-table-based exceptions
