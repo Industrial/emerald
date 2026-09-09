@@ -1,6 +1,6 @@
 use crate::ast::{
-  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function, InterfaceDef,
-  Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, TypeParam,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function,
+  InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -49,6 +49,7 @@ pub Program: Program = {
 Item: Item = {
   <f:FuncDef> => Item::Function(f),
   <c:ClassDef> => Item::Class(c),
+  <a:ActorDef> => Item::Actor(a),
   <m:ModuleDef> => Item::Module(m),
   <i:InterfaceDef> => Item::Interface(i),
   <e:EnumDef> => Item::Enum(e),
@@ -134,6 +135,27 @@ SuperclassClause: String = {
 // `module` is reserved the same LALR(1) way `class`/`def` already are.
 ModuleDef: ModuleDef = {
   "module" <name:Ident> <methods:FuncDef*> "end" => ModuleDef { name, methods }
+};
+
+// `actor Counter ... end` (plan 54's Decision log) — structurally
+// identical to `ClassDef` above minus `SuperclassClause?`/
+// `ImplementsClause?`: no optional `"<" Ident` clause exists in this
+// production at all, so `actor Dog < Animal ... end` is a real, direct
+// parse error (the same category of failure as `module Dog < Animal
+// ... end` today), not a semantic rejection of an otherwise-parseable
+// shape. `actor` is reserved the same LALR(1) way `class`/`module`/
+// `def` already are.
+ActorDef: ActorDef = {
+  "actor" <name:Ident> <actor_fields:ClassField*> <methods:MethodDef*> "end" => {
+    let mut fields = Vec::new();
+    let mut all_methods = Vec::new();
+    for (p, synthesized) in actor_fields {
+      fields.push(p);
+      all_methods.extend(synthesized);
+    }
+    all_methods.extend(methods);
+    ActorDef { name, fields, methods: all_methods }
+  }
 };
 
 FuncDef: Function = {
@@ -720,6 +742,12 @@ StmtPrimaryExpr: Spanned<Expr> = {
   // Plan 39's Decision log: see `PrimaryExpr`'s own mirror alternative.
   <l:@L> <name:Ident> "(" <kwargs:CallKwArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::CallKw(name, kwargs) },
   <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
+  // Plan 54's Decision log: deliberately distinct from `.new` above —
+  // `spawn` is a new reserved keyword for the same LALR(1) reason `new`
+  // already is, so `Counter.new(0)`/`AnyClass.spawn(0)` are both real,
+  // symmetric, textually-disjoint call forms (sema decides which
+  // receivers are actually valid for each, not the grammar).
+  <l:@L> <recv:Ident> "." "spawn" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Spawn(recv, args) },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
   // Plan 53's Decision log: `Ok`/`Err` are literal-keyword-headed
   // constructor productions, the same convention `Array`/`Hash`/`Proc`
@@ -1026,6 +1054,7 @@ PrimaryExpr: Spanned<Expr> = {
   // `recv "." Ident` alternative below never compete for the same
   // lookahead token.
   <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
+  <l:@L> <recv:Ident> "." "spawn" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Spawn(recv, args) },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
   <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
   <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },

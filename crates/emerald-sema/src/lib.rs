@@ -13,8 +13,8 @@
 //! `Spanned<T>` doc comment for why that's the cheaper edit.
 
 use emerald_parser::{
-  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, Expr, Function, Item, ModuleDef, Param,
-  Program, RescueClause, Spanned, Stmt, StringPart,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, Expr, Function, Item, ModuleDef,
+  Param, Program, RescueClause, Spanned, Stmt, StringPart,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -178,6 +178,15 @@ struct ClassInfo {
   /// difference. `resolve_type` checks this field before falling
   /// through to its ordinary `Type::Class` branch.
   enum_variants: Option<Vec<(String, Vec<Type>)>>,
+  /// Plan 54's Decision log: mirrors `is_module` exactly — an actor
+  /// reuses this same `classes` registry (a real, disclosed adaptation:
+  /// no separate `actors` map) tagged `is_actor: true`. `.new` rejects
+  /// an actor receiver; `.spawn` requires one. `fields`/`methods` are
+  /// populated exactly like an ordinary class's (an actor is flat, but
+  /// still has real fields/methods, unlike a module); `superclass`/
+  /// `implements`/`enum_variants` stay their defaults, since `ActorDef`
+  /// has no grammar path to produce any of them.
+  is_actor: bool,
 }
 
 /// One `interface`'s single required method, kept as raw, unresolved
@@ -559,6 +568,7 @@ fn build_flattened_class_info(
     superclass: class_defs[name].superclass.clone(),
     implements: class_defs[name].implements.clone(),
     enum_variants: None,
+    is_actor: false,
   })
 }
 
@@ -582,6 +592,35 @@ fn module_info(
     superclass: None,
     implements: None,
     enum_variants: None,
+    is_actor: false,
+  })
+}
+
+/// An actor's field/method table (plan 54's Decision log: mirrors
+/// `module_info`'s own directness — a single-pass, non-chain-walking
+/// function, since `ActorDef` has no superclass to flatten against, and
+/// its grammar production already forbids one structurally). Unlike a
+/// module, an actor DOES have real fields, populated exactly like a
+/// class's own (`resolve_type` on each declared field type, no
+/// inheritance merge needed since there is only ever one "ancestor":
+/// the actor itself).
+fn actor_info(a: &ActorDef, classes: &HashMap<String, ClassInfo>) -> Result<ClassInfo, Diagnostic> {
+  let mut fields = HashMap::new();
+  for f in &a.fields {
+    fields.insert(f.name.clone(), resolve_type(&f.ty, classes)?);
+  }
+  let mut methods = HashMap::new();
+  for m in &a.methods {
+    methods.insert(m.name.clone(), function_signature(m, classes)?);
+  }
+  Ok(ClassInfo {
+    fields,
+    methods,
+    is_module: false,
+    superclass: None,
+    implements: None,
+    enum_variants: None,
+    is_actor: true,
   })
 }
 
@@ -1290,6 +1329,14 @@ fn infer_expr_type(
           expr.span,
         ));
       }
+      if info.is_actor {
+        return Err(Diagnostic::new(
+          format!(
+            "cannot `.new` actor `{class_name}` — actors are constructed with `.spawn`, not `.new`"
+          ),
+          expr.span,
+        ));
+      }
       match info.methods.get("initialize") {
         Some(sig) => check_args(
           "initialize",
@@ -1306,6 +1353,49 @@ fn infer_expr_type(
           return Err(Diagnostic::new(
             format!(
               "`{class_name}.new` called with {} argument(s), but `{class_name}` declares no `initialize`",
+              args.len()
+            ),
+            expr.span,
+          ));
+        }
+      }
+      Ok(Type::Class(class_name.clone()))
+    }
+    // Plan 54: `.spawn` is `.new`'s exact structural mirror — the same
+    // `initialize`-arity/type check, the same inferred `Type::Class`
+    // (an actor reference is typed and passed around identically to an
+    // ordinary class instance in this plan's scope; only construction
+    // and codegen's allocation call site differ) — but requires
+    // `is_actor == true`, the exact opposite of `.new`'s two checks
+    // above.
+    Expr::Spawn(class_name, args) => {
+      let info = classes
+        .get(class_name)
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
+      if !info.is_actor {
+        return Err(Diagnostic::new(
+          format!(
+            "cannot `.spawn` `{class_name}` — `.spawn` only constructs actors, and `{class_name}` is not one"
+          ),
+          expr.span,
+        ));
+      }
+      match info.methods.get("initialize") {
+        Some(sig) => check_args(
+          "initialize",
+          args,
+          &sig.params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?,
+        None if args.is_empty() => {}
+        None => {
+          return Err(Diagnostic::new(
+            format!(
+              "`{class_name}.spawn` called with {} argument(s), but `{class_name}` declares no `initialize`",
               args.len()
             ),
             expr.span,
@@ -3351,6 +3441,13 @@ fn check_block_call_sites(
       // Plan 52: an enum is pure data — no method bodies, no block
       // call sites of any kind.
       Item::Enum(_) => {}
+      // Plan 54: an actor's methods are ordinary method bodies, exactly
+      // like a class's own arm above.
+      Item::Actor(a) => {
+        for m in &a.methods {
+          scan_block_call_sites(&m.body, sigs, classes, func_defs, gctx, &mut diags);
+        }
+      }
       Item::Error => {}
     }
   }
@@ -3682,6 +3779,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           superclass: c.superclass.clone(),
           implements: c.implements.clone(),
           enum_variants: None,
+          is_actor: false,
         },
       );
     }
@@ -3695,6 +3793,21 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           superclass: None,
           implements: None,
           enum_variants: None,
+          is_actor: false,
+        },
+      );
+    }
+    if let Item::Actor(a) = item {
+      classes.insert(
+        a.name.clone(),
+        ClassInfo {
+          fields: HashMap::new(),
+          methods: HashMap::new(),
+          is_module: false,
+          superclass: None,
+          implements: None,
+          enum_variants: None,
+          is_actor: true,
         },
       );
     }
@@ -3712,6 +3825,12 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
       if let Ok(info) = module_info(m, &classes) {
         classes.insert(m.name.clone(), info.clone());
         resolved_classes.insert(m.name.clone(), info);
+      }
+    }
+    if let Item::Actor(a) = item {
+      if let Ok(info) = actor_info(a, &classes) {
+        classes.insert(a.name.clone(), info.clone());
+        resolved_classes.insert(a.name.clone(), info);
       }
     }
   }
@@ -3796,6 +3915,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           superclass: c.superclass.clone(),
           implements: c.implements.clone(),
           enum_variants: None,
+          is_actor: false,
         },
       );
     }
@@ -3809,6 +3929,21 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           superclass: None,
           implements: None,
           enum_variants: None,
+          is_actor: false,
+        },
+      );
+    }
+    if let Item::Actor(a) = item {
+      classes.insert(
+        a.name.clone(),
+        ClassInfo {
+          fields: HashMap::new(),
+          methods: HashMap::new(),
+          is_module: false,
+          superclass: None,
+          implements: None,
+          enum_variants: None,
+          is_actor: true,
         },
       );
     }
@@ -3863,6 +3998,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           superclass: None,
           implements: None,
           enum_variants: Some(Vec::new()),
+          is_actor: false,
         },
       );
       enum_defs.push(e);
@@ -3903,6 +4039,14 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       match module_info(m, &classes) {
         Ok(info) => {
           classes.insert(m.name.clone(), info);
+        }
+        Err(d) => diags.push(d),
+      }
+    }
+    if let Item::Actor(a) = item {
+      match actor_info(a, &classes) {
+        Ok(info) => {
+          classes.insert(a.name.clone(), info);
         }
         Err(d) => diags.push(d),
       }
@@ -4048,6 +4192,18 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       Item::Module(m) => {
         for f in &m.methods {
           if let Err(d) = check_function_body(f, &sigs, &classes, &gctx) {
+            diags.push(d);
+          }
+        }
+      }
+      // Plan 54: an actor's method bodies check exactly like a class's
+      // own methods — real `self`/`@field` access, same `check_method_body`.
+      Item::Actor(a) => {
+        let Some(info) = classes.get(&a.name) else {
+          continue;
+        };
+        for m in &a.methods {
+          if let Err(d) = check_method_body(&a.name, m, &sigs, &classes, &info.fields, &gctx) {
             diags.push(d);
           }
         }
@@ -6015,6 +6171,50 @@ mod tests {
     let src = "n: Int64 = 1\ncase n\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("an Int64 scrutinee is not Result[T, E]-typed");
+    assert!(!errs.is_empty());
+  }
+
+  // Plan 54 (actor declarations and isolated heaps).
+
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\nputs a.value\nputs b.value\n";
+
+  #[test]
+  fn accepts_the_actor_worked_example() {
+    let program = emerald_parser::parse(COUNTER_ACTOR_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_new_called_on_an_actor() {
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.new(0)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("actors are constructed with `.spawn`, not `.new`");
+    assert!(errs.iter().any(|d| d.message.contains(".spawn")));
+  }
+
+  #[test]
+  fn rejects_spawn_called_on_a_plain_class() {
+    let src = "class Foo\nend\n\nf: Foo = Foo.spawn()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("`.spawn` only constructs actors, and Foo is not one");
+    assert!(errs.iter().any(|d| d.message.contains(".spawn")));
+  }
+
+  #[test]
+  fn rejects_spawn_with_wrong_arity() {
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(0, 1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`initialize` takes exactly one argument");
+    assert!(!errs.is_empty());
+  }
+
+  #[test]
+  fn rejects_spawn_with_wrong_argument_type() {
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(\"x\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`initialize` expects Int64, not String");
     assert!(!errs.is_empty());
   }
 }

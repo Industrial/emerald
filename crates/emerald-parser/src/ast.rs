@@ -256,6 +256,14 @@ pub enum Expr {
   /// `Ok`'s payload in place; on `Err`, immediately returns the same
   /// `Result` value from the enclosing function, unchanged.
   Try(Box<Spanned<Expr>>),
+  /// `ActorName.spawn(args)` (plan 54's Decision log) — deliberately
+  /// distinct from `Expr::New`, not a reuse disambiguated later in sema:
+  /// keeps `Counter.new(0)`/`AnyClass.spawn(0)` both real, symmetric,
+  /// grammar-level-textually-distinct call forms. Allocates the
+  /// instance from its own arena (plan 51) instead of the shared heap;
+  /// every method call on the result still compiles as an ordinary
+  /// synchronous call in this plan — only isolation is proven here.
+  Spawn(String, Vec<Spanned<Expr>>),
 }
 
 /// One statement in a block (a function body or the program's top level).
@@ -563,6 +571,23 @@ pub struct EnumDef {
   pub variants: Vec<EnumVariant>,
 }
 
+/// `actor Counter ... end` (plan 54's Decision log) — a flat,
+/// non-inheriting top-level declaration reusing `ClassDef`'s own field/
+/// method syntax verbatim, its own struct rather than `ClassDef` plus a
+/// marker flag: unlike `ClassDef`, `superclass` doesn't exist as a
+/// field at all — `actor Foo < Bar` is unrepresentable in this AST, a
+/// real grammar-level decline, not merely a semantic rejection of an
+/// otherwise-parseable shape. Instances live in their own arena (plan
+/// 51's mechanism) instead of the shared never-freed heap; this plan
+/// proves isolation only — every method call still compiles as an
+/// ordinary, synchronous call (no scheduler, no mailbox exist yet).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorDef {
+  pub name: String,
+  pub fields: Vec<Param>,
+  pub methods: Vec<Function>,
+}
+
 /// A single top-level construct: a function definition, a class
 /// definition, a module definition, or a top-level statement (e.g.
 /// `x: Int64 = 10`, `if x > 5 ... end`, `puts x`).
@@ -571,6 +596,8 @@ pub enum Item {
   Function(Function),
   Class(ClassDef),
   Module(ModuleDef),
+  /// `actor Counter ... end` (plan 54's Decision log).
+  Actor(ActorDef),
   /// `enum Shape = Circle(Float64) | ...` (plan 52's Decision log).
   Enum(EnumDef),
   /// `interface Comparable ... end` (plan 41's Decision log) — a

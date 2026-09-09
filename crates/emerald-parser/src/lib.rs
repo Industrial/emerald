@@ -19,8 +19,9 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function, InterfaceDef,
-  Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart, TypeParam,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, Function,
+  InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
+  TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -114,6 +115,11 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
       Item::Module(m) => {
         for f in &mut m.methods {
           rewrite_stmts(&mut f.body, name, source);
+        }
+      }
+      Item::Actor(a) => {
+        for m in &mut a.methods {
+          rewrite_stmts(&mut m.body, name, source);
         }
       }
       Item::Interface(_) | Item::Require(_) | Item::Error | Item::Enum(_) => {}
@@ -326,6 +332,11 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
       }
     }
     Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => rewrite_expr(e, name, source),
+    Expr::Spawn(_, args) => {
+      for a in args {
+        rewrite_expr(a, name, source);
+      }
+    }
   }
 }
 
@@ -2948,6 +2959,69 @@ mod tests {
     assert_eq!(err_var, "e");
     assert_eq!(ok_body.len(), 1);
     assert_eq!(err_body.len(), 1);
+  }
+
+  // Plan 54 (actor declarations and isolated heaps).
+
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\nputs a.value\nputs b.value\n";
+
+  #[test]
+  fn actor_worked_example_parses_into_expected_shapes() {
+    let program = parse(COUNTER_ACTOR_EXAMPLE).expect("worked example should parse");
+    let Item::Actor(a) = &program.items[0] else {
+      panic!("expected Item::Actor, got {:?}", program.items[0]);
+    };
+    assert_eq!(a.name, "Counter");
+    assert_eq!(a.fields.len(), 1);
+    assert_eq!(a.fields[0].name, "count");
+    assert_eq!(a.methods.len(), 3);
+
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[1]
+    else {
+      panic!("expected a Let statement, got {:?}", program.items[1]);
+    };
+    assert_eq!(
+      value.node,
+      Expr::Spawn("Counter".to_string(), vec![s(Expr::Int(0))])
+    );
+
+    // `a.increment`/`a.value` parse as the *existing* Expr::MethodCall/
+    // Stmt::Expr shapes — no new AST node for the call sites themselves.
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::MethodCall(..),
+        ..
+      }),
+      ..
+    }) = &program.items[3]
+    else {
+      panic!(
+        "expected a MethodCall statement, got {:?}",
+        program.items[3]
+      );
+    };
+  }
+
+  #[test]
+  fn actor_inheritance_is_a_real_parse_error() {
+    let src = "actor Dog < Animal\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "actor grammar has no superclass clause at all"
+    );
+  }
+
+  #[test]
+  fn a_class_spawn_called_and_an_actor_new_called_both_parse_at_this_leaf() {
+    // Grammar-only leaf: rejecting these two shapes is leaf-sema-actor's
+    // job, not this one's — both must parse successfully here.
+    let src1 = "class Foo\nend\n\nf: Foo = Foo.spawn()\n";
+    assert!(parse(src1).is_ok());
+    let src2 = "actor Bar\nend\n\nb: Bar = Bar.new()\n";
+    assert!(parse(src2).is_ok());
   }
 
   #[test]

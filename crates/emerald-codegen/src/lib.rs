@@ -451,7 +451,7 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
       collect_idents_in_expr(l, out);
       collect_idents_in_expr(r, out);
     }
-    Expr::Call(_, args) | Expr::New(_, args) => {
+    Expr::Call(_, args) | Expr::New(_, args) | Expr::Spawn(_, args) => {
       for a in args {
         collect_idents_in_expr(a, out);
       }
@@ -743,7 +743,7 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
       collect_symbols_in_expr(l, table);
       collect_symbols_in_expr(r, table);
     }
-    Expr::Call(_, args) | Expr::New(_, args) => {
+    Expr::Call(_, args) | Expr::New(_, args) | Expr::Spawn(_, args) => {
       for a in args {
         collect_symbols_in_expr(a, table);
       }
@@ -950,6 +950,13 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
       // Plan 52: an enum's variant fields are raw `TypeName` strings —
       // no `Symbol` literal appears anywhere in an `Item::Enum` itself.
       Item::Enum(_) => {}
+      Item::Actor(a) => {
+        for m in &a.methods {
+          for s in &m.body {
+            collect_symbols_in_stmt(s, &mut table);
+          }
+        }
+      }
       Item::Interface(_) | Item::Require(_) | Item::Error => {}
     }
   }
@@ -1146,7 +1153,7 @@ fn collect_specializations_in_expr(
       collect_specializations_in_expr(l, generic_fns, local_classes, out);
       collect_specializations_in_expr(r, generic_fns, local_classes, out);
     }
-    Expr::Call(_, args) | Expr::New(_, args) => {
+    Expr::Call(_, args) | Expr::New(_, args) | Expr::Spawn(_, args) => {
       for a in args {
         collect_specializations_in_expr(a, generic_fns, local_classes, out);
       }
@@ -1769,7 +1776,7 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
         mark_expr(&v.node, out);
       }
     }
-    Expr::New(_, args) => {
+    Expr::New(_, args) | Expr::Spawn(_, args) => {
       for a in args {
         mark_expr(&a.node, out);
       }
@@ -2193,6 +2200,16 @@ struct Ctx<'a, 'ctx> {
   /// — real string-parsing runtime helpers, no dependency on plan 45.
   is_valid_int_fn: FunctionValue<'ctx>,
   parse_digits_fn: FunctionValue<'ctx>,
+  /// Plan 54's Decision log: `Expr::Spawn`'s own allocation call site —
+  /// plan 51's real, landed two-call region API (`create` then
+  /// `alloc`), swapped in for `Expr::New`'s single `ctx.alloc` call.
+  /// No `Ctx` field tracks the created region handle anywhere past its
+  /// own `Expr::Spawn` codegen site — this plan has no actor-
+  /// termination event yet, so (like `ctx.alloc`'s own allocations
+  /// already do) it leaks exactly as disclosed in this plan's own
+  /// non-goals.
+  region_create_fn: FunctionValue<'ctx>,
+  region_alloc_fn: FunctionValue<'ctx>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -3303,6 +3320,45 @@ fn build_expr<'ctx>(
       if let Some(stats) = ctx.escape_stats {
         stats.borrow_mut().heap_allocated += 1;
       }
+      Ok((ptr.into(), ValKind::Ptr))
+    }
+    // Plan 54: `.spawn`'s exact structural mirror of `Expr::New` above —
+    // same `layout`/`build_initialize_call`, the one difference being
+    // the allocation call site itself: plan 51's real two-call region
+    // API (`create` then `alloc`) in place of `Expr::New`'s single
+    // `ctx.alloc` call. Never counted in `escape_stats` — plan 50's
+    // stack-allocation optimization is `Expr::New`-only by design (see
+    // this plan's own Decision log): an actor instance always
+    // heap-allocates into its own region.
+    Expr::Spawn(class_name, args) => {
+      let layout = ctx
+        .classes
+        .get(class_name)
+        .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let region_call = builder
+        .build_call(ctx.region_create_fn, &[], "spawnregion")
+        .map_err(|e| e.to_string())?;
+      let region = call_result(region_call)?.into_pointer_value();
+      let alloc_call = builder
+        .build_call(
+          ctx.region_alloc_fn,
+          &[region.into(), size_val.into()],
+          "spawntmp",
+        )
+        .map_err(|e| e.to_string())?;
+      let ptr = call_result(alloc_call)?.into_pointer_value();
+      build_initialize_call(
+        context,
+        builder,
+        class_name,
+        args,
+        ptr,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       Ok((ptr.into(), ValKind::Ptr))
     }
     Expr::MethodCall(recv, method, args) => build_method_call(
@@ -7908,6 +7964,20 @@ fn declare_user_functions<'ctx>(
           user_func_ids.insert(mangled, (fv, ret_kind));
         }
       }
+      // Plan 54: an actor method's LLVM signature is identical to a
+      // class method's own (leading `self` ptr) — the only difference
+      // is `.spawn`'s own allocation call site, not the method ABI.
+      Item::Actor(a) => {
+        for m in &a.methods {
+          let ret_kind = value_kind_for_type(&m.return_type);
+          let mut kinds = vec![ValKind::Ptr]; // self
+          kinds.extend(param_kinds(&m.params));
+          let fn_ty = make_fn_type(context, &kinds, &ret_kind);
+          let mangled = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
+          let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
+          user_func_ids.insert(mangled, (fv, ret_kind));
+        }
+      }
       Item::Stmt(_) => {}
       // Plan 41: nothing to declare — an interface has no body of its
       // own to compile.
@@ -8328,6 +8398,18 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 54 (actor declarations and isolated heaps): plan 51's real,
+  // landed two-call region API — `.spawn`'s own allocation call site.
+  let region_create_fn = module.add_function(
+    "emerald_region_create",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let region_alloc_fn = module.add_function(
+    "emerald_region_alloc",
+    ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 25 (stdlib expansion).
   let alloc_zeroed = module.add_function(
     "emerald_alloc_zeroed",
@@ -8344,11 +8426,35 @@ fn compile_to_object_impl(
   // Plan 32: raw `ClassDef`s keyed by name, so `build_class_layout`/
   // `build_method_owners` can walk any class's inheritance chain by
   // name lookup alone — independent of `program.items`' order.
+  // Plan 54's Decision log: each `Item::Actor` normalizes into a
+  // synthetic `ClassDef` (no `superclass`/`implements` — an actor has
+  // neither) BEFORE `resolve_class_chain`/`build_class_layout`/
+  // `build_method_owners` run — actors reuse that machinery entirely
+  // unmodified rather than duplicating it. Kept alive for the rest of
+  // this function so `class_defs`' borrows into it stay valid.
+  let actor_class_defs: Vec<ClassDef> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Actor(a) => Some(ClassDef {
+        name: a.name.clone(),
+        superclass: None,
+        implements: None,
+        fields: a.fields.clone(),
+        methods: a.methods.clone(),
+      }),
+      _ => None,
+    })
+    .collect();
+
   let mut class_defs: HashMap<String, &ClassDef> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
       class_defs.insert(c.name.clone(), c);
     }
+  }
+  for c in &actor_class_defs {
+    class_defs.insert(c.name.clone(), c);
   }
 
   // Class layouts (field offsets/kinds, now chain-flattened — ancestor
@@ -8360,6 +8466,10 @@ fn compile_to_object_impl(
     if let Item::Class(c) = item {
       classes.insert(c.name.clone(), build_class_layout(&c.name, &class_defs)?);
       class_tags.insert(c.name.clone(), class_tags.len() as i64);
+    }
+    if let Item::Actor(a) = item {
+      classes.insert(a.name.clone(), build_class_layout(&a.name, &class_defs)?);
+      class_tags.insert(a.name.clone(), class_tags.len() as i64);
     }
   }
   let method_owners = build_method_owners(&class_defs)?;
@@ -8502,6 +8612,8 @@ fn compile_to_object_impl(
     escape_stats: stats,
     is_valid_int_fn,
     parse_digits_fn,
+    region_create_fn,
+    region_alloc_fn,
   };
 
   for item in &program.items {
@@ -8540,6 +8652,18 @@ fn compile_to_object_impl(
           // exactly like a free function, just under a mangled name
           // and a signature with no leading self param.
           define_user_function(&context, &builder, f, fv, &gen_ctx)?;
+        }
+      }
+      // Plan 54: an actor method body compiles exactly like a class
+      // method's own — real `self`/`@field` access via `define_method`,
+      // using the `ClassLayout` `classes` already built for it above
+      // (the actor-normalization step, alongside every real class's).
+      Item::Actor(a) => {
+        let layout = &classes[&a.name];
+        for m in &a.methods {
+          let mangled = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
+          let (fv, _) = user_func_ids[&mangled];
+          define_method(&context, &builder, m, fv, &layout.fields, &gen_ctx)?;
         }
       }
       Item::Stmt(Spanned {
@@ -8737,6 +8861,11 @@ fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
       Item::Module(m) => {
         for f in &mut m.methods {
           desugar_asserts_in_stmts(&mut f.body, &mut rewrote);
+        }
+      }
+      Item::Actor(a) => {
+        for m in &mut a.methods {
+          desugar_asserts_in_stmts(&mut m.body, &mut rewrote);
         }
       }
       Item::Stmt(s) => desugar_asserts_in_stmt(s, &mut rewrote),
@@ -10899,5 +11028,36 @@ mod tests {
       "the Err path must return directly:\n{err_block}"
     );
     let _ = compile_link_run(&result_worked_example("21"));
+  }
+
+  // Plan 54 (actor declarations and isolated heaps).
+
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\nputs a.value\nputs b.value\n";
+
+  #[test]
+  fn actor_worked_example_compiled_linked_and_run_prints_2_and_101() {
+    assert_eq!(compile_link_run(COUNTER_ACTOR_EXAMPLE), "2\n101\n");
+  }
+
+  #[test]
+  fn each_spawn_call_site_allocates_from_its_own_freshly_created_region() {
+    // Real, structural proof of plan 54's "isolated heaps" claim,
+    // independent of the worked example's own black-box output above:
+    // each `.spawn` call must reach its own `emerald_region_create`
+    // call — never a cached/shared region handle — so two live actor
+    // instances are backed by two entirely separate arenas from the
+    // moment they're constructed.
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("actor_disjoint_regions_ir");
+    let obj_path = dir.join("out.o");
+    let ir =
+      compile_to_object_ir_text_for_test(&program, &obj_path).expect("should compile to IR text");
+    std::fs::remove_dir_all(&dir).ok();
+    let region_create_calls = ir.matches("call ptr @emerald_region_create()").count();
+    assert_eq!(
+      region_create_calls, 2,
+      "each of the two `.spawn` sites must call emerald_region_create independently:\n{ir}"
+    );
   }
 }
