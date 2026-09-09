@@ -79,6 +79,40 @@ async fn check_source_reports_a_real_parse_error_and_a_clean_pass() {
 }
 
 #[tokio::test]
+async fn check_source_reports_a_real_line_and_column_for_a_sema_type_mismatch() {
+  // Plan 22's `leaf-span-rendering` AC3: `emerald_sema::Diagnostic` now
+  // carries a real span, so `check_source` no longer reports `line`/
+  // `column` as absent for sema diagnostics — same worked example as
+  // the CLI (`sema_type_mismatch_renders_a_miette_source_snippet_with_a_caret_at_b`)
+  // and the LSP (`a_sema_type_mismatch_publishes_a_diagnostic_at_the_real_b_position`)
+  // tests, pointing at the same `b` on line 2.
+  let client = connect().await;
+
+  let result = call(
+    &client,
+    "check_source",
+    serde_json::json!({ "source": "def add(a: Int64, b: String) -> Int64\n  a + b\nend\n" }),
+  )
+  .await;
+  let diagnostics = result["diagnostics"].as_array().expect("diagnostics array");
+  assert_eq!(diagnostics.len(), 1, "{result}");
+  assert_eq!(
+    diagnostics[0]["kind"],
+    serde_json::json!("sema"),
+    "{result}"
+  );
+  assert_eq!(diagnostics[0]["line"], serde_json::json!(2), "{result}");
+  assert_eq!(diagnostics[0]["column"], serde_json::json!(7), "{result}");
+  let message = diagnostics[0]["message"].as_str().expect("message string");
+  assert!(
+    message.contains("Int64") && message.contains("String"),
+    "message should name both types: {message}"
+  );
+
+  client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn compile_and_run_actually_compiles_links_and_runs_hello_em() {
   let client = connect().await;
 

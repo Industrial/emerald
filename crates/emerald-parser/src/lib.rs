@@ -19,8 +19,8 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause,
-  Stmt, StringPart, TypeParam,
+  CaseArm, ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
+  RescueClause, Spanned, Stmt, StringPart, TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -123,14 +123,14 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
   }
 }
 
-fn rewrite_stmts(stmts: &mut [Stmt], name: &str, source: &str) {
+fn rewrite_stmts(stmts: &mut [Spanned<Stmt>], name: &str, source: &str) {
   for s in stmts {
     rewrite_stmt(s, name, source);
   }
 }
 
-fn rewrite_stmt(stmt: &mut Stmt, name: &str, source: &str) {
-  match stmt {
+fn rewrite_stmt(stmt: &mut Spanned<Stmt>, name: &str, source: &str) {
+  match &mut stmt.node {
     Stmt::Let { value, .. }
     | Stmt::SetField { value, .. }
     | Stmt::Assign { value, .. }
@@ -219,8 +219,8 @@ fn rewrite_stmt(stmt: &mut Stmt, name: &str, source: &str) {
   }
 }
 
-fn rewrite_expr(expr: &mut Expr, name: &str, source: &str) {
-  match expr {
+fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
+  match &mut expr.node {
     Expr::Ident(_)
     | Expr::Int(_)
     | Expr::Float(_)
@@ -269,13 +269,13 @@ fn rewrite_expr(expr: &mut Expr, name: &str, source: &str) {
         _ => None,
       };
       if expected_arity == Some(args.len()) {
-        let offset = match args.last() {
+        let offset = match args.last().map(|s| &s.node) {
           Some(Expr::Int(offset)) => Some(*offset),
           _ => None,
         };
         if let Some(offset) = offset {
           let line = line_at(source, offset as usize);
-          *args.last_mut().expect("checked non-empty above") =
+          args.last_mut().expect("checked non-empty above").node =
             Expr::StringLit(format!("{name}:{line}"));
         }
       }
@@ -343,6 +343,13 @@ pub fn parse(src: &str) -> Result<Program, Vec<ParseError>> {
 mod tests {
   use super::*;
 
+  /// Test-only shorthand for `Spanned::synthetic` — a hand-written
+  /// expected-value literal has no real source text to derive a span
+  /// from, so every nested `Expr`/`Stmt` position in one needs this.
+  fn s<T>(node: T) -> Spanned<T> {
+    Spanned::synthetic(node)
+  }
+
   const FUNC_ONLY: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend";
 
   #[test]
@@ -371,10 +378,10 @@ mod tests {
     assert_eq!(f.return_type, "Int64");
     assert_eq!(
       f.body,
-      vec![Stmt::Expr(Expr::Add(
-        Box::new(Expr::Ident("a".into())),
-        Box::new(Expr::Ident("b".into()))
-      ))]
+      vec![s(Stmt::Expr(s(Expr::Add(
+        Box::new(s(Expr::Ident("a".into()))),
+        Box::new(s(Expr::Ident("b".into())))
+      ))))]
     );
   }
 
@@ -422,7 +429,11 @@ mod tests {
     };
     assert_eq!(f.name, "add");
 
-    let Item::Stmt(Stmt::Expr(call)) = &program.items[1] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(call),
+      ..
+    }) = &program.items[1]
+    else {
       panic!(
         "expected item 1 to be the puts call, got {:?}",
         program.items[1]
@@ -432,7 +443,10 @@ mod tests {
       *call,
       Expr::Call(
         "puts".into(),
-        vec![Expr::Call("add".into(), vec![Expr::Int(20), Expr::Int(22)])]
+        vec![s(Expr::Call(
+          "add".into(),
+          vec![s(Expr::Int(20)), s(Expr::Int(22))]
+        ))]
       )
     );
   }
@@ -444,7 +458,11 @@ mod tests {
     let program = parse(MILESTONE2).expect("milestone-2 example should parse");
     assert_eq!(program.items.len(), 2);
 
-    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, ty, value },
+      ..
+    }) = &program.items[0]
+    else {
       panic!(
         "expected item 0 to be `x: Int64 = 10`, got {:?}",
         program.items[0]
@@ -454,10 +472,13 @@ mod tests {
     assert_eq!(ty, "Int64");
     assert_eq!(*value, Expr::Int(10));
 
-    let Item::Stmt(Stmt::If {
-      cond,
-      then_branch,
-      else_branch,
+    let Item::Stmt(Spanned {
+      node: Stmt::If {
+        cond,
+        then_branch,
+        else_branch,
+      },
+      ..
     }) = &program.items[1]
     else {
       panic!(
@@ -468,17 +489,17 @@ mod tests {
     assert_eq!(
       *cond,
       Expr::Compare(
-        Box::new(Expr::Ident("x".into())),
+        Box::new(s(Expr::Ident("x".into()))),
         CompareOp::Gt,
-        Box::new(Expr::Int(5))
+        Box::new(s(Expr::Int(5)))
       )
     );
     assert_eq!(
       then_branch,
-      &vec![Stmt::Expr(Expr::Call(
+      &vec![s(Stmt::Expr(s(Expr::Call(
         "puts".into(),
-        vec![Expr::Ident("x".into())]
-      ))]
+        vec![s(Expr::Ident("x".into()))]
+      ))))]
     );
     assert_eq!(else_branch, &None);
   }
@@ -487,7 +508,11 @@ mod tests {
   fn parses_while_break_next() {
     let src = "while x < 3\n  next\n  break\nend\n";
     let program = parse(src).expect("while/break/next should parse");
-    let Item::Stmt(Stmt::While { body, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::While { body, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a while statement, got {:?}", program.items[0]);
     };
     assert_eq!(body, &vec![Stmt::Next, Stmt::Break]);
@@ -497,7 +522,11 @@ mod tests {
   fn parses_if_else() {
     let src = "if x > 5\n  puts x\nelse\n  puts x\nend\n";
     let program = parse(src).expect("if/else should parse");
-    let Item::Stmt(Stmt::If { else_branch, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::If { else_branch, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected an if statement, got {:?}", program.items[0]);
     };
     assert!(else_branch.is_some(), "else branch should be present");
@@ -510,7 +539,10 @@ mod tests {
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function, got {:?}", program.items[0]);
     };
-    assert_eq!(f.body, vec![Stmt::Return(Some(Expr::Ident("a".into())))]);
+    assert_eq!(
+      f.body,
+      vec![s(Stmt::Return(Some(s(Expr::Ident("a".into())))))]
+    );
   }
 
   const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
@@ -547,26 +579,30 @@ mod tests {
     assert_eq!(
       class.methods[0].body,
       vec![
-        Stmt::SetField {
+        s(Stmt::SetField {
           name: "x".into(),
-          value: Expr::Ident("x".into())
-        },
-        Stmt::SetField {
+          value: s(Expr::Ident("x".into()))
+        }),
+        s(Stmt::SetField {
           name: "y".into(),
-          value: Expr::Ident("y".into())
-        },
+          value: s(Expr::Ident("y".into()))
+        }),
       ]
     );
     assert_eq!(class.methods[1].name, "sum");
     assert_eq!(
       class.methods[1].body,
-      vec![Stmt::Expr(Expr::Add(
-        Box::new(Expr::InstanceVar("x".into())),
-        Box::new(Expr::InstanceVar("y".into()))
-      ))]
+      vec![s(Stmt::Expr(s(Expr::Add(
+        Box::new(s(Expr::InstanceVar("x".into()))),
+        Box::new(s(Expr::InstanceVar("y".into())))
+      ))))]
     );
 
-    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[1] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, ty, value },
+      ..
+    }) = &program.items[1]
+    else {
       panic!(
         "expected item 1 to be `p: Point = Point.new(...)`, got {:?}",
         program.items[1]
@@ -576,10 +612,17 @@ mod tests {
     assert_eq!(ty, "Point");
     assert_eq!(
       *value,
-      Expr::New("Point".into(), vec![Expr::Float(2.0), Expr::Float(3.0)])
+      Expr::New(
+        "Point".into(),
+        vec![s(Expr::Float(2.0)), s(Expr::Float(3.0))]
+      )
     );
 
-    let Item::Stmt(Stmt::Expr(call)) = &program.items[2] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(call),
+      ..
+    }) = &program.items[2]
+    else {
       panic!(
         "expected item 2 to be `puts p.sum`, got {:?}",
         program.items[2]
@@ -589,11 +632,11 @@ mod tests {
       *call,
       Expr::Call(
         "puts".into(),
-        vec![Expr::MethodCall(
-          Box::new(Expr::Ident("p".into())),
+        vec![s(Expr::MethodCall(
+          Box::new(s(Expr::Ident("p".into()))),
           "sum".into(),
           vec![]
-        )]
+        ))]
       )
     );
   }
@@ -606,7 +649,11 @@ mod tests {
     let program = parse(ARRAY_EXAMPLE).expect("array example should parse");
     assert_eq!(program.items.len(), 4);
 
-    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, ty, value },
+      ..
+    }) = &program.items[0]
+    else {
       panic!(
         "expected item 0 to be `arr: Array[Int64] = [...]`, got {:?}",
         program.items[0]
@@ -616,19 +663,23 @@ mod tests {
     assert_eq!(ty, "Array[Int64]");
     assert_eq!(
       *value,
-      Expr::ArrayLit(vec![Expr::Int(10), Expr::Int(20), Expr::Int(30)])
+      Expr::ArrayLit(vec![s(Expr::Int(10)), s(Expr::Int(20)), s(Expr::Int(30))])
     );
 
     assert_eq!(
       program.items[1],
-      Item::Stmt(Stmt::SetIndex {
-        array: Expr::Ident("arr".into()),
-        index: Expr::Int(1),
-        value: Expr::Int(99),
-      })
+      Item::Stmt(s(Stmt::SetIndex {
+        array: s(Expr::Ident("arr".into())),
+        index: s(Expr::Int(1)),
+        value: s(Expr::Int(99)),
+      }))
     );
 
-    let Item::Stmt(Stmt::Expr(call)) = &program.items[2] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(call),
+      ..
+    }) = &program.items[2]
+    else {
       panic!(
         "expected item 2 to be `puts arr[1]`, got {:?}",
         program.items[2]
@@ -638,14 +689,18 @@ mod tests {
       *call,
       Expr::Call(
         "puts".into(),
-        vec![Expr::Index(
-          Box::new(Expr::Ident("arr".into())),
-          Box::new(Expr::Int(1))
-        )]
+        vec![s(Expr::Index(
+          Box::new(s(Expr::Ident("arr".into()))),
+          Box::new(s(Expr::Int(1)))
+        ))]
       )
     );
 
-    let Item::Stmt(Stmt::Expr(call)) = &program.items[3] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(call),
+      ..
+    }) = &program.items[3]
+    else {
       panic!(
         "expected item 3 to be `puts arr[0] + arr[2]`, got {:?}",
         program.items[3]
@@ -655,16 +710,16 @@ mod tests {
       *call,
       Expr::Call(
         "puts".into(),
-        vec![Expr::Add(
-          Box::new(Expr::Index(
-            Box::new(Expr::Ident("arr".into())),
-            Box::new(Expr::Int(0))
-          )),
-          Box::new(Expr::Index(
-            Box::new(Expr::Ident("arr".into())),
-            Box::new(Expr::Int(2))
-          ))
-        )]
+        vec![s(Expr::Add(
+          Box::new(s(Expr::Index(
+            Box::new(s(Expr::Ident("arr".into()))),
+            Box::new(s(Expr::Int(0)))
+          ))),
+          Box::new(s(Expr::Index(
+            Box::new(s(Expr::Ident("arr".into()))),
+            Box::new(s(Expr::Int(2)))
+          )))
+        ))]
       )
     );
   }
@@ -677,7 +732,11 @@ mod tests {
     let program = parse(LAMBDA_EXAMPLE).expect("lambda example should parse");
     assert_eq!(program.items.len(), 3);
 
-    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[1] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, ty, value },
+      ..
+    }) = &program.items[1]
+    else {
       panic!(
         "expected item 1 to be `add_x: Proc = ->(...) -> Int64 {{...}}`, got {:?}",
         program.items[1]
@@ -694,14 +753,18 @@ mod tests {
           default: None
         }],
         return_type: "Int64".into(),
-        body: vec![Stmt::Expr(Expr::Add(
-          Box::new(Expr::Ident("y".into())),
-          Box::new(Expr::Ident("x".into()))
-        ))],
+        body: vec![s(Stmt::Expr(s(Expr::Add(
+          Box::new(s(Expr::Ident("y".into()))),
+          Box::new(s(Expr::Ident("x".into())))
+        ))))],
       }
     );
 
-    let Item::Stmt(Stmt::Expr(call)) = &program.items[2] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(call),
+      ..
+    }) = &program.items[2]
+    else {
       panic!(
         "expected item 2 to be `puts add_x.call(5)`, got {:?}",
         program.items[2]
@@ -711,11 +774,11 @@ mod tests {
       *call,
       Expr::Call(
         "puts".into(),
-        vec![Expr::MethodCall(
-          Box::new(Expr::Ident("add_x".into())),
+        vec![s(Expr::MethodCall(
+          Box::new(s(Expr::Ident("add_x".into()))),
           "call".into(),
-          vec![Expr::Int(5)]
-        )]
+          vec![s(Expr::Int(5))]
+        ))]
       )
     );
   }
@@ -727,7 +790,11 @@ mod tests {
     // now parses with a populated argument list.
     let src = "p.move(1, 2)\n";
     let program = parse(src).expect("method call with args should parse");
-    let Item::Stmt(Stmt::Expr(call)) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(call),
+      ..
+    }) = &program.items[0]
+    else {
       panic!(
         "expected a method-call statement, got {:?}",
         program.items[0]
@@ -736,9 +803,9 @@ mod tests {
     assert_eq!(
       *call,
       Expr::MethodCall(
-        Box::new(Expr::Ident("p".into())),
+        Box::new(s(Expr::Ident("p".into()))),
         "move".into(),
-        vec![Expr::Int(1), Expr::Int(2)]
+        vec![s(Expr::Int(1)), s(Expr::Int(2))]
       )
     );
   }
@@ -749,10 +816,10 @@ mod tests {
     let program = parse(src).expect("raise should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Raise(Expr::New(
+      Item::Stmt(s(Stmt::Raise(s(Expr::New(
         "MyError".into(),
-        vec![Expr::Int(99)]
-      )))
+        vec![s(Expr::Int(99))]
+      )))))
     );
   }
 
@@ -763,10 +830,13 @@ mod tests {
     let program = parse(EXCEPTION_EXAMPLE).expect("exception example should parse");
     assert_eq!(program.items.len(), 3);
 
-    let Item::Stmt(Stmt::Begin {
-      body,
-      rescues,
-      ensure,
+    let Item::Stmt(Spanned {
+      node: Stmt::Begin {
+        body,
+        rescues,
+        ensure,
+      },
+      ..
     }) = &program.items[2]
     else {
       panic!(
@@ -780,21 +850,21 @@ mod tests {
     assert_eq!(ensure, &None);
     assert_eq!(
       body,
-      &vec![Stmt::Expr(Expr::Call(
+      &vec![s(Stmt::Expr(s(Expr::Call(
         "puts".into(),
-        vec![Expr::Call("risky".into(), vec![Expr::Int(999)])]
-      ))]
+        vec![s(Expr::Call("risky".into(), vec![s(Expr::Int(999))]))]
+      ))))]
     );
     assert_eq!(
       rescues[0].body,
-      vec![Stmt::Expr(Expr::Call(
+      vec![s(Stmt::Expr(s(Expr::Call(
         "puts".into(),
-        vec![Expr::MethodCall(
-          Box::new(Expr::Ident("e".into())),
+        vec![s(Expr::MethodCall(
+          Box::new(s(Expr::Ident("e".into()))),
           "code".into(),
           vec![]
-        )]
-      ))]
+        ))]
+      ))))]
     );
   }
 
@@ -804,8 +874,11 @@ mod tests {
   fn begin_with_multiple_rescues_and_ensure_parses_in_source_order() {
     let src = "begin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Begin {
-      rescues, ensure, ..
+    let Item::Stmt(Spanned {
+      node: Stmt::Begin {
+        rescues, ensure, ..
+      },
+      ..
     }) = &program.items[0]
     else {
       panic!("expected a begin statement");
@@ -815,10 +888,10 @@ mod tests {
     assert_eq!(rescues[1].class_name, Some("TimeoutError".to_string()));
     assert_eq!(
       ensure,
-      &Some(vec![Stmt::Expr(Expr::Call(
+      &Some(vec![s(Stmt::Expr(s(Expr::Call(
         "puts".into(),
-        vec![Expr::StringLit("cleanup".into())]
-      ))])
+        vec![s(Expr::StringLit("cleanup".into()))]
+      ))))])
     );
   }
 
@@ -826,8 +899,11 @@ mod tests {
   fn begin_with_bare_rescue_and_no_ensure_parses() {
     let src = "begin\n  puts 1\nrescue => e\n  puts 2\nend\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Begin {
-      rescues, ensure, ..
+    let Item::Stmt(Spanned {
+      node: Stmt::Begin {
+        rescues, ensure, ..
+      },
+      ..
     }) = &program.items[0]
     else {
       panic!("expected a begin statement");
@@ -842,7 +918,11 @@ mod tests {
   fn retry_parses_to_stmt_retry_wherever_a_stmt_is_legal() {
     let src = "begin\n  puts 1\nrescue => e\n  retry\nend\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Begin { rescues, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Begin { rescues, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a begin statement");
     };
     assert_eq!(rescues[0].body, vec![Stmt::Retry]);
@@ -858,7 +938,7 @@ mod tests {
       panic!("expected a Function");
     };
     assert_eq!(f.params[0].default, None);
-    assert_eq!(f.params[1].default, Some(Expr::Int(1)));
+    assert_eq!(f.params[1].default, Some(s(Expr::Int(1))));
   }
 
   #[test]
@@ -901,10 +981,10 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::CallKw(
+      Item::Stmt(s(Stmt::Expr(s(Expr::CallKw(
         "greet".to_string(),
-        vec![("name".to_string(), Expr::StringLit("yo".to_string()))]
-      )))
+        vec![("name".to_string(), s(Expr::StringLit("yo".to_string())))]
+      )))))
     );
   }
 
@@ -914,10 +994,10 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::Call(
+      Item::Stmt(s(Stmt::Expr(s(Expr::Call(
         "greet".to_string(),
-        vec![Expr::StringLit("yo".to_string())]
-      )))
+        vec![s(Expr::StringLit("yo".to_string()))]
+      )))))
     );
   }
 
@@ -948,7 +1028,7 @@ mod tests {
           default: None,
         }],
         return_type: "Vector2".to_string(),
-        body: vec![Stmt::Expr(Expr::Ident("self".to_string()))],
+        body: vec![s(Stmt::Expr(s(Expr::Ident("self".to_string()))))],
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
@@ -1026,13 +1106,17 @@ mod tests {
     assert_eq!(m.methods[0].return_type, "Int64");
     assert_eq!(
       m.methods[0].body,
-      vec![Stmt::Expr(Expr::Add(
-        Box::new(Expr::Ident("x".into())),
-        Box::new(Expr::Ident("x".into()))
-      ))]
+      vec![s(Stmt::Expr(s(Expr::Add(
+        Box::new(s(Expr::Ident("x".into()))),
+        Box::new(s(Expr::Ident("x".into())))
+      ))))]
     );
 
-    let Item::Stmt(Stmt::Expr(call)) = &program.items[1] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(call),
+      ..
+    }) = &program.items[1]
+    else {
       panic!(
         "expected item 1 to be `puts MathUtils.double(21)`, got {:?}",
         program.items[1]
@@ -1042,11 +1126,11 @@ mod tests {
       *call,
       Expr::Call(
         "puts".into(),
-        vec![Expr::MethodCall(
-          Box::new(Expr::Ident("MathUtils".into())),
+        vec![s(Expr::MethodCall(
+          Box::new(s(Expr::Ident("MathUtils".into()))),
           "double".into(),
-          vec![Expr::Int(21)]
-        )]
+          vec![s(Expr::Int(21))]
+        ))]
       )
     );
   }
@@ -1057,14 +1141,24 @@ mod tests {
   #[test]
   fn mul_binds_tighter_than_add() {
     let program = parse("puts 2 + 3 * 4\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(
       args[0],
       Expr::Add(
-        Box::new(Expr::Int(2)),
-        Box::new(Expr::Mul(Box::new(Expr::Int(3)), Box::new(Expr::Int(4))))
+        Box::new(s(Expr::Int(2))),
+        Box::new(s(Expr::Mul(
+          Box::new(s(Expr::Int(3))),
+          Box::new(s(Expr::Int(4)))
+        )))
       )
     );
   }
@@ -1072,14 +1166,21 @@ mod tests {
   #[test]
   fn unary_minus_binds_tighter_than_add() {
     let program = parse("puts -3 + 10\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(
       args[0],
       Expr::Add(
-        Box::new(Expr::Neg(Box::new(Expr::Int(3)))),
-        Box::new(Expr::Int(10))
+        Box::new(s(Expr::Neg(Box::new(s(Expr::Int(3)))))),
+        Box::new(s(Expr::Int(10)))
       )
     );
   }
@@ -1087,21 +1188,31 @@ mod tests {
   #[test]
   fn and_binds_tighter_than_or() {
     let program = parse("puts a > 0 && b > 0 || c > 0\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     let gt = |name: &str, n: i64| {
       Expr::Compare(
-        Box::new(Expr::Ident(name.into())),
+        Box::new(s(Expr::Ident(name.into()))),
         CompareOp::Gt,
-        Box::new(Expr::Int(n)),
+        Box::new(s(Expr::Int(n))),
       )
     };
     assert_eq!(
       args[0],
       Expr::Or(
-        Box::new(Expr::And(Box::new(gt("a", 0)), Box::new(gt("b", 0)))),
-        Box::new(gt("c", 0))
+        Box::new(s(Expr::And(
+          Box::new(s(gt("a", 0))),
+          Box::new(s(gt("b", 0)))
+        ))),
+        Box::new(s(gt("c", 0)))
       )
     );
   }
@@ -1113,15 +1224,22 @@ mod tests {
     // Real, Ruby-divergent precedence, documented by this test rather
     // than left unspecified.
     let program = parse("puts !x > 0\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(
       args[0],
       Expr::Compare(
-        Box::new(Expr::Not(Box::new(Expr::Ident("x".into())))),
+        Box::new(s(Expr::Not(Box::new(s(Expr::Ident("x".into())))))),
         CompareOp::Gt,
-        Box::new(Expr::Int(0))
+        Box::new(s(Expr::Int(0)))
       )
     );
   }
@@ -1141,27 +1259,27 @@ mod tests {
     assert_eq!(
       f.body[0],
       Stmt::If {
-        cond: Expr::Compare(
-          Box::new(Expr::Ident("n".into())),
+        cond: s(Expr::Compare(
+          Box::new(s(Expr::Ident("n".into()))),
           CompareOp::Le,
-          Box::new(Expr::Int(1))
-        ),
-        then_branch: vec![Stmt::Return(Some(Expr::Int(1)))],
+          Box::new(s(Expr::Int(1)))
+        )),
+        then_branch: vec![s(Stmt::Return(Some(s(Expr::Int(1)))))],
         else_branch: None,
       }
     );
     assert_eq!(
       f.body[1],
-      Stmt::Return(Some(Expr::Mul(
-        Box::new(Expr::Ident("n".into())),
-        Box::new(Expr::Call(
+      Stmt::Return(Some(s(Expr::Mul(
+        Box::new(s(Expr::Ident("n".into()))),
+        Box::new(s(Expr::Call(
           "factorial".into(),
-          vec![Expr::Sub(
-            Box::new(Expr::Ident("n".into())),
-            Box::new(Expr::Int(1))
-          )]
-        ))
-      )))
+          vec![s(Expr::Sub(
+            Box::new(s(Expr::Ident("n".into()))),
+            Box::new(s(Expr::Int(1)))
+          ))]
+        )))
+      ))))
     );
   }
 
@@ -1172,18 +1290,22 @@ mod tests {
     let program = parse(SHORT_CIRCUIT_EXAMPLE).expect("short-circuit example should parse");
     // 1 function + 1 let + 4 ifs.
     assert_eq!(program.items.len(), 6);
-    let Item::Stmt(Stmt::If { cond, .. }) = &program.items[2] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::If { cond, .. },
+      ..
+    }) = &program.items[2]
+    else {
       panic!("expected the first if, got {:?}", program.items[2]);
     };
     assert_eq!(
       *cond,
       Expr::And(
-        Box::new(Expr::Compare(
-          Box::new(Expr::Ident("x".into())),
+        Box::new(s(Expr::Compare(
+          Box::new(s(Expr::Ident("x".into()))),
           CompareOp::Gt,
-          Box::new(Expr::Int(0))
-        )),
-        Box::new(Expr::Call("noisy".into(), vec![Expr::Int(1)]))
+          Box::new(s(Expr::Int(0)))
+        ))),
+        Box::new(s(Expr::Call("noisy".into(), vec![s(Expr::Int(1))])))
       )
     );
   }
@@ -1201,7 +1323,14 @@ mod tests {
   #[test]
   fn parses_plain_string_literal() {
     let program = parse("puts \"hello\"\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(args[0], Expr::StringLit("hello".to_string()));
@@ -1210,7 +1339,14 @@ mod tests {
   #[test]
   fn decodes_escaped_quote() {
     let program = parse("puts \"a\\\"b\"\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(args[0], Expr::StringLit("a\"b".to_string()));
@@ -1219,7 +1355,14 @@ mod tests {
   #[test]
   fn decodes_escaped_newline() {
     let program = parse("puts \"line1\\nline2\"\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(args[0], Expr::StringLit("line1\nline2".to_string()));
@@ -1260,7 +1403,14 @@ mod tests {
   #[test]
   fn hash_inside_string_literal_is_not_eaten_as_a_comment() {
     let program = parse("puts \"a#b\"\n").expect("should parse");
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, args))) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(args[0], Expr::StringLit("a#b".to_string()));
@@ -1271,10 +1421,13 @@ mod tests {
   #[test]
   fn parses_case_when_example() {
     let program = parse(CASE_EXAMPLE).expect("should parse");
-    let Item::Stmt(Stmt::Case {
-      scrutinee,
-      arms,
-      else_body,
+    let Item::Stmt(Spanned {
+      node: Stmt::Case {
+        scrutinee,
+        arms,
+        else_body,
+      },
+      ..
     }) = &program.items[2]
     else {
       panic!("expected a case statement, got {:?}", program.items[2]);
@@ -1284,11 +1437,11 @@ mod tests {
     assert_eq!(arms[0].0, vec![Expr::Int(1)]);
     assert_eq!(
       arms[0].1,
-      vec![Stmt::Let {
+      vec![s(Stmt::Let {
         name: "label".into(),
         ty: "Int64".into(),
-        value: Expr::Int(10),
-      }]
+        value: s(Expr::Int(10)),
+      })]
     );
     assert_eq!(arms[1].0, vec![Expr::Int(2), Expr::Int(3)]);
     assert!(else_body.is_some());
@@ -1301,15 +1454,36 @@ mod tests {
     let program = parse("puts true\nputs false\nputs nil\n")
       .expect("should parse")
       .items;
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, a1))) = &program[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, a1),
+        ..
+      }),
+      ..
+    }) = &program[0]
+    else {
       panic!("expected a puts call, got {:?}", program[0]);
     };
     assert_eq!(a1[0], Expr::Bool(true));
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, a2))) = &program[1] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, a2),
+        ..
+      }),
+      ..
+    }) = &program[1]
+    else {
       panic!("expected a puts call, got {:?}", program[1]);
     };
     assert_eq!(a2[0], Expr::Bool(false));
-    let Item::Stmt(Stmt::Expr(Expr::Call(_, a3))) = &program[2] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, a3),
+        ..
+      }),
+      ..
+    }) = &program[2]
+    else {
       panic!("expected a puts call, got {:?}", program[2]);
     };
     assert_eq!(a3[0], Expr::Nil);
@@ -1319,7 +1493,11 @@ mod tests {
   fn parses_hash_literal_and_indexing() {
     let src = "h: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nputs h[2]\nh[2] = 99\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Let { name, ty, value }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, ty, value },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a Let, got {:?}", program.items[0]);
     };
     assert_eq!(name, "h");
@@ -1327,18 +1505,18 @@ mod tests {
     assert_eq!(
       *value,
       Expr::HashLit(vec![
-        (Expr::Int(1), Expr::Int(10)),
-        (Expr::Int(2), Expr::Int(20)),
-        (Expr::Int(3), Expr::Int(30)),
+        (s(Expr::Int(1)), s(Expr::Int(10))),
+        (s(Expr::Int(2)), s(Expr::Int(20))),
+        (s(Expr::Int(3)), s(Expr::Int(30))),
       ])
     );
     assert_eq!(
       program.items[2],
-      Item::Stmt(Stmt::SetIndex {
-        array: Expr::Ident("h".into()),
-        index: Expr::Int(2),
-        value: Expr::Int(99),
-      })
+      Item::Stmt(s(Stmt::SetIndex {
+        array: s(Expr::Ident("h".into())),
+        index: s(Expr::Int(2)),
+        value: s(Expr::Int(99)),
+      }))
     );
   }
 
@@ -1347,11 +1525,11 @@ mod tests {
     let program = parse("arr: Array[Int64] = Array.new(5)\n").expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Let {
+      Item::Stmt(s(Stmt::Let {
         name: "arr".into(),
         ty: "Array[Int64]".into(),
-        value: Expr::ArrayNew(Box::new(Expr::Int(5))),
-      })
+        value: s(Expr::ArrayNew(Box::new(s(Expr::Int(5))))),
+      }))
     );
   }
 
@@ -1360,11 +1538,11 @@ mod tests {
     let program = parse("n: Int64 = 5\narr: Array[Int64] = Array.new(n)\n").expect("should parse");
     assert_eq!(
       program.items[1],
-      Item::Stmt(Stmt::Let {
+      Item::Stmt(s(Stmt::Let {
         name: "arr".into(),
         ty: "Array[Int64]".into(),
-        value: Expr::ArrayNew(Box::new(Expr::Ident("n".into()))),
-      })
+        value: s(Expr::ArrayNew(Box::new(s(Expr::Ident("n".into()))))),
+      }))
     );
   }
 
@@ -1372,7 +1550,11 @@ mod tests {
   fn case_with_no_else_parses() {
     let src = "case n\nwhen 1\n  puts 1\nend\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Case { else_body, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Case { else_body, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a case statement, got {:?}", program.items[0]);
     };
     assert_eq!(*else_body, None);
@@ -1386,10 +1568,10 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[1],
-      Item::Stmt(Stmt::Assign {
+      Item::Stmt(s(Stmt::Assign {
         name: "x".to_string(),
-        value: Expr::Int(2),
-      })
+        value: s(Expr::Int(2)),
+      }))
     );
   }
 
@@ -1399,13 +1581,13 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Assign {
+      Item::Stmt(s(Stmt::Assign {
         name: "total".to_string(),
-        value: Expr::Add(
-          Box::new(Expr::Ident("total".to_string())),
-          Box::new(Expr::Ident("i".to_string())),
-        ),
-      })
+        value: s(Expr::Add(
+          Box::new(s(Expr::Ident("total".to_string()))),
+          Box::new(s(Expr::Ident("i".to_string()))),
+        )),
+      }))
     );
   }
 
@@ -1413,18 +1595,18 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Assign {
+      Item::Stmt(s(Stmt::Assign {
         name: "x".to_string(),
-        value: expected_value,
-      }),
+        value: s(expected_value),
+      })),
       "mismatched desugaring for {src:?}"
     );
   }
 
   #[test]
   fn all_compound_assign_operators_desugar_to_the_matching_binop() {
-    let x = || Box::new(Expr::Ident("x".to_string()));
-    let one = || Box::new(Expr::Int(1));
+    let x = || Box::new(s(Expr::Ident("x".to_string())));
+    let one = || Box::new(s(Expr::Int(1)));
     assert_compound_assign_desugars_to("x -= 1\n", Expr::Sub(x(), one()));
     assert_compound_assign_desugars_to("x *= 1\n", Expr::Mul(x(), one()));
     assert_compound_assign_desugars_to("x /= 1\n", Expr::Div(x(), one()));
@@ -1437,10 +1619,13 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::MultiAssign {
+      Item::Stmt(s(Stmt::MultiAssign {
         names: vec!["a".to_string(), "b".to_string()],
-        values: vec![Expr::Ident("b".to_string()), Expr::Ident("a".to_string())],
-      })
+        values: vec![
+          s(Expr::Ident("b".to_string())),
+          s(Expr::Ident("a".to_string()))
+        ],
+      }))
     );
   }
 
@@ -1497,24 +1682,24 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::Call(
+      Item::Stmt(s(Stmt::Expr(s(Expr::Call(
         "repeat".to_string(),
         vec![
-          Expr::Int(3),
-          Expr::Lambda {
+          s(Expr::Int(3)),
+          s(Expr::Lambda {
             params: vec![Param {
               name: "i".to_string(),
               ty: "Int64".to_string(),
               default: None
             }],
             return_type: "Void".to_string(),
-            body: vec![Stmt::Expr(Expr::Call(
+            body: vec![s(Stmt::Expr(s(Expr::Call(
               "puts".to_string(),
-              vec![Expr::Ident("i".to_string())]
-            ))],
-          },
+              vec![s(Expr::Ident("i".to_string()))]
+            ))))],
+          }),
         ]
-      )))
+      )))))
     );
   }
 
@@ -1524,10 +1709,10 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::Call(
+      Item::Stmt(s(Stmt::Expr(s(Expr::Call(
         "add".to_string(),
-        vec![Expr::Int(1), Expr::Int(2)]
-      )))
+        vec![s(Expr::Int(1)), s(Expr::Int(2))]
+      )))))
     );
   }
 
@@ -1537,7 +1722,7 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Yield(vec![Expr::Ident("i".to_string())]))
+      Item::Stmt(s(Stmt::Yield(vec![s(Expr::Ident("i".to_string()))])))
     );
   }
 
@@ -1555,14 +1740,14 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::Call(
+      Item::Stmt(s(Stmt::Expr(s(Expr::Call(
         "puts".to_string(),
-        vec![Expr::Interpolate(vec![
+        vec![s(Expr::Interpolate(vec![
           StringPart::Literal("Hello, ".to_string()),
-          StringPart::Expr(Box::new(Expr::Ident("name".to_string()))),
+          StringPart::Expr(Box::new(s(Expr::Ident("name".to_string())))),
           StringPart::Literal("!".to_string()),
-        ])]
-      )))
+        ]))]
+      )))))
     );
   }
 
@@ -1572,10 +1757,10 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::Call(
+      Item::Stmt(s(Stmt::Expr(s(Expr::Call(
         "puts".to_string(),
-        vec![Expr::StringLit("hello".to_string())]
-      )))
+        vec![s(Expr::StringLit("hello".to_string()))]
+      )))))
     );
   }
 
@@ -1655,7 +1840,7 @@ mod tests {
     assert_eq!(x_accessor.return_type, "Int64");
     assert_eq!(
       x_accessor.body,
-      vec![Stmt::Expr(Expr::InstanceVar("x".to_string()))]
+      vec![s(Stmt::Expr(s(Expr::InstanceVar("x".to_string()))))]
     );
     assert!(c.methods.iter().any(|m| m.name == "initialize"));
     assert!(!c.methods.iter().any(|m| m.name == "y"));
@@ -1703,14 +1888,14 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::For {
+      Item::Stmt(s(Stmt::For {
         var: "x".to_string(),
-        elements: vec![Expr::Int(10), Expr::Int(20), Expr::Int(30)],
-        body: vec![Stmt::Expr(Expr::Call(
+        elements: vec![s(Expr::Int(10)), s(Expr::Int(20)), s(Expr::Int(30))],
+        body: vec![s(Stmt::Expr(s(Expr::Call(
           "puts".to_string(),
-          vec![Expr::Ident("x".to_string())]
-        ))],
-      })
+          vec![s(Expr::Ident("x".to_string()))]
+        ))))],
+      }))
     );
   }
 
@@ -1731,16 +1916,16 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::ForRange {
+      Item::Stmt(s(Stmt::ForRange {
         var: "i".to_string(),
-        start: Expr::Int(1),
-        end: Expr::Int(5),
+        start: s(Expr::Int(1)),
+        end: s(Expr::Int(5)),
         exclusive: false,
-        body: vec![Stmt::Expr(Expr::Call(
+        body: vec![s(Stmt::Expr(s(Expr::Call(
           "puts".to_string(),
-          vec![Expr::Ident("i".to_string())]
-        ))],
-      })
+          vec![s(Expr::Ident("i".to_string()))]
+        ))))],
+      }))
     );
   }
 
@@ -1750,16 +1935,16 @@ mod tests {
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::ForRange {
+      Item::Stmt(s(Stmt::ForRange {
         var: "i".to_string(),
-        start: Expr::Int(1),
-        end: Expr::Int(5),
+        start: s(Expr::Int(1)),
+        end: s(Expr::Int(5)),
         exclusive: true,
-        body: vec![Stmt::Expr(Expr::Call(
+        body: vec![s(Stmt::Expr(s(Expr::Call(
           "puts".to_string(),
-          vec![Expr::Ident("i".to_string())]
-        ))],
-      })
+          vec![s(Expr::Ident("i".to_string()))]
+        ))))],
+      }))
     );
   }
 
@@ -1787,71 +1972,83 @@ mod tests {
   fn elsif_chain_desugars_to_nested_if_in_else_branch() {
     let src = "if a\n  1\nelsif b\n  2\nelsif c\n  3\nelse\n  4\nend\n";
     let program = parse(src).unwrap();
-    let Item::Stmt(Stmt::If {
-      then_branch,
-      else_branch,
+    let Item::Stmt(Spanned {
+      node: Stmt::If {
+        then_branch,
+        else_branch,
+        ..
+      },
       ..
     }) = &program.items[0]
     else {
       panic!("expected a top-level If statement");
     };
-    assert_eq!(*then_branch, vec![Stmt::Expr(Expr::Int(1))]);
+    assert_eq!(*then_branch, vec![s(Stmt::Expr(s(Expr::Int(1))))]);
 
     // First elsif link.
     let Some(outer_else) = else_branch else {
       panic!("expected an else_branch from the first elsif");
     };
     assert_eq!(outer_else.len(), 1);
-    let Stmt::If {
-      then_branch: b2,
-      else_branch: e2,
+    let Spanned {
+      node: Stmt::If {
+        then_branch: b2,
+        else_branch: e2,
+        ..
+      },
       ..
     } = &outer_else[0]
     else {
       panic!("expected a nested If for the first elsif");
     };
-    assert_eq!(*b2, vec![Stmt::Expr(Expr::Int(2))]);
+    assert_eq!(*b2, vec![s(Stmt::Expr(s(Expr::Int(2))))]);
 
     // Second elsif link.
     let Some(inner_else) = e2 else {
       panic!("expected an else_branch from the second elsif");
     };
     assert_eq!(inner_else.len(), 1);
-    let Stmt::If {
-      then_branch: b3,
-      else_branch: e3,
+    let Spanned {
+      node: Stmt::If {
+        then_branch: b3,
+        else_branch: e3,
+        ..
+      },
       ..
     } = &inner_else[0]
     else {
       panic!("expected a nested If for the second elsif");
     };
-    assert_eq!(*b3, vec![Stmt::Expr(Expr::Int(3))]);
+    assert_eq!(*b3, vec![s(Stmt::Expr(s(Expr::Int(3))))]);
 
     // Trailing plain else.
-    assert_eq!(*e3, Some(vec![Stmt::Expr(Expr::Int(4))]));
+    assert_eq!(*e3, Some(vec![s(Stmt::Expr(s(Expr::Int(4))))]));
   }
 
   #[test]
   fn unless_desugars_to_if_not() {
     let src = "unless x > 0\n  return 0\nend\n";
     let program = parse(src).unwrap();
-    let Item::Stmt(Stmt::If {
-      cond,
-      then_branch,
-      else_branch,
+    let Item::Stmt(Spanned {
+      node: Stmt::If {
+        cond,
+        then_branch,
+        else_branch,
+      },
+      ..
     }) = &program.items[0]
     else {
       panic!("expected an If statement");
     };
     assert_eq!(
       *cond,
-      Expr::Not(Box::new(Expr::Compare(
-        Box::new(Expr::Ident("x".to_string())),
+      Expr::Not(Box::new(s(Expr::Compare(
+        Box::new(s(Expr::Ident("x".to_string()))),
         CompareOp::Gt,
-        Box::new(Expr::Int(0)),
-      )))
+        Box::new(s(Expr::Int(0))),
+      ))))
     );
-    assert_eq!(*then_branch, vec![Stmt::Return(Some(Expr::Int(0)))]);
+    assert_eq!(*then_branch, vec![s(Stmt::Return(Some(s(Expr::Int(0)))))]);
     assert_eq!(*else_branch, None);
   }
 
@@ -1859,23 +2056,27 @@ mod tests {
   fn until_desugars_to_while_not() {
     let src = "until i >= 3\n  puts i\nend\n";
     let program = parse(src).unwrap();
-    let Item::Stmt(Stmt::While { cond, body }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::While { cond, body },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a While statement");
     };
     assert_eq!(
       *cond,
-      Expr::Not(Box::new(Expr::Compare(
-        Box::new(Expr::Ident("i".to_string())),
+      Expr::Not(Box::new(s(Expr::Compare(
+        Box::new(s(Expr::Ident("i".to_string()))),
         CompareOp::Ge,
-        Box::new(Expr::Int(3)),
-      )))
+        Box::new(s(Expr::Int(3))),
+      ))))
     );
     assert_eq!(
       *body,
-      vec![Stmt::Expr(Expr::Call(
+      vec![s(Stmt::Expr(s(Expr::Call(
         "puts".to_string(),
-        vec![Expr::Ident("i".to_string())]
-      ))]
+        vec![s(Expr::Ident("i".to_string()))]
+      ))))]
     );
   }
 
@@ -1900,8 +2101,11 @@ mod tests {
     assert_eq!(
       *value,
       Expr::BitOr(
-        Box::new(Expr::Int(1)),
-        Box::new(Expr::BitAnd(Box::new(Expr::Int(2)), Box::new(Expr::Int(3)))),
+        Box::new(s(Expr::Int(1))),
+        Box::new(s(Expr::BitAnd(
+          Box::new(s(Expr::Int(2))),
+          Box::new(s(Expr::Int(3)))
+        ))),
       )
     );
   }
@@ -1916,8 +2120,11 @@ mod tests {
     assert_eq!(
       *value,
       Expr::BitAnd(
-        Box::new(Expr::Shl(Box::new(Expr::Int(1)), Box::new(Expr::Int(2)))),
-        Box::new(Expr::Int(3)),
+        Box::new(s(Expr::Shl(
+          Box::new(s(Expr::Int(1))),
+          Box::new(s(Expr::Int(2)))
+        ))),
+        Box::new(s(Expr::Int(3))),
       )
     );
   }
@@ -1932,12 +2139,12 @@ mod tests {
     assert_eq!(
       *value,
       Expr::Compare(
-        Box::new(Expr::BitAnd(
-          Box::new(Expr::Ident("flags".to_string())),
-          Box::new(Expr::Ident("flag".to_string())),
-        )),
+        Box::new(s(Expr::BitAnd(
+          Box::new(s(Expr::Ident("flags".to_string()))),
+          Box::new(s(Expr::Ident("flag".to_string()))),
+        ))),
         CompareOp::Eq,
-        Box::new(Expr::Ident("flag".to_string())),
+        Box::new(s(Expr::Ident("flag".to_string()))),
       )
     );
   }
@@ -1947,25 +2154,38 @@ mod tests {
     let src = "x: Int64 = ~0\ny: Int64 = ~x + 1\n";
     let program = parse(src).unwrap();
     assert_eq!(program.items.len(), 2);
-    let Item::Stmt(Stmt::Let { value: v0, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value: v0, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a Let statement");
     };
-    assert_eq!(*v0, Expr::BitNot(Box::new(Expr::Int(0))));
-    let Item::Stmt(Stmt::Let { value: v1, .. }) = &program.items[1] else {
+    assert_eq!(*v0, Expr::BitNot(Box::new(s(Expr::Int(0)))));
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value: v1, .. },
+      ..
+    }) = &program.items[1]
+    else {
       panic!("expected a Let statement");
     };
     assert_eq!(
       *v1,
       Expr::Add(
-        Box::new(Expr::BitNot(Box::new(Expr::Ident("x".to_string())))),
-        Box::new(Expr::Int(1)),
+        Box::new(s(Expr::BitNot(Box::new(s(Expr::Ident("x".to_string())))))),
+        Box::new(s(Expr::Int(1))),
       )
     );
   }
 
   fn as_let(program: &Program) -> &Stmt {
     match &program.items[0] {
-      Item::Stmt(s @ Stmt::Let { .. }) => s,
+      Item::Stmt(
+        spanned @ Spanned {
+          node: Stmt::Let { .. },
+          ..
+        },
+      ) => &spanned.node,
       other => panic!("expected a Let statement, got {other:?}"),
     }
   }
@@ -2010,22 +2230,22 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Let {
+      Item::Stmt(s(Stmt::Let {
         name: "s".into(),
         ty: "String".into(),
-        value: Expr::StringLit("hello".into()),
-      })
+        value: s(Expr::StringLit("hello".into())),
+      }))
     );
     assert_eq!(
       program.items[1],
-      Item::Stmt(Stmt::Let {
+      Item::Stmt(s(Stmt::Let {
         name: "a".into(),
         ty: "String".into(),
-        value: Expr::Add(
-          Box::new(Expr::StringLit("foo".into())),
-          Box::new(Expr::StringLit("bar".into()))
-        ),
-      })
+        value: s(Expr::Add(
+          Box::new(s(Expr::StringLit("foo".into()))),
+          Box::new(s(Expr::StringLit("bar".into())))
+        )),
+      }))
     );
   }
 
@@ -2117,7 +2337,11 @@ mod tests {
   fn nullable_suffix_parses_into_a_compound_type_string() {
     let src = "g: Greeter? = nil\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Let { ty, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a Let, got {:?}", program.items[0]);
     };
     assert_eq!(ty, "Greeter?");
@@ -2127,13 +2351,17 @@ mod tests {
   fn safe_call_parses_to_expr_safe_call() {
     let src = "message: String? = g&.shout\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a Let, got {:?}", program.items[0]);
     };
     assert_eq!(
       *value,
       Expr::SafeCall(
-        Box::new(Expr::Ident("g".to_string())),
+        Box::new(s(Expr::Ident("g".to_string()))),
         "shout".to_string(),
         vec![]
       )
@@ -2144,15 +2372,19 @@ mod tests {
   fn safe_call_with_args_parses_to_expr_safe_call() {
     let src = "x: Int64? = g&.add(1, 2)\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a Let, got {:?}", program.items[0]);
     };
     assert_eq!(
       *value,
       Expr::SafeCall(
-        Box::new(Expr::Ident("g".to_string())),
+        Box::new(s(Expr::Ident("g".to_string()))),
         "add".to_string(),
-        vec![Expr::Int(1), Expr::Int(2)]
+        vec![s(Expr::Int(1)), s(Expr::Int(2))]
       )
     );
   }
@@ -2161,13 +2393,17 @@ mod tests {
   fn ordinary_dot_method_call_still_parses_to_expr_method_call_unchanged() {
     let src = "x: Int64 = g.shout\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a Let, got {:?}", program.items[0]);
     };
     assert_eq!(
       *value,
       Expr::MethodCall(
-        Box::new(Expr::Ident("g".to_string())),
+        Box::new(s(Expr::Ident("g".to_string()))),
         "shout".to_string(),
         vec![]
       )
@@ -2180,10 +2416,10 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[1],
-      Item::Stmt(Stmt::OrAssign {
+      Item::Stmt(s(Stmt::OrAssign {
         name: "message".to_string(),
-        default: Expr::StringLit("nobody here".to_string()),
-      })
+        default: s(Expr::StringLit("nobody here".to_string())),
+      }))
     );
   }
 
@@ -2193,13 +2429,13 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[1],
-      Item::Stmt(Stmt::AndAssign {
+      Item::Stmt(s(Stmt::AndAssign {
         name: "g".to_string(),
-        value: Expr::New(
+        value: s(Expr::New(
           "Greeter".to_string(),
-          vec![Expr::StringLit("upgraded".to_string())]
-        ),
-      })
+          vec![s(Expr::StringLit("upgraded".to_string()))]
+        )),
+      }))
     );
   }
 
@@ -2225,7 +2461,7 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::SymbolLit("foo".to_string())))
+      Item::Stmt(s(Stmt::Expr(s(Expr::SymbolLit("foo".to_string())))))
     );
   }
 
@@ -2235,11 +2471,11 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Let {
+      Item::Stmt(s(Stmt::Let {
         name: "x".to_string(),
         ty: "Symbol".to_string(),
-        value: Expr::SymbolLit("foo".to_string()),
-      })
+        value: s(Expr::SymbolLit("foo".to_string())),
+      }))
     );
   }
 
@@ -2249,11 +2485,11 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Let {
+      Item::Stmt(s(Stmt::Let {
         name: "x".to_string(),
         ty: "Int64".to_string(),
-        value: Expr::Int(1),
-      })
+        value: s(Expr::Int(1)),
+      }))
     );
   }
 
@@ -2261,14 +2497,18 @@ mod tests {
   fn symbol_keyed_hash_literal_parses() {
     let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82}\n";
     let program = parse(src).expect("should parse");
-    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
       panic!("expected a Let, got {:?}", program.items[0]);
     };
     assert_eq!(
       *value,
       Expr::HashLit(vec![
-        (Expr::SymbolLit("alice".to_string()), Expr::Int(90)),
-        (Expr::SymbolLit("bob".to_string()), Expr::Int(82)),
+        (s(Expr::SymbolLit("alice".to_string())), s(Expr::Int(90))),
+        (s(Expr::SymbolLit("bob".to_string())), s(Expr::Int(82))),
       ])
     );
   }
@@ -2292,15 +2532,15 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Let {
+      Item::Stmt(s(Stmt::Let {
         name: "content".to_string(),
         ty: "String".to_string(),
-        value: Expr::MethodCall(
-          Box::new(Expr::Ident("File".to_string())),
+        value: s(Expr::MethodCall(
+          Box::new(s(Expr::Ident("File".to_string()))),
           "read".to_string(),
-          vec![Expr::StringLit("x.txt".to_string())],
-        ),
-      })
+          vec![s(Expr::StringLit("x.txt".to_string()))],
+        )),
+      }))
     );
   }
 
@@ -2335,10 +2575,13 @@ mod tests {
     };
     assert_eq!(
       f.body,
-      vec![Stmt::Expr(Expr::Call(
+      vec![s(Stmt::Expr(s(Expr::Call(
         "assert".to_string(),
-        vec![Expr::Bool(true), Expr::StringLit("t.em:2".to_string())]
-      ))]
+        vec![
+          s(Expr::Bool(true)),
+          s(Expr::StringLit("t.em:2".to_string()))
+        ]
+      ))))]
     );
   }
 
@@ -2348,14 +2591,17 @@ mod tests {
     let program = parse_named(src, "math_test.em").expect("should parse");
     assert_eq!(
       program.items[0],
-      Item::Stmt(Stmt::Expr(Expr::Call(
+      Item::Stmt(s(Stmt::Expr(s(Expr::Call(
         "assert_eq".to_string(),
         vec![
-          Expr::Int(3),
-          Expr::Add(Box::new(Expr::Int(1)), Box::new(Expr::Int(1))),
-          Expr::StringLit("math_test.em:1".to_string()),
+          s(Expr::Int(3)),
+          s(Expr::Add(
+            Box::new(s(Expr::Int(1))),
+            Box::new(s(Expr::Int(1)))
+          )),
+          s(Expr::StringLit("math_test.em:1".to_string())),
         ]
-      )))
+      )))))
     );
   }
 
@@ -2365,10 +2611,21 @@ mod tests {
     // just top-level statements — this asserts on line 3.
     let src = "x: Int64 = 1\nif x == 1\n  assert(x == 1)\nend\n";
     let program = parse_named(src, "nested.em").expect("should parse");
-    let Item::Stmt(Stmt::If { then_branch, .. }) = &program.items[1] else {
+    let Item::Stmt(Spanned {
+      node: Stmt::If { then_branch, .. },
+      ..
+    }) = &program.items[1]
+    else {
       panic!("expected an if statement");
     };
-    let Stmt::Expr(Expr::Call(_, args)) = &then_branch[0] else {
+    let Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(_, args),
+        ..
+      }),
+      ..
+    } = &then_branch[0]
+    else {
       panic!("expected an assert call");
     };
     assert_eq!(args[1], Expr::StringLit("nested.em:3".to_string()));
@@ -2381,5 +2638,92 @@ mod tests {
     assert_eq!(program.items.len(), 2);
     assert!(matches!(program.items[0], Item::Test { .. }));
     assert!(matches!(program.items[1], Item::Test { .. }));
+  }
+
+  // Plan 22 (sema diagnostic spans) — leaf-ast-spans.
+
+  #[test]
+  fn add_rhs_span_points_at_the_real_second_b_not_the_parameter_or_the_whole_fn() {
+    // This plan's own concrete-proof program (Decision log): the `rhs`
+    // of `a + b` inside `add`'s body must carry the real byte offset of
+    // the *second* `b` in the source — the one actually used in `a +
+    // b`, not the first `b` (the `b: String` parameter declaration) and
+    // not some placeholder/whole-document span.
+    let src = "def add(a: Int64, b: String) -> Int64\n  a + b\nend";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    let Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Add(_, rhs),
+        ..
+      }),
+      ..
+    } = &f.body[0]
+    else {
+      panic!("expected `a + b` as add's only statement, got {:?}", f.body);
+    };
+    let second_b = src
+      .match_indices('b')
+      .nth(1)
+      .expect("source has two occurrences of 'b'")
+      .0;
+    assert_eq!(rhs.span, (second_b, second_b + 1));
+  }
+
+  #[test]
+  fn spans_are_non_degenerate_for_both_multi_and_single_character_tokens() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    let Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Add(lhs, rhs),
+        span: add_span,
+      }),
+      ..
+    } = &f.body[0]
+    else {
+      panic!("expected `a + b` as add's only statement, got {:?}", f.body);
+    };
+    // The whole `a + b` expression spans "a + b" — 5 real bytes, a
+    // genuinely multi-character span.
+    assert!(
+      add_span.1 > add_span.0,
+      "multi-character span must be non-degenerate: {add_span:?}"
+    );
+    assert_eq!(
+      *add_span,
+      (src.find("a + b").unwrap(), src.find("a + b").unwrap() + 5)
+    );
+    // `a` and `b` are each a single-character token: span.1 ==
+    // span.0 + 1, never wider and never degenerate (span.1 == span.0).
+    assert_eq!(lhs.span.1, lhs.span.0 + 1);
+    assert_eq!(rhs.span.1, rhs.span.0 + 1);
+  }
+
+  #[test]
+  fn parses_to_an_ast_structurally_equal_before_and_after_this_plan_modulo_spans() {
+    // Regression (AC3): every prior worked example in this file still
+    // parses; this one specifically proves a real, non-`FUNC_ONLY`
+    // program's `.node` shape survives completely unchanged — real
+    // spans differ per-node (never asserted equal to each other here),
+    // but `Spanned<T>`'s own `PartialEq` (node-only, see ast.rs) is
+    // exactly what makes this comparison possible without hand-deriving
+    // every nested byte offset.
+    let program = parse(HELLO_EM).expect("hello.em should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected the add function");
+    };
+    assert_eq!(
+      f.body,
+      vec![s(Stmt::Expr(s(Expr::Add(
+        Box::new(s(Expr::Ident("a".into()))),
+        Box::new(s(Expr::Ident("b".into())))
+      ))))]
+    );
   }
 }

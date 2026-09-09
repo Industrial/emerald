@@ -1,3 +1,77 @@
+/// Plan 22's Decision log: wraps every `Expr`/`Stmt` *position* with the
+/// real byte-offset span LALRPOP's own `@L`/`@R` markers compute at
+/// parse time — an outer wrapper around each node rather than a `span`
+/// field bolted onto every enum variant, so `infer_expr_type`/
+/// `check_stmt`/`build_expr`/`build_stmt` change their *signatures*
+/// (taking `&Spanned<Expr>`/`&Spanned<Stmt>`) but not their match arms'
+/// binding patterns. `Deref`/`DerefMut` to `T` keep `.node`-holding
+/// field access ergonomic at the (many) call sites that only ever
+/// wanted the node, never the span.
+#[derive(Debug, Clone)]
+pub struct Spanned<T> {
+  pub span: (usize, usize),
+  pub node: T,
+}
+
+/// Deliberately `node`-only, not `#[derive(PartialEq)]` — a real gap
+/// found implementing this plan, not the Decision log's original
+/// assumption: comments are skipped as lexer whitespace (`match {}`'s
+/// `r"#[^\n]*" => {}`), so `@L`/`@R` positions still shift by exactly a
+/// leading comment's length even though the parsed `Expr`/`Stmt` shape
+/// is identical either way. `trailing_and_leading_comments_dont_change_
+/// the_ast` (this crate's own existing regression test, predating this
+/// plan) asserts exactly that: two parses of comment-differing source
+/// produce an equal AST — comparing spans too would make that
+/// assertion fail on the equality it's specifically testing for.
+/// Comparing `node` only keeps `assert_eq!` a real structural check
+/// (this AST shape vs. that one) without conflating it with a
+/// byte-offset check no test in this codebase actually wants from
+/// `==` — a real span is still verified directly via `.span` wherever
+/// a test's whole point *is* the position (see `leaf-ast-spans`' own
+/// concrete-proof test).
+impl<T: PartialEq> PartialEq for Spanned<T> {
+  fn eq(&self, other: &Self) -> bool {
+    self.node == other.node
+  }
+}
+
+impl<T> std::ops::Deref for Spanned<T> {
+  type Target = T;
+  fn deref(&self) -> &T {
+    &self.node
+  }
+}
+
+impl<T> std::ops::DerefMut for Spanned<T> {
+  fn deref_mut(&mut self) -> &mut T {
+    &mut self.node
+  }
+}
+
+impl<T> Spanned<T> {
+  /// A synthetic node with no real source position — used only where
+  /// codegen/rewrite passes construct a brand-new `Expr`/`Stmt` that
+  /// was never actually written in source (e.g. the assert/assert_eq
+  /// desugaring pass's synthesized `if`/`raise`).
+  pub fn synthetic(node: T) -> Self {
+    Spanned { span: (0, 0), node }
+  }
+}
+
+/// Lets a test compare a real, parsed `Spanned<T>` directly against a
+/// bare `T` literal (`assert_eq!(*value, Expr::Int(10))`) without a
+/// `.node` accessor at every flat (non-nested) comparison site — there
+/// is no span on the bare-literal side to compare, so this compares
+/// `node` only. `std`'s own blanket impls (`&A: PartialEq<&B>`,
+/// `Vec<A>: PartialEq<Vec<B>>`, `Option<A>: PartialEq<Option<B>>`) then
+/// make `&Spanned<T>`/`Vec<Spanned<T>>`/`Option<Spanned<T>>` comparable
+/// to `&T`/`Vec<T>`/`Option<T>` the same way, for free.
+impl<T: PartialEq> PartialEq<T> for Spanned<T> {
+  fn eq(&self, other: &T) -> bool {
+    self.node == *other
+  }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
   pub name: String,
@@ -10,7 +84,7 @@ pub struct Param {
   /// can). Restricted to compile-time-evaluable literal tokens
   /// (`Int`/`Float`/`StringLit`/`Bool`/`Nil`) — never an arbitrary
   /// expression, and never a reference to another parameter.
-  pub default: Option<Expr>,
+  pub default: Option<Spanned<Expr>>,
 }
 
 /// Decodes a raw `"..."` token's `\"`/`\n` escapes into the literal's
@@ -45,7 +119,7 @@ pub fn decode_string_lit(raw: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StringPart {
   Literal(String),
-  Expr(Box<Expr>),
+  Expr(Box<Spanned<Expr>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,17 +161,17 @@ pub enum Expr {
   /// see `emerald-sema`'s `Type::Symbol` and `emerald-codegen`'s
   /// `ValKind::Symbol`.
   SymbolLit(String),
-  Add(Box<Expr>, Box<Expr>),
-  Sub(Box<Expr>, Box<Expr>),
-  Mul(Box<Expr>, Box<Expr>),
-  Div(Box<Expr>, Box<Expr>),
-  Rem(Box<Expr>, Box<Expr>),
-  Neg(Box<Expr>),
-  Not(Box<Expr>),
-  And(Box<Expr>, Box<Expr>),
-  Or(Box<Expr>, Box<Expr>),
-  Compare(Box<Expr>, CompareOp, Box<Expr>),
-  Call(String, Vec<Expr>),
+  Add(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  Sub(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  Mul(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  Div(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  Rem(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  Neg(Box<Spanned<Expr>>),
+  Not(Box<Spanned<Expr>>),
+  And(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  Or(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  Compare(Box<Spanned<Expr>>, CompareOp, Box<Spanned<Expr>>),
+  Call(String, Vec<Spanned<Expr>>),
   /// `f(name: value, ...)` (plan 39's Decision log) — a plain function
   /// call whose arguments are resolved entirely at compile time by
   /// name-to-position matching against the callee's declared parameter
@@ -106,34 +180,34 @@ pub enum Expr {
   /// call sites (mixing positional and keyword arguments in one call is
   /// out of scope) — a call with any `name:` argument parses as this
   /// node instead of `Expr::Call`.
-  CallKw(String, Vec<(String, Expr)>),
+  CallKw(String, Vec<(String, Spanned<Expr>)>),
   /// `ClassName.new(args)`.
-  New(String, Vec<Expr>),
+  New(String, Vec<Spanned<Expr>>),
   /// `receiver.method(args)` — `args` is empty for a bare `receiver.method`
   /// call (plan `08`'s Point example, `sum`/`initialize` never take
   /// arguments); plan `10` is the first to actually parse a non-empty
   /// argument list here.
-  MethodCall(Box<Expr>, String, Vec<Expr>),
+  MethodCall(Box<Spanned<Expr>>, String, Vec<Spanned<Expr>>),
   /// `receiver&.method(args)` (plan 43's Decision log) — kept distinct
   /// from `MethodCall`, not a reuse: sema's dispatch (nullable receiver
   /// only, pointer-representable return type only) and codegen (a real
   /// is-nil-guarded branch + PHI, producing a `U?` result) are both
   /// genuinely different, not just an evaluation-order variant of an
   /// ordinary call.
-  SafeCall(Box<Expr>, String, Vec<Expr>),
+  SafeCall(Box<Spanned<Expr>>, String, Vec<Spanned<Expr>>),
   /// `@name` — instance-variable read, valid only inside a method body.
   InstanceVar(String),
   /// `[e1, e2, ...]` — an array literal.
-  ArrayLit(Vec<Expr>),
+  ArrayLit(Vec<Spanned<Expr>>),
   /// `array[index]` — an indexed read.
-  Index(Box<Expr>, Box<Expr>),
+  Index(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
   /// `->(params) -> ReturnType { body }` — a lambda literal (plan `10`'s
   /// Decision log: by-value capture, top-level-`Let`-only, statically
   /// dispatched `.call`).
   Lambda {
     params: Vec<Param>,
     return_type: String,
-    body: Vec<Stmt>,
+    body: Vec<Spanned<Stmt>>,
   },
   /// `true`/`false` (plan 25's Decision log) — a real `Boolean` value,
   /// not just `Compare`'s byproduct.
@@ -143,23 +217,23 @@ pub enum Expr {
   Nil,
   /// `{k1 => v1, k2 => v2, ...}` (plan 25's Decision log) — `Int64`
   /// keys only, no `Symbol`-keyed `{a: 1}` shorthand.
-  HashLit(Vec<(Expr, Expr)>),
+  HashLit(Vec<(Spanned<Expr>, Spanned<Expr>)>),
   /// `Array.new(size)` (plan 25's Decision log) — a dedicated node, not
   /// a reuse of `Expr::New`, since `Array` is a reserved keyword, not a
   /// class name in the class registry.
-  ArrayNew(Box<Expr>),
+  ArrayNew(Box<Spanned<Expr>>),
   /// `a & b` (plan 28's Decision log) — `Int64`-only bitwise AND.
-  BitAnd(Box<Expr>, Box<Expr>),
+  BitAnd(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
   /// `a | b` — `Int64`-only bitwise OR.
-  BitOr(Box<Expr>, Box<Expr>),
+  BitOr(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
   /// `a ^ b` — `Int64`-only bitwise XOR.
-  BitXor(Box<Expr>, Box<Expr>),
+  BitXor(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
   /// `~a` — `Int64`-only bitwise NOT.
-  BitNot(Box<Expr>),
+  BitNot(Box<Spanned<Expr>>),
   /// `a << b` — `Int64`-only left shift.
-  Shl(Box<Expr>, Box<Expr>),
+  Shl(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
   /// `a >> b` — `Int64`-only arithmetic (signed) right shift.
-  Shr(Box<Expr>, Box<Expr>),
+  Shr(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
 }
 
 /// One statement in a block (a function body or the program's top level).
@@ -168,20 +242,20 @@ pub enum Stmt {
   Let {
     name: String,
     ty: String,
-    value: Expr,
+    value: Spanned<Expr>,
   },
   /// `@name = value` — instance-variable write, valid only inside a
   /// method body. No type annotation (the field's type is already
   /// declared on the class), unlike `Let`.
   SetField {
     name: String,
-    value: Expr,
+    value: Spanned<Expr>,
   },
   /// `array[index] = value` — an indexed write.
   SetIndex {
-    array: Expr,
-    index: Expr,
-    value: Expr,
+    array: Spanned<Expr>,
+    index: Spanned<Expr>,
+    value: Spanned<Expr>,
   },
   /// `name = value` — reassignment of an already-declared plain local,
   /// no type annotation restated (plan 31's Decision log: the
@@ -192,7 +266,7 @@ pub enum Stmt {
   /// already present in scope — this is never a fresh declaration.
   Assign {
     name: String,
-    value: Expr,
+    value: Spanned<Expr>,
   },
   /// `n1, n2, ... = v1, v2, ...` — fixed-arity multiple assignment over
   /// already-declared plain locals (plan 31's Decision log: no fresh
@@ -202,25 +276,25 @@ pub enum Stmt {
   /// swap (`a, b = b, a`).
   MultiAssign {
     names: Vec<String>,
-    values: Vec<Expr>,
+    values: Vec<Spanned<Expr>>,
   },
   If {
-    cond: Expr,
-    then_branch: Vec<Stmt>,
-    else_branch: Option<Vec<Stmt>>,
+    cond: Spanned<Expr>,
+    then_branch: Vec<Spanned<Stmt>>,
+    else_branch: Option<Vec<Spanned<Stmt>>>,
   },
   While {
-    cond: Expr,
-    body: Vec<Stmt>,
+    cond: Spanned<Expr>,
+    body: Vec<Spanned<Stmt>>,
   },
-  Return(Option<Expr>),
+  Return(Option<Spanned<Expr>>),
   Break,
   Next,
-  Expr(Expr),
+  Expr(Spanned<Expr>),
   /// `raise <expr>` — `expr` must evaluate to a class instance (plan
   /// `11`'s Decision log: in practice always a direct `ClassName.new(args)`
   /// call, the only shape codegen supports).
-  Raise(Expr),
+  Raise(Spanned<Expr>),
   /// `begin body rescue Type => e ... [rescue => e2 ...] [ensure ...]
   /// end` (plan 38's Decision log) — one or more `rescue` clauses tried
   /// in source order (subtype-aware: a clause naming a superclass
@@ -230,9 +304,9 @@ pub enum Stmt {
   /// re-raise path alike). Generalizes plan 11's original single-typed-
   /// clause, no-`ensure` shape (`rescues.len() == 1`, `ensure: None`).
   Begin {
-    body: Vec<Stmt>,
+    body: Vec<Spanned<Stmt>>,
     rescues: Vec<RescueClause>,
-    ensure: Option<Vec<Stmt>>,
+    ensure: Option<Vec<Spanned<Stmt>>>,
   },
   /// `case scrutinee when v1, v2 ... when v3 ... else ... end` (plan
   /// 20's Decision log): value-match via the same `CompareOp::Eq`
@@ -243,9 +317,9 @@ pub enum Stmt {
   /// matches if the scrutinee equals *any* of them. First matching arm
   /// wins, source order, matching Ruby's own semantics.
   Case {
-    scrutinee: Expr,
-    arms: Vec<(Vec<Expr>, Vec<Stmt>)>,
-    else_body: Option<Vec<Stmt>>,
+    scrutinee: Spanned<Expr>,
+    arms: Vec<CaseArm>,
+    else_body: Option<Vec<Spanned<Stmt>>>,
   },
   /// `for var in [e1, e2, ...] body end` (plan 30's Decision log) —
   /// `elements` is restricted to a literal array at the grammar level
@@ -256,8 +330,8 @@ pub enum Stmt {
   /// already proved.
   For {
     var: String,
-    elements: Vec<Expr>,
-    body: Vec<Stmt>,
+    elements: Vec<Spanned<Expr>>,
+    body: Vec<Spanned<Stmt>>,
   },
   /// `yield <args>` (plan 34's Decision log) — legal only inside a
   /// function that declares `Function.block_param`. Codegen lowers this
@@ -265,7 +339,7 @@ pub enum Stmt {
   /// fresh per call site that attaches a literal block, and each
   /// `Stmt::Yield` becomes a direct call to that block's synthesized
   /// function — never an indirect/first-class call.
-  Yield(Vec<Expr>),
+  Yield(Vec<Spanned<Expr>>),
   /// `for var in start..end body end` (`exclusive: false`) or
   /// `start...end` (`exclusive: true`) — plan 37's Decision log: no
   /// first-class `Range` value exists anywhere (this shape only ever
@@ -275,10 +349,10 @@ pub enum Stmt {
   /// before the loop begins, not just literals.
   ForRange {
     var: String,
-    start: Expr,
-    end: Expr,
+    start: Spanned<Expr>,
+    end: Spanned<Expr>,
     exclusive: bool,
-    body: Vec<Stmt>,
+    body: Vec<Spanned<Stmt>>,
   },
   /// `retry` (plan 38's Decision log) — legal only inside a `rescue`
   /// clause's own body (not the `begin`'s try body, not `ensure`),
@@ -298,7 +372,7 @@ pub enum Stmt {
   /// unconditionally `inner`-typed).
   OrAssign {
     name: String,
-    default: Expr,
+    default: Spanned<Expr>,
   },
   /// `name &&= value` (plan 43's Decision log) — assign `value` only if
   /// `name`'s current value is non-nil; the asymmetric twin of
@@ -306,9 +380,14 @@ pub enum Stmt {
   /// nil-and-skipped branch leaves it exactly as nilable as before).
   AndAssign {
     name: String,
-    value: Expr,
+    value: Spanned<Expr>,
   },
 }
+
+/// One `when v1, v2, ... body` arm of a `Stmt::Case` (plan 22's
+/// Decision log — named to keep `arms`' field type out of clippy's
+/// `type_complexity` lint, not a new AST concept).
+pub type CaseArm = (Vec<Spanned<Expr>>, Vec<Spanned<Stmt>>);
 
 /// One `rescue` clause of a `Stmt::Begin` (plan 38's Decision log).
 /// `class_name: None` is a bare `rescue => e` catch-all — matches
@@ -318,7 +397,7 @@ pub enum Stmt {
 pub struct RescueClause {
   pub class_name: Option<String>,
   pub var: String,
-  pub body: Vec<Stmt>,
+  pub body: Vec<Spanned<Stmt>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -326,7 +405,7 @@ pub struct Function {
   pub name: String,
   pub params: Vec<Param>,
   pub return_type: String,
-  pub body: Vec<Stmt>,
+  pub body: Vec<Spanned<Stmt>>,
   /// `&blk` in the parameter list (plan 34's Decision log) — a bare
   /// name, not a `Param`: unlike an ordinary parameter, its type can't
   /// be pinned at the function's own declaration site (no first-class
@@ -421,7 +500,7 @@ pub enum Item {
   /// general, user-declarable grammar production, not a fourth
   /// hardcoded builtin the way `Array`/`Hash`/`Proc` are.
   Interface(InterfaceDef),
-  Stmt(Stmt),
+  Stmt(Spanned<Stmt>),
   /// `require <path>` (plan 23's Decision log) — a bare, unquoted,
   /// `/`-separated path (no string-literal syntax dependency), always
   /// relative to the *containing* file, `.em` implied. Reachable only
@@ -446,7 +525,7 @@ pub enum Item {
   /// `Program` containing one.
   Test {
     description: String,
-    body: Vec<Stmt>,
+    body: Vec<Spanned<Stmt>>,
   },
   /// A top-level construct LALRPOP's `!` error-recovery mechanism
   /// resynchronized past (plan 26's Decision log) — a real parse error

@@ -21,7 +21,7 @@ pub fn run(args: &[String]) {
   let output_path = std::env::temp_dir().join(format!("emerald_test_bin_{}", process::id()));
 
   if let Err(e) = emerald_driver::compile_test(&source, source_path, &output_path) {
-    crate::report_driver_error(e);
+    crate::report_driver_error(e, Some((source_path, &source)));
     process::exit(1);
   }
 

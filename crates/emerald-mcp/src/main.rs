@@ -48,10 +48,10 @@ struct CheckDiagnostic {
   /// "parse" or "sema".
   kind: &'static str,
   message: String,
-  /// 1-based line; `None` for sema diagnostics — `emerald_sema::Diagnostic`
-  /// carries no span at all (a real, disclosed pre-existing gap).
+  /// 1-based line; `None` only for "internal" diagnostics (codegen/link
+  /// failures, which carry no source position at all).
   line: Option<usize>,
-  /// 1-based byte column; `None` for sema diagnostics.
+  /// 1-based byte column; `None` only for "internal" diagnostics.
   column: Option<usize>,
 }
 
@@ -76,16 +76,17 @@ fn parse_diagnostic<E: miette::Diagnostic + std::fmt::Display>(
   }
 }
 
-/// Takes the message by value rather than naming `emerald_sema::Diagnostic`
-/// directly — this crate doesn't otherwise need `emerald-sema` as a
-/// dependency, since `emerald_driver::DriverError` already re-exports it
-/// structurally.
-fn sema_diagnostic(message: String) -> CheckDiagnostic {
+/// Takes the message and span by value rather than naming
+/// `emerald_sema::Diagnostic` directly — this crate doesn't otherwise
+/// need `emerald-sema` as a dependency, since `emerald_driver::DriverError`
+/// already re-exports it structurally.
+fn sema_diagnostic(source: &str, message: String, span: (usize, usize)) -> CheckDiagnostic {
+  let (line, column) = offset_to_line_col(source, span.0);
   CheckDiagnostic {
     kind: "sema",
     message,
-    line: None,
-    column: None,
+    line: Some(line),
+    column: Some(column),
   }
 }
 
@@ -228,7 +229,7 @@ impl EmeraldServer {
 #[tool_router]
 impl EmeraldServer {
   #[tool(
-    description = "Parse and type-check Emerald source text in memory. Returns structured diagnostics: parse errors carry a real line/column, sema errors carry only a message (emerald-sema has no span tracking yet — a disclosed gap). Empty diagnostics means the source compiles cleanly."
+    description = "Parse and type-check Emerald source text in memory. Returns structured diagnostics with a real 1-based line/column for both parse and sema errors. Empty diagnostics means the source compiles cleanly."
   )]
   async fn check_source(
     &self,
@@ -242,7 +243,7 @@ impl EmeraldServer {
         .collect(),
       Err(DriverError::Sema(diags)) => diags
         .iter()
-        .map(|d| sema_diagnostic(d.message.clone()))
+        .map(|d| sema_diagnostic(&req.source, d.message.clone(), d.span))
         .collect(),
       // `check()` only ever parses + type-checks — codegen/link are
       // unreachable here, but the match must stay exhaustive.
@@ -313,7 +314,7 @@ impl EmeraldServer {
         stderr: None,
         diagnostics: diags
           .iter()
-          .map(|d| sema_diagnostic(d.message.clone()))
+          .map(|d| sema_diagnostic(&req.source, d.message.clone(), d.span))
           .collect(),
       },
       Err(DriverError::Codegen(e)) => CompileAndRunResponse {

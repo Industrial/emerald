@@ -456,7 +456,15 @@ pub fn check_diagnostics(text: &str) -> Vec<Diagnostic> {
     }
     Err(emerald_driver::DriverError::Sema(diags)) => diags
       .iter()
-      .map(|d| whole_document_diagnostic(text, &d.message))
+      .map(|d| Diagnostic {
+        range: Range {
+          start: offset_to_position(text, d.span.0),
+          end: offset_to_position(text, d.span.1.max(d.span.0 + 1)),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: d.message.clone(),
+        ..Default::default()
+      })
       .collect(),
     // `check()` only ever parses + type-checks — codegen/link are
     // unreachable here, but the match must stay exhaustive.
@@ -486,27 +494,6 @@ fn parse_diagnostic<E: miette::Diagnostic + std::fmt::Display>(e: &E, text: &str
     message,
     ..Default::default()
   }
-}
-
-/// `emerald_sema::Diagnostic` carries no span at all (a real,
-/// pre-existing, disclosed gap — plan 13's own deferral) — anchored at
-/// the whole document instead of fabricating a precise range.
-fn whole_document_diagnostic(text: &str, message: &str) -> Diagnostic {
-  Diagnostic {
-    range: Range {
-      start: Position::new(0, 0),
-      end: end_of_document(text),
-    },
-    severity: Some(DiagnosticSeverity::ERROR),
-    message: message.to_string(),
-    ..Default::default()
-  }
-}
-
-fn end_of_document(text: &str) -> Position {
-  let last_line = text.lines().count().saturating_sub(1) as u32;
-  let last_line_text = text.lines().last().unwrap_or("");
-  Position::new(last_line, utf16_len(last_line_text))
 }
 
 /// Converts a byte offset to an LSP `Position` — LSP columns are

@@ -39,7 +39,43 @@ fn report_error(e: CliError) {
   }
 }
 
-pub(crate) fn report_driver_error(e: DriverError) {
+/// Plan 22's `leaf-span-rendering`: a `Diagnostic`'s real byte span,
+/// wrapped exactly like `emerald_parser::ParseError` (plan 13) so it
+/// renders through the same miette `fancy` graphical handler — a
+/// source snippet plus a caret, not a bare one-line message. `source`
+/// is `Some((name, text))` only where a single coherent source string
+/// actually exists for the whole checked `Program` — `run_legacy`'s
+/// single-file path, not `cmd_build`'s multi-file `require`-spliced
+/// one (a real, disclosed gap: a `require`-spliced program has no one
+/// source string byte offsets index into, so that path keeps today's
+/// plain-text rendering unchanged).
+#[derive(Debug)]
+struct SemaError {
+  message: String,
+  src: miette::NamedSource<String>,
+  span: miette::SourceSpan,
+}
+
+impl std::fmt::Display for SemaError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}", self.message)
+  }
+}
+
+impl std::error::Error for SemaError {}
+
+impl miette::Diagnostic for SemaError {
+  fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+    Some(&self.src)
+  }
+  fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+    Some(Box::new(std::iter::once(
+      miette::LabeledSpan::new_with_span(Some("here".to_string()), self.span),
+    )))
+  }
+}
+
+pub(crate) fn report_driver_error(e: DriverError, source: Option<(&str, &str)>) {
   match e {
     // `ParseError` implements `miette::Diagnostic` (plan 13) — its
     // `{:?}` rendering, via miette's `fancy`-feature graphical
@@ -54,7 +90,17 @@ pub(crate) fn report_driver_error(e: DriverError) {
     }
     DriverError::Sema(diags) => {
       for d in &diags {
-        eprintln!("error: {}", d.message);
+        match source {
+          Some((name, text)) => {
+            let report = SemaError {
+              message: d.message.clone(),
+              src: miette::NamedSource::new(name, text.to_string()),
+              span: (d.span.0, d.span.1.saturating_sub(d.span.0).max(1)).into(),
+            };
+            eprintln!("{:?}", miette::Report::new(report));
+          }
+          None => eprintln!("error: {}", d.message),
+        }
       }
     }
     DriverError::Codegen(e) => eprintln!("codegen error: {e}"),
@@ -107,7 +153,7 @@ fn run_legacy(args: &[String]) {
   });
 
   if let Err(e) = emerald_driver::compile(&source, source_path, &output_path) {
-    report_driver_error(e);
+    report_driver_error(e, Some((source_path, &source)));
     process::exit(1);
   }
 }
@@ -195,7 +241,10 @@ fn cmd_build() -> PathBuf {
 
   let output_path = cwd.join(&manifest.package.name);
   if let Err(e) = emerald_driver::compile_program(program, &output_path) {
-    report_driver_error(e);
+    // No single coherent source string exists for a `require`-spliced
+    // `Program` (see `report_driver_error`'s own doc comment) — plain
+    // text, unchanged.
+    report_driver_error(e, None);
     process::exit(1);
   }
 

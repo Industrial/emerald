@@ -1,6 +1,6 @@
 use crate::ast::{
-  ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
-  RescueClause, Stmt, TypeParam,
+  CaseArm, ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
+  RescueClause, Spanned, Stmt, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -112,7 +112,7 @@ ClassField: (Param, Vec<Function>) = {
       name: p.name.clone(),
       params: vec![],
       return_type: p.ty.clone(),
-      body: vec![Stmt::Expr(Expr::InstanceVar(p.name.clone()))],
+      body: vec![Spanned::synthetic(Stmt::Expr(Spanned::synthetic(Expr::InstanceVar(p.name.clone()))))],
       block_param: None,
       splat_param: None,
       type_params: Vec::new(),
@@ -265,13 +265,13 @@ FuncParam: Param = {
   <name:Ident> ":" <ty:TypeName> "=" <d:DefaultLit> => Param { name, ty, default: Some(d) },
 };
 
-DefaultLit: Expr = {
-  <n:Num> => Expr::Int(n),
-  <f:FloatLit> => Expr::Float(f),
-  <s:StringLitTok> => Expr::StringLit(decode_string_lit(&s)),
-  "true" => Expr::Bool(true),
-  "false" => Expr::Bool(false),
-  "nil" => Expr::Nil,
+DefaultLit: Spanned<Expr> = {
+  <l:@L> <n:Num> <r:@R> => Spanned { span: (l, r), node: Expr::Int(n) },
+  <l:@L> <f:FloatLit> <r:@R> => Spanned { span: (l, r), node: Expr::Float(f) },
+  <l:@L> <s:StringLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::StringLit(decode_string_lit(&s)) },
+  <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
+  <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
+  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
 };
 
 SplatParam: Param = {
@@ -282,7 +282,7 @@ SplatParam: Param = {
 // (mirrors `CaseValues`/`YieldArgs`) — at least one keyword argument,
 // since a zero-argument call already parses via the ordinary `Args`
 // path (`Expr::Call`), never this one.
-CallKwArgs: Vec<(String, Expr)> = {
+CallKwArgs: Vec<(String, Spanned<Expr>)> = {
   <n:Ident> ":" <e:Expr> => vec![(n, e)],
   <n:Ident> ":" <e:Expr> "," <rest:CallKwArgs> => {
     let mut v = vec![(n, e)];
@@ -296,66 +296,76 @@ CallKwArgs: Vec<(String, Expr)> = {
 // rule alongside a general "bare Expr statement" rule is a genuine
 // LALR(1) shift/reduce conflict when both start with Ident; reserving the
 // one builtin this compiler has sidesteps it entirely.
-Stmt: Stmt = {
-  <name:Ident> ":" <ty:TypeName> "=" <value:Expr> => Stmt::Let { name, ty, value },
-  "if" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" => Stmt::If { cond, then_branch, else_branch },
-  "while" <cond:Expr> <body:Stmt*> "end" => Stmt::While { cond, body },
+// Plan 22's Decision log: every alternative below captures its own
+// `<l:@L> ... <r:@R>` and wraps its `Stmt::Variant{...}` result in
+// `Spanned { span: (l, r), node: ... }` — the statement's span always
+// covers the whole statement (keyword through terminator), the honest
+// fallback described in the Decision log for statements with no
+// better sub-expression to blame more precisely (`break`/`next`/
+// `retry` in particular). A desugared sub-expression an action
+// synthesizes itself (`unless`'s `Expr::Not`, a compound assignment's
+// `Expr::Add`/etc.) reuses this same outer `(l, r)` span — there's no
+// real source text for just the synthesized node to point at instead.
+Stmt: Spanned<Stmt> = {
+  <l:@L> <name:Ident> ":" <ty:TypeName> "=" <value:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Let { name, ty, value } },
+  <l:@L> "if" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If { cond, then_branch, else_branch } },
+  <l:@L> "while" <cond:Expr> <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While { cond, body } },
   // Plan 29: pure parse-time desugaring — no new AST shape, just the
   // condition wrapped in plan 18's `Expr::Not` (see the Decision log).
   // Reuses `ElseClause` as-is, so `unless ... else ... end` falls out
   // for free.
-  "unless" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" => Stmt::If {
-    cond: Expr::Not(Box::new(cond)),
+  <l:@L> "unless" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If {
+    cond: Spanned { span: (l, r), node: Expr::Not(Box::new(cond)) },
     then_branch,
     else_branch,
-  },
-  "until" <cond:Expr> <body:Stmt*> "end" => Stmt::While {
-    cond: Expr::Not(Box::new(cond)),
+  }},
+  <l:@L> "until" <cond:Expr> <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While {
+    cond: Spanned { span: (l, r), node: Expr::Not(Box::new(cond)) },
     body,
-  },
+  }},
   // Plan 30: deliberately mirrors `PrimaryExpr`'s own `"[" Args "]"`
   // array-literal shape rather than accepting an arbitrary `Expr`
   // scrutinee, so `for x in arr` (a bare identifier) is a parse error,
   // not deferred to sema — see the Decision log's scope cut.
-  "for" <var:Ident> "in" "[" <elements:Args> "]" <body:Stmt*> "end" => Stmt::For {
+  <l:@L> "for" <var:Ident> "in" "[" <elements:Args> "]" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::For {
     var,
     elements,
     body,
-  },
+  }},
   // Plan 37: no first-class `Range` value — `..`/`...` are grammar-
   // restricted to appear only directly after a `for <var> in`
   // scrutinee, mirroring plan 30's own array-literal-only restriction
   // immediately above. LALRPOP's literal-terminal tokenizer resolves
   // `"..."` vs `".."` vs the pre-existing single `"."` token by
   // longest-match, so no `match {}` priority reordering is needed.
-  "for" <var:Ident> "in" <start:Expr> ".." <end:Expr> <body:Stmt*> "end" => Stmt::ForRange {
+  <l:@L> "for" <var:Ident> "in" <start:Expr> ".." <end:Expr> <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::ForRange {
     var,
     start,
     end,
     exclusive: false,
     body,
-  },
-  "for" <var:Ident> "in" <start:Expr> "..." <end:Expr> <body:Stmt*> "end" => Stmt::ForRange {
+  }},
+  <l:@L> "for" <var:Ident> "in" <start:Expr> "..." <end:Expr> <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::ForRange {
     var,
     start,
     end,
     exclusive: true,
     body,
-  },
+  }},
   // Requires a value (no bare `return;`) — `<e:Expr?>` here is genuinely
   // LALR(1)-ambiguous: with no significant newlines (plan 04's
   // simplification), the parser can't tell "return" (empty, followed by a
   // new Expr-statement) from "return <expr>" (one statement) when the
   // next token can start an Expr either way. Bare Void-returning `return`
   // is deferred until source-line significance is added.
-  "return" <e:Expr> => Stmt::Return(Some(e)),
-  "break" => Stmt::Break,
-  "next" => Stmt::Next,
-  "puts" <arg:Expr> => Stmt::Expr(Expr::Call("puts".to_string(), vec![arg])),
+  <l:@L> "return" <e:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Return(Some(e)) },
+  <l:@L> "break" <r:@R> => Spanned { span: (l, r), node: Stmt::Break },
+  <l:@L> "next" <r:@R> => Spanned { span: (l, r), node: Stmt::Next },
+  <l:@L> "puts" <arg:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Expr(Spanned { span: (l, r), node: Expr::Call("puts".to_string(), vec![arg]) }) },
   // Same "always requires a value" shape as `return` above, same reason
   // (no bare `<e:Expr?>` — genuinely LALR(1)-ambiguous with no
   // significant newlines).
-  "raise" <e:Expr> => Stmt::Raise(e),
+  <l:@L> "raise" <e:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Raise(e) },
   // Plan 34: `yield <args>` — legal only inside a function declaring
   // `Function.block_param` (sema's job, not the grammar's). Uses
   // `YieldArgs`, NOT the ordinary `Args` (which can derive zero
@@ -366,31 +376,31 @@ Stmt: Stmt = {
   // fresh Expr-statement from "yield <expr>" whenever the next token
   // can start an Expr either way — a real, disclosed narrowing versus
   // Ruby's own bare zero-arg `yield`, not attempted here.
-  "yield" <args:YieldArgs> => Stmt::Yield(args),
+  <l:@L> "yield" <args:YieldArgs> <r:@R> => Spanned { span: (l, r), node: Stmt::Yield(args) },
   // Plan 38: one or more `rescue` clauses (subtype-aware matching,
   // source order — sema/codegen's job, not the grammar's), an optional
   // trailing `ensure`. `"rescue"`/`"ensure"` can't start a `Stmt`, so
   // `body`'s `Stmt*` unambiguously stops at the next `"rescue"`, the
   // same way `"end"`/`"else"` already terminate other `Stmt*` blocks.
-  "begin" <body:Stmt*> <rescues:RescueClause+> <ensure:EnsureClause?> "end" => Stmt::Begin {
+  <l:@L> "begin" <body:Stmt*> <rescues:RescueClause+> <ensure:EnsureClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::Begin {
     body,
     rescues,
     ensure,
-  },
+  }},
   // Plan 38: legal only inside a `rescue` clause's own body — sema's
   // job, not the grammar's, exactly like `break`/`next`'s in-loop
   // restriction.
-  "retry" => Stmt::Retry,
+  <l:@L> "retry" <r:@R> => Spanned { span: (l, r), node: Stmt::Retry },
   // Plan 20: value-match, not `spec/GRAMMAR.md`'s eventual `===`
   // dispatch (see the Decision log). `"when"` can't start a `Stmt`, so
   // `CaseArm`'s own trailing `Stmt*` unambiguously stops at the next
   // `"when"`/`"else"`/`"end"`, the same way `"rescue"` already
   // terminates `begin`'s body above.
-  "case" <scrutinee:Expr> <arms:CaseArm+> <else_body:ElseClause?> "end" => Stmt::Case {
+  <l:@L> "case" <scrutinee:Expr> <arms:CaseArm+> <else_body:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::Case {
     scrutinee,
     arms,
     else_body,
-  },
+  }},
   // Assignment to an instance variable (`@x = value`), an array index
   // (`arr[i] = value`), or a plain local (`x = value`, plan 31's
   // Decision log). All three are just `Expr` on the left — `CallExpr`'s
@@ -401,10 +411,10 @@ Stmt: Stmt = {
   // Accepting a general `Expr` on the left and checking its shape in the
   // action (`=>?`, a real parse error on an invalid target — not a
   // panic) is the standard fix.
-  <lhs:StmtExpr> "=" <value:Expr> =>? match lhs {
-    Expr::InstanceVar(name) => Ok(Stmt::SetField { name, value }),
-    Expr::Index(array, index) => Ok(Stmt::SetIndex { array: *array, index: *index, value }),
-    Expr::Ident(name) => Ok(Stmt::Assign { name, value }),
+  <l:@L> <lhs:StmtExpr> "=" <value:Expr> <r:@R> =>? match lhs.node {
+    Expr::InstanceVar(name) => Ok(Spanned { span: (l, r), node: Stmt::SetField { name, value } }),
+    Expr::Index(array, index) => Ok(Spanned { span: (l, r), node: Stmt::SetIndex { array: *array, index: *index, value } }),
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::Assign { name, value } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid assignment target: {other:?}"),
     }),
@@ -416,32 +426,32 @@ Stmt: Stmt = {
   // plain `"="` rule above, compound assignment doesn't extend to
   // `@field`/`arr[i]` targets (Decision log: `Stmt::Assign`'s `name` is
   // a flat `String`, not a general assignable `Expr`).
-  <lhs:StmtExpr> "+=" <rhs:Expr> =>? match lhs {
-    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Add(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+  <l:@L> <lhs:StmtExpr> "+=" <rhs:Expr> <r:@R> =>? match lhs.node {
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::Assign { value: Spanned { span: (l, r), node: Expr::Add(Box::new(Spanned::synthetic(Expr::Ident(name.clone()))), Box::new(rhs)) }, name } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
   },
-  <lhs:StmtExpr> "-=" <rhs:Expr> =>? match lhs {
-    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Sub(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+  <l:@L> <lhs:StmtExpr> "-=" <rhs:Expr> <r:@R> =>? match lhs.node {
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::Assign { value: Spanned { span: (l, r), node: Expr::Sub(Box::new(Spanned::synthetic(Expr::Ident(name.clone()))), Box::new(rhs)) }, name } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
   },
-  <lhs:StmtExpr> "*=" <rhs:Expr> =>? match lhs {
-    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Mul(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+  <l:@L> <lhs:StmtExpr> "*=" <rhs:Expr> <r:@R> =>? match lhs.node {
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::Assign { value: Spanned { span: (l, r), node: Expr::Mul(Box::new(Spanned::synthetic(Expr::Ident(name.clone()))), Box::new(rhs)) }, name } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
   },
-  <lhs:StmtExpr> "/=" <rhs:Expr> =>? match lhs {
-    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Div(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+  <l:@L> <lhs:StmtExpr> "/=" <rhs:Expr> <r:@R> =>? match lhs.node {
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::Assign { value: Spanned { span: (l, r), node: Expr::Div(Box::new(Spanned::synthetic(Expr::Ident(name.clone()))), Box::new(rhs)) }, name } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
   },
-  <lhs:StmtExpr> "%=" <rhs:Expr> =>? match lhs {
-    Expr::Ident(name) => Ok(Stmt::Assign { value: Expr::Rem(Box::new(Expr::Ident(name.clone())), Box::new(rhs)), name }),
+  <l:@L> <lhs:StmtExpr> "%=" <rhs:Expr> <r:@R> =>? match lhs.node {
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::Assign { value: Spanned { span: (l, r), node: Expr::Rem(Box::new(Spanned::synthetic(Expr::Ident(name.clone()))), Box::new(rhs)) }, name } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
@@ -451,14 +461,14 @@ Stmt: Stmt = {
   // works because `+` is unconditionally evaluated either way; `||=`/
   // `&&=` are not). Same plain-local-target restriction as every
   // compound-assignment form above.
-  <lhs:StmtExpr> "||=" <default:Expr> =>? match lhs {
-    Expr::Ident(name) => Ok(Stmt::OrAssign { name, default }),
+  <l:@L> <lhs:StmtExpr> "||=" <default:Expr> <r:@R> =>? match lhs.node {
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::OrAssign { name, default } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
   },
-  <lhs:StmtExpr> "&&=" <value:Expr> =>? match lhs {
-    Expr::Ident(name) => Ok(Stmt::AndAssign { name, value }),
+  <l:@L> <lhs:StmtExpr> "&&=" <value:Expr> <r:@R> =>? match lhs.node {
+    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::AndAssign { name, value } }),
     other => Err(lalrpop_util::ParseError::User {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
@@ -471,14 +481,14 @@ Stmt: Stmt = {
   // `StmtExpr` in any other Stmt-initial context in this grammar, so
   // there's no existing FOLLOW-set overlap this collides with (same
   // reasoning as plan 20's `CaseValues` right-recursion).
-  <names:MultiAssignNames> "=" <values:MultiAssignValues> => Stmt::MultiAssign { names, values },
-  <e:StmtExpr> => Stmt::Expr(e),
+  <l:@L> <names:MultiAssignNames> "=" <values:MultiAssignValues> <r:@R> => Spanned { span: (l, r), node: Stmt::MultiAssign { names, values } },
+  <l:@L> <e:StmtExpr> <r:@R> => Spanned { span: (l, r), node: Stmt::Expr(e) },
 };
 
 // Plan 34: mandatory-first-element, right-recursive — mirrors
 // `CaseValues`/`MultiAssignNames`'s own trick for the identical reason
 // (see `Stmt`'s `"yield" <args:YieldArgs>` comment).
-YieldArgs: Vec<Expr> = {
+YieldArgs: Vec<Spanned<Expr>> = {
   <e:Expr> => vec![e],
   <e:Expr> "," <rest:YieldArgs> => {
     let mut v = vec![e];
@@ -496,7 +506,7 @@ MultiAssignNames: Vec<String> = {
   },
 };
 
-MultiAssignValues: Vec<Expr> = {
+MultiAssignValues: Vec<Spanned<Expr>> = {
   <first:Expr> "," <last:Expr> => vec![first, last],
   <first:Expr> "," <rest:MultiAssignValues> => {
     let mut v = vec![first];
@@ -528,55 +538,55 @@ MultiAssignValues: Vec<Expr> = {
 // tier below it, since by the time the parser is past the operator
 // token it's no longer at a Stmt-initial position and the array-literal
 // ambiguity this split exists to avoid can't recur.
-StmtExpr: Expr = {
+StmtExpr: Spanned<Expr> = {
   StmtOrExpr,
 };
 
-StmtOrExpr: Expr = {
-  <lhs:StmtOrExpr> "||" <rhs:AndExpr> => Expr::Or(Box::new(lhs), Box::new(rhs)),
+StmtOrExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtOrExpr> "||" <rhs:AndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Or(Box::new(lhs), Box::new(rhs)) },
   StmtAndExpr,
 };
 
-StmtAndExpr: Expr = {
-  <lhs:StmtAndExpr> "&&" <rhs:CompareExpr> => Expr::And(Box::new(lhs), Box::new(rhs)),
+StmtAndExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtAndExpr> "&&" <rhs:CompareExpr> <r:@R> => Spanned { span: (l, r), node: Expr::And(Box::new(lhs), Box::new(rhs)) },
   StmtCompareExpr,
 };
 
 // Plan 28: mirrors `BitOrExpr`/`BitAndExpr`/`ShiftExpr` below, one tier
 // each, for the same Stmt-initial reason every other tier here is
 // mirrored (see the block comment above `StmtExpr`).
-StmtCompareExpr: Expr = {
-  <lhs:StmtBitOrExpr> <op:CompareOp> <rhs:BitOrExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+StmtCompareExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtBitOrExpr> <op:CompareOp> <rhs:BitOrExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Compare(Box::new(lhs), op, Box::new(rhs)) },
   StmtBitOrExpr,
 };
 
-StmtBitOrExpr: Expr = {
-  <lhs:StmtBitOrExpr> "|" <rhs:BitAndExpr> => Expr::BitOr(Box::new(lhs), Box::new(rhs)),
-  <lhs:StmtBitOrExpr> "^" <rhs:BitAndExpr> => Expr::BitXor(Box::new(lhs), Box::new(rhs)),
+StmtBitOrExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtBitOrExpr> "|" <rhs:BitAndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitOr(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:StmtBitOrExpr> "^" <rhs:BitAndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitXor(Box::new(lhs), Box::new(rhs)) },
   StmtBitAndExpr,
 };
 
-StmtBitAndExpr: Expr = {
-  <lhs:StmtBitAndExpr> "&" <rhs:ShiftExpr> => Expr::BitAnd(Box::new(lhs), Box::new(rhs)),
+StmtBitAndExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtBitAndExpr> "&" <rhs:ShiftExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitAnd(Box::new(lhs), Box::new(rhs)) },
   StmtShiftExpr,
 };
 
-StmtShiftExpr: Expr = {
-  <lhs:StmtShiftExpr> "<<" <rhs:AddExpr> => Expr::Shl(Box::new(lhs), Box::new(rhs)),
-  <lhs:StmtShiftExpr> ">>" <rhs:AddExpr> => Expr::Shr(Box::new(lhs), Box::new(rhs)),
+StmtShiftExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtShiftExpr> "<<" <rhs:AddExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Shl(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:StmtShiftExpr> ">>" <rhs:AddExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Shr(Box::new(lhs), Box::new(rhs)) },
   StmtAddExpr,
 };
 
-StmtAddExpr: Expr = {
-  <lhs:StmtAddExpr> "+" <rhs:MulExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
-  <lhs:StmtAddExpr> "-" <rhs:MulExpr> => Expr::Sub(Box::new(lhs), Box::new(rhs)),
+StmtAddExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtAddExpr> "+" <rhs:MulExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Add(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:StmtAddExpr> "-" <rhs:MulExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Sub(Box::new(lhs), Box::new(rhs)) },
   StmtMulExpr,
 };
 
-StmtMulExpr: Expr = {
-  <lhs:StmtMulExpr> "*" <rhs:UnaryExpr> => Expr::Mul(Box::new(lhs), Box::new(rhs)),
-  <lhs:StmtMulExpr> "/" <rhs:UnaryExpr> => Expr::Div(Box::new(lhs), Box::new(rhs)),
-  <lhs:StmtMulExpr> "%" <rhs:UnaryExpr> => Expr::Rem(Box::new(lhs), Box::new(rhs)),
+StmtMulExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtMulExpr> "*" <rhs:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Mul(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:StmtMulExpr> "/" <rhs:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Div(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:StmtMulExpr> "%" <rhs:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Rem(Box::new(lhs), Box::new(rhs)) },
   StmtUnaryExpr,
 };
 
@@ -593,12 +603,12 @@ StmtMulExpr: Expr = {
 // reachable from the same state. Unary `-`/`!` remain fully available
 // everywhere else (Let's RHS, a call argument, nested inside a binary
 // operator's operand) via the ordinary, non-`Stmt` `UnaryExpr`.
-StmtUnaryExpr: Expr = {
+StmtUnaryExpr: Spanned<Expr> = {
   StmtCallExpr,
 };
 
-StmtCallExpr: Expr = {
-  <base:StmtCallExpr> "[" <idx:Expr> "]" => Expr::Index(Box::new(base), Box::new(idx)),
+StmtCallExpr: Spanned<Expr> = {
+  <l:@L> <base:StmtCallExpr> "[" <idx:Expr> "]" <r:@R> => Spanned { span: (l, r), node: Expr::Index(Box::new(base), Box::new(idx)) },
   StmtPrimaryExpr,
 };
 
@@ -615,28 +625,33 @@ CallMethodName: String = {
   "read" => "read".to_string(),
 };
 
-StmtPrimaryExpr: Expr = {
-  <name:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
+// Plan 22's Decision log: an implicit bare-`Ident` receiver
+// (`Expr::Ident(recv)` inside a `.method`/`&.method` alternative below)
+// is a synthesized node with no real source span of its own to point
+// at more precisely than the whole call — `Spanned::synthetic` marks
+// that honestly rather than fabricating one.
+StmtPrimaryExpr: Spanned<Expr> = {
+  <l:@L> <name:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
     if let Some(b) = blk { args.push(b); }
-    Expr::Call(name, args)
+    Spanned { span: (l, r), node: Expr::Call(name, args) }
   },
   // Plan 39's Decision log: see `PrimaryExpr`'s own mirror alternative.
-  <name:Ident> "(" <kwargs:CallKwArgs> ")" => Expr::CallKw(name, kwargs),
-  <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
-  "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
-  <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
+  <l:@L> <name:Ident> "(" <kwargs:CallKwArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::CallKw(name, kwargs) },
+  <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
+  <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
+  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
     if let Some(b) = blk { args.push(b); }
-    Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args)
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
-  <recv:Ident> "." <method:CallMethodName> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
   // immediately above exactly, `"&."` in place of `"."` — a genuinely
   // new terminal, distinct from `"."`/`"&"` (bitwise/block-param
   // marker)/`"&&"`, so there's no FIRST-set overlap to disambiguate.
-  <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" => {
-    Expr::SafeCall(Box::new(Expr::Ident(recv)), method, args)
+  <l:@L> <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
+    Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
-  <recv:Ident> "&." <method:CallMethodName> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <l:@L> <recv:Ident> "&." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   // Plan 47's Decision log: `assert`/`assert_eq` need their own
   // productions (not the generic `<name:Ident> "(" <args:Args> ")"`
   // call shape) purely to capture `@L` — LALRPOP's own byte-offset
@@ -645,16 +660,17 @@ StmtPrimaryExpr: Expr = {
   // raw-offset placeholder `parse_named`'s own post-parse pass
   // (`rewrite_assert_locations`) rewrites into a real
   // `Expr::StringLit("{name}:{line}")` before any caller ever sees it.
-  <l:@L> "assert" "(" <cond:Expr> ")" => Expr::Call("assert".to_string(), vec![cond, Expr::Int(l as i64)]),
-  <l:@L> "assert_eq" "(" <expected:Expr> "," <actual:Expr> ")" => Expr::Call("assert_eq".to_string(), vec![expected, actual, Expr::Int(l as i64)]),
-  <f:FloatLit> => Expr::Float(f),
-  <n:Num> => Expr::Int(n),
-  <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
+  <l:@L> "assert" "(" <cond:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Call("assert".to_string(), vec![cond, Spanned::synthetic(Expr::Int(l as i64))]) },
+  <l:@L> "assert_eq" "(" <expected:Expr> "," <actual:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Call("assert_eq".to_string(), vec![expected, actual, Spanned::synthetic(Expr::Int(l as i64))]) },
+  <l:@L> <f:FloatLit> <r:@R> => Spanned { span: (l, r), node: Expr::Float(f) },
+  <l:@L> <n:Num> <r:@R> => Spanned { span: (l, r), node: Expr::Int(n) },
+  <l:@L> <s:StringLitTok> <r:@R> =>? interpolate::parse_interpolated_string(&s)
+    .map(|node| Spanned { span: (l, r), node })
     .map_err(|error| lalrpop_util::ParseError::User { error }),
-  <s:SymbolLitTok> => Expr::SymbolLit(s),
-  "true" => Expr::Bool(true),
-  "false" => Expr::Bool(false),
-  "nil" => Expr::Nil,
+  <l:@L> <s:SymbolLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::SymbolLit(s) },
+  <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
+  <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
+  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
   // Plan 34: `HashLit`'s bare `"{" HashPairs "}"` alternative is
   // deliberately DROPPED from this Stmt-initial position (unlike
   // `PrimaryExpr`, which keeps it) — a real, build-verified LALR(1)
@@ -668,8 +684,8 @@ StmtPrimaryExpr: Expr = {
   // side-effect-free and useless). `HashLit` remains fully available
   // everywhere else (a `Let`'s RHS, a call argument) via the ordinary,
   // non-`Stmt` `PrimaryExpr`.
-  <name:InstanceVarTok> => Expr::InstanceVar(name),
-  <name:Ident> => Expr::Ident(name),
+  <l:@L> <name:InstanceVarTok> <r:@R> => Spanned { span: (l, r), node: Expr::InstanceVar(name) },
+  <l:@L> <name:Ident> <r:@R> => Spanned { span: (l, r), node: Expr::Ident(name) },
 };
 
 // Plan 34: `{ |params| body }` — a trailing block literal, desugared to
@@ -678,12 +694,12 @@ StmtPrimaryExpr: Expr = {
 // call it attaches to. Always `Void`-returning (no `-> Type>` — real
 // Ruby block syntax has none either, and this plan's blocks are never
 // value-producing).
-BlockLiteral: Expr = {
-  "{" "|" <params:Params> "|" <body:Stmt*> "}" => Expr::Lambda {
+BlockLiteral: Spanned<Expr> = {
+  <l:@L> "{" "|" <params:Params> "|" <body:Stmt*> "}" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
     params,
     return_type: "Void".to_string(),
     body,
-  },
+  }},
 };
 
 // Plan 25: `{k1 => v1, k2 => v2, ...}` — reuses `"=>"` (already a
@@ -693,7 +709,7 @@ BlockLiteral: Expr = {
 // `CaseValues`-style ambiguity, since nothing after `HashPairs` is ever
 // `Stmt*`. Zero pairs (`{}`) is grammar-legal; sema rejects it (same
 // "no element type to infer" reasoning plan 09 already applies to `[]`).
-HashPairs: Vec<(Expr, Expr)> = {
+HashPairs: Vec<(Spanned<Expr>, Spanned<Expr>)> = {
   <mut v:(<HashPair> ",")*> <last:HashPair?> => {
     match last {
       None => v,
@@ -702,22 +718,22 @@ HashPairs: Vec<(Expr, Expr)> = {
   }
 };
 
-HashPair: (Expr, Expr) = {
+HashPair: (Spanned<Expr>, Spanned<Expr>) = {
   <k:Expr> "=>" <v:Expr> => (k, v)
 };
 
-ElseClause: Vec<Stmt> = {
+ElseClause: Vec<Spanned<Stmt>> = {
   "else" <body:Stmt*> => body,
   // Plan 29: an `elsif` chain is a real, correctly-nested `Stmt::If`
   // sequence — one single-element `Vec<Stmt>` per link, wrapping the
   // rest of the chain (another `elsif`, a trailing `else`, or nothing)
   // as this nested `If`'s own `else_branch`. No new AST variant; see
   // the Decision log.
-  "elsif" <cond:Expr> <then_branch:Stmt*> <rest:ElseClause?> => vec![Stmt::If {
+  <l:@L> "elsif" <cond:Expr> <then_branch:Stmt*> <rest:ElseClause?> <r:@R> => vec![Spanned { span: (l, r), node: Stmt::If {
     cond,
     then_branch,
     else_branch: rest,
-  }],
+  }}],
 };
 
 // Plan 20: `when v1, v2, ... body`. NOT `Args` (the existing
@@ -732,16 +748,16 @@ ElseClause: Vec<Stmt> = {
 // Right recursion sidesteps it: the only decision after a value is
 // "is the very next token a literal `,`" — never ambiguous with
 // `Stmt*`'s FIRST set, since no `Stmt` can start with `,`.
-CaseValues: Vec<Expr> = {
-  <n:Num> => vec![Expr::Int(n)],
-  <n:Num> "," <rest:CaseValues> => {
-    let mut v = vec![Expr::Int(n)];
+CaseValues: Vec<Spanned<Expr>> = {
+  <l:@L> <n:Num> <r:@R> => vec![Spanned { span: (l, r), node: Expr::Int(n) }],
+  <l:@L> <n:Num> <r:@R> "," <rest:CaseValues> => {
+    let mut v = vec![Spanned { span: (l, r), node: Expr::Int(n) }];
     v.extend(rest);
     v
   },
 };
 
-CaseArm: (Vec<Expr>, Vec<Stmt>) = {
+CaseArm: CaseArm = {
   "when" <values:CaseValues> <body:Stmt*> => (values, body)
 };
 
@@ -762,7 +778,7 @@ RescueClause: RescueClause = {
   },
 };
 
-EnsureClause: Vec<Stmt> = {
+EnsureClause: Vec<Spanned<Stmt>> = {
   "ensure" <b:Stmt*> => b,
 };
 
@@ -781,22 +797,22 @@ EnsureClause: Vec<Stmt> = {
 // re-parse (never a runtime `eval`), reusing the same static grammar
 // that parses the rest of the program rather than inventing a second,
 // smaller one.
-pub Expr: Expr = {
+pub Expr: Spanned<Expr> = {
   OrExpr,
 };
 
-OrExpr: Expr = {
-  <lhs:OrExpr> "||" <rhs:AndExpr> => Expr::Or(Box::new(lhs), Box::new(rhs)),
+OrExpr: Spanned<Expr> = {
+  <l:@L> <lhs:OrExpr> "||" <rhs:AndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Or(Box::new(lhs), Box::new(rhs)) },
   AndExpr,
 };
 
-AndExpr: Expr = {
-  <lhs:AndExpr> "&&" <rhs:CompareExpr> => Expr::And(Box::new(lhs), Box::new(rhs)),
+AndExpr: Spanned<Expr> = {
+  <l:@L> <lhs:AndExpr> "&&" <rhs:CompareExpr> <r:@R> => Spanned { span: (l, r), node: Expr::And(Box::new(lhs), Box::new(rhs)) },
   CompareExpr,
 };
 
-CompareExpr: Expr = {
-  <lhs:BitOrExpr> <op:CompareOp> <rhs:BitOrExpr> => Expr::Compare(Box::new(lhs), op, Box::new(rhs)),
+CompareExpr: Spanned<Expr> = {
+  <l:@L> <lhs:BitOrExpr> <op:CompareOp> <rhs:BitOrExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Compare(Box::new(lhs), op, Box::new(rhs)) },
   BitOrExpr,
 };
 
@@ -805,20 +821,20 @@ CompareExpr: Expr = {
 // (see this plan's Decision log for why `|`/`^` share one tier: Ruby
 // really does give them equal precedence, unlike plan 18's relational/
 // equality merge, which was a real simplification).
-BitOrExpr: Expr = {
-  <lhs:BitOrExpr> "|" <rhs:BitAndExpr> => Expr::BitOr(Box::new(lhs), Box::new(rhs)),
-  <lhs:BitOrExpr> "^" <rhs:BitAndExpr> => Expr::BitXor(Box::new(lhs), Box::new(rhs)),
+BitOrExpr: Spanned<Expr> = {
+  <l:@L> <lhs:BitOrExpr> "|" <rhs:BitAndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitOr(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:BitOrExpr> "^" <rhs:BitAndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitXor(Box::new(lhs), Box::new(rhs)) },
   BitAndExpr,
 };
 
-BitAndExpr: Expr = {
-  <lhs:BitAndExpr> "&" <rhs:ShiftExpr> => Expr::BitAnd(Box::new(lhs), Box::new(rhs)),
+BitAndExpr: Spanned<Expr> = {
+  <l:@L> <lhs:BitAndExpr> "&" <rhs:ShiftExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitAnd(Box::new(lhs), Box::new(rhs)) },
   ShiftExpr,
 };
 
-ShiftExpr: Expr = {
-  <lhs:ShiftExpr> "<<" <rhs:AddExpr> => Expr::Shl(Box::new(lhs), Box::new(rhs)),
-  <lhs:ShiftExpr> ">>" <rhs:AddExpr> => Expr::Shr(Box::new(lhs), Box::new(rhs)),
+ShiftExpr: Spanned<Expr> = {
+  <l:@L> <lhs:ShiftExpr> "<<" <rhs:AddExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Shl(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:ShiftExpr> ">>" <rhs:AddExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Shr(Box::new(lhs), Box::new(rhs)) },
   AddExpr,
 };
 
@@ -831,16 +847,16 @@ CompareOp: CompareOp = {
   "!=" => CompareOp::Ne,
 };
 
-AddExpr: Expr = {
-  <lhs:AddExpr> "+" <rhs:MulExpr> => Expr::Add(Box::new(lhs), Box::new(rhs)),
-  <lhs:AddExpr> "-" <rhs:MulExpr> => Expr::Sub(Box::new(lhs), Box::new(rhs)),
+AddExpr: Spanned<Expr> = {
+  <l:@L> <lhs:AddExpr> "+" <rhs:MulExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Add(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:AddExpr> "-" <rhs:MulExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Sub(Box::new(lhs), Box::new(rhs)) },
   MulExpr,
 };
 
-MulExpr: Expr = {
-  <lhs:MulExpr> "*" <rhs:UnaryExpr> => Expr::Mul(Box::new(lhs), Box::new(rhs)),
-  <lhs:MulExpr> "/" <rhs:UnaryExpr> => Expr::Div(Box::new(lhs), Box::new(rhs)),
-  <lhs:MulExpr> "%" <rhs:UnaryExpr> => Expr::Rem(Box::new(lhs), Box::new(rhs)),
+MulExpr: Spanned<Expr> = {
+  <l:@L> <lhs:MulExpr> "*" <rhs:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Mul(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:MulExpr> "/" <rhs:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Div(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:MulExpr> "%" <rhs:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Rem(Box::new(lhs), Box::new(rhs)) },
   UnaryExpr,
 };
 
@@ -848,12 +864,12 @@ MulExpr: Expr = {
 // (`--x` parses as `Neg(Neg(x))`, not that this language has any use for
 // it) — sits directly above `CallExpr`, so `-a.b`/`-a(1)`/`-a[0]` all
 // negate the *result* of the postfix chain, not just `a`.
-UnaryExpr: Expr = {
-  "-" <e:UnaryExpr> => Expr::Neg(Box::new(e)),
-  "!" <e:UnaryExpr> => Expr::Not(Box::new(e)),
+UnaryExpr: Spanned<Expr> = {
+  <l:@L> "-" <e:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Neg(Box::new(e)) },
+  <l:@L> "!" <e:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Not(Box::new(e)) },
   // Plan 28: `~` joins `-`/`!` at this tier, additively — same shape,
   // no restructuring (see the Decision log).
-  "~" <e:UnaryExpr> => Expr::BitNot(Box::new(e)),
+  <l:@L> "~" <e:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitNot(Box::new(e)) },
   CallExpr,
 };
 
@@ -867,12 +883,12 @@ UnaryExpr: Expr = {
 // `Stmt` right after a completed one — which is exactly the shift/reduce
 // conflict LALRPOP reported. Routing *all* indexing through this single
 // recursive rule means there is only ever one derivation for `arr[i]`.
-CallExpr: Expr = {
-  <base:CallExpr> "[" <idx:Expr> "]" => Expr::Index(Box::new(base), Box::new(idx)),
+CallExpr: Spanned<Expr> = {
+  <l:@L> <base:CallExpr> "[" <idx:Expr> "]" <r:@R> => Spanned { span: (l, r), node: Expr::Index(Box::new(base), Box::new(idx)) },
   PrimaryExpr,
 };
 
-PrimaryExpr: Expr = {
+PrimaryExpr: Spanned<Expr> = {
   // Plan 34: unlike `StmtPrimaryExpr` below, this non-Stmt-initial
   // position doesn't gain a trailing `BlockLiteral?` — `PrimaryExpr`
   // still has its own bare `"{" HashPairs "}"` alternative (below), and
@@ -888,28 +904,28 @@ PrimaryExpr: Expr = {
   // scoped to `StmtPrimaryExpr` only — exactly what this plan's own
   // worked example (`repeat(3) { ... }` as a bare top-level statement)
   // needs.
-  <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
+  <l:@L> <name:Ident> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Call(name, args) },
   // Plan 39's Decision log: keyword-argument calls are scoped to plain
   // function calls only (never `.method(...)`/`.new(...)`) and to
   // all-keyword-or-all-positional call sites — a call with any `name:`
   // argument parses as `Expr::CallKw` instead, never mixed with `Args`.
-  <name:Ident> "(" <kwargs:CallKwArgs> ")" => Expr::CallKw(name, kwargs),
+  <l:@L> <name:Ident> "(" <kwargs:CallKwArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::CallKw(name, kwargs) },
   // `new` is a reserved keyword (see plan 08's Decision log): LALRPOP
   // tokenizes the literal `"new"` distinctly from the generic `Ident`
   // regex wherever it appears verbatim, so this and the bare
   // `recv "." Ident` alternative below never compete for the same
   // lookahead token.
-  <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
-  "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
-  <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
-  <recv:Ident> "." <method:CallMethodName> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
+  <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
+  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
+  <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
   // immediately above exactly, `"&."` in place of `"."`.
-  <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" => {
-    Expr::SafeCall(Box::new(Expr::Ident(recv)), method, args)
+  <l:@L> <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
+    Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
-  <recv:Ident> "&." <method:CallMethodName> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
-  "[" <elements:Args> "]" => Expr::ArrayLit(elements),
+  <l:@L> <recv:Ident> "&." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  <l:@L> "[" <elements:Args> "]" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayLit(elements) },
   // `->(params) -> ReturnType { body }` — plan 10's lambda literal.
   // `"->"` doesn't start any other `PrimaryExpr` alternative, so this
   // can't collide with the FuncDef-return-arrow usage of `"->"` or
@@ -918,22 +934,23 @@ PrimaryExpr: Expr = {
   // only ever appears after `"->" "(" ... ")" "->" TypeName` is already
   // consumed, never as `PrimaryExpr`'s own first token, so it's in a
   // disjoint parser state from `HashPairs`' leading `"{"`.
-  "->" "(" <params:Params> ")" "->" <return_type:TypeName> "{" <body:Stmt*> "}" => Expr::Lambda {
+  <l:@L> "->" "(" <params:Params> ")" "->" <return_type:TypeName> "{" <body:Stmt*> "}" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
     params,
     return_type,
     body,
-  },
-  <f:FloatLit> => Expr::Float(f),
-  <n:Num> => Expr::Int(n),
-  <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
+  }},
+  <l:@L> <f:FloatLit> <r:@R> => Spanned { span: (l, r), node: Expr::Float(f) },
+  <l:@L> <n:Num> <r:@R> => Spanned { span: (l, r), node: Expr::Int(n) },
+  <l:@L> <s:StringLitTok> <r:@R> =>? interpolate::parse_interpolated_string(&s)
+    .map(|node| Spanned { span: (l, r), node })
     .map_err(|error| lalrpop_util::ParseError::User { error }),
-  <s:SymbolLitTok> => Expr::SymbolLit(s),
-  "true" => Expr::Bool(true),
-  "false" => Expr::Bool(false),
-  "nil" => Expr::Nil,
-  "{" <pairs:HashPairs> "}" => Expr::HashLit(pairs),
-  <name:InstanceVarTok> => Expr::InstanceVar(name),
-  <name:Ident> => Expr::Ident(name),
+  <l:@L> <s:SymbolLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::SymbolLit(s) },
+  <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
+  <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
+  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
+  <l:@L> "{" <pairs:HashPairs> "}" <r:@R> => Spanned { span: (l, r), node: Expr::HashLit(pairs) },
+  <l:@L> <name:InstanceVarTok> <r:@R> => Spanned { span: (l, r), node: Expr::InstanceVar(name) },
+  <l:@L> <name:Ident> <r:@R> => Spanned { span: (l, r), node: Expr::Ident(name) },
 };
 
 // Plan 18: widened from `CallExpr` to the full `Expr` — a call argument
@@ -942,7 +959,7 @@ PrimaryExpr: Expr = {
 // `Args` is already delimited by `(`/`)` or `[`/`]` with `,` separators,
 // so there's no bare-leading-token collision the `Stmt`-initial split
 // exists to avoid.
-Args: Vec<Expr> = {
+Args: Vec<Spanned<Expr>> = {
   <mut v:(<Expr> ",")*> <last:Expr?> => {
     match last {
       None => v,

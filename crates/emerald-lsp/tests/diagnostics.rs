@@ -116,6 +116,39 @@ fn a_parse_error_publishes_one_diagnostic_at_the_real_utf16_column() {
 }
 
 #[test]
+fn a_sema_type_mismatch_publishes_a_diagnostic_at_the_real_b_position() {
+  // Plan 22's `leaf-span-rendering` AC2: `emerald_sema::Diagnostic` now
+  // carries a real span, so the LSP no longer anchors sema diagnostics
+  // at the whole document — it should point at the same `b` on line 2
+  // that the CLI's miette rendering already proves (see
+  // `emerald-cli/tests/hello_em.rs`'s
+  // `sema_type_mismatch_renders_a_miette_source_snippet_with_a_caret_at_b`).
+  let (client, handle) = start_server();
+  initialize(&client);
+
+  did_open(
+    &client,
+    "file:///bad_types.em",
+    "def add(a: Int64, b: String) -> Int64\n  a + b\nend\n",
+  );
+  let published = recv_diagnostics(&client);
+
+  assert_eq!(published.diagnostics.len(), 1);
+  let diag = &published.diagnostics[0];
+  assert_eq!(diag.range.start.line, 1);
+  assert_eq!(diag.range.start.character, 6);
+  assert!(diag.range.end.character > diag.range.start.character);
+  assert!(
+    diag.message.contains("Int64") && diag.message.contains("String"),
+    "message should name both types: {}",
+    diag.message
+  );
+
+  drop(client);
+  handle.join().unwrap();
+}
+
+#[test]
 fn a_real_working_program_publishes_no_diagnostics() {
   let (client, handle) = start_server();
   initialize(&client);

@@ -5,7 +5,7 @@
 //! `emerald <file>` already uses (see this leaf's own Decision log for
 //! the real, disclosed per-line latency cost that trades for).
 
-use emerald_parser::{Expr, Item, Stmt};
+use emerald_parser::{Expr, Item, Spanned, Stmt};
 use std::io::{self, BufRead, Write};
 use std::process::{self, Command};
 
@@ -57,7 +57,13 @@ fn handle_line(prelude: &mut String, line: &str) {
   // (an `if`/`while`/`begin`/... spanning just one physical line) is
   // treated as a declaration too — appended verbatim, never
   // `puts`-wrapped — since it isn't `Stmt::Expr` either.
-  let is_transient = matches!(program.items.as_slice(), [Item::Stmt(Stmt::Expr(_))]);
+  let is_transient = matches!(
+    program.items.as_slice(),
+    [Item::Stmt(Spanned {
+      node: Stmt::Expr(_),
+      ..
+    })]
+  );
 
   if !is_transient {
     let candidate = format!("{prelude}{line}\n");
@@ -72,7 +78,13 @@ fn handle_line(prelude: &mut String, line: &str) {
 
   let already_puts = matches!(
     program.items.as_slice(),
-    [Item::Stmt(Stmt::Expr(Expr::Call(name, _)))] if name == "puts"
+    [Item::Stmt(Spanned {
+      node: Stmt::Expr(Spanned {
+        node: Expr::Call(name, _),
+        ..
+      }),
+      ..
+    })] if name == "puts"
   );
   // `puts` is a Stmt-level keyword taking one bare `Expr` (`"puts"
   // <arg:Expr>`) — this grammar has no parenthesized-expression-
@@ -112,7 +124,7 @@ fn compile_and_run(candidate: &str) -> Result<String, ()> {
       }
     }
     Err(e) => {
-      crate::report_driver_error(e);
+      crate::report_driver_error(e, Some(("<repl>", candidate)));
       Err(())
     }
   }

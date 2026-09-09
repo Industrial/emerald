@@ -1,13 +1,20 @@
 //! Name resolution + type checking over `emerald_parser::Program`
 //! (plan-of-plans row 05, inception §17 steps 4–7 and §25.E).
 //!
-//! No source-span tracking yet (`crates/emerald-lexer`/`emerald-parser`
-//! don't carry spans) — diagnostics are function/call-scoped text.
-//! Line/column-precise diagnostics are `13 diagnostics`'s job.
+//! Plan 22's Decision log: every `Diagnostic` now carries a real
+//! `span: (usize, usize)`, populated from whichever `Spanned<Expr>`/
+//! `Spanned<Stmt>` node the check that raised it was actually
+//! inspecting — the mismatched sub-expression for a type error, the
+//! whole call for an arity error, the enclosing statement as the
+//! honest fallback where no better candidate exists (`break`/`next`
+//! outside a loop, etc.). `infer_expr_type`/`check_stmt`/etc. all
+//! changed their *signatures* to take `&Spanned<Expr>`/`&Spanned<Stmt>`
+//! rather than every match arm's binding pattern — see `ast.rs`'s own
+//! `Spanned<T>` doc comment for why that's the cheaper edit.
 
 use emerald_parser::{
-  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt,
-  StringPart,
+  CaseArm, ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause,
+  Spanned, Stmt, StringPart,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -70,12 +77,20 @@ pub enum Type {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
   pub message: String,
+  /// Plan 22's Decision log: real for every diagnostic raised while
+  /// checking a `Spanned<Expr>`/`Spanned<Stmt>` — the span of whichever
+  /// node the check was actually inspecting when it failed. `(0, 0)`
+  /// only for the handful of module/class-registration-time
+  /// diagnostics that predate any specific expression being in scope
+  /// at all (see each call site's own comment).
+  pub span: (usize, usize),
 }
 
 impl Diagnostic {
-  fn new(message: impl Into<String>) -> Self {
+  fn new(message: impl Into<String>, span: (usize, usize)) -> Self {
     Self {
       message: message.into(),
+      span,
     }
   }
 }
@@ -98,7 +113,7 @@ struct FunctionSig {
   /// declared (`None` for every parameter without one — always `None`
   /// for every pre-plan-39 declaration). Filled into a call site's
   /// trailing omitted arguments, both positional and keyword.
-  defaults: Vec<Option<Expr>>,
+  defaults: Vec<Option<Spanned<Expr>>>,
   /// Plan 39's Decision log: `Some(elem_ty)` when this function declares
   /// a trailing `*xs: Elem` splat parameter — every call-site argument
   /// beyond `params.len()` must have this type. `None` for every
@@ -195,9 +210,17 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
         Type::Class(_) | Type::String | Type::Array(_) | Type::Hash(_, _) => {
           Ok(Type::Nullable(Box::new(inner)))
         }
-        other_inner => Err(Diagnostic::new(format!(
-          "`{inner_name}?` is not supported — only reference types (a class, String, Array, or Hash) can be nullable, found {other_inner:?}"
-        ))),
+        // Plan 22's Decision log: type *annotations* are plain strings
+        // in this grammar (plan 09's compound-string convention), never
+        // a `Spanned` AST node — there is no real span to blame here
+        // more precisely than "no position at all," disclosed via
+        // `(0, 0)` rather than fabricated.
+        other_inner => Err(Diagnostic::new(
+          format!(
+            "`{inner_name}?` is not supported — only reference types (a class, String, Array, or Hash) can be nullable, found {other_inner:?}"
+          ),
+          (0, 0),
+        )),
       }
     }
     // Modules are namespaces, not types (plan 12's Decision log) — a
@@ -220,9 +243,9 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     // rule), so a single `", "` split is unambiguous here.
     other if other.starts_with("Hash[") && other.ends_with(']') => {
       let inner = &other["Hash[".len()..other.len() - 1];
-      let (k_name, v_name) = inner
-        .split_once(", ")
-        .ok_or_else(|| Diagnostic::new(format!("malformed Hash type annotation `{other}`")))?;
+      let (k_name, v_name) = inner.split_once(", ").ok_or_else(|| {
+        Diagnostic::new(format!("malformed Hash type annotation `{other}`"), (0, 0))
+      })?;
       let k_ty = resolve_type(k_name, classes)?;
       let v_ty = resolve_type(v_name, classes)?;
       Ok(Type::Hash(Box::new(k_ty), Box::new(v_ty)))
@@ -234,7 +257,7 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     // were used as a function parameter/return type, which this plan
     // doesn't exercise.
     "Proc" => Ok(Type::Proc(Vec::new(), Box::new(Type::Void))),
-    other => Err(Diagnostic::new(format!("unknown type `{other}`"))),
+    other => Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0))),
   }
 }
 
@@ -268,10 +291,10 @@ fn function_signature(
   // instead. Caught here, before `resolve_type` ever sees a bare `"T"`
   // and fails with a confusing "unknown type" diagnostic instead.
   if !f.type_params.is_empty() {
-    return Err(Diagnostic::new(format!(
-      "generic methods are not supported yet (`{}`)",
-      f.name
-    )));
+    return Err(Diagnostic::new(
+      format!("generic methods are not supported yet (`{}`)", f.name),
+      (0, 0),
+    ));
   }
   let params = f
     .params
@@ -313,17 +336,21 @@ fn resolve_chain(
   let mut current = name.to_string();
   loop {
     if !visited.insert(current.clone()) {
-      return Err(Diagnostic::new(format!(
-        "cyclic inheritance detected involving class `{current}`"
-      )));
+      return Err(Diagnostic::new(
+        format!("cyclic inheritance detected involving class `{current}`"),
+        (0, 0),
+      ));
     }
     let info = classes
       .get(&current)
-      .ok_or_else(|| Diagnostic::new(format!("undefined class `{current}`")))?;
+      .ok_or_else(|| Diagnostic::new(format!("undefined class `{current}`"), (0, 0)))?;
     if info.is_module {
-      return Err(Diagnostic::new(format!(
-        "cannot inherit from module `{current}` — modules are namespaces, not instantiable"
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "cannot inherit from module `{current}` — modules are namespaces, not instantiable"
+        ),
+        (0, 0),
+      ));
     }
     chain.push(current.clone());
     match &info.superclass {
@@ -361,10 +388,13 @@ fn build_flattened_class_info(
       .expect("every name in a resolved chain came from a registered ClassDef");
     for f in &c.fields {
       if let Some(owner) = field_owner.get(&f.name) {
-        return Err(Diagnostic::new(format!(
-          "field `{}` already declared in superclass `{owner}`",
-          f.name
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "field `{}` already declared in superclass `{owner}`",
+            f.name
+          ),
+          (0, 0),
+        ));
       }
       fields.insert(f.name.clone(), resolve_type(&f.ty, classes)?);
       field_owner.insert(f.name.clone(), class_name.clone());
@@ -380,10 +410,13 @@ fn build_flattened_class_info(
       if m.name != "initialize" {
         if let Some(existing) = methods.get(&m.name) {
           if existing.params != sig.params || existing.return_type != sig.return_type {
-            return Err(Diagnostic::new(format!(
-              "method `{}` override in `{class_name}` has a different signature than the method it overrides: expected {:?} -> {:?}, found {:?} -> {:?}",
-              m.name, existing.params, existing.return_type, sig.params, sig.return_type
-            )));
+            return Err(Diagnostic::new(
+              format!(
+                "method `{}` override in `{class_name}` has a different signature than the method it overrides: expected {:?} -> {:?}, found {:?} -> {:?}",
+                m.name, existing.params, existing.return_type, sig.params, sig.return_type
+              ),
+              (0, 0),
+            ));
           }
         }
       }
@@ -427,8 +460,8 @@ fn module_info(
 #[allow(clippy::too_many_arguments)]
 fn check_numeric_binop(
   op: &str,
-  lhs: &Expr,
-  rhs: &Expr,
+  lhs: &Spanned<Expr>,
+  rhs: &Spanned<Expr>,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -448,14 +481,21 @@ fn check_numeric_binop(
   }
   let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
   if lt != rt {
-    return Err(Diagnostic::new(format!(
-      "type mismatch: `{op}` requires both operands to have the same type, found {lt:?} and {rt:?}"
-    )));
+    // Plan 22's own concrete-proof diagnostic (Decision log): points at
+    // `rhs`'s own span — the operand that disagrees with `lhs`'s
+    // already-established type — not the whole binary expression.
+    return Err(Diagnostic::new(
+      format!(
+        "type mismatch: `{op}` requires both operands to have the same type, found {lt:?} and {rt:?}"
+      ),
+      rhs.span,
+    ));
   }
   if lt != Type::Int64 && lt != Type::Float64 {
-    return Err(Diagnostic::new(format!(
-      "type `{lt:?}` does not support `{op}`"
-    )));
+    return Err(Diagnostic::new(
+      format!("type `{lt:?}` does not support `{op}`"),
+      lhs.span,
+    ));
   }
   Ok(lt)
 }
@@ -499,7 +539,7 @@ fn string_intrinsic_signature(method: &str) -> Option<(Vec<Type>, Type)> {
 fn resolve_class_operator(
   op: &str,
   class_name: &str,
-  rhs: &Expr,
+  rhs: &Spanned<Expr>,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -508,11 +548,12 @@ fn resolve_class_operator(
 ) -> Result<Type, Diagnostic> {
   let info = classes
     .get(class_name)
-    .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`")))?;
+    .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), rhs.span))?;
   let sig = info.methods.get(op).ok_or_else(|| {
-    Diagnostic::new(format!(
-      "class `{class_name}` has no operator method `{op}`"
-    ))
+    Diagnostic::new(
+      format!("class `{class_name}` has no operator method `{op}`"),
+      rhs.span,
+    )
   })?;
   check_args(
     op,
@@ -531,8 +572,8 @@ fn resolve_class_operator(
 #[allow(clippy::too_many_arguments)]
 fn check_boolean_binop(
   op: &str,
-  lhs: &Expr,
-  rhs: &Expr,
+  lhs: &Spanned<Expr>,
+  rhs: &Spanned<Expr>,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -541,15 +582,17 @@ fn check_boolean_binop(
 ) -> Result<Type, Diagnostic> {
   let lt = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
   if lt != Type::Boolean {
-    return Err(Diagnostic::new(format!(
-      "`{op}` requires a Boolean left operand, found {lt:?}"
-    )));
+    return Err(Diagnostic::new(
+      format!("`{op}` requires a Boolean left operand, found {lt:?}"),
+      lhs.span,
+    ));
   }
   let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
   if rt != Type::Boolean {
-    return Err(Diagnostic::new(format!(
-      "`{op}` requires a Boolean right operand, found {rt:?}"
-    )));
+    return Err(Diagnostic::new(
+      format!("`{op}` requires a Boolean right operand, found {rt:?}"),
+      rhs.span,
+    ));
   }
   Ok(Type::Boolean)
 }
@@ -560,8 +603,8 @@ fn check_boolean_binop(
 #[allow(clippy::too_many_arguments)]
 fn check_bitwise_binop(
   op: &str,
-  lhs: &Expr,
-  rhs: &Expr,
+  lhs: &Spanned<Expr>,
+  rhs: &Spanned<Expr>,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -570,15 +613,17 @@ fn check_bitwise_binop(
 ) -> Result<Type, Diagnostic> {
   let lt = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
   if lt != Type::Int64 {
-    return Err(Diagnostic::new(format!(
-      "`{op}` requires an Int64 left operand, found {lt:?}"
-    )));
+    return Err(Diagnostic::new(
+      format!("`{op}` requires an Int64 left operand, found {lt:?}"),
+      lhs.span,
+    ));
   }
   let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
   if rt != Type::Int64 {
-    return Err(Diagnostic::new(format!(
-      "`{op}` requires an Int64 right operand, found {rt:?}"
-    )));
+    return Err(Diagnostic::new(
+      format!("`{op}` requires an Int64 right operand, found {rt:?}"),
+      rhs.span,
+    ));
   }
   Ok(Type::Int64)
 }
@@ -587,18 +632,18 @@ fn check_bitwise_binop(
 /// `None` everywhere else — gates `@field` legality (plan 08 AC4).
 #[allow(clippy::too_many_arguments)]
 fn infer_expr_type(
-  expr: &Expr,
+  expr: &Spanned<Expr>,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
   gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
-  match expr {
+  match &expr.node {
     Expr::Ident(name) => env
       .get(name)
       .cloned()
-      .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"))),
+      .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), expr.span)),
     Expr::Int(_) => Ok(Type::Int64),
     Expr::Float(_) => Ok(Type::Float64),
     // Plan 19: a real `Type::String` value at last (the annotation
@@ -624,9 +669,12 @@ fn infer_expr_type(
             t,
             Type::Int64 | Type::Float64 | Type::String | Type::Boolean
           ) {
-            return Err(Diagnostic::new(format!(
-              "type `{t:?}` cannot be interpolated into a string — only Int64, Float64, String, and Boolean are supported"
-            )));
+            return Err(Diagnostic::new(
+              format!(
+                "type `{t:?}` cannot be interpolated into a string — only Int64, Float64, String, and Boolean are supported"
+              ),
+              e.span,
+            ));
           }
         }
       }
@@ -643,17 +691,25 @@ fn infer_expr_type(
       }
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
       if lt != rt {
-        return Err(Diagnostic::new(format!(
-          "type mismatch: `+` requires both operands to have the same type, found {lt:?} and {rt:?}"
-        )));
+        // Plan 22's own concrete-proof diagnostic (Decision log /
+        // AC1): `rhs`'s own span, not `lhs`'s and not the whole `Add`
+        // expression — the operand that disagrees with `lhs`'s
+        // already-established type.
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch: `+` requires both operands to have the same type, found {lt:?} and {rt:?}"
+          ),
+          rhs.span,
+        ));
       }
       // Plan 19: `+` on two `String`s concatenates — this plan owns all
       // of `Add`'s `Type::String` case (the separate operators plan is
       // numeric/boolean-only and never touches `Add`/`String`).
       if lt != Type::Int64 && lt != Type::Float64 && lt != Type::String {
-        return Err(Diagnostic::new(format!(
-          "type `{lt:?}` does not support `+`"
-        )));
+        return Err(Diagnostic::new(
+          format!("type `{lt:?}` does not support `+`"),
+          lhs.span,
+        ));
       }
       Ok(lt)
     }
@@ -672,18 +728,20 @@ fn infer_expr_type(
     Expr::Neg(e) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if t != Type::Int64 && t != Type::Float64 {
-        return Err(Diagnostic::new(format!(
-          "type `{t:?}` does not support unary `-`"
-        )));
+        return Err(Diagnostic::new(
+          format!("type `{t:?}` does not support unary `-`"),
+          e.span,
+        ));
       }
       Ok(t)
     }
     Expr::Not(e) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if t != Type::Boolean {
-        return Err(Diagnostic::new(format!(
-          "`!` requires a Boolean operand, found {t:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`!` requires a Boolean operand, found {t:?}"),
+          e.span,
+        ));
       }
       Ok(Type::Boolean)
     }
@@ -712,9 +770,10 @@ fn infer_expr_type(
     Expr::BitNot(e) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if t != Type::Int64 {
-        return Err(Diagnostic::new(format!(
-          "`~` requires an Int64 operand, found {t:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`~` requires an Int64 operand, found {t:?}"),
+          e.span,
+        ));
       }
       Ok(Type::Int64)
     }
@@ -737,15 +796,19 @@ fn infer_expr_type(
             let ret =
               resolve_class_operator("==", class_name, rhs, env, sigs, classes, self_fields, gctx)?;
             if ret != Type::Boolean {
-              return Err(Diagnostic::new(format!(
-                "class `{class_name}`'s `==` method must return Boolean, found {ret:?}"
-              )));
+              return Err(Diagnostic::new(
+                format!("class `{class_name}`'s `==` method must return Boolean, found {ret:?}"),
+                expr.span,
+              ));
             }
             Ok(Type::Boolean)
           }
-          _ => Err(Diagnostic::new(format!(
-            "ordering comparison `{op:?}` is not supported on class `{class_name}` — define `<=>`, not a direct `{op:?}` overload"
-          ))),
+          _ => Err(Diagnostic::new(
+            format!(
+              "ordering comparison `{op:?}` is not supported on class `{class_name}` — define `<=>`, not a direct `{op:?}` overload"
+            ),
+            expr.span,
+          )),
         };
       }
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
@@ -762,9 +825,12 @@ fn infer_expr_type(
         return Ok(Type::Boolean);
       }
       if lt != rt {
-        return Err(Diagnostic::new(format!(
-          "type mismatch: `{op:?}` requires both operands to have the same type, found {lt:?} and {rt:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch: `{op:?}` requires both operands to have the same type, found {lt:?} and {rt:?}"
+          ),
+          rhs.span,
+        ));
       }
       Ok(Type::Boolean)
     }
@@ -774,16 +840,19 @@ fn infer_expr_type(
     // a `FunctionSig` in `sigs` (see plan 08's Decision log).
     Expr::Call(name, args) if name == "puts" => {
       if args.len() != 1 {
-        return Err(Diagnostic::new(format!(
-          "`puts` expects 1 argument, found {}",
-          args.len()
-        )));
+        // Arity is a property of the whole call (Decision log), not
+        // any one argument — the call's own span, not a per-arg one.
+        return Err(Diagnostic::new(
+          format!("`puts` expects 1 argument, found {}", args.len()),
+          expr.span,
+        ));
       }
       let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields, gctx)?;
       if arg_ty != Type::Int64 && arg_ty != Type::Float64 && arg_ty != Type::String {
-        return Err(Diagnostic::new(format!(
-          "`puts` does not support type {arg_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`puts` does not support type {arg_ty:?}"),
+          args[0].span,
+        ));
       }
       Ok(Type::Void)
     }
@@ -792,10 +861,10 @@ fn infer_expr_type(
     // `puts` is, directly here, not via a `FunctionSig` in `sigs`.
     Expr::Call(name, args) if name == "gets" => {
       if !args.is_empty() {
-        return Err(Diagnostic::new(format!(
-          "`gets` expects 0 arguments, found {}",
-          args.len()
-        )));
+        return Err(Diagnostic::new(
+          format!("`gets` expects 0 arguments, found {}", args.len()),
+          expr.span,
+        ));
       }
       Ok(Type::String)
     }
@@ -808,16 +877,20 @@ fn infer_expr_type(
     // so it needs no special-casing here beyond the arity check.
     Expr::Call(name, args) if name == "assert" => {
       if args.len() != 2 {
-        return Err(Diagnostic::new(format!(
-          "`assert` expects 1 argument, found {}",
-          args.len().saturating_sub(1)
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`assert` expects 1 argument, found {}",
+            args.len().saturating_sub(1)
+          ),
+          expr.span,
+        ));
       }
       let cond_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields, gctx)?;
       if cond_ty != Type::Boolean {
-        return Err(Diagnostic::new(format!(
-          "`assert` expects a Boolean condition, found {cond_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`assert` expects a Boolean condition, found {cond_ty:?}"),
+          args[0].span,
+        ));
       }
       Ok(Type::Void)
     }
@@ -829,16 +902,19 @@ fn infer_expr_type(
     // already supports, not classes/arrays/hashes.
     Expr::Call(name, args) if name == "assert_eq" => {
       if args.len() != 3 {
-        return Err(Diagnostic::new(format!(
-          "`assert_eq` expects 2 arguments, found {}",
-          args.len().saturating_sub(1)
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`assert_eq` expects 2 arguments, found {}",
+            args.len().saturating_sub(1)
+          ),
+          expr.span,
+        ));
       }
-      let compare = Expr::Compare(
+      let compare = Spanned::synthetic(Expr::Compare(
         Box::new(args[0].clone()),
         CompareOp::Eq,
         Box::new(args[1].clone()),
-      );
+      ));
       infer_expr_type(&compare, env, sigs, classes, self_fields, gctx)?;
       Ok(Type::Void)
     }
@@ -859,44 +935,59 @@ fn infer_expr_type(
           continue;
         }
         let Some(actual) = arg_types.get(i) else {
-          return Err(Diagnostic::new(format!(
-            "`{name}` expects {} argument(s), found {}",
-            g.params_raw.len(),
-            args.len()
-          )));
+          return Err(Diagnostic::new(
+            format!(
+              "`{name}` expects {} argument(s), found {}",
+              g.params_raw.len(),
+              args.len()
+            ),
+            expr.span,
+          ));
         };
         match &concrete {
           None => concrete = Some(actual.clone()),
           Some(c) if c != actual => {
-            return Err(Diagnostic::new(format!(
-              "type parameter `{}` resolved inconsistently in call to `{name}`: `{c:?}` at an earlier argument, `{actual:?}` at argument {}",
-              g.type_param,
-              i + 1
-            )));
+            return Err(Diagnostic::new(
+              format!(
+                "type parameter `{}` resolved inconsistently in call to `{name}`: `{c:?}` at an earlier argument, `{actual:?}` at argument {}",
+                g.type_param,
+                i + 1
+              ),
+              args[i].span,
+            ));
           }
           Some(_) => {}
         }
       }
       let concrete = concrete.ok_or_else(|| {
-        Diagnostic::new(format!(
-          "internal error: generic function `{name}` never uses its own type parameter `{}`",
-          g.type_param
-        ))
+        Diagnostic::new(
+          format!(
+            "internal error: generic function `{name}` never uses its own type parameter `{}`",
+            g.type_param
+          ),
+          expr.span,
+        )
       })?;
       let Type::Class(concrete_class) = &concrete else {
-        return Err(Diagnostic::new(format!(
-          "type parameter `{}` in call to `{name}` resolved to non-class type {concrete:?} — only a class implementing `{}` is a legal generic argument",
-          g.type_param, g.bound
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type parameter `{}` in call to `{name}` resolved to non-class type {concrete:?} — only a class implementing `{}` is a legal generic argument",
+            g.type_param, g.bound
+          ),
+          expr.span,
+        ));
       };
       let class_info = classes
         .get(concrete_class)
-        .ok_or_else(|| Diagnostic::new(format!("undefined class `{concrete_class}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{concrete_class}`"), expr.span))?;
       if class_info.implements.as_deref() != Some(g.bound.as_str()) {
-        return Err(Diagnostic::new(format!(
-          "`{concrete_class}` does not implement `{}`, required by generic function `{name}`'s type parameter `{}`",
-          g.bound, g.type_param
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`{concrete_class}` does not implement `{}`, required by generic function `{name}`'s type parameter `{}`",
+            g.bound, g.type_param
+          ),
+          expr.span,
+        ));
       }
       let effective_params = g
         .params_raw
@@ -928,7 +1019,7 @@ fn infer_expr_type(
     Expr::Call(name, args) => {
       let sig = sigs
         .get(name)
-        .ok_or_else(|| Diagnostic::new(format!("undefined function `{name}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined function `{name}`"), expr.span))?;
       // Plan 34: a trailing block literal desugars into an extra,
       // implicit `Expr::Lambda` argument at parse time (`grammar.
       // lalrpop`'s Decision log) — it's not one of `sig.params`'
@@ -936,13 +1027,29 @@ fn infer_expr_type(
       // ordinary arity/type check. Its own legality (present when
       // required, well-typed, `yield`-arity-compatible) is
       // `check_block_call_sites`' separate job, not this one's.
-      let positional =
-        if sig.block_param.is_some() && matches!(args.last(), Some(Expr::Lambda { .. })) {
-          &args[..args.len() - 1]
-        } else {
-          args.as_slice()
-        };
-      check_call_args(name, positional, sig, env, sigs, classes, self_fields, gctx)?;
+      let positional = if sig.block_param.is_some()
+        && matches!(
+          args.last(),
+          Some(Spanned {
+            node: Expr::Lambda { .. },
+            ..
+          })
+        ) {
+        &args[..args.len() - 1]
+      } else {
+        args.as_slice()
+      };
+      check_call_args(
+        name,
+        positional,
+        sig,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        expr.span,
+        gctx,
+      )?;
       Ok(sig.return_type.clone())
     }
     // Plan 39's Decision log: resolved entirely at compile time by
@@ -953,37 +1060,45 @@ fn infer_expr_type(
     Expr::CallKw(name, kwargs) => {
       let sig = sigs
         .get(name)
-        .ok_or_else(|| Diagnostic::new(format!("undefined function `{name}`")))?;
-      let mut positional: Vec<Option<&Expr>> = vec![None; sig.param_names.len()];
+        .ok_or_else(|| Diagnostic::new(format!("undefined function `{name}`"), expr.span))?;
+      let mut positional: Vec<Option<&Spanned<Expr>>> = vec![None; sig.param_names.len()];
       for (kw_name, kw_value) in kwargs {
         let Some(pos) = sig.param_names.iter().position(|p| p == kw_name) else {
-          return Err(Diagnostic::new(format!(
-            "unrecognized keyword `{kw_name}` for `{name}`"
-          )));
+          return Err(Diagnostic::new(
+            format!("unrecognized keyword `{kw_name}` for `{name}`"),
+            kw_value.span,
+          ));
         };
         if positional[pos].is_some() {
-          return Err(Diagnostic::new(format!(
-            "duplicate keyword `{kw_name}` in call to `{name}`"
-          )));
+          return Err(Diagnostic::new(
+            format!("duplicate keyword `{kw_name}` in call to `{name}`"),
+            kw_value.span,
+          ));
         }
         positional[pos] = Some(kw_value);
       }
       for (i, slot) in positional.iter().enumerate() {
         if slot.is_none() && sig.defaults[i].is_none() {
-          return Err(Diagnostic::new(format!(
-            "`{name}` is missing required keyword `{}`",
-            sig.param_names[i]
-          )));
+          return Err(Diagnostic::new(
+            format!(
+              "`{name}` is missing required keyword `{}`",
+              sig.param_names[i]
+            ),
+            expr.span,
+          ));
         }
       }
       for (i, slot) in positional.iter().enumerate() {
         let Some(value) = slot else { continue };
         let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
         if actual != sig.params[i] {
-          return Err(Diagnostic::new(format!(
-            "keyword `{}` to `{name}` has type {actual:?}, expected {:?}",
-            sig.param_names[i], sig.params[i]
-          )));
+          return Err(Diagnostic::new(
+            format!(
+              "keyword `{}` to `{name}` has type {actual:?}, expected {:?}",
+              sig.param_names[i], sig.params[i]
+            ),
+            value.span,
+          ));
         }
       }
       Ok(sig.return_type.clone())
@@ -991,11 +1106,12 @@ fn infer_expr_type(
     Expr::New(class_name, args) => {
       let info = classes
         .get(class_name)
-        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
       if info.is_module {
-        return Err(Diagnostic::new(format!(
-          "cannot `.new` module `{class_name}` — modules are namespaces, not instantiable"
-        )));
+        return Err(Diagnostic::new(
+          format!("cannot `.new` module `{class_name}` — modules are namespaces, not instantiable"),
+          expr.span,
+        ));
       }
       match info.methods.get("initialize") {
         Some(sig) => check_args(
@@ -1010,10 +1126,13 @@ fn infer_expr_type(
         )?,
         None if args.is_empty() => {}
         None => {
-          return Err(Diagnostic::new(format!(
-            "`{class_name}.new` called with {} argument(s), but `{class_name}` declares no `initialize`",
-            args.len()
-          )));
+          return Err(Diagnostic::new(
+            format!(
+              "`{class_name}.new` called with {} argument(s), but `{class_name}` declares no `initialize`",
+              args.len()
+            ),
+            expr.span,
+          ));
         }
       }
       Ok(Type::Class(class_name.clone()))
@@ -1027,13 +1146,15 @@ fn infer_expr_type(
     // is free to write `module File ... end`, which registers into
     // `classes` as normal — this arm never consults that registry at
     // all, so there is nothing to shadow).
-    Expr::MethodCall(recv, method, args) if matches!(recv.as_ref(), Expr::Ident(n) if n == "File") =>
-    {
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "File") => {
       let (expected_params, ret) = match method.as_str() {
         "read" => (vec![Type::String], Type::String),
         "write" => (vec![Type::String, Type::String], Type::Void),
         other => {
-          return Err(Diagnostic::new(format!("File has no method `{other}`")));
+          return Err(Diagnostic::new(
+            format!("File has no method `{other}`"),
+            expr.span,
+          ));
         }
       };
       check_args(
@@ -1054,14 +1175,17 @@ fn infer_expr_type(
     // and before `infer_expr_type(recv)` runs at all, since a bare
     // module reference isn't a value — evaluating it as one would fail
     // with "undefined variable" (a module name is never in `env`).
-    Expr::MethodCall(recv, method, args) if matches!(recv.as_ref(), Expr::Ident(n) if classes.get(n).is_some_and(|c| c.is_module)) =>
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if classes.get(n).is_some_and(|c| c.is_module)) =>
     {
-      let Expr::Ident(module_name) = recv.as_ref() else {
+      let Expr::Ident(module_name) = &recv.node else {
         unreachable!()
       };
       let info = &classes[module_name];
       let sig = info.methods.get(method).ok_or_else(|| {
-        Diagnostic::new(format!("module `{module_name}` has no method `{method}`"))
+        Diagnostic::new(
+          format!("module `{module_name}` has no method `{method}`"),
+          expr.span,
+        )
       })?;
       check_args(
         method,
@@ -1084,24 +1208,30 @@ fn infer_expr_type(
     // appears in). Guarded syntactically (`env.get(n)`, not a value
     // this arm has already computed) since match-arm guards can't run
     // a fallible `infer_expr_type` call.
-    Expr::MethodCall(recv, method, args) if matches!(recv.as_ref(), Expr::Ident(n) if matches!(env.get(n), Some(Type::Generic(_, _)))) =>
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if matches!(env.get(n), Some(Type::Generic(_, _)))) =>
     {
-      let Expr::Ident(recv_name) = recv.as_ref() else {
+      let Expr::Ident(recv_name) = &recv.node else {
         unreachable!()
       };
       let Some(Type::Generic(type_param, bound)) = env.get(recv_name) else {
         unreachable!()
       };
       let iface = gctx.interfaces.get(bound).ok_or_else(|| {
-        Diagnostic::new(format!(
-          "internal error: unknown interface `{bound}` bounding type parameter `{type_param}`"
-        ))
+        Diagnostic::new(
+          format!(
+            "internal error: unknown interface `{bound}` bounding type parameter `{type_param}`"
+          ),
+          expr.span,
+        )
       })?;
       if *method != iface.method_name {
-        return Err(Diagnostic::new(format!(
-          "type parameter `{type_param}` (bounded by `{bound}`) has no method `{method}` — only `{}` is available",
-          iface.method_name
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type parameter `{type_param}` (bounded by `{bound}`) has no method `{method}` — only `{}` is available",
+            iface.method_name
+          ),
+          expr.span,
+        ));
       }
       let self_ty = Type::Generic(type_param.clone(), bound.clone());
       let expected = iface
@@ -1137,9 +1267,10 @@ fn infer_expr_type(
     Expr::MethodCall(recv, method, args) if method == "call" => {
       let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
       let Type::Proc(param_types, return_type) = &recv_ty else {
-        return Err(Diagnostic::new(format!(
-          "method call `.call` on non-Proc type {recv_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("method call `.call` on non-Proc type {recv_ty:?}"),
+          recv.span,
+        ));
       };
       check_args(
         "call",
@@ -1162,9 +1293,12 @@ fn infer_expr_type(
       // "non-class type" message this arm already produces for other
       // mismatches).
       if let Type::Nullable(_) = &recv_ty {
-        return Err(Diagnostic::new(format!(
-          "method call `.{method}` on a nullable receiver (type {recv_ty:?}) — use safe navigation `&.` or an explicit `== nil` check"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "method call `.{method}` on a nullable receiver (type {recv_ty:?}) — use safe navigation `&.` or an explicit `== nil` check"
+          ),
+          recv.span,
+        ));
       }
       // Plan 45's Decision log: dispatched by checking the receiver's
       // *inferred type* here, inside the existing generic `MethodCall`
@@ -1174,7 +1308,10 @@ fn infer_expr_type(
       // not an overloaded function" precedent.
       if recv_ty == Type::String {
         let Some((expected_params, ret)) = string_intrinsic_signature(method) else {
-          return Err(Diagnostic::new(format!("String has no method `{method}`")));
+          return Err(Diagnostic::new(
+            format!("String has no method `{method}`"),
+            expr.span,
+          ));
         };
         check_args(
           method,
@@ -1189,17 +1326,23 @@ fn infer_expr_type(
         return Ok(ret);
       }
       let Type::Class(class_name) = &recv_ty else {
-        return Err(Diagnostic::new(format!(
-          "method call `.{method}` on non-class type {recv_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("method call `.{method}` on non-class type {recv_ty:?}"),
+          recv.span,
+        ));
       };
       let info = classes.get(class_name).ok_or_else(|| {
-        Diagnostic::new(format!("internal error: unregistered class `{class_name}`"))
+        Diagnostic::new(
+          format!("internal error: unregistered class `{class_name}`"),
+          expr.span,
+        )
       })?;
-      let sig = info
-        .methods
-        .get(method)
-        .ok_or_else(|| Diagnostic::new(format!("class `{class_name}` has no method `{method}`")))?;
+      let sig = info.methods.get(method).ok_or_else(|| {
+        Diagnostic::new(
+          format!("class `{class_name}` has no method `{method}`"),
+          expr.span,
+        )
+      })?;
       check_args(
         method,
         args,
@@ -1223,30 +1366,42 @@ fn infer_expr_type(
     Expr::SafeCall(recv, method, args) => {
       let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
       let Type::Nullable(inner) = &recv_ty else {
-        return Err(Diagnostic::new(format!(
-          "`&.{method}` requires a nullable receiver, found {recv_ty:?} — use `.` instead"
-        )));
+        return Err(Diagnostic::new(
+          format!("`&.{method}` requires a nullable receiver, found {recv_ty:?} — use `.` instead"),
+          recv.span,
+        ));
       };
       let Type::Class(class_name) = inner.as_ref() else {
-        return Err(Diagnostic::new(format!(
-          "`&.{method}` is only supported on a nullable class-typed receiver, found {recv_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`&.{method}` is only supported on a nullable class-typed receiver, found {recv_ty:?}"
+          ),
+          recv.span,
+        ));
       };
       let info = classes.get(class_name).ok_or_else(|| {
-        Diagnostic::new(format!("internal error: unregistered class `{class_name}`"))
+        Diagnostic::new(
+          format!("internal error: unregistered class `{class_name}`"),
+          expr.span,
+        )
       })?;
-      let sig = info
-        .methods
-        .get(method)
-        .ok_or_else(|| Diagnostic::new(format!("class `{class_name}` has no method `{method}`")))?;
+      let sig = info.methods.get(method).ok_or_else(|| {
+        Diagnostic::new(
+          format!("class `{class_name}` has no method `{method}`"),
+          expr.span,
+        )
+      })?;
       if !matches!(
         sig.return_type,
         Type::Class(_) | Type::String | Type::Array(_) | Type::Hash(_, _)
       ) {
-        return Err(Diagnostic::new(format!(
-          "`&.{method}` returns {:?}, which cannot be wrapped as a nullable result — only a class, String, Array, or Hash return type is supported",
-          sig.return_type
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`&.{method}` returns {:?}, which cannot be wrapped as a nullable result — only a class, String, Array, or Hash return type is supported",
+            sig.return_type
+          ),
+          expr.span,
+        ));
       }
       check_args(
         method,
@@ -1261,12 +1416,16 @@ fn infer_expr_type(
       Ok(Type::Nullable(Box::new(sig.return_type.clone())))
     }
     Expr::InstanceVar(name) => {
-      let fields = self_fields
-        .ok_or_else(|| Diagnostic::new(format!("`@{name}` used outside of a method body")))?;
+      let fields = self_fields.ok_or_else(|| {
+        Diagnostic::new(
+          format!("`@{name}` used outside of a method body"),
+          expr.span,
+        )
+      })?;
       fields
         .get(name)
         .cloned()
-        .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`")))
+        .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`"), expr.span))
     }
     // Empty arrays are rejected (plan 09's Decision log): with no
     // structured type annotation on the literal itself, an empty
@@ -1285,17 +1444,19 @@ fn infer_expr_type(
       match array_ty {
         Type::Array(elem_ty) => {
           if index_ty != Type::Int64 {
-            return Err(Diagnostic::new(format!(
-              "array index must be Int64, found {index_ty:?}"
-            )));
+            return Err(Diagnostic::new(
+              format!("array index must be Int64, found {index_ty:?}"),
+              index.span,
+            ));
           }
           Ok(*elem_ty)
         }
         Type::Hash(key_ty, value_ty) => {
           if index_ty != *key_ty {
-            return Err(Diagnostic::new(format!(
-              "Hash key must be {key_ty:?}, found {index_ty:?}"
-            )));
+            return Err(Diagnostic::new(
+              format!("Hash key must be {key_ty:?}, found {index_ty:?}"),
+              index.span,
+            ));
           }
           Ok(*value_ty)
         }
@@ -1315,15 +1476,17 @@ fn infer_expr_type(
         // `String`, not an `Int64` byte value.
         Type::String => {
           if index_ty != Type::Int64 {
-            return Err(Diagnostic::new(format!(
-              "String index must be Int64, found {index_ty:?}"
-            )));
+            return Err(Diagnostic::new(
+              format!("String index must be Int64, found {index_ty:?}"),
+              index.span,
+            ));
           }
           Ok(Type::String)
         }
-        other => Err(Diagnostic::new(format!(
-          "`[...]` indexing requires an Array or a Hash, found {other:?}"
-        ))),
+        other => Err(Diagnostic::new(
+          format!("`[...]` indexing requires an Array or a Hash, found {other:?}"),
+          array.span,
+        )),
       }
     }
     Expr::Lambda {
@@ -1342,9 +1505,10 @@ fn infer_expr_type(
     Expr::ArrayNew(size) => {
       let size_ty = infer_expr_type(size, env, sigs, classes, self_fields, gctx)?;
       if size_ty != Type::Int64 {
-        return Err(Diagnostic::new(format!(
-          "`Array.new` size must be Int64, found {size_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`Array.new` size must be Int64, found {size_ty:?}"),
+          size.span,
+        ));
       }
       // `Array.new(size)`'s element type comes from the enclosing
       // `Let`'s declared annotation (plan 25's Decision log — the same
@@ -1354,6 +1518,7 @@ fn infer_expr_type(
       // alone has no declared-type context to draw on here.
       Err(Diagnostic::new(
         "`Array.new(...)` may only appear as a top-level `Let`'s value, where its element type is known from the declared annotation",
+        expr.span,
       ))
     }
   }
@@ -1365,7 +1530,7 @@ fn infer_expr_type(
 /// structured type annotation on the literal itself to fall back on —
 /// the literal can't be empty (mirrors `infer_array_lit_type` exactly).
 fn infer_hash_lit_type(
-  pairs: &[(Expr, Expr)],
+  pairs: &[(Spanned<Expr>, Spanned<Expr>)],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -1373,8 +1538,11 @@ fn infer_hash_lit_type(
   gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
   let Some(((first_k, first_v), rest)) = pairs.split_first() else {
+    // No pair at all to blame for a real span — an honest (0, 0), see
+    // `Diagnostic::span`'s own doc comment.
     return Err(Diagnostic::new(
       "empty hash literals are not supported — the key/value types can't be inferred",
+      (0, 0),
     ));
   };
   let key_ty = infer_expr_type(first_k, env, sigs, classes, self_fields, gctx)?;
@@ -1382,17 +1550,23 @@ fn infer_hash_lit_type(
   for (i, (k, v)) in rest.iter().enumerate() {
     let kt = infer_expr_type(k, env, sigs, classes, self_fields, gctx)?;
     if kt != key_ty {
-      return Err(Diagnostic::new(format!(
-        "hash literal pair {} has key type {kt:?}, expected {key_ty:?} (all keys must share one type)",
-        i + 2
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "hash literal pair {} has key type {kt:?}, expected {key_ty:?} (all keys must share one type)",
+          i + 2
+        ),
+        k.span,
+      ));
     }
     let vt = infer_expr_type(v, env, sigs, classes, self_fields, gctx)?;
     if vt != value_ty {
-      return Err(Diagnostic::new(format!(
-        "hash literal pair {} has value type {vt:?}, expected {value_ty:?} (all values must share one type)",
-        i + 2
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "hash literal pair {} has value type {vt:?}, expected {value_ty:?} (all values must share one type)",
+          i + 2
+        ),
+        v.span,
+      ));
     }
   }
   Ok(Type::Hash(Box::new(key_ty), Box::new(value_ty)))
@@ -1405,7 +1579,7 @@ fn infer_hash_lit_type(
 fn infer_lambda_type(
   params: &[Param],
   return_type: &str,
-  body: &[Stmt],
+  body: &[Spanned<Stmt>],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -1453,7 +1627,7 @@ fn infer_lambda_type(
 /// there's no structured type annotation on the literal itself to fall
 /// back on — the literal can't be empty (plan 09's Decision log).
 fn infer_array_lit_type(
-  elements: &[Expr],
+  elements: &[Spanned<Expr>],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -1463,16 +1637,20 @@ fn infer_array_lit_type(
   let Some((first, rest)) = elements.split_first() else {
     return Err(Diagnostic::new(
       "empty array literals are not supported — the element type can't be inferred",
+      (0, 0),
     ));
   };
   let elem_ty = infer_expr_type(first, env, sigs, classes, self_fields, gctx)?;
   for (i, e) in rest.iter().enumerate() {
     let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
     if t != elem_ty {
-      return Err(Diagnostic::new(format!(
-        "array literal element {} has type {t:?}, expected {elem_ty:?} (all elements must share one type)",
-        i + 2
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "array literal element {} has type {t:?}, expected {elem_ty:?} (all elements must share one type)",
+          i + 2
+        ),
+        e.span,
+      ));
     }
   }
   Ok(Type::Array(Box::new(elem_ty)))
@@ -1481,7 +1659,7 @@ fn infer_array_lit_type(
 #[allow(clippy::too_many_arguments)]
 fn check_args(
   name: &str,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   expected: &[Type],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
@@ -1490,19 +1668,30 @@ fn check_args(
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   if args.len() != expected.len() {
-    return Err(Diagnostic::new(format!(
-      "`{name}` expects {} argument(s), found {}",
-      expected.len(),
-      args.len()
-    )));
+    // Arity is a property of the whole call, not any one argument
+    // (Decision log) — the honest fallback is the first arg's span
+    // when one exists (closest real position to "the call"), or
+    // `(0, 0)` for a zero-arg call with too many expected.
+    let span = args.first().map(|a| a.span).unwrap_or((0, 0));
+    return Err(Diagnostic::new(
+      format!(
+        "`{name}` expects {} argument(s), found {}",
+        expected.len(),
+        args.len()
+      ),
+      span,
+    ));
   }
   for (i, (arg, expected_ty)) in args.iter().zip(expected).enumerate() {
     let actual = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
     if !is_assignable(&actual, expected_ty) {
-      return Err(Diagnostic::new(format!(
-        "argument {} to `{name}` has type {actual:?}, expected {expected_ty:?}",
-        i + 1
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "argument {} to `{name}` has type {actual:?}, expected {expected_ty:?}",
+          i + 1
+        ),
+        arg.span,
+      ));
     }
   }
   Ok(())
@@ -1519,28 +1708,39 @@ fn check_args(
 #[allow(clippy::too_many_arguments)]
 fn check_call_args(
   name: &str,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   sig: &FunctionSig,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  // Plan 22's own concrete AC2: an arity diagnostic's span is the
+  // *whole call expression* (`add(20)`), not any one argument's own
+  // span — arity is a property of the call, never of an individual
+  // argument (Decision log).
+  call_span: (usize, usize),
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   let required = sig.params.len();
   if sig.splat_elem.is_none() && args.len() > required {
-    return Err(Diagnostic::new(format!(
-      "`{name}` expects {required} argument(s), found {}",
-      args.len()
-    )));
+    return Err(Diagnostic::new(
+      format!(
+        "`{name}` expects {required} argument(s), found {}",
+        args.len()
+      ),
+      call_span,
+    ));
   }
   if args.len() < required {
     for (i, default) in sig.defaults.iter().enumerate().skip(args.len()) {
       if default.is_none() {
-        return Err(Diagnostic::new(format!(
-          "`{name}` is missing required argument `{}`",
-          sig.param_names[i]
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`{name}` is missing required argument `{}`",
+            sig.param_names[i]
+          ),
+          call_span,
+        ));
       }
     }
   }
@@ -1548,21 +1748,27 @@ fn check_call_args(
   for (i, arg) in args.iter().enumerate().take(checked) {
     let actual = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
     if actual != sig.params[i] {
-      return Err(Diagnostic::new(format!(
-        "argument {} to `{name}` has type {actual:?}, expected {:?}",
-        i + 1,
-        sig.params[i]
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "argument {} to `{name}` has type {actual:?}, expected {:?}",
+          i + 1,
+          sig.params[i]
+        ),
+        arg.span,
+      ));
     }
   }
   if let Some(splat_ty) = &sig.splat_elem {
     for (i, arg) in args.iter().enumerate().skip(required) {
       let actual = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
       if actual != *splat_ty {
-        return Err(Diagnostic::new(format!(
-          "trailing (splat) argument {} to `{name}` has type {actual:?}, expected {splat_ty:?}",
-          i + 1
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "trailing (splat) argument {} to `{name}` has type {actual:?}, expected {splat_ty:?}",
+            i + 1
+          ),
+          arg.span,
+        ));
       }
     }
   }
@@ -1573,9 +1779,9 @@ fn check_call_args(
 /// must match the array's element type.
 #[allow(clippy::too_many_arguments)]
 fn check_set_index(
-  array: &Expr,
-  index: &Expr,
-  value: &Expr,
+  array: &Spanned<Expr>,
+  index: &Spanned<Expr>,
+  value: &Spanned<Expr>,
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -1594,34 +1800,45 @@ fn check_set_index(
     Type::Class(class_name) => {
       let info = classes
         .get(&class_name)
-        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), array.span))?;
       let sig = info.methods.get("[]=").ok_or_else(|| {
-        Diagnostic::new(format!("class `{class_name}` has no operator method `[]=`"))
+        Diagnostic::new(
+          format!("class `{class_name}` has no operator method `[]=`"),
+          array.span,
+        )
       })?;
       if sig.params.len() != 2 {
-        return Err(Diagnostic::new(format!(
-          "class `{class_name}`'s `[]=` method must take exactly 2 parameters (index, value), found {}",
-          sig.params.len()
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "class `{class_name}`'s `[]=` method must take exactly 2 parameters (index, value), found {}",
+            sig.params.len()
+          ),
+          array.span,
+        ));
       }
       ("[]=", sig.params[1].clone(), sig.params[0].clone())
     }
     other => {
-      return Err(Diagnostic::new(format!(
-        "`[...] = ...` indexing requires an Array or a Hash, found {other:?}"
-      )));
+      return Err(Diagnostic::new(
+        format!("`[...] = ...` indexing requires an Array or a Hash, found {other:?}"),
+        array.span,
+      ));
     }
   };
   if index_ty != index_expected {
-    return Err(Diagnostic::new(format!(
-      "{container} index must be {index_expected:?}, found {index_ty:?}"
-    )));
+    return Err(Diagnostic::new(
+      format!("{container} index must be {index_expected:?}, found {index_ty:?}"),
+      index.span,
+    ));
   }
   let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
   if !is_assignable(&actual, &elem_ty) {
-    return Err(Diagnostic::new(format!(
-      "type mismatch in {container} assignment: element type is {elem_ty:?}, value has type {actual:?}"
-    )));
+    return Err(Diagnostic::new(
+      format!(
+        "type mismatch in {container} assignment: element type is {elem_ty:?}, value has type {actual:?}"
+      ),
+      value.span,
+    ));
   }
   Ok(())
 }
@@ -1635,7 +1852,7 @@ fn check_set_index(
 #[allow(clippy::too_many_arguments)]
 fn check_multi_assign(
   names: &[String],
-  values: &[Expr],
+  values: &[Spanned<Expr>],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -1643,26 +1860,34 @@ fn check_multi_assign(
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   if names.len() != values.len() {
-    return Err(Diagnostic::new(format!(
-      "multiple assignment arity mismatch: {} target(s), {} value(s)",
-      names.len(),
-      values.len()
-    )));
+    let span = values.first().map(|v| v.span).unwrap_or((0, 0));
+    return Err(Diagnostic::new(
+      format!(
+        "multiple assignment arity mismatch: {} target(s), {} value(s)",
+        names.len(),
+        values.len()
+      ),
+      span,
+    ));
   }
   let value_types = values
     .iter()
     .map(|v| infer_expr_type(v, env, sigs, classes, self_fields, gctx))
     .collect::<Result<Vec<_>, _>>()?;
   for (i, (name, actual)) in names.iter().zip(value_types).enumerate() {
+    let value_span = values[i].span;
     let declared = env
       .get(name)
       .cloned()
-      .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+      .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), value_span))?;
     if !is_assignable(&actual, &declared) {
-      return Err(Diagnostic::new(format!(
-        "type mismatch in multiple assignment at position {}: `{name}` has type {declared:?}, value has type {actual:?}",
-        i + 1
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "type mismatch in multiple assignment at position {}: `{name}` has type {declared:?}, value has type {actual:?}",
+          i + 1
+        ),
+        value_span,
+      ));
     }
   }
   Ok(())
@@ -1675,7 +1900,7 @@ fn check_multi_assign(
 /// body (see `infer_expr_type`).
 #[allow(clippy::too_many_arguments)]
 fn check_stmt(
-  stmt: &Stmt,
+  stmt: &Spanned<Stmt>,
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -1691,7 +1916,7 @@ fn check_stmt(
   yields_allowed: bool,
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
-  match stmt {
+  match &stmt.node {
     // `Proc` is special-cased: the bare annotation carries no signature
     // (see `Type::Proc`'s doc comment), so instead of comparing against
     // `resolve_type("Proc", ...)`'s opaque placeholder, any actual
@@ -1700,9 +1925,12 @@ fn check_stmt(
     Stmt::Let { name, ty, value } if ty == "Proc" => {
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !matches!(actual, Type::Proc(_, _)) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch in `{name}: Proc = ...`: expected a Proc (lambda literal), found {actual:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name}: Proc = ...`: expected a Proc (lambda literal), found {actual:?}"
+          ),
+          value.span,
+        ));
       }
       env.insert(name.clone(), actual);
       Ok(())
@@ -1714,19 +1942,26 @@ fn check_stmt(
     Stmt::Let {
       name,
       ty,
-      value: Expr::ArrayNew(size),
+      value: Spanned {
+        node: Expr::ArrayNew(size),
+        ..
+      },
     } => {
       let declared = resolve_type(ty, classes)?;
       if !matches!(declared, Type::Array(_)) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch in `{name}: {ty} = Array.new(...)`: `Array.new` produces an Array, not {declared:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name}: {ty} = Array.new(...)`: `Array.new` produces an Array, not {declared:?}"
+          ),
+          stmt.span,
+        ));
       }
       let size_ty = infer_expr_type(size, env, sigs, classes, self_fields, gctx)?;
       if size_ty != Type::Int64 {
-        return Err(Diagnostic::new(format!(
-          "`Array.new` size must be Int64, found {size_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`Array.new` size must be Int64, found {size_ty:?}"),
+          size.span,
+        ));
       }
       env.insert(name.clone(), declared);
       Ok(())
@@ -1735,25 +1970,35 @@ fn check_stmt(
       let declared = resolve_type(ty, classes)?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch in `{name}: {ty} = ...`: declared type {declared:?}, value has type {actual:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name}: {ty} = ...`: declared type {declared:?}, value has type {actual:?}"
+          ),
+          value.span,
+        ));
       }
       env.insert(name.clone(), declared);
       Ok(())
     }
     Stmt::SetField { name, value } => {
-      let fields = self_fields
-        .ok_or_else(|| Diagnostic::new(format!("`@{name} = ...` used outside of a method body")))?;
+      let fields = self_fields.ok_or_else(|| {
+        Diagnostic::new(
+          format!("`@{name} = ...` used outside of a method body"),
+          stmt.span,
+        )
+      })?;
       let declared = fields
         .get(name)
         .cloned()
-        .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`"), stmt.span))?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch in `@{name} = ...`: field declared {declared:?}, value has type {actual:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `@{name} = ...`: field declared {declared:?}, value has type {actual:?}"
+          ),
+          value.span,
+        ));
       }
       Ok(())
     }
@@ -1771,12 +2016,15 @@ fn check_stmt(
       let declared = env
         .get(name)
         .cloned()
-        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch in `{name} = ...`: `{name}` has type {declared:?}, value has type {actual:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name} = ...`: `{name}` has type {declared:?}, value has type {actual:?}"
+          ),
+          value.span,
+        ));
       }
       Ok(())
     }
@@ -1791,17 +2039,21 @@ fn check_stmt(
       let declared = env
         .get(name)
         .cloned()
-        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
       let Type::Nullable(inner) = &declared else {
-        return Err(Diagnostic::new(format!(
-          "`{name} ||= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`{name} ||= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
+          ),
+          stmt.span,
+        ));
       };
       let actual = infer_expr_type(default, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, inner) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch in `{name} ||= ...`: expected {inner:?}, found {actual:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("type mismatch in `{name} ||= ...`: expected {inner:?}, found {actual:?}"),
+          default.span,
+        ));
       }
       env.insert(name.clone(), (**inner).clone());
       Ok(())
@@ -1817,17 +2069,21 @@ fn check_stmt(
       let declared = env
         .get(name)
         .cloned()
-        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
       if !matches!(declared, Type::Nullable(_)) {
-        return Err(Diagnostic::new(format!(
-          "`{name} &&= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`{name} &&= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
+          ),
+          stmt.span,
+        ));
       }
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch in `{name} &&= ...`: expected {declared:?}, found {actual:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("type mismatch in `{name} &&= ...`: expected {declared:?}, found {actual:?}"),
+          value.span,
+        ));
       }
       Ok(())
     }
@@ -1841,9 +2097,12 @@ fn check_stmt(
     } => {
       let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields, gctx)?;
       if cond_ty != Type::Boolean {
-        return Err(Diagnostic::new(format!(
-          "`if` condition must be Boolean, found {cond_ty:?} (no truthy/falsy coercion — spec/GRAMMAR.md §5)"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "`if` condition must be Boolean, found {cond_ty:?} (no truthy/falsy coercion — spec/GRAMMAR.md §5)"
+          ),
+          cond.span,
+        ));
       }
       check_block(
         then_branch,
@@ -1876,9 +2135,10 @@ fn check_stmt(
     Stmt::While { cond, body } => {
       let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields, gctx)?;
       if cond_ty != Type::Boolean {
-        return Err(Diagnostic::new(format!(
-          "`while` condition must be Boolean, found {cond_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`while` condition must be Boolean, found {cond_ty:?}"),
+          cond.span,
+        ));
       }
       check_block(
         body,
@@ -1896,22 +2156,25 @@ fn check_stmt(
     Stmt::Return(Some(e)) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&t, return_type) {
-        return Err(Diagnostic::new(format!(
-          "type mismatch: `return` value has type {t:?} but the enclosing function declares {return_type:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch: `return` value has type {t:?} but the enclosing function declares {return_type:?}"
+          ),
+          e.span,
+        ));
       }
       Ok(())
     }
     Stmt::Return(None) => Ok(()),
     Stmt::Break => {
       if !in_loop {
-        return Err(Diagnostic::new("`break` outside of a loop"));
+        return Err(Diagnostic::new("`break` outside of a loop", stmt.span));
       }
       Ok(())
     }
     Stmt::Next => {
       if !in_loop {
-        return Err(Diagnostic::new("`next` outside of a loop"));
+        return Err(Diagnostic::new("`next` outside of a loop", stmt.span));
       }
       Ok(())
     }
@@ -1919,9 +2182,10 @@ fn check_stmt(
     Stmt::Raise(e) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if !matches!(t, Type::Class(_)) {
-        return Err(Diagnostic::new(format!(
-          "`raise` requires a class instance, found {t:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`raise` requires a class instance, found {t:?}"),
+          e.span,
+        ));
       }
       Ok(())
     }
@@ -1938,6 +2202,7 @@ fn check_stmt(
       if !yields_allowed {
         return Err(Diagnostic::new(
           "`yield` used outside of a function or method that declares a block parameter (`&name`)",
+          stmt.span,
         ));
       }
       for a in args {
@@ -2030,15 +2295,17 @@ fn check_stmt(
     } => {
       let start_ty = infer_expr_type(start, env, sigs, classes, self_fields, gctx)?;
       if start_ty != Type::Int64 {
-        return Err(Diagnostic::new(format!(
-          "range start must be Int64, found {start_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("range start must be Int64, found {start_ty:?}"),
+          start.span,
+        ));
       }
       let end_ty = infer_expr_type(end, env, sigs, classes, self_fields, gctx)?;
       if end_ty != Type::Int64 {
-        return Err(Diagnostic::new(format!(
-          "range end must be Int64, found {end_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("range end must be Int64, found {end_ty:?}"),
+          end.span,
+        ));
       }
       env.insert(var.clone(), Type::Int64);
       check_block(
@@ -2059,7 +2326,10 @@ fn check_stmt(
     // for the `begin`'s own try `body` or its `ensure` body.
     Stmt::Retry => {
       if !in_rescue {
-        return Err(Diagnostic::new("`retry` outside of a rescue body"));
+        return Err(Diagnostic::new(
+          "`retry` outside of a rescue body",
+          stmt.span,
+        ));
       }
       Ok(())
     }
@@ -2073,9 +2343,9 @@ fn check_stmt(
 /// `spec/GRAMMAR.md`'s eventual method-dispatched `===`.
 #[allow(clippy::too_many_arguments)]
 fn check_case(
-  scrutinee: &Expr,
-  arms: &[(Vec<Expr>, Vec<Stmt>)],
-  else_body: &Option<Vec<Stmt>>,
+  scrutinee: &Spanned<Expr>,
+  arms: &[CaseArm],
+  else_body: &Option<Vec<Spanned<Stmt>>>,
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -2088,17 +2358,19 @@ fn check_case(
 ) -> Result<(), Diagnostic> {
   let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields, gctx)?;
   if scrutinee_ty != Type::Int64 {
-    return Err(Diagnostic::new(format!(
-      "`case` scrutinee must be Int64, found {scrutinee_ty:?}"
-    )));
+    return Err(Diagnostic::new(
+      format!("`case` scrutinee must be Int64, found {scrutinee_ty:?}"),
+      scrutinee.span,
+    ));
   }
   for (values, body) in arms {
     for v in values {
       let value_ty = infer_expr_type(v, env, sigs, classes, self_fields, gctx)?;
       if value_ty != Type::Int64 {
-        return Err(Diagnostic::new(format!(
-          "`when` value must be Int64, found {value_ty:?}"
-        )));
+        return Err(Diagnostic::new(
+          format!("`when` value must be Int64, found {value_ty:?}"),
+          v.span,
+        ));
       }
     }
     check_block(
@@ -2144,9 +2416,9 @@ fn check_case(
 /// both, matching Ruby's own restriction.
 #[allow(clippy::too_many_arguments)]
 fn check_begin(
-  body: &[Stmt],
+  body: &[Spanned<Stmt>],
   rescues: &[RescueClause],
-  ensure: &Option<Vec<Stmt>>,
+  ensure: &Option<Vec<Spanned<Stmt>>>,
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -2173,9 +2445,13 @@ fn check_begin(
     if let Some(class_name) = &rescue.class_name {
       let rescue_ty = resolve_type(class_name, classes)?;
       if !matches!(rescue_ty, Type::Class(_)) {
-        return Err(Diagnostic::new(format!(
-          "`rescue {class_name}` must name a class, found {rescue_ty:?}"
-        )));
+        // `RescueClause` carries no span of its own (ast.rs never wraps
+        // it in `Spanned` — see plan 22's own scope note); an honest
+        // `(0, 0)`.
+        return Err(Diagnostic::new(
+          format!("`rescue {class_name}` must name a class, found {rescue_ty:?}"),
+          (0, 0),
+        ));
       }
       env.insert(rescue.var.clone(), rescue_ty);
     }
@@ -2211,7 +2487,7 @@ fn check_begin(
 
 #[allow(clippy::too_many_arguments)]
 fn check_block(
-  stmts: &[Stmt],
+  stmts: &[Spanned<Stmt>],
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -2244,7 +2520,7 @@ fn check_block(
 /// bare expression returns that expression's value).
 #[allow(clippy::too_many_arguments)]
 fn check_implicit_return(
-  body: &[Stmt],
+  body: &[Spanned<Stmt>],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
@@ -2253,12 +2529,19 @@ fn check_implicit_return(
   owner_name: &str,
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
-  if let Some(Stmt::Expr(e)) = body.last() {
+  if let Some(Spanned {
+    node: Stmt::Expr(e),
+    ..
+  }) = body.last()
+  {
     let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
     if t != *declared_return {
-      return Err(Diagnostic::new(format!(
-        "type mismatch in `{owner_name}`: body has type {t:?} but declared return type is {declared_return:?}"
-      )));
+      return Err(Diagnostic::new(
+        format!(
+          "type mismatch in `{owner_name}`: body has type {t:?} but declared return type is {declared_return:?}"
+        ),
+        e.span,
+      ));
     }
   }
   Ok(())
@@ -2320,16 +2603,22 @@ fn check_method_body(
   // disclosed diagnostic here, not a silently-ignored parsed-but-dead
   // AST field.
   if let Some(p) = m.params.iter().find(|p| p.default.is_some()) {
-    return Err(Diagnostic::new(format!(
-      "default parameter values are not supported on methods yet (`{class_name}#{}`'s `{}`)",
-      m.name, p.name
-    )));
+    return Err(Diagnostic::new(
+      format!(
+        "default parameter values are not supported on methods yet (`{class_name}#{}`'s `{}`)",
+        m.name, p.name
+      ),
+      (0, 0),
+    ));
   }
   if m.splat_param.is_some() {
-    return Err(Diagnostic::new(format!(
-      "splat parameters are not supported on methods yet (`{class_name}#{}`)",
-      m.name
-    )));
+    return Err(Diagnostic::new(
+      format!(
+        "splat parameters are not supported on methods yet (`{class_name}#{}`)",
+        m.name
+      ),
+      (0, 0),
+    ));
   }
   let mut env = HashMap::new();
   for p in &m.params {
@@ -2420,7 +2709,7 @@ fn check_block_call_sites(
 }
 
 fn scan_block_call_sites(
-  stmts: &[Stmt],
+  stmts: &[Spanned<Stmt>],
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   func_defs: &HashMap<String, &Function>,
@@ -2433,15 +2722,18 @@ fn scan_block_call_sites(
 }
 
 fn scan_block_call_site(
-  stmt: &Stmt,
+  stmt: &Spanned<Stmt>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   func_defs: &HashMap<String, &Function>,
   gctx: &GenericsCtx,
   diags: &mut Vec<Diagnostic>,
 ) {
-  match stmt {
-    Stmt::Expr(Expr::Call(name, args)) => {
+  match &stmt.node {
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) => {
       let declares_block = sigs.get(name).is_some_and(|s| s.block_param.is_some());
       if declares_block {
         check_one_block_call_site(name, args, sigs, classes, func_defs, gctx, diags);
@@ -2488,22 +2780,29 @@ fn scan_block_call_site(
 
 fn check_one_block_call_site(
   name: &str,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   func_defs: &HashMap<String, &Function>,
   gctx: &GenericsCtx,
   diags: &mut Vec<Diagnostic>,
 ) {
-  let Some(Expr::Lambda {
-    params: blk_params,
-    body: blk_body,
+  let Some(Spanned {
+    node: Expr::Lambda {
+      params: blk_params,
+      body: blk_body,
+      ..
+    },
     ..
   }) = args.last()
   else {
-    diags.push(Diagnostic::new(format!(
-      "`{name}` requires a trailing block (`{{ |params| ... }}`) — it declares a block parameter"
-    )));
+    let span = args.last().map(|a| a.span).unwrap_or((0, 0));
+    diags.push(Diagnostic::new(
+      format!(
+        "`{name}` requires a trailing block (`{{ |params| ... }}`) — it declares a block parameter"
+      ),
+      span,
+    ));
     return;
   };
   let mut blk_env: HashMap<String, Type> = HashMap::new();
@@ -2568,7 +2867,7 @@ fn check_one_block_call_site(
 /// routine `check_function_body` pass; re-verifying it here would be
 /// redundant, not incorrect.
 fn check_yields_against_block(
-  stmts: &[Stmt],
+  stmts: &[Spanned<Stmt>],
   expected: &[Type],
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
@@ -2576,22 +2875,29 @@ fn check_yields_against_block(
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   for stmt in stmts {
-    match stmt {
+    match &stmt.node {
       Stmt::Yield(args) => {
         if args.len() != expected.len() {
-          return Err(Diagnostic::new(format!(
-            "block arity mismatch: `yield` passes {} argument(s), attached block declares {} parameter(s)",
-            args.len(),
-            expected.len()
-          )));
+          let span = args.first().map(|a| a.span).unwrap_or(stmt.span);
+          return Err(Diagnostic::new(
+            format!(
+              "block arity mismatch: `yield` passes {} argument(s), attached block declares {} parameter(s)",
+              args.len(),
+              expected.len()
+            ),
+            span,
+          ));
         }
         for (i, (a, want)) in args.iter().zip(expected).enumerate() {
           let actual = infer_expr_type(a, env, sigs, classes, None, gctx)?;
           if actual != *want {
-            return Err(Diagnostic::new(format!(
-              "type mismatch in `yield` argument {}: attached block's parameter has type {want:?}, value has type {actual:?}",
-              i + 1
-            )));
+            return Err(Diagnostic::new(
+              format!(
+                "type mismatch in `yield` argument {}: attached block's parameter has type {want:?}, value has type {actual:?}",
+                i + 1
+              ),
+              a.span,
+            ));
           }
         }
       }
@@ -2918,11 +3224,14 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           Err(d) => diags.push(d),
         }
       } else if f.type_params.len() != 1 {
-        diags.push(Diagnostic::new(format!(
-          "generic function `{}` declares {} type parameters — multiple type parameters are not supported",
-          f.name,
-          f.type_params.len()
-        )));
+        diags.push(Diagnostic::new(
+          format!(
+            "generic function `{}` declares {} type parameters — multiple type parameters are not supported",
+            f.name,
+            f.type_params.len()
+          ),
+          (0, 0),
+        ));
         bad_generic_fns.insert(f.name.clone());
       } else {
         let tp = &f.type_params[0];
@@ -3067,9 +3376,10 @@ fn check_interface_conformance(
   classes: &HashMap<String, ClassInfo>,
 ) -> Result<(), Diagnostic> {
   let iface = interfaces.get(iface_name).ok_or_else(|| {
-    Diagnostic::new(format!(
-      "class `{class_name}` declares `implements {iface_name}`, but no interface named `{iface_name}` is declared"
-    ))
+    Diagnostic::new(
+      format!("class `{class_name}` declares `implements {iface_name}`, but no interface named `{iface_name}` is declared"),
+      (0, 0),
+    )
   })?;
   let expected_params = iface
     .params_raw
@@ -3085,16 +3395,22 @@ fn check_interface_conformance(
     classes,
   )?;
   let Some(actual) = info.methods.get(&iface.method_name) else {
-    return Err(Diagnostic::new(format!(
-      "class `{class_name}` declares `implements {iface_name}` but does not define required method `{}`",
-      iface.method_name
-    )));
+    return Err(Diagnostic::new(
+      format!(
+        "class `{class_name}` declares `implements {iface_name}` but does not define required method `{}`",
+        iface.method_name
+      ),
+      (0, 0),
+    ));
   };
   if actual.params != expected_params || actual.return_type != expected_return {
-    return Err(Diagnostic::new(format!(
-      "class `{class_name}`'s `{}` does not match interface `{iface_name}`'s required signature: expected {expected_params:?} -> {expected_return:?}, found {:?} -> {:?}",
-      iface.method_name, actual.params, actual.return_type
-    )));
+    return Err(Diagnostic::new(
+      format!(
+        "class `{class_name}`'s `{}` does not match interface `{iface_name}`'s required signature: expected {expected_params:?} -> {expected_return:?}, found {:?} -> {:?}",
+        iface.method_name, actual.params, actual.return_type
+      ),
+      (0, 0),
+    ));
   }
   Ok(())
 }
@@ -4634,5 +4950,48 @@ mod tests {
     assert!(!table.classes.contains_key("Bad"));
     assert!(table.classes.contains_key("Good"));
     assert!(table.functions.contains_key("ok"));
+  }
+
+  // Plan 22 (sema diagnostic spans) — leaf-sema-spans.
+
+  #[test]
+  fn add_type_mismatch_diagnostic_span_points_at_the_real_second_b() {
+    // AC1: the exact concrete-proof program from this plan's own
+    // Decision log — proves the span actually threads from the parser
+    // through sema (not just that the AST carries one internally).
+    let src = "def add(a: Int64, b: String) -> Int64\n  a + b\nend";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject Int64 + String");
+    assert_eq!(errs.len(), 1);
+    let second_b = src
+      .match_indices('b')
+      .nth(1)
+      .expect("source has two occurrences of 'b'")
+      .0;
+    assert_eq!(errs[0].span, (second_b, second_b + 1));
+  }
+
+  #[test]
+  fn arity_mismatch_diagnostic_span_covers_the_whole_call_expression() {
+    // AC2: `add(20)`'s own span — not just `add` and not just `20`.
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject 1-arg call to 2-arg add");
+    let d = errs
+      .iter()
+      .find(|d| d.message.contains("missing required argument `b`"))
+      .expect("expected the missing-argument diagnostic");
+    let call_start = src.find("add(20)").unwrap();
+    assert_eq!(d.span, (call_start, call_start + "add(20)".len()));
+  }
+
+  #[test]
+  fn break_outside_loop_diagnostic_span_is_the_break_statements_own_span() {
+    // AC3: the honest fallback — no better sub-expression to blame,
+    // so the statement's own span, still real and non-degenerate.
+    let src = "break\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject break outside a loop");
+    assert_eq!(errs[0].span, (0, "break".len()));
   }
 }

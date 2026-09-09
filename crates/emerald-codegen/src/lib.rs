@@ -20,8 +20,8 @@
 //! change for well-typed Emerald programs.
 
 use emerald_parser::{
-  ClassDef, CompareOp, Expr, Function as AstFunction, Item, ModuleDef, Param, Program,
-  RescueClause, Stmt, StringPart,
+  CaseArm, ClassDef, CompareOp, Expr, Function as AstFunction, Item, ModuleDef, Param, Program,
+  RescueClause, Spanned, Stmt, StringPart,
 };
 use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
@@ -250,8 +250,8 @@ struct LambdaInfo {
 
 // --- Free-variable analysis (language-only — no LLVM/Cranelift API) ---
 
-fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
-  match expr {
+fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
+  match &expr.node {
     Expr::Ident(name) => out.push(name.clone()),
     Expr::Int(_)
     | Expr::Float(_)
@@ -327,8 +327,12 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
   }
 }
 
-fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut HashSet<String>) {
-  match stmt {
+fn collect_idents_in_stmt(
+  stmt: &Spanned<Stmt>,
+  referenced: &mut Vec<String>,
+  bound: &mut HashSet<String>,
+) {
+  match &stmt.node {
     Stmt::Let { name, value, .. } => {
       bound.insert(name.clone());
       collect_idents_in_expr(value, referenced);
@@ -488,8 +492,8 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
 /// `Expr::Ident` reference." Assigns the next unused dense ID
 /// (`table.len() as i64`) to each newly-seen spelling — two `:foo`
 /// occurrences anywhere in the program produce the exact same ID.
-fn collect_symbols_in_expr(expr: &Expr, table: &mut HashMap<String, i64>) {
-  match expr {
+fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64>) {
+  match &expr.node {
     Expr::SymbolLit(name) => {
       if !table.contains_key(name) {
         let id = table.len() as i64;
@@ -563,8 +567,8 @@ fn collect_symbols_in_expr(expr: &Expr, table: &mut HashMap<String, i64>) {
   }
 }
 
-fn collect_symbols_in_stmt(stmt: &Stmt, table: &mut HashMap<String, i64>) {
-  match stmt {
+fn collect_symbols_in_stmt(stmt: &Spanned<Stmt>, table: &mut HashMap<String, i64>) {
+  match &stmt.node {
     Stmt::Let { value, .. } => collect_symbols_in_expr(value, table),
     Stmt::SetField { value, .. } => collect_symbols_in_expr(value, table),
     Stmt::SetIndex {
@@ -730,10 +734,10 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
 /// this can't resolve is a real, disclosed codegen gap (AC4), not a
 /// miscompile.
 fn resolve_arg_concrete_class<'a>(
-  arg: &'a Expr,
+  arg: &'a Spanned<Expr>,
   local_classes: &'a HashMap<String, String>,
 ) -> Option<&'a str> {
-  match arg {
+  match &arg.node {
     Expr::Ident(name) => local_classes.get(name).map(String::as_str),
     Expr::New(class_name, _) => Some(class_name.as_str()),
     _ => None,
@@ -747,7 +751,7 @@ fn resolve_arg_concrete_class<'a>(
 fn mangled_generic_call_symbol(
   name: &str,
   g: &AstFunction,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   local_classes: &HashMap<String, String>,
 ) -> Result<String, String> {
   let type_param = g
@@ -846,12 +850,12 @@ fn collect_generic_specializations(
 }
 
 fn collect_specializations_in_expr(
-  expr: &Expr,
+  expr: &Spanned<Expr>,
   generic_fns: &HashMap<String, &AstFunction>,
   local_classes: &HashMap<String, String>,
   out: &mut HashMap<String, HashSet<String>>,
 ) {
-  if let Expr::Call(name, args) = expr {
+  if let Expr::Call(name, args) = &expr.node {
     if let Some(g) = generic_fns.get(name) {
       if let Some(type_param) = g.type_params.first() {
         for (i, p) in g.params.iter().enumerate() {
@@ -870,7 +874,7 @@ fn collect_specializations_in_expr(
       }
     }
   }
-  match expr {
+  match &expr.node {
     Expr::Ident(_)
     | Expr::Int(_)
     | Expr::Float(_)
@@ -942,13 +946,13 @@ fn collect_specializations_in_expr(
 }
 
 fn collect_specializations_in_stmt(
-  stmt: &Stmt,
+  stmt: &Spanned<Stmt>,
   generic_fns: &HashMap<String, &AstFunction>,
   local_classes: &mut HashMap<String, String>,
   classes: &HashMap<String, ClassLayout>,
   out: &mut HashMap<String, HashSet<String>>,
 ) {
-  match stmt {
+  match &stmt.node {
     Stmt::Let { name, ty, value } => {
       collect_specializations_in_expr(value, generic_fns, local_classes, out);
       if classes.contains_key(ty.as_str()) {
@@ -1107,7 +1111,7 @@ fn substitute_generic_function(
   }
 }
 
-fn free_vars_in_lambda(params: &[Param], body: &[Stmt]) -> Vec<String> {
+fn free_vars_in_lambda(params: &[Param], body: &[Spanned<Stmt>]) -> Vec<String> {
   let mut referenced = Vec::new();
   let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
   for s in body {
@@ -1126,17 +1130,29 @@ fn free_vars_in_lambda(params: &[Param], body: &[Stmt]) -> Vec<String> {
 fn collect_lambda_infos(program: &Program) -> Result<HashMap<String, LambdaInfo>, String> {
   let mut top_level_types: HashMap<String, String> = HashMap::new();
   for item in &program.items {
-    if let Item::Stmt(Stmt::Let { name, ty, .. }) = item {
+    if let Item::Stmt(Spanned {
+      node: Stmt::Let { name, ty, .. },
+      ..
+    }) = item
+    {
       top_level_types.insert(name.clone(), ty.clone());
     }
   }
 
   let mut lambda_infos: HashMap<String, LambdaInfo> = HashMap::new();
   for item in &program.items {
-    let Item::Stmt(Stmt::Let {
-      name,
-      ty,
-      value: Expr::Lambda { params, body, .. },
+    let Item::Stmt(Spanned {
+      node:
+        Stmt::Let {
+          name,
+          ty,
+          value:
+            Spanned {
+              node: Expr::Lambda { params, body, .. },
+              ..
+            },
+        },
+      ..
     }) = item
     else {
       continue;
@@ -1179,9 +1195,9 @@ fn collect_lambda_infos(program: &Program) -> Result<HashMap<String, LambdaInfo>
 /// note) — just hoisted up front instead of declared lazily, since
 /// Cranelift's own `Variable` SSA construction doesn't need the entry-
 /// block-dominance discipline LLVM's `alloca`+`mem2reg` does.
-fn collect_lets(stmts: &[Stmt], out: &mut Vec<(String, ValKind)>) {
+fn collect_lets(stmts: &[Spanned<Stmt>], out: &mut Vec<(String, ValKind)>) {
   for stmt in stmts {
-    match stmt {
+    match &stmt.node {
       Stmt::Let { name, ty, .. } => out.push((name.clone(), value_kind_for_type(ty))),
       Stmt::While { body, .. } => collect_lets(body, out),
       // Plan 30: `var` itself is deliberately NOT hoisted here — unlike
@@ -1295,8 +1311,8 @@ struct ExceptionRuntimeFuncs<'ctx> {
 /// Plan 38: does `stmt` (at any nesting depth) contain a `Stmt::Retry`?
 /// Used to decide whether `compile_to_object` must skip optimization
 /// for correctness (see its own call site's Decision-log comment).
-fn stmt_contains_retry(stmt: &Stmt) -> bool {
-  match stmt {
+fn stmt_contains_retry(stmt: &Spanned<Stmt>) -> bool {
+  match &stmt.node {
     Stmt::Retry => true,
     Stmt::If {
       then_branch,
@@ -1341,7 +1357,7 @@ fn stmt_contains_retry(stmt: &Stmt) -> bool {
 /// Plan 38: does `program` use `retry` anywhere — in a free function, a
 /// method, or a top-level statement?
 fn program_uses_retry(program: &Program) -> bool {
-  fn body_uses_retry(body: &[Stmt]) -> bool {
+  fn body_uses_retry(body: &[Spanned<Stmt>]) -> bool {
     body.iter().any(stmt_contains_retry)
   }
   program.items.iter().any(|item| match item {
@@ -1510,7 +1526,7 @@ struct Ctx<'a, 'ctx> {
   /// reads this to know what to substitute. `None` everywhere else
   /// (ordinary function/method/lambda bodies never reach a `Stmt::
   /// Yield` — sema already guarantees that).
-  yield_target: Option<(&'a [Param], &'a [Stmt])>,
+  yield_target: Option<(&'a [Param], &'a [Spanned<Stmt>])>,
   /// `{symbol spelling} -> a dense compile-time integer ID` (plan 44's
   /// Decision log) — every distinct `:foo` spelling anywhere in the
   /// whole program, assigned in first-occurrence order, mirroring
@@ -1578,8 +1594,8 @@ fn build_numeric_binop<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   op_symbol: &str,
-  lhs: &Expr,
-  rhs: &Expr,
+  lhs: &Spanned<Expr>,
+  rhs: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -1596,7 +1612,7 @@ fn build_numeric_binop<'ctx>(
   // scoped tokens) plus `%` (outside the plan's literal list, but
   // routed identically — see `check_numeric_binop`'s own sema-side
   // comment).
-  if let Expr::Ident(name) = lhs {
+  if let Expr::Ident(name) = &lhs.node {
     if local_classes.contains_key(name) {
       return build_method_call(
         context,
@@ -1660,8 +1676,8 @@ fn build_bitwise_binop<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   op_symbol: &str,
-  lhs: &Expr,
-  rhs: &Expr,
+  lhs: &Spanned<Expr>,
+  rhs: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -1726,8 +1742,8 @@ fn build_short_circuit<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   is_and: bool,
-  lhs: &Expr,
-  rhs: &Expr,
+  lhs: &Spanned<Expr>,
+  rhs: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -1897,13 +1913,13 @@ fn build_interpolate<'ctx>(
 fn build_expr<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  expr: &Expr,
+  expr: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
-  match expr {
+  match &expr.node {
     Expr::Ident(name) => {
       let (ptr, kind) = *vars
         .get(name)
@@ -1960,7 +1976,7 @@ fn build_expr<'ctx>(
     ),
     // Plan 40's Decision log: checked before either operand is built —
     // see `build_numeric_binop`'s identical branch for `-`/`*`/`/`.
-    Expr::Add(lhs, rhs) if matches!(lhs.as_ref(), Expr::Ident(name) if local_classes.contains_key(name)) => {
+    Expr::Add(lhs, rhs) if matches!(&lhs.node, Expr::Ident(name) if local_classes.contains_key(name)) => {
       build_method_call(
         context,
         builder,
@@ -2238,7 +2254,7 @@ fn build_expr<'ctx>(
     // default: no separate `!=` overload token). Sema already rejects
     // any other `CompareOp` on a class operand, so reaching this arm
     // with one is an internal-error `Err`, not a panic.
-    Expr::Compare(lhs, op, rhs) if matches!(lhs.as_ref(), Expr::Ident(name) if local_classes.contains_key(name)) =>
+    Expr::Compare(lhs, op, rhs) if matches!(&lhs.node, Expr::Ident(name) if local_classes.contains_key(name)) =>
     {
       if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
         return Err(format!(
@@ -2616,7 +2632,7 @@ fn build_expr<'ctx>(
 fn build_hash_lit<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  pairs: &[(Expr, Expr)],
+  pairs: &[(Spanned<Expr>, Spanned<Expr>)],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -2714,15 +2730,15 @@ fn field_ptr<'ctx>(
 fn build_method_call<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  recv: &Expr,
+  recv: &Spanned<Expr>,
   method: &str,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
-  let Expr::Ident(recv_name) = recv else {
+  let Expr::Ident(recv_name) = &recv.node else {
     return Err(
       "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
     );
@@ -2915,15 +2931,15 @@ fn build_method_call<'ctx>(
 fn build_safe_call<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  recv: &Expr,
+  recv: &Spanned<Expr>,
   method: &str,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
-  if !matches!(recv, Expr::Ident(_)) {
+  if !matches!(&recv.node, Expr::Ident(_)) {
     return Err("codegen: `&.` is only supported on a plain local-variable receiver".to_string());
   }
   let (recv_val, recv_kind) = build_expr(
@@ -2999,7 +3015,7 @@ fn build_safe_call<'ctx>(
 fn build_array_lit<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  elements: &[Expr],
+  elements: &[Spanned<Expr>],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -3043,7 +3059,7 @@ fn build_call_arg_vals<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   name: &str,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -3078,7 +3094,7 @@ fn build_call_arg_vals<'ctx>(
     arg_vals.push(v.into());
   }
   if f.splat_param.is_some() {
-    let trailing: &[Expr] = if args.len() > ordinary_count {
+    let trailing: &[Spanned<Expr>] = if args.len() > ordinary_count {
       &args[ordinary_count..]
     } else {
       &[]
@@ -3108,7 +3124,7 @@ fn build_call_expr<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   name: &str,
-  args: &[Expr],
+  args: &[Spanned<Expr>],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -3180,7 +3196,7 @@ fn build_call_kw_expr<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   name: &str,
-  kwargs: &[(String, Expr)],
+  kwargs: &[(String, Spanned<Expr>)],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -3193,7 +3209,7 @@ fn build_call_kw_expr<'ctx>(
     .func_defs
     .get(name)
     .ok_or_else(|| format!("codegen: internal error — `{name}` has no known declaration"))?;
-  let mut resolved: Vec<Option<&Expr>> = vec![None; f.params.len()];
+  let mut resolved: Vec<Option<&Spanned<Expr>>> = vec![None; f.params.len()];
   for (kw_name, kw_value) in kwargs {
     let pos = f
       .params
@@ -3365,14 +3381,14 @@ fn build_hash_lookup<'ctx>(
 fn build_index<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  array: &Expr,
-  index: &Expr,
+  array: &Spanned<Expr>,
+  index: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
-  let Expr::Ident(arr_name) = array else {
+  let Expr::Ident(arr_name) = &array.node else {
     return Err(
       "codegen: indexing is only supported on a plain local-variable receiver".to_string(),
     );
@@ -3479,15 +3495,15 @@ fn build_index<'ctx>(
 fn build_set_index<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  array: &Expr,
-  index: &Expr,
-  value: &Expr,
+  array: &Spanned<Expr>,
+  index: &Spanned<Expr>,
+  value: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<bool, String> {
-  let Expr::Ident(arr_name) = array else {
+  let Expr::Ident(arr_name) = &array.node else {
     return Err(
       "codegen: indexed assignment is only supported on a plain local-variable receiver"
         .to_string(),
@@ -3602,7 +3618,7 @@ fn build_set_index<'ctx>(
 fn build_puts<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  arg: &Expr,
+  arg: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -3688,15 +3704,15 @@ fn build_for<'a, 'ctx>(
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
   var: &str,
-  elements: &[Expr],
-  body: &'a [Stmt],
+  elements: &[Spanned<Expr>],
+  body: &'a [Spanned<Stmt>],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
   // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
   // own doc comment for the full rationale.
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
@@ -3843,17 +3859,17 @@ fn build_for_range<'a, 'ctx>(
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
   var: &str,
-  start: &Expr,
-  end: &Expr,
+  start: &Spanned<Expr>,
+  end: &Spanned<Expr>,
   exclusive: bool,
-  body: &'a [Stmt],
+  body: &'a [Spanned<Stmt>],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
   // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
   // own doc comment for the full rationale.
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
@@ -4015,21 +4031,24 @@ fn build_inline_block_call<'a, 'ctx>(
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
   callee: &'a AstFunction,
-  args: &'a [Expr],
+  args: &'a [Spanned<Expr>],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
   // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
   // own doc comment for the full rationale.
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
-  let Some(Expr::Lambda {
-    params: blk_params,
-    body: blk_body,
+  let Some(Spanned {
+    node: Expr::Lambda {
+      params: blk_params,
+      body: blk_body,
+      ..
+    },
     ..
   }) = args.last()
   else {
@@ -4149,7 +4168,7 @@ fn emit_active_ensures<'a, 'ctx>(
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
@@ -4159,7 +4178,7 @@ fn emit_active_ensures<'a, 'ctx>(
   // every entry regardless of its tag.
   raise_only: bool,
 ) -> Result<(), String> {
-  let ensure_bodies: Vec<&'a [Stmt]> = ensure_stack
+  let ensure_bodies: Vec<&'a [Spanned<Stmt>]> = ensure_stack
     .iter()
     .rev()
     .filter(|(_, raise_visible)| !raise_only || *raise_visible)
@@ -4193,7 +4212,7 @@ fn build_stmt<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  stmt: &'a Stmt,
+  stmt: &'a Spanned<Stmt>,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
@@ -4206,18 +4225,21 @@ fn build_stmt<'a, 'ctx>(
   // log). `retry` deliberately never consults this.
   // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
   // own doc comment for the full rationale.
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   // Plan 38: the active `begin`'s `begin.retry` block, innermost last
   // — `Stmt::Retry` branches to `retry_stack.last()`.
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
-  match stmt {
+  match &stmt.node {
     Stmt::Let {
       name,
       ty,
-      value: Expr::Lambda { .. },
+      value: Spanned {
+        node: Expr::Lambda { .. },
+        ..
+      },
     } if ty == "Proc" => {
       build_lambda_let(context, builder, name, vars, ctx)?;
       Ok(false)
@@ -4229,7 +4251,10 @@ fn build_stmt<'a, 'ctx>(
     Stmt::Let {
       name,
       ty,
-      value: Expr::ArrayNew(size),
+      value: Spanned {
+        node: Expr::ArrayNew(size),
+        ..
+      },
     } => {
       let elem_name = ty
         .strip_prefix("Array[")
@@ -4275,7 +4300,8 @@ fn build_stmt<'a, 'ctx>(
       // a pointer-backed declared type builds a real null pointer
       // constant directly instead.
       let expected_kind = value_kind_for_type(ty);
-      let v = if matches!(value, Expr::Nil) && matches!(expected_kind, ValKind::Ptr | ValKind::Str)
+      let v = if matches!(value.node, Expr::Nil)
+        && matches!(expected_kind, ValKind::Ptr | ValKind::Str)
       {
         context
           .ptr_type(AddressSpace::default())
@@ -4334,23 +4360,24 @@ fn build_stmt<'a, 'ctx>(
       // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot special
       // case as `Stmt::Let` above, driven by the target's already-
       // recorded `ValKind` in `vars` instead of a declared-type string.
-      let v = if matches!(value, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
-        context
-          .ptr_type(AddressSpace::default())
-          .const_null()
-          .into()
-      } else {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          value,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        v
-      };
+      let v =
+        if matches!(value.node, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
+          context
+            .ptr_type(AddressSpace::default())
+            .const_null()
+            .into()
+        } else {
+          let (v, _) = build_expr(
+            context,
+            builder,
+            value,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          v
+        };
       builder.build_store(ptr, v).map_err(|e| e.to_string())?;
       Ok(false)
     }
@@ -4375,7 +4402,7 @@ fn build_stmt<'a, 'ctx>(
         .map_err(|e| e.to_string())?;
 
       builder.position_at_end(assign_block);
-      let v = if matches!(default, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
+      let v = if matches!(default.node, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
         context
           .ptr_type(AddressSpace::default())
           .const_null()
@@ -4419,7 +4446,7 @@ fn build_stmt<'a, 'ctx>(
         .map_err(|e| e.to_string())?;
 
       builder.position_at_end(assign_block);
-      let v = if matches!(value, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
+      let v = if matches!(value.node, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
         context
           .ptr_type(AddressSpace::default())
           .const_null()
@@ -4461,23 +4488,24 @@ fn build_stmt<'a, 'ctx>(
         let (_, target_kind) = *vars
           .get(name)
           .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
-        let val = if matches!(v, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
-          context
-            .ptr_type(AddressSpace::default())
-            .const_null()
-            .into()
-        } else {
-          let (val, _) = build_expr(
-            context,
-            builder,
-            v,
-            vars,
-            local_classes,
-            local_array_elem_types,
-            ctx,
-          )?;
-          val
-        };
+        let val =
+          if matches!(v.node, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
+            context
+              .ptr_type(AddressSpace::default())
+              .const_null()
+              .into()
+          } else {
+            let (val, _) = build_expr(
+              context,
+              builder,
+              v,
+              vars,
+              local_classes,
+              local_array_elem_types,
+              ctx,
+            )?;
+            val
+          };
         evaluated.push(val);
       }
       for (name, val) in names.iter().zip(evaluated) {
@@ -4527,7 +4555,10 @@ fn build_stmt<'a, 'ctx>(
     // ordinary LLVM `call` — the callee was never declared as one (see
     // `declare_user_functions`). It's compiled fresh, inline, at this
     // one call site instead — see `build_inline_block_call`.
-    Stmt::Expr(Expr::Call(name, args)) if ctx.block_funcs.contains_key(name.as_str()) => {
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) if ctx.block_funcs.contains_key(name.as_str()) => {
       let callee = ctx.block_funcs[name.as_str()];
       build_inline_block_call(
         context,
@@ -4545,7 +4576,10 @@ fn build_stmt<'a, 'ctx>(
         ctx,
       )
     }
-    Stmt::Expr(Expr::Call(name, args)) if name == "puts" && args.len() == 1 => {
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) if name == "puts" && args.len() == 1 => {
       build_puts(
         context,
         builder,
@@ -4561,7 +4595,10 @@ fn build_stmt<'a, 'ctx>(
     // `gets` is never in `ctx.user_func_ids`, so it could never reach
     // the generic `Expr::Call` arm below successfully; mirrors
     // `build_expr`'s own `gets` guard.
-    Stmt::Expr(Expr::Call(name, args)) if name == "gets" => {
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) if name == "gets" => {
       if !args.is_empty() {
         return Err(format!(
           "codegen: `gets` expects 0 arguments, found {}",
@@ -4580,7 +4617,10 @@ fn build_stmt<'a, 'ctx>(
     // `build_call_expr`/`build_call_kw_expr` (unlike `build_expr`'s own
     // arms) never reject `Void`, exactly because they're shared with
     // this statement-position dispatch.
-    Stmt::Expr(Expr::Call(name, args)) => {
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) => {
       build_call_expr(
         context,
         builder,
@@ -4593,7 +4633,10 @@ fn build_stmt<'a, 'ctx>(
       )?;
       Ok(false)
     }
-    Stmt::Expr(Expr::CallKw(name, kwargs)) => {
+    Stmt::Expr(Spanned {
+      node: Expr::CallKw(name, kwargs),
+      ..
+    }) => {
       build_call_kw_expr(
         context,
         builder,
@@ -4622,7 +4665,7 @@ fn build_stmt<'a, 'ctx>(
       // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot special
       // case, driven by `ret_kind` (already a `build_stmt` parameter —
       // the enclosing function/method's own declared return kind).
-      let v = if matches!(e, Expr::Nil) && matches!(ret_kind, ValKind::Ptr | ValKind::Str) {
+      let v = if matches!(e.node, Expr::Nil) && matches!(ret_kind, ValKind::Ptr | ValKind::Str) {
         context
           .ptr_type(AddressSpace::default())
           .const_null()
@@ -5070,16 +5113,16 @@ fn build_case<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  scrutinee: &Expr,
-  arms: &'a [(Vec<Expr>, Vec<Stmt>)],
-  else_body: &'a Option<Vec<Stmt>>,
+  scrutinee: &Spanned<Expr>,
+  arms: &'a [CaseArm],
+  else_body: &'a Option<Vec<Spanned<Stmt>>>,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
   // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
   // own doc comment for the full rationale.
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
@@ -5200,7 +5243,7 @@ fn build_case<'a, 'ctx>(
 fn build_bool<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  cond: &Expr,
+  cond: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
@@ -5229,13 +5272,13 @@ fn build_bool<'ctx>(
 fn build_raise<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
-  e: &Expr,
+  e: &Spanned<Expr>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<bool, String> {
-  let Expr::New(class_name, _) = e else {
+  let Expr::New(class_name, _) = &e.node else {
     return Err("codegen: `raise` only supports a direct `ClassName.new(args)` expression".into());
   };
   let tag = *ctx
@@ -5284,21 +5327,21 @@ fn build_begin<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  body: &'a [Stmt],
+  body: &'a [Spanned<Stmt>],
   rescues: &'a [RescueClause],
-  ensure: &'a Option<Vec<Stmt>>,
+  ensure: &'a Option<Vec<Spanned<Stmt>>>,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
   // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
   // own doc comment for the full rationale.
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
-  let ensure_body: &'a [Stmt] = ensure.as_deref().unwrap_or(&[]);
+  let ensure_body: &'a [Spanned<Stmt>] = ensure.as_deref().unwrap_or(&[]);
 
   let retry_blk = context.append_basic_block(func, "begin.retry");
   builder
@@ -5565,14 +5608,14 @@ fn build_block<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  stmts: &'a [Stmt],
+  stmts: &'a [Spanned<Stmt>],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
   // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
   // own doc comment for the full rationale.
-  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
   retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
@@ -5609,7 +5652,7 @@ fn build_function_body<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  body: &'a [Stmt],
+  body: &'a [Spanned<Stmt>],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
@@ -5617,7 +5660,7 @@ fn build_function_body<'a, 'ctx>(
   ctx: &Ctx<'a, 'ctx>,
 ) -> Result<(), String> {
   let mut loop_stack = Vec::new();
-  let mut ensure_stack: Vec<(&'a [Stmt], bool)> = Vec::new();
+  let mut ensure_stack: Vec<(&'a [Spanned<Stmt>], bool)> = Vec::new();
   let mut retry_stack = Vec::new();
   let Some((last, init)) = body.split_last() else {
     builder.build_return(None).map_err(|e| e.to_string())?;
@@ -5642,7 +5685,7 @@ fn build_function_body<'a, 'ctx>(
     return Ok(());
   }
 
-  match last {
+  match &last.node {
     Stmt::Expr(e) => {
       let (v, _) = build_expr(
         context,
@@ -5655,7 +5698,8 @@ fn build_function_body<'a, 'ctx>(
       )?;
       builder.build_return(Some(&v)).map_err(|e| e.to_string())?;
     }
-    other => {
+    _ => {
+      let other = last;
       let terminated = build_stmt(
         context,
         builder,
@@ -5887,7 +5931,7 @@ fn define_lambda<'ctx>(
   builder: &Builder<'ctx>,
   params: &[Param],
   return_type: &str,
-  body: &[Stmt],
+  body: &[Spanned<Stmt>],
   info: &LambdaInfo,
   fv: FunctionValue<'ctx>,
   gen_ctx: &Ctx<'_, 'ctx>,
@@ -5965,7 +6009,7 @@ fn define_main<'ctx>(
   let entry = context.append_basic_block(main_fn, "entry");
   builder.position_at_end(entry);
 
-  let top_stmts: Vec<Stmt> = program
+  let top_stmts: Vec<Spanned<Stmt>> = program
     .items
     .iter()
     .filter_map(|it| match it {
@@ -6139,14 +6183,23 @@ fn declare_lambda_functions<'ctx>(
 ) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
   let mut lambda_func_ids = HashMap::new();
   for item in &program.items {
-    let Item::Stmt(Stmt::Let {
-      name,
-      ty,
-      value: Expr::Lambda {
-        params,
-        return_type,
-        ..
-      },
+    let Item::Stmt(Spanned {
+      node:
+        Stmt::Let {
+          name,
+          ty,
+          value:
+            Spanned {
+              node:
+                Expr::Lambda {
+                  params,
+                  return_type,
+                  ..
+                },
+              ..
+            },
+        },
+      ..
     }) = item
     else {
       continue;
@@ -6520,14 +6573,23 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
           define_user_function(&context, &builder, f, fv, &gen_ctx)?;
         }
       }
-      Item::Stmt(Stmt::Let {
-        name,
-        ty,
-        value: Expr::Lambda {
-          params,
-          return_type,
-          body,
-        },
+      Item::Stmt(Spanned {
+        node:
+          Stmt::Let {
+            name,
+            ty,
+            value:
+              Spanned {
+                node:
+                  Expr::Lambda {
+                    params,
+                    return_type,
+                    body,
+                  },
+                ..
+              },
+          },
+        ..
       }) if ty == "Proc" => {
         if let (Some(info), Some(&(fv, _))) = (lambda_infos.get(name), lambda_func_ids.get(name)) {
           define_lambda(
@@ -6636,6 +6698,16 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
 /// arbitrary sub-expressions. Returns whether it rewrote anything, so
 /// the synthetic `AssertionError` class is only ever injected into a
 /// program that actually needed it (never a plain `hello.em`).
+/// Plan 22's Decision log: this whole desugar/synthesized-test-harness
+/// section constructs brand-new `Expr`/`Stmt` nodes at codegen time —
+/// none of them came from real source text, so every one wraps in
+/// `Spanned::synthetic` (span `(0, 0)`) rather than fabricating a
+/// position. `syn` is a short local alias, since this section
+/// constructs a *lot* of them.
+fn syn<T>(node: T) -> Spanned<T> {
+  Spanned::synthetic(node)
+}
+
 fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
   let mut rewrote = false;
   for item in items {
@@ -6659,14 +6731,14 @@ fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
   rewrote
 }
 
-fn desugar_asserts_in_stmts(stmts: &mut [Stmt], rewrote: &mut bool) {
+fn desugar_asserts_in_stmts(stmts: &mut [Spanned<Stmt>], rewrote: &mut bool) {
   for s in stmts {
     desugar_asserts_in_stmt(s, rewrote);
   }
 }
 
-fn desugar_asserts_in_stmt(stmt: &mut Stmt, rewrote: &mut bool) {
-  match stmt {
+fn desugar_asserts_in_stmt(stmt: &mut Spanned<Stmt>, rewrote: &mut bool) {
+  match &mut stmt.node {
     Stmt::If {
       then_branch,
       else_branch,
@@ -6705,28 +6777,35 @@ fn desugar_asserts_in_stmt(stmt: &mut Stmt, rewrote: &mut bool) {
     }
     _ => {}
   }
-  let replacement = match stmt {
-    Stmt::Expr(Expr::Call(name, args)) if name == "assert" && args.len() == 2 => {
-      Some(desugar_assert(&args[0], &args[1]))
-    }
-    Stmt::Expr(Expr::Call(name, args)) if name == "assert_eq" && args.len() == 3 => {
+  let replacement = match &stmt.node {
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) if name == "assert" && args.len() == 2 => Some(desugar_assert(&args[0], &args[1])),
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) if name == "assert_eq" && args.len() == 3 => {
       Some(desugar_assert_eq(&args[0], &args[1], &args[2]))
     }
     _ => None,
   };
   if let Some(new_stmt) = replacement {
-    *stmt = new_stmt;
+    // The original statement's own real span is kept — this replaces
+    // exactly that source text, unlike every node synthesized *inside*
+    // the new shape (which has no real source text to point at).
+    stmt.node = new_stmt;
     *rewrote = true;
   }
 }
 
-fn desugar_assert(cond: &Expr, loc: &Expr) -> Stmt {
+fn desugar_assert(cond: &Spanned<Expr>, loc: &Spanned<Expr>) -> Stmt {
   Stmt::If {
-    cond: Expr::Not(Box::new(cond.clone())),
-    then_branch: vec![Stmt::Raise(Expr::New(
+    cond: syn(Expr::Not(Box::new(cond.clone()))),
+    then_branch: vec![syn(Stmt::Raise(syn(Expr::New(
       "AssertionError".to_string(),
       vec![loc.clone()],
-    ))],
+    ))))],
     else_branch: None,
   }
 }
@@ -6740,26 +6819,39 @@ fn desugar_assert(cond: &Expr, loc: &Expr) -> Stmt {
 /// `Boolean`/`Symbol` `assert_eq` (sema accepts both, matching `==`'s
 /// own scope) fails at this point with `build_puts`'s own, unchanged
 /// "does not support" codegen error.
-fn desugar_assert_eq(expected: &Expr, actual: &Expr, loc: &Expr) -> Stmt {
-  let compare = Expr::Compare(
+fn desugar_assert_eq(
+  expected: &Spanned<Expr>,
+  actual: &Spanned<Expr>,
+  loc: &Spanned<Expr>,
+) -> Stmt {
+  let compare = syn(Expr::Compare(
     Box::new(expected.clone()),
     CompareOp::Eq,
     Box::new(actual.clone()),
-  );
+  ));
   Stmt::If {
-    cond: Expr::Not(Box::new(compare)),
+    cond: syn(Expr::Not(Box::new(compare))),
     then_branch: vec![
-      Stmt::Expr(Expr::Call(
+      syn(Stmt::Expr(syn(Expr::Call(
         "puts".to_string(),
-        vec![Expr::StringLit("expected:".to_string())],
-      )),
-      Stmt::Expr(Expr::Call("puts".to_string(), vec![expected.clone()])),
-      Stmt::Expr(Expr::Call(
+        vec![syn(Expr::StringLit("expected:".to_string()))],
+      )))),
+      syn(Stmt::Expr(syn(Expr::Call(
         "puts".to_string(),
-        vec![Expr::StringLit("but got:".to_string())],
-      )),
-      Stmt::Expr(Expr::Call("puts".to_string(), vec![actual.clone()])),
-      Stmt::Raise(Expr::New("AssertionError".to_string(), vec![loc.clone()])),
+        vec![expected.clone()],
+      )))),
+      syn(Stmt::Expr(syn(Expr::Call(
+        "puts".to_string(),
+        vec![syn(Expr::StringLit("but got:".to_string()))],
+      )))),
+      syn(Stmt::Expr(syn(Expr::Call(
+        "puts".to_string(),
+        vec![actual.clone()],
+      )))),
+      syn(Stmt::Raise(syn(Expr::New(
+        "AssertionError".to_string(),
+        vec![loc.clone()],
+      )))),
     ],
     else_branch: None,
   }
@@ -6791,10 +6883,10 @@ fn assertion_error_class_item() -> Item {
           default: None,
         }],
         return_type: "Void".to_string(),
-        body: vec![Stmt::SetField {
+        body: vec![syn(Stmt::SetField {
           name: "message".to_string(),
-          value: Expr::Ident("message".to_string()),
-        }],
+          value: syn(Expr::Ident("message".to_string())),
+        })],
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
@@ -6803,7 +6895,9 @@ fn assertion_error_class_item() -> Item {
         name: "message".to_string(),
         params: Vec::new(),
         return_type: "String".to_string(),
-        body: vec![Stmt::Expr(Expr::InstanceVar("message".to_string()))],
+        body: vec![syn(Stmt::Expr(syn(Expr::InstanceVar(
+          "message".to_string(),
+        ))))],
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
@@ -6837,7 +6931,7 @@ fn ensure_assertion_error_class(items: &mut Vec<Item>) {
 /// program is then compiled by the ordinary, unmodified
 /// `compile_to_object` — this function never touches LLVM directly.
 pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize, String> {
-  let tests: Vec<(String, Vec<Stmt>)> = program
+  let tests: Vec<(String, Vec<Spanned<Stmt>>)> = program
     .items
     .iter()
     .filter_map(|it| match it {
@@ -6855,16 +6949,16 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
     .collect();
 
   let mut harness_stmts = vec![
-    Stmt::Let {
+    syn(Stmt::Let {
       name: "passed".to_string(),
       ty: "Int64".to_string(),
-      value: Expr::Int(0),
-    },
-    Stmt::Let {
+      value: syn(Expr::Int(0)),
+    }),
+    syn(Stmt::Let {
       name: "failed".to_string(),
       ty: "Int64".to_string(),
-      value: Expr::Int(0),
-    },
+      value: syn(Expr::Int(0)),
+    }),
   ];
 
   for (i, (description, body)) in tests.into_iter().enumerate() {
@@ -6879,79 +6973,79 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
       type_params: Vec::new(),
     }));
 
-    harness_stmts.push(Stmt::Begin {
+    harness_stmts.push(syn(Stmt::Begin {
       body: vec![
-        Stmt::Expr(Expr::Call(fn_name, Vec::new())),
-        Stmt::Expr(Expr::Call(
+        syn(Stmt::Expr(syn(Expr::Call(fn_name, Vec::new())))),
+        syn(Stmt::Expr(syn(Expr::Call(
           "puts".to_string(),
-          vec![Expr::StringLit(format!("PASS: {description}"))],
-        )),
-        Stmt::Assign {
+          vec![syn(Expr::StringLit(format!("PASS: {description}")))],
+        )))),
+        syn(Stmt::Assign {
           name: "passed".to_string(),
-          value: Expr::Add(
-            Box::new(Expr::Ident("passed".to_string())),
-            Box::new(Expr::Int(1)),
-          ),
-        },
+          value: syn(Expr::Add(
+            Box::new(syn(Expr::Ident("passed".to_string()))),
+            Box::new(syn(Expr::Int(1))),
+          )),
+        }),
       ],
       rescues: vec![RescueClause {
         class_name: Some("AssertionError".to_string()),
         var: "e".to_string(),
         body: vec![
-          Stmt::Expr(Expr::Call(
+          syn(Stmt::Expr(syn(Expr::Call(
             "puts".to_string(),
-            vec![Expr::Add(
-              Box::new(Expr::StringLit(format!("FAIL: {description}: "))),
-              Box::new(Expr::MethodCall(
-                Box::new(Expr::Ident("e".to_string())),
+            vec![syn(Expr::Add(
+              Box::new(syn(Expr::StringLit(format!("FAIL: {description}: ")))),
+              Box::new(syn(Expr::MethodCall(
+                Box::new(syn(Expr::Ident("e".to_string()))),
                 "message".to_string(),
                 Vec::new(),
-              )),
-            )],
-          )),
-          Stmt::Assign {
+              ))),
+            ))],
+          )))),
+          syn(Stmt::Assign {
             name: "failed".to_string(),
-            value: Expr::Add(
-              Box::new(Expr::Ident("failed".to_string())),
-              Box::new(Expr::Int(1)),
-            ),
-          },
+            value: syn(Expr::Add(
+              Box::new(syn(Expr::Ident("failed".to_string()))),
+              Box::new(syn(Expr::Int(1))),
+            )),
+          }),
         ],
       }],
       ensure: None,
-    });
+    }));
   }
 
-  harness_stmts.push(Stmt::Expr(Expr::Call(
+  harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(
     "puts".to_string(),
-    vec![Expr::StringLit("passed:".to_string())],
-  )));
-  harness_stmts.push(Stmt::Expr(Expr::Call(
+    vec![syn(Expr::StringLit("passed:".to_string()))],
+  )))));
+  harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(
     "puts".to_string(),
-    vec![Expr::Ident("passed".to_string())],
-  )));
-  harness_stmts.push(Stmt::Expr(Expr::Call(
+    vec![syn(Expr::Ident("passed".to_string()))],
+  )))));
+  harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(
     "puts".to_string(),
-    vec![Expr::StringLit("failed:".to_string())],
-  )));
-  harness_stmts.push(Stmt::Expr(Expr::Call(
+    vec![syn(Expr::StringLit("failed:".to_string()))],
+  )))));
+  harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(
     "puts".to_string(),
-    vec![Expr::Ident("failed".to_string())],
-  )));
-  harness_stmts.push(Stmt::If {
-    cond: Expr::Compare(
-      Box::new(Expr::Ident("failed".to_string())),
+    vec![syn(Expr::Ident("failed".to_string()))],
+  )))));
+  harness_stmts.push(syn(Stmt::If {
+    cond: syn(Expr::Compare(
+      Box::new(syn(Expr::Ident("failed".to_string()))),
       CompareOp::Gt,
-      Box::new(Expr::Int(0)),
-    ),
-    then_branch: vec![Stmt::Raise(Expr::New(
+      Box::new(syn(Expr::Int(0))),
+    )),
+    then_branch: vec![syn(Stmt::Raise(syn(Expr::New(
       "AssertionError".to_string(),
-      vec![Expr::StringLit(
+      vec![syn(Expr::StringLit(
         "emerald test: one or more tests failed".to_string(),
-      )],
-    ))],
+      ))],
+    ))))],
     else_branch: None,
-  });
+  }));
 
   items.extend(harness_stmts.into_iter().map(Item::Stmt));
   ensure_assertion_error_class(&mut items);
@@ -7190,10 +7284,10 @@ mod tests {
   #[test]
   fn unsupported_top_level_shape_errors_not_panics() {
     let program = Program {
-      items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
+      items: vec![Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
         "puts".into(),
-        vec![Expr::Int(1), Expr::Int(2)],
-      )))],
+        vec![syn(Expr::Int(1)), syn(Expr::Int(2))],
+      )))))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_should_not_exist.o");
     // Grammar can't actually produce 2-arg `puts` (its production takes
@@ -7304,13 +7398,13 @@ mod tests {
     // Float64 `%` is explicitly out of scope (plan 18's Decision log) —
     // codegen must reject it with an `Err`, not panic.
     let program = Program {
-      items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
+      items: vec![Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
         "puts".into(),
-        vec![Expr::Rem(
-          Box::new(Expr::Float(1.5)),
-          Box::new(Expr::Float(2.0)),
-        )],
-      )))],
+        vec![syn(Expr::Rem(
+          Box::new(syn(Expr::Float(1.5))),
+          Box::new(syn(Expr::Float(2.0))),
+        ))],
+      )))))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_rem_float_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
@@ -7341,14 +7435,14 @@ mod tests {
     // is defined anywhere — is a descriptive `Err`, not a panic and not
     // silently-wrong generated code.
     let program = Program {
-      items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
+      items: vec![Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
         "puts".into(),
-        vec![Expr::Compare(
-          Box::new(Expr::StringLit("a".into())),
+        vec![syn(Expr::Compare(
+          Box::new(syn(Expr::StringLit("a".into()))),
           CompareOp::Lt,
-          Box::new(Expr::StringLit("b".into())),
-        )],
-      )))],
+          Box::new(syn(Expr::StringLit("b".into()))),
+        ))],
+      )))))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_string_lt_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
@@ -7487,13 +7581,13 @@ mod tests {
     // codegen itself rejects a Float64 operand even though sema (leaf
     // 2) already would have caught it first in the normal pipeline.
     let program = Program {
-      items: vec![Item::Stmt(Stmt::Expr(Expr::Call(
+      items: vec![Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
         "puts".into(),
-        vec![Expr::BitAnd(
-          Box::new(Expr::Float(1.5)),
-          Box::new(Expr::Int(1)),
-        )],
-      )))],
+        vec![syn(Expr::BitAnd(
+          Box::new(syn(Expr::Float(1.5))),
+          Box::new(syn(Expr::Int(1))),
+        ))],
+      )))))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_bitand_float_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
@@ -7552,14 +7646,14 @@ mod tests {
     // rejection) can actually receive is an empty `elements` list. It
     // must not panic; zero iterations is a coherent, defensible result.
     let program = Program {
-      items: vec![Item::Stmt(Stmt::For {
+      items: vec![Item::Stmt(syn(Stmt::For {
         var: "x".into(),
         elements: vec![],
-        body: vec![Stmt::Expr(Expr::Call(
+        body: vec![syn(Stmt::Expr(syn(Expr::Call(
           "puts".into(),
-          vec![Expr::Ident("x".into())],
-        ))],
-      })],
+          vec![syn(Expr::Ident("x".into()))],
+        ))))],
+      }))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_empty_for_in_should_not_exist.o");
     let result = compile_to_object(&program, &out);
@@ -7683,12 +7777,15 @@ mod tests {
             default: None,
           }],
           return_type: "Void".into(),
-          body: vec![Stmt::Yield(vec![Expr::Ident("n".into())])],
+          body: vec![syn(Stmt::Yield(vec![syn(Expr::Ident("n".into()))]))],
           block_param: Some("blk".into()),
           splat_param: None,
           type_params: Vec::new(),
         }),
-        Item::Stmt(Stmt::Expr(Expr::Call("repeat".into(), vec![Expr::Int(3)]))),
+        Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
+          "repeat".into(),
+          vec![syn(Expr::Int(3))],
+        ))))),
       ],
     };
     let out = std::env::temp_dir().join("emerald_codegen_missing_block_should_not_exist.o");
@@ -7834,7 +7931,7 @@ mod tests {
     // to prove codegen alone rejects a `retry` with an empty
     // `retry_stack` with a descriptive `Err`, not a panic.
     let program = Program {
-      items: vec![Item::Stmt(Stmt::Retry)],
+      items: vec![Item::Stmt(syn(Stmt::Retry))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_bare_retry_should_not_exist.o");
     let result = compile_to_object(&program, &out);
@@ -8088,11 +8185,11 @@ mod tests {
     // at all, so this is a real codegen-level defensive check) —
     // returns a descriptive `Err`, not a panic.
     let program = Program {
-      items: vec![Item::Stmt(Stmt::Expr(Expr::Compare(
-        Box::new(Expr::SymbolLit("foo".to_string())),
+      items: vec![Item::Stmt(syn(Stmt::Expr(syn(Expr::Compare(
+        Box::new(syn(Expr::SymbolLit("foo".to_string()))),
         CompareOp::Lt,
-        Box::new(Expr::SymbolLit("bar".to_string())),
-      )))],
+        Box::new(syn(Expr::SymbolLit("bar".to_string()))),
+      )))))],
     };
     let out = std::env::temp_dir().join("emerald_codegen_symbol_ordering_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());

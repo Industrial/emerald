@@ -71,6 +71,54 @@ fn rejects_type_mismatch_with_nonzero_exit_and_stderr_diagnostic() {
 }
 
 #[test]
+fn sema_type_mismatch_renders_a_miette_source_snippet_with_a_caret_at_b() {
+  // Plan 22's own concrete-proof program (leaf-span-rendering AC1): a
+  // real `miette`-rendered diagnostic — source snippet plus a caret —
+  // pointing at `b` on line 2, the same rendering-quality standard
+  // plan 13 already proved for parse errors, now met for a sema error
+  // too.
+  let dir = std::env::temp_dir();
+  let src_path = dir.join(format!("emerald_sema_span_{}.em", std::process::id()));
+  std::fs::write(
+    &src_path,
+    "def add(a: Int64, b: String) -> Int64\n  a + b\nend\n",
+  )
+  .unwrap();
+  let output_path = dir.join(format!("emerald_sema_span_out_{}", std::process::id()));
+
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg(&src_path)
+    .arg("-o")
+    .arg(&output_path)
+    .output()
+    .expect("failed to run emerald-cli");
+
+  assert!(
+    !output.status.success(),
+    "must exit non-zero on a rejected program"
+  );
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains(src_path.to_str().unwrap()),
+    "diagnostic should name the source file path: {stderr}"
+  );
+  assert!(
+    stderr.contains("  a + b"),
+    "diagnostic should render the actual source line (`  a + b`): {stderr}"
+  );
+  assert!(
+    stderr.contains("here") && (stderr.contains('┬') || stderr.contains('^')),
+    "diagnostic should include a caret/underline label: {stderr}"
+  );
+  assert!(
+    !output_path.exists(),
+    "must not produce an executable for a rejected program"
+  );
+
+  std::fs::remove_file(&src_path).ok();
+}
+
+#[test]
 fn parse_error_renders_a_miette_source_snippet_with_a_caret() {
   // Plan 13 AC1: not just a non-zero exit and *some* stderr text — a
   // real `miette`-rendered diagnostic containing the source line, a
