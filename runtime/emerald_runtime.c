@@ -601,6 +601,27 @@ typedef struct EmeraldActorHeader {
   /* 0 = idle (not linked into the runnable queue, no worker owns it);
    * 1 = runnable-or-executing (see this section's own doc comment). */
   int scheduled;
+  /* Plan 57 (supervision trees). Set once, true forever, under
+   * `mailbox_mutex` — `emerald_actor_enqueue` drops any further send
+   * once set (Decision log: a dead reference's send silently drops,
+   * matching Erlang's own dead-Pid-send behavior), and `emerald_
+   * worker_main`'s own drain loop stops calling this actor's
+   * trampolines and discards whatever else was already queued. */
+  int terminated;
+  /* This actor's own region handle (plan 51), set by `.spawn`'s own
+   * codegen via `emerald_actor_set_region` right after `emerald_
+   * region_alloc` — `NULL` until then, and for any actor nobody ever
+   * calls the setter for (this leaf's own pre-existing test harnesses,
+   * which never terminate their actors). Bulk-freed by `emerald_
+   * actor_terminate` — plan 51's own disclosed "actor termination is a
+   * second, later-arriving trigger for the identical bulk-free
+   * operation" materializing for real. */
+  void *region;
+  /* `NULL` unless this actor was registered as a tracked child of a
+   * `supervise do ... end` block (`emerald_supervisor_register_child`)
+   * — consulted only by `emerald_actor_terminate`. */
+  void *supervisor;
+  long long child_slot;
   struct EmeraldActorHeader *next_runnable;
 } EmeraldActorHeader;
 
@@ -617,9 +638,25 @@ void *emerald_actor_init_header(void *arena_base) {
   header->mailbox_head = NULL;
   header->mailbox_tail = NULL;
   header->scheduled = 0;
+  header->terminated = 0;
+  header->region = NULL;
+  header->supervisor = NULL;
+  header->child_slot = -1;
   header->next_runnable = NULL;
   *(void **) arena_base = header;
   return header;
+}
+
+/* Plan 57's own addition — a separate setter rather than widening
+ * `emerald_actor_init_header`'s own signature, so every existing
+ * caller (codegen's own `.spawn` call site from before this plan, and
+ * every pre-existing hand-written C test harness that constructs a
+ * bare actor arena directly) keeps compiling completely unchanged;
+ * only `.spawn`'s own codegen calls this, immediately after `emerald_
+ * region_alloc`. */
+void emerald_actor_set_region(void *self, void *region) {
+  EmeraldActorHeader *header = *(EmeraldActorHeader **) ((char *) self - sizeof(void *));
+  header->region = region;
 }
 
 static pthread_mutex_t emerald_runnable_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -654,12 +691,24 @@ void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
   }
   msg->next = NULL;
 
+  int need_schedule = 0;
+  pthread_mutex_lock(&header->mailbox_mutex);
+  /* Plan 57 (supervision trees): a terminated actor's mailbox never
+   * accepts another message — silently dropped, matching Erlang's own
+   * dead-Pid-send behavior (Decision log). Checked and appended inside
+   * the SAME `mailbox_mutex` critical section as the outstanding-
+   * message increment below, so there is no window where a message
+   * could be counted as in-flight (blocking `emerald_worker_pool_
+   * drain_and_join`/`emerald_supervisor_child` forever) without ever
+   * actually being enqueued anywhere. */
+  if (header->terminated) {
+    pthread_mutex_unlock(&header->mailbox_mutex);
+    free(msg);
+    return;
+  }
   pthread_mutex_lock(&emerald_runnable_mutex);
   emerald_outstanding_messages++;
   pthread_mutex_unlock(&emerald_runnable_mutex);
-
-  int need_schedule = 0;
-  pthread_mutex_lock(&header->mailbox_mutex);
   if (header->mailbox_tail == NULL) {
     header->mailbox_head = msg;
     header->mailbox_tail = msg;
@@ -715,6 +764,34 @@ static void *emerald_worker_main(void *arg) {
      * invariant this section's own doc comment states. */
     for (;;) {
       pthread_mutex_lock(&header->mailbox_mutex);
+      /* Plan 57 (supervision trees): a message's own trampoline call
+       * (below) can terminate this actor via `emerald_actor_terminate`
+       * — checked back here, at the top of every iteration, so the
+       * NEXT message never gets dispatched against a now-freed arena.
+       * Every message still queued at that point is drained and
+       * dropped here instead (each one still counted in `emerald_
+       * outstanding_messages`, so each must still be individually
+       * decremented, or `drain_and_join`/`emerald_supervisor_child`
+       * would wait forever). */
+      if (header->terminated) {
+        EmeraldMessage *dead = header->mailbox_head;
+        header->mailbox_head = NULL;
+        header->mailbox_tail = NULL;
+        header->scheduled = 0;
+        pthread_mutex_unlock(&header->mailbox_mutex);
+        while (dead != NULL) {
+          EmeraldMessage *next = dead->next;
+          free(dead);
+          pthread_mutex_lock(&emerald_runnable_mutex);
+          emerald_outstanding_messages--;
+          if (emerald_outstanding_messages == 0) {
+            pthread_cond_broadcast(&emerald_runnable_cond);
+          }
+          pthread_mutex_unlock(&emerald_runnable_mutex);
+          dead = next;
+        }
+        break;
+      }
       EmeraldMessage *msg = header->mailbox_head;
       if (msg == NULL) {
         header->scheduled = 0;
@@ -804,4 +881,206 @@ void emerald_worker_pool_drain_and_join(void) {
  * any dispatch/safety logic above. */
 long long emerald_current_thread_id(void) {
   return (long long) (intptr_t) pthread_self();
+}
+
+/* Plan 57 (supervision trees).
+ *
+ * Crash isolation reuses plan 38's own `setjmp`/`longjmp` handler
+ * stack verbatim (see this file's own `EmeraldHandler` section above)
+ * — codegen wraps every actor method's real call, inside its own
+ * trampoline, in a `push_handler`/`setjmp` frame exactly shaped like
+ * `build_begin`'s existing bare-`rescue`-equivalent codegen. On the
+ * `setjmp`-returned-nonzero path (a `raise` reached this frame
+ * uncaught), the trampoline calls `emerald_actor_terminate` — below —
+ * instead of resuming normal dispatch.
+ *
+ * `Supervisor` is a real, disclosed architectural simplification of
+ * this plan's own literal "compiled as an ordinary actor" framing: an
+ * ordinary actor's own query (`child(name)`) would have to be
+ * synchronous-with-a-return-value, a genuine "ask" pattern plan 55's
+ * own Decision log explicitly declined to build. A plain, `pthread_
+ * mutex_t`-guarded record achieves the identical *observable*
+ * contract this plan's own acceptance criteria actually test (one_for_
+ * one isolation, state-reset on restart, dead-reference sends silently
+ * dropped) via directly-synchronizable reads/writes instead of
+ * inventing a new blocking-round-trip messaging primitive this batch's
+ * scheduler design doesn't otherwise need. */
+
+#define EMERALD_SUPERVISOR_MAX_CHILDREN 16
+
+typedef struct EmeraldSupervisedChild {
+  /* `NULL` for a bare, unnamed `.spawn` inside the block — a real,
+   * disclosed gap (Decision log): unreachable via `child(name)`. */
+  char *name;
+  /* For the `"restarting %s\n"` line only. */
+  char *class_name;
+  /* A per-supervised-class, codegen-generated "respawn thunk" —
+   * `void *(*)(long long *argv)` — doing exactly what `Expr::Spawn`'s
+   * own codegen already does (region_create, region_alloc, actor_
+   * init_header, unpack argv, call initialize), just callable from
+   * plain C with a raw argv array instead of an AST `Args` list. */
+  void *(*respawn)(long long *argv);
+  long long args[EMERALD_MESSAGE_ARGV_MAX];
+  long long argc;
+  /* The currently-live reference — read by `emerald_supervisor_child`,
+   * replaced (never mutated through an outstanding pointer — a whole
+   * new pointer value is written here) by `emerald_supervisor_notify_
+   * terminated` on restart. */
+  void *current_self;
+} EmeraldSupervisedChild;
+
+typedef struct EmeraldSupervisor {
+  pthread_mutex_t mutex;
+  EmeraldSupervisedChild children[EMERALD_SUPERVISOR_MAX_CHILDREN];
+  long long child_count;
+} EmeraldSupervisor;
+
+/* Called once per `supervise do ... end` expression, before any of its
+ * tracked `.spawn`s run. */
+void *emerald_supervisor_create(void) {
+  EmeraldSupervisor *sup = malloc(sizeof(EmeraldSupervisor));
+  pthread_mutex_init(&sup->mutex, NULL);
+  sup->child_count = 0;
+  return sup;
+}
+
+/* Registers the next free slot for a just-spawned tracked child,
+ * capturing its already-evaluated original spawn arguments (Decision
+ * log: captured values, never re-evaluated expressions) and wiring
+ * the child's own header back-pointer so a future crash can find this
+ * supervisor again. Called once per tracked `.spawn`, in source order,
+ * by `supervise`'s own generated body — same call site shape as an
+ * ordinary `Expr::Spawn`, just followed by this one extra call.
+ * Returns the assigned slot index (also stored in the child's own
+ * header). */
+long long emerald_supervisor_register_child(void *sup_ptr, const char *name,
+                                             const char *class_name,
+                                             void *(*respawn)(long long *),
+                                             void *child_self, long long *args,
+                                             long long argc) {
+  EmeraldSupervisor *sup = (EmeraldSupervisor *) sup_ptr;
+  long long slot = sup->child_count++;
+  EmeraldSupervisedChild *child = &sup->children[slot];
+  child->name = name != NULL ? strdup(name) : NULL;
+  child->class_name = strdup(class_name);
+  child->respawn = respawn;
+  long long n = argc < EMERALD_MESSAGE_ARGV_MAX ? argc : EMERALD_MESSAGE_ARGV_MAX;
+  for (long long i = 0; i < n; i++) {
+    child->args[i] = args[i];
+  }
+  child->argc = argc;
+  child->current_self = child_self;
+
+  EmeraldActorHeader *header =
+      *(EmeraldActorHeader **) ((char *) child_self - sizeof(void *));
+  pthread_mutex_lock(&header->mailbox_mutex);
+  header->supervisor = sup_ptr;
+  header->child_slot = slot;
+  pthread_mutex_unlock(&header->mailbox_mutex);
+
+  return slot;
+}
+
+/* Called from `emerald_actor_terminate`, synchronously, on the crashed
+ * actor's own worker thread (before that thread does anything else) —
+ * re-`.spawn`s the failed child ALONE (`one_for_one`: no sibling is
+ * touched) from its captured original arguments, replaces its record
+ * entry with the fresh reference, wires the new instance's own
+ * supervisor back-pointer (so IT can be supervised/restarted again in
+ * turn), and logs the restart. Mutex-guarded so a concurrent `emerald_
+ * supervisor_child` query never observes a half-updated record. */
+void emerald_supervisor_notify_terminated(void *sup_ptr, long long slot) {
+  EmeraldSupervisor *sup = (EmeraldSupervisor *) sup_ptr;
+  pthread_mutex_lock(&sup->mutex);
+  EmeraldSupervisedChild *child = &sup->children[slot];
+  void *new_self = child->respawn(child->args);
+  child->current_self = new_self;
+  printf("restarting %s\n", child->class_name);
+  pthread_mutex_unlock(&sup->mutex);
+
+  EmeraldActorHeader *header =
+      *(EmeraldActorHeader **) ((char *) new_self - sizeof(void *));
+  pthread_mutex_lock(&header->mailbox_mutex);
+  header->supervisor = sup_ptr;
+  header->child_slot = slot;
+  pthread_mutex_unlock(&header->mailbox_mutex);
+}
+
+/* A blocking query for `name`'s current live reference. Waits for the
+ * WHOLE mailbox system to quiesce first (the same condition `emerald_
+ * worker_pool_drain_and_join` waits on) — a real, disclosed
+ * conservative simplification: this guarantees any restart already
+ * triggered by an earlier send has genuinely finished before this
+ * reads the record (Decision log: "blocks until any restart in flight
+ * ... has completed"), at the real cost of also waiting on totally
+ * unrelated in-flight traffic elsewhere in the program. Scoped to
+ * being called from OUTSIDE any actor's own worker thread — this
+ * plan's own real scope, matching its worked example's own usage
+ * (every call is top-level, never from inside another actor's own
+ * message handler, which could deadlock against its own pending
+ * message under this design). */
+void *emerald_supervisor_child(void *sup_ptr, const char *name) {
+  EmeraldSupervisor *sup = (EmeraldSupervisor *) sup_ptr;
+
+  pthread_mutex_lock(&emerald_runnable_mutex);
+  while (emerald_outstanding_messages > 0) {
+    pthread_cond_wait(&emerald_runnable_cond, &emerald_runnable_mutex);
+  }
+  pthread_mutex_unlock(&emerald_runnable_mutex);
+
+  pthread_mutex_lock(&sup->mutex);
+  void *result = NULL;
+  for (long long i = 0; i < sup->child_count; i++) {
+    if (sup->children[i].name != NULL && strcmp(sup->children[i].name, name) == 0) {
+      result = sup->children[i].current_self;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&sup->mutex);
+  if (result == NULL) {
+    fprintf(stderr, "uncaught error: supervisor has no child named '%s'\n", name);
+    exit(1);
+  }
+  return result;
+}
+
+/* Called from a message trampoline's own synthetic catch handler
+ * (codegen, `leaf-crash-isolation`) when an uncaught exception escapes
+ * the real method call. Marks the actor terminated — under `mailbox_
+ * mutex`, the same lock `emerald_actor_enqueue`/`emerald_worker_main`
+ * already synchronize on for this exact flag — and, if supervised,
+ * notifies the supervisor synchronously before returning.
+ *
+ * Real, disclosed non-goal found and accepted this session, NOT the
+ * plan's own original design: this does NOT call `emerald_region_
+ * destroy` on `header->region`, despite `region` being tracked for
+ * exactly that purpose. The actor's own header-pointer slot (`self -
+ * sizeof(void*)`, `EmeraldActorHeader`'s own doc comment) lives INSIDE
+ * that same region — freeing the region would free the very memory
+ * every future `self`-based header lookup (starting with `emerald_
+ * actor_enqueue`'s own terminated-check on a *later, post-crash* send
+ * to this same dead reference) depends on, corrupting exactly the
+ * mechanism this leaf exists to make safe. Verified as a real, not
+ * hypothetical, bug this session (a genuine `SIGSEGV` in `emerald_
+ * actor_enqueue`, reproduced and root-caused via `gdb`, not merely
+ * theorized). Actually fixing it needs the header-pointer slot moved
+ * to its own allocation independent of the region — a real, disclosed,
+ * larger redesign of plan 54/55's own established arena-layout
+ * convention, deferred as future work; this leaf keeps the actor's
+ * arena allocated-but-unused after termination, the same disclosed
+ * "leaks by design" precedent `emerald_alloc`'s own no-corresponding-
+ * free contract and plan 54's own untracked region handle already
+ * established — a real cost, not a silent one. */
+void emerald_actor_terminate(void *self) {
+  EmeraldActorHeader *header = *(EmeraldActorHeader **) ((char *) self - sizeof(void *));
+
+  pthread_mutex_lock(&header->mailbox_mutex);
+  header->terminated = 1;
+  void *supervisor = header->supervisor;
+  long long slot = header->child_slot;
+  pthread_mutex_unlock(&header->mailbox_mutex);
+
+  if (supervisor != NULL) {
+    emerald_supervisor_notify_terminated(supervisor, slot);
+  }
 }

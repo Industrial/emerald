@@ -337,6 +337,7 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
         rewrite_expr(a, name, source);
       }
     }
+    Expr::Supervise(body) => rewrite_stmts(body, name, source),
   }
 }
 

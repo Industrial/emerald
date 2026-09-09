@@ -505,6 +505,14 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
     }
     // Plan 53: `Ok`/`Err`/`?`'s inner expression is a real free-variable site.
     Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => collect_idents_in_expr(e, out),
+    // Plan 57: not recursed into, the same deliberate gap `Expr::
+    // Lambda { .. }` above already leaves — a `supervise do ... end`
+    // body is sema-restricted to spawn statements only (no arbitrary
+    // expression that could reference an enclosing local), and its
+    // real free-variable/capture analysis (for the child actors it
+    // spawns) is `mark_expr`'s job (via `collect_referenced_idents`),
+    // not this function's.
+    Expr::Supervise(_) => {}
   }
 }
 
@@ -703,6 +711,119 @@ fn collect_idents_in_stmt(
   }
 }
 
+/// Plan 57 (supervision trees): every actor class name that appears in
+/// at least one tracked `<Class>.spawn(...)` spawn inside ANY
+/// `supervise do ... end` block anywhere in the program — what
+/// `declare_supervisor_respawn_thunks` actually needs a thunk for.
+/// Deliberately NOT a full generic expression-position walk the way
+/// `collect_idents_in_stmt` is: `Expr::Supervise` is only ever
+/// meaningfully reached at a statement's own direct value position (a
+/// `Let`'s value or a bare `Stmt::Expr`) in every real, sema-accepted
+/// program (sema's own `Expr::Supervise` typing already rejects most
+/// other uses downstream — see `infer_expr_type`'s own arm) — a real,
+/// disclosed narrow scope, not a panic risk, since an actor missed here
+/// simply never gets a thunk and any `supervise` block that really did
+/// reference it would fail codegen's own `no respawn thunk compiled
+/// for actor` internal-error check loudly, not silently.
+fn collect_supervised_classes_in_stmt(stmt: &Spanned<Stmt>, out: &mut HashSet<String>) {
+  match &stmt.node {
+    Stmt::Let {
+      value: Spanned {
+        node: Expr::Supervise(body),
+        ..
+      },
+      ..
+    }
+    | Stmt::Expr(Spanned {
+      node: Expr::Supervise(body),
+      ..
+    }) => {
+      for s in body {
+        match &s.node {
+          Stmt::Let {
+            value:
+              Spanned {
+                node: Expr::Spawn(class_name, _),
+                ..
+              },
+            ..
+          }
+          | Stmt::Expr(Spanned {
+            node: Expr::Spawn(class_name, _),
+            ..
+          }) => {
+            out.insert(class_name.clone());
+          }
+          _ => {}
+        }
+      }
+    }
+    Stmt::If {
+      then_branch,
+      else_branch,
+      ..
+    } => {
+      for s in then_branch {
+        collect_supervised_classes_in_stmt(s, out);
+      }
+      if let Some(else_b) = else_branch {
+        for s in else_b {
+          collect_supervised_classes_in_stmt(s, out);
+        }
+      }
+    }
+    Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ForRange { body, .. } => {
+      for s in body {
+        collect_supervised_classes_in_stmt(s, out);
+      }
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        collect_supervised_classes_in_stmt(s, out);
+      }
+      for rescue in rescues {
+        for s in &rescue.body {
+          collect_supervised_classes_in_stmt(s, out);
+        }
+      }
+      if let Some(ensure_body) = ensure {
+        for s in ensure_body {
+          collect_supervised_classes_in_stmt(s, out);
+        }
+      }
+    }
+    Stmt::Case {
+      arms, else_body, ..
+    } => {
+      for (_, body) in arms {
+        for s in body {
+          collect_supervised_classes_in_stmt(s, out);
+        }
+      }
+      if let Some(else_b) = else_body {
+        for s in else_b {
+          collect_supervised_classes_in_stmt(s, out);
+        }
+      }
+    }
+    Stmt::MatchResult {
+      ok_body, err_body, ..
+    } => {
+      for s in ok_body {
+        collect_supervised_classes_in_stmt(s, out);
+      }
+      for s in err_body {
+        collect_supervised_classes_in_stmt(s, out);
+      }
+    }
+    _ => {}
+  }
+}
+
 /// Plan 44's Decision log: a second use of this file's existing
 /// exhaustive `Expr`/`Stmt` walker shape (`collect_idents_in_expr`/
 /// `_stmt` immediately above), substituting "record every distinct
@@ -788,6 +909,11 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
       }
     }
     Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => collect_symbols_in_expr(e, table),
+    Expr::Supervise(body) => {
+      for s in body {
+        collect_symbols_in_stmt(s, table);
+      }
+    }
   }
 }
 
@@ -1200,6 +1326,13 @@ fn collect_specializations_in_expr(
     Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => {
       collect_specializations_in_expr(e, generic_fns, local_classes, out)
     }
+    // Plan 57: not recursed into, the same deliberate gap `Expr::
+    // Lambda { .. }` above already leaves for this function — a
+    // `supervise do ... end` body is sema-restricted to spawn
+    // statements only, and this function has no `&mut local_classes`/
+    // `classes` context available to call `collect_specializations_
+    // in_stmt` with anyway (unlike its statement-level namesake).
+    Expr::Supervise(_) => {}
   }
 }
 
@@ -1830,6 +1963,7 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
     | Expr::Bool(_)
     | Expr::Nil => {}
     Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => mark_expr(&e.node, out),
+    Expr::Supervise(body) => collect_referenced_idents(body, out),
   }
 }
 
@@ -2065,6 +2199,13 @@ struct ActorRuntimeFuncs<'ctx> {
   pool_start: FunctionValue<'ctx>,
   pool_drain_and_join: FunctionValue<'ctx>,
   current_thread_id: FunctionValue<'ctx>,
+  /// Plan 57 (supervision trees) — see each declaration's own comment
+  /// in `declare_actor_runtime_funcs` for its real C signature/purpose.
+  set_region: FunctionValue<'ctx>,
+  terminate: FunctionValue<'ctx>,
+  supervisor_create: FunctionValue<'ctx>,
+  supervisor_register_child: FunctionValue<'ctx>,
+  supervisor_child: FunctionValue<'ctx>,
 }
 
 fn declare_actor_runtime_funcs<'ctx>(
@@ -2104,12 +2245,55 @@ fn declare_actor_runtime_funcs<'ctx>(
     Some(Linkage::External),
   );
 
+  // Plan 57 (supervision trees).
+  let set_region = module.add_function(
+    "emerald_actor_set_region",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let terminate = module.add_function(
+    "emerald_actor_terminate",
+    void_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let supervisor_create = module.add_function(
+    "emerald_supervisor_create",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let supervisor_register_child = module.add_function(
+    "emerald_supervisor_register_child",
+    i64_ty.fn_type(
+      &[
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        i64_ty.into(),
+      ],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let supervisor_child = module.add_function(
+    "emerald_supervisor_child",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+
   ActorRuntimeFuncs {
     init_header,
     enqueue,
     pool_start,
     pool_drain_and_join,
     current_thread_id,
+    set_region,
+    terminate,
+    supervisor_create,
+    supervisor_register_child,
+    supervisor_child,
   }
 }
 
@@ -2138,6 +2322,8 @@ fn declare_actor_trampolines<'ctx>(
   module: &Module<'ctx>,
   program: &Program,
   user_func_ids: &HashMap<String, (FunctionValue<'ctx>, ValKind)>,
+  exc_funcs: &ExceptionRuntimeFuncs<'ctx>,
+  actor_funcs: &ActorRuntimeFuncs<'ctx>,
 ) -> Result<HashMap<String, FunctionValue<'ctx>>, String> {
   let ptr_ty = context.ptr_type(AddressSpace::default());
   let i64_ty = context.i64_type();
@@ -2205,8 +2391,76 @@ fn declare_actor_trampolines<'ctx>(
         };
         call_args.push(value);
       }
+
+      // Plan 57 (supervision trees), `leaf-crash-isolation`: wraps the
+      // real method call in a synthetic, compiler-only `push_handler`/
+      // `setjmp` frame — the unconditional-catch equivalent of
+      // `build_begin`'s own bare-`rescue` codegen (mirrored here
+      // directly in raw IR, since this function builds trampolines
+      // outside `build_stmt`'s own Stmt-level machinery). A `raise`
+      // that reaches this frame uncaught terminates the actor
+      // (`emerald_actor_terminate`) instead of the process; a `raise`
+      // a USER `rescue` inside the method body already caught never
+      // reaches here at all — this frame only ever fires for what
+      // would otherwise have been a true, process-fatal uncaught
+      // exception.
+      let push_call = builder
+        .build_call(exc_funcs.push_handler, &[], "actorpushhandler")
+        .map_err(|e| e.to_string())?;
+      let handler_ptr = call_result(push_call)?.into_pointer_value();
+      let jmpbuf_call = builder
+        .build_call(
+          exc_funcs.handler_jmpbuf,
+          &[handler_ptr.into()],
+          "actorjmpbuf",
+        )
+        .map_err(|e| e.to_string())?;
+      let jmpbuf_ptr = call_result(jmpbuf_call)?.into_pointer_value();
+      let setjmp_call = builder
+        .build_call(exc_funcs.setjmp, &[jmpbuf_ptr.into()], "actorsetjmpres")
+        .map_err(|e| e.to_string())?;
+      let returns_twice_id = Attribute::get_named_enum_kind_id("returns_twice");
+      let returns_twice_attr = context.create_enum_attribute(returns_twice_id, 0);
+      setjmp_call.add_attribute(AttributeLoc::Function, returns_twice_attr);
+      let setjmp_result = call_result(setjmp_call)?.into_int_value();
+
+      let try_blk = context.append_basic_block(trampoline_fv, "trampoline.try");
+      let catch_blk = context.append_basic_block(trampoline_fv, "trampoline.catch");
+      let zero = context.i32_type().const_int(0, false);
+      let is_first_pass = builder
+        .build_int_compare(IntPredicate::EQ, setjmp_result, zero, "actorisfirstpass")
+        .map_err(|e| e.to_string())?;
+      builder
+        .build_conditional_branch(is_first_pass, try_blk, catch_blk)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(try_blk);
       builder
         .build_call(method_fv, &call_args, "trampolinecall")
+        .map_err(|e| e.to_string())?;
+      builder
+        .build_call(exc_funcs.pop_handler, &[], "actorpophandler")
+        .map_err(|e| e.to_string())?;
+      builder.build_return(None).map_err(|e| e.to_string())?;
+
+      builder.position_at_end(catch_blk);
+      // `emerald_raise` already unlinked this handler from the stack
+      // before jumping back here (see `emerald_raise`'s own doc
+      // comment) — `free_handler`, not `pop_handler`, matches plan
+      // 38's own established split between the two.
+      builder
+        .build_call(
+          exc_funcs.free_handler,
+          &[handler_ptr.into()],
+          "actorfreehandler",
+        )
+        .map_err(|e| e.to_string())?;
+      builder
+        .build_call(
+          actor_funcs.terminate,
+          &[self_param.into()],
+          "actorterminate",
+        )
         .map_err(|e| e.to_string())?;
       builder.build_return(None).map_err(|e| e.to_string())?;
 
@@ -2214,6 +2468,153 @@ fn declare_actor_trampolines<'ctx>(
     }
   }
   Ok(trampolines)
+}
+
+/// One `void *(long long *argv)` "respawn thunk" per actor in the
+/// program (plan 57, `leaf-one-for-one-restart-runtime`) — callable
+/// straight from C (`EmeraldSupervisedChild.respawn`,
+/// `runtime/emerald_runtime.c`'s own `emerald_supervisor_notify_
+/// terminated`), doing exactly what `build_spawn_alloc` already does
+/// for an ordinary `.spawn` — region_create, region_alloc, actor_init_
+/// header, set_region, `initialize` — just unpacking its arguments
+/// from a raw argv array (mirroring `declare_actor_trampolines`'s own
+/// per-param unpacking) instead of evaluating an AST `Args` list,
+/// since a supervisor's own restart call has no expression context to
+/// evaluate at all — only the child's already-captured, already-
+/// evaluated original spawn arguments (Decision log: captured values,
+/// never re-evaluated expressions). Actors never have a superclass
+/// (plan 54's own grammar constraint), so `{name}_initialize` is
+/// always the actor's own defining symbol — no `method_owners` chain
+/// walk needed here, unlike `build_initialize_call`'s general case.
+/// Unlike `declare_actor_trampolines`'s own "one per actor method,
+/// whether or not cross-actor-called" precedent, this is scoped to
+/// `supervised_classes` (`collect_supervised_classes_in_stmt`'s own
+/// program-wide result) — an UNCONDITIONAL one-per-actor pass was
+/// tried first and reverted (this session): it compiles a real, always
+/// dead `emerald_region_create` call into every never-supervised
+/// actor's own unused thunk, which broke an existing, unrelated
+/// regression test counting `emerald_region_create` calls program-wide
+/// (`each_spawn_call_site_allocates_from_its_own_freshly_created_
+/// region`) — scoping to only the classes actually spawned inside a
+/// real `supervise` block fixes that without weakening this leaf's own
+/// coverage (every class a `supervise` block can ever reference still
+/// gets exactly one thunk).
+#[allow(clippy::too_many_arguments)]
+fn declare_supervisor_respawn_thunks<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  program: &Program,
+  user_func_ids: &HashMap<String, (FunctionValue<'ctx>, ValKind)>,
+  actor_funcs: &ActorRuntimeFuncs<'ctx>,
+  region_create_fn: FunctionValue<'ctx>,
+  region_alloc_fn: FunctionValue<'ctx>,
+  classes: &HashMap<String, ClassLayout>,
+  supervised_classes: &HashSet<String>,
+) -> Result<HashMap<String, FunctionValue<'ctx>>, String> {
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let i64_ty = context.i64_type();
+  let builder = context.create_builder();
+  let thunk_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
+
+  let mut thunks = HashMap::new();
+  for item in &program.items {
+    let Item::Actor(a) = item else { continue };
+    if !supervised_classes.contains(a.name.as_str()) {
+      continue;
+    }
+    let layout = classes
+      .get(a.name.as_str())
+      .ok_or_else(|| format!("codegen: unknown class `{}`", a.name))?;
+
+    let thunk_fv = module.add_function(
+      &format!("{}__respawn", a.name),
+      thunk_ty,
+      Some(Linkage::External),
+    );
+    let entry = context.append_basic_block(thunk_fv, "entry");
+    builder.position_at_end(entry);
+    let argv_param = thunk_fv
+      .get_nth_param(0)
+      .expect("respawn thunk always has an argv param")
+      .into_pointer_value();
+
+    let header_size = 8u64;
+    let size_val = i64_ty.const_int(layout.size + header_size, false);
+    let region_call = builder
+      .build_call(region_create_fn, &[], "respawnregion")
+      .map_err(|e| e.to_string())?;
+    let region = call_result(region_call)?.into_pointer_value();
+    let alloc_call = builder
+      .build_call(
+        region_alloc_fn,
+        &[region.into(), size_val.into()],
+        "respawntmp",
+      )
+      .map_err(|e| e.to_string())?;
+    let raw_ptr = call_result(alloc_call)?.into_pointer_value();
+    builder
+      .build_call(actor_funcs.init_header, &[raw_ptr.into()], "respawnheader")
+      .map_err(|e| e.to_string())?;
+    let self_ptr = field_ptr(context, &builder, raw_ptr, header_size)?;
+    builder
+      .build_call(
+        actor_funcs.set_region,
+        &[self_ptr.into(), region.into()],
+        "respawnsetregion",
+      )
+      .map_err(|e| e.to_string())?;
+
+    if let Some(init) = a.methods.iter().find(|m| m.name == "initialize") {
+      let init_key = format!("{}_initialize", a.name);
+      if let Some(&(init_fv, _)) = user_func_ids.get(&init_key) {
+        let mut call_args: Vec<BasicMetadataValueEnum> = vec![self_ptr.into()];
+        for (i, p) in init.params.iter().enumerate() {
+          let idx = i64_ty.const_int(i as u64, false);
+          let slot_ptr = unsafe {
+            builder
+              .build_in_bounds_gep(i64_ty, argv_param, &[idx], "respawnargvslot")
+              .map_err(|e| e.to_string())?
+          };
+          let raw = builder
+            .build_load(i64_ty, slot_ptr, "respawnargraw")
+            .map_err(|e| e.to_string())?
+            .into_int_value();
+          let value: BasicMetadataValueEnum = match value_kind_for_type(&p.ty) {
+            ValKind::Int64 | ValKind::Nil | ValKind::Symbol => raw.into(),
+            ValKind::Float64 => builder
+              .build_bit_cast(raw, context.f64_type(), "respawnargf64")
+              .map_err(|e| e.to_string())?
+              .into(),
+            ValKind::Ptr | ValKind::Str => builder
+              .build_int_to_ptr(raw, ptr_ty, "respawnargptr")
+              .map_err(|e| e.to_string())?
+              .into(),
+            ValKind::Bool => builder
+              .build_int_truncate(raw, context.bool_type(), "respawnargbool")
+              .map_err(|e| e.to_string())?
+              .into(),
+            ValKind::Void | ValKind::Tuple(_) => {
+              return Err(format!(
+                "codegen: internal — `{}` is not a valid actor initialize param kind",
+                p.ty
+              ));
+            }
+          };
+          call_args.push(value);
+        }
+        builder
+          .build_call(init_fv, &call_args, "respawninittmp")
+          .map_err(|e| e.to_string())?;
+      }
+    }
+
+    builder
+      .build_return(Some(&self_ptr))
+      .map_err(|e| e.to_string())?;
+
+    thunks.insert(a.name.clone(), thunk_fv);
+  }
+  Ok(thunks)
 }
 
 /// The header/exit blocks of the innermost enclosing loop, for `break`
@@ -2416,6 +2817,14 @@ struct Ctx<'a, 'ctx> {
   /// class is IN this set becomes a cross-actor `emerald_actor_enqueue`
   /// call instead).
   actor_names: &'a HashSet<String>,
+  /// Plan 57 (supervision trees): `{actor class name} -> its own
+  /// codegen-generated "respawn thunk" FunctionValue` — see
+  /// `declare_supervisor_respawn_thunks`'s own doc comment. One per
+  /// actor in the whole program, regardless of whether any `supervise`
+  /// block actually tracks it (mirrors `actor_trampolines`'s own
+  /// "one per actor method, whether or not it's ever cross-actor-
+  /// called" precedent).
+  supervisor_respawn_thunks: &'a HashMap<String, FunctionValue<'ctx>>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -2812,6 +3221,78 @@ fn build_initialize_call<'ctx>(
       .map_err(|e| e.to_string())?;
   }
   Ok(())
+}
+
+/// `region_create` → `region_alloc` (the header-prefixed size) →
+/// `emerald_actor_init_header` → `emerald_actor_set_region` →
+/// `initialize`, in that order — the exact sequence `Expr::Spawn`'s own
+/// codegen originally inlined, factored out (plan 57) so `Expr::
+/// Supervise`'s own tracked-child spawns can reuse it verbatim instead
+/// of a second, drifting copy. Returns the new instance's own `self`
+/// pointer (past the header slot — see `EmeraldActorHeader`'s own doc
+/// comment in `runtime/emerald_runtime.c`).
+#[allow(clippy::too_many_arguments)]
+fn build_spawn_alloc<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  class_name: &str,
+  args: &[Spanned<Expr>],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+  let layout = ctx
+    .classes
+    .get(class_name)
+    .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
+  let header_size = 8u64;
+  let size_val = context
+    .i64_type()
+    .const_int(layout.size + header_size, false);
+  let region_call = builder
+    .build_call(ctx.region_create_fn, &[], "spawnregion")
+    .map_err(|e| e.to_string())?;
+  let region = call_result(region_call)?.into_pointer_value();
+  let alloc_call = builder
+    .build_call(
+      ctx.region_alloc_fn,
+      &[region.into(), size_val.into()],
+      "spawntmp",
+    )
+    .map_err(|e| e.to_string())?;
+  let raw_ptr = call_result(alloc_call)?.into_pointer_value();
+  builder
+    .build_call(
+      ctx.actor_funcs.init_header,
+      &[raw_ptr.into()],
+      "spawnheader",
+    )
+    .map_err(|e| e.to_string())?;
+  let self_ptr = field_ptr(context, builder, raw_ptr, header_size)?;
+  // Plan 57 (supervision trees): records this instance's own region on
+  // its header, so `emerald_actor_terminate` can find it — see that
+  // function's own doc comment for why it's tracked but deliberately
+  // not yet freed there.
+  builder
+    .build_call(
+      ctx.actor_funcs.set_region,
+      &[self_ptr.into(), region.into()],
+      "spawnsetregion",
+    )
+    .map_err(|e| e.to_string())?;
+  build_initialize_call(
+    context,
+    builder,
+    class_name,
+    args,
+    self_ptr,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  Ok(self_ptr)
 }
 
 fn build_expr<'ctx>(
@@ -3566,46 +4047,156 @@ fn build_expr<'ctx>(
     // (`@field` reads/writes, same-actor `self` calls) stays completely
     // unaware this header prefix exists.
     Expr::Spawn(class_name, args) => {
-      let layout = ctx
-        .classes
-        .get(class_name)
-        .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
-      let header_size = 8u64;
-      let size_val = context
-        .i64_type()
-        .const_int(layout.size + header_size, false);
-      let region_call = builder
-        .build_call(ctx.region_create_fn, &[], "spawnregion")
-        .map_err(|e| e.to_string())?;
-      let region = call_result(region_call)?.into_pointer_value();
-      let alloc_call = builder
-        .build_call(
-          ctx.region_alloc_fn,
-          &[region.into(), size_val.into()],
-          "spawntmp",
-        )
-        .map_err(|e| e.to_string())?;
-      let raw_ptr = call_result(alloc_call)?.into_pointer_value();
-      builder
-        .build_call(
-          ctx.actor_funcs.init_header,
-          &[raw_ptr.into()],
-          "spawnheader",
-        )
-        .map_err(|e| e.to_string())?;
-      let self_ptr = field_ptr(context, builder, raw_ptr, header_size)?;
-      build_initialize_call(
+      let self_ptr = build_spawn_alloc(
         context,
         builder,
         class_name,
         args,
-        self_ptr,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
       Ok((self_ptr.into(), ValKind::Ptr))
+    }
+    // Plan 57 (supervision trees), `leaf-supervise-declaration`: sema
+    // has already restricted `body` to a flat list of bound-or-bare
+    // `<Class>.spawn(<args>)` statements (`Stmt::Let{value: Expr::
+    // Spawn(...)}` or `Stmt::Expr(Expr::Spawn(...))` — see `infer_expr_
+    // type`'s own `Expr::Supervise` arm) — codegen trusts that shape
+    // unconditionally, the same "codegen runs on already-checked
+    // input" contract every other leaf in this backend relies on.
+    // Registers each tracked child with its own per-class "respawn
+    // thunk" (`declare_supervisor_respawn_thunks`) and its already-
+    // evaluated spawn arguments, packed into a raw argv buffer the
+    // exact same way `build_actor_enqueue_call` already packs a
+    // cross-actor message's own arguments (Decision log: captured
+    // values, never re-evaluated expressions).
+    Expr::Supervise(body) => {
+      let sup_call = builder
+        .build_call(ctx.actor_funcs.supervisor_create, &[], "supcreate")
+        .map_err(|e| e.to_string())?;
+      let sup_ptr = call_result(sup_call)?.into_pointer_value();
+      let i64_ty = context.i64_type();
+      let ptr_ty = context.ptr_type(AddressSpace::default());
+      const ARGV_MAX: usize = 16;
+      for stmt in body {
+        let (name_opt, class_name, spawn_args): (Option<&str>, &str, &[Spanned<Expr>]) = match &stmt
+          .node
+        {
+          Stmt::Let {
+            name,
+            value:
+              Spanned {
+                node: Expr::Spawn(class_name, spawn_args),
+                ..
+              },
+            ..
+          } => (
+            Some(name.as_str()),
+            class_name.as_str(),
+            spawn_args.as_slice(),
+          ),
+          Stmt::Expr(Spanned {
+            node: Expr::Spawn(class_name, spawn_args),
+            ..
+          }) => (None, class_name.as_str(), spawn_args.as_slice()),
+          other => {
+            return Err(format!(
+              "codegen: internal error — `supervise do ... end` body statement {other:?} is not a spawn (sema should have rejected this)"
+            ));
+          }
+        };
+        let self_ptr = build_spawn_alloc(
+          context,
+          builder,
+          class_name,
+          spawn_args,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+
+        let argv_alloca = builder
+          .build_alloca(i64_ty.array_type(ARGV_MAX as u32), "supargv")
+          .map_err(|e| e.to_string())?;
+        for (i, a) in spawn_args.iter().enumerate() {
+          let (v, kind) = build_expr(
+            context,
+            builder,
+            a,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          let raw = match kind {
+            ValKind::Int64 | ValKind::Nil | ValKind::Symbol => v.into_int_value(),
+            ValKind::Float64 => builder
+              .build_bit_cast(v, i64_ty, "supargraw")
+              .map_err(|e| e.to_string())?
+              .into_int_value(),
+            ValKind::Ptr | ValKind::Str => builder
+              .build_ptr_to_int(v.into_pointer_value(), i64_ty, "supargraw")
+              .map_err(|e| e.to_string())?,
+            ValKind::Bool => builder
+              .build_int_z_extend(v.into_int_value(), i64_ty, "supargraw")
+              .map_err(|e| e.to_string())?,
+            ValKind::Void | ValKind::Tuple(_) => {
+              return Err(
+                "codegen: internal — not a valid supervised-spawn argument kind".to_string(),
+              );
+            }
+          };
+          let idx = i64_ty.const_int(i as u64, false);
+          let slot_ptr = unsafe {
+            builder
+              .build_in_bounds_gep(i64_ty, argv_alloca, &[idx], "supargvslot")
+              .map_err(|e| e.to_string())?
+          };
+          builder
+            .build_store(slot_ptr, raw)
+            .map_err(|e| e.to_string())?;
+        }
+        let argc = i64_ty.const_int(spawn_args.len() as u64, false);
+
+        let respawn_fv = *ctx
+          .supervisor_respawn_thunks
+          .get(class_name)
+          .ok_or_else(|| {
+            format!("codegen: internal error — no respawn thunk compiled for actor `{class_name}`")
+          })?;
+        let respawn_ptr = respawn_fv.as_global_value().as_pointer_value();
+        let name_ptr = match name_opt {
+          Some(n) => builder
+            .build_global_string_ptr(n, "supchildname")
+            .map_err(|e| e.to_string())?
+            .as_pointer_value(),
+          None => ptr_ty.const_null(),
+        };
+        let class_name_ptr = builder
+          .build_global_string_ptr(class_name, "supchildclass")
+          .map_err(|e| e.to_string())?
+          .as_pointer_value();
+
+        builder
+          .build_call(
+            ctx.actor_funcs.supervisor_register_child,
+            &[
+              sup_ptr.into(),
+              name_ptr.into(),
+              class_name_ptr.into(),
+              respawn_ptr.into(),
+              self_ptr.into(),
+              argv_alloca.into(),
+              argc.into(),
+            ],
+            "supregister",
+          )
+          .map_err(|e| e.to_string())?;
+      }
+      Ok((sup_ptr.into(), ValKind::Ptr))
     }
     Expr::MethodCall(recv, method, args) => build_method_call(
       context,
@@ -3903,6 +4494,54 @@ fn build_method_call<'ctx>(
       "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
     );
   };
+
+  // Plan 57 (supervision trees), `leaf-one-for-one-restart-runtime`:
+  // `sup.child(:name)` is the ONLY method a `Supervisor`-typed local
+  // ever dispatches — checked before the ordinary `local_classes`-
+  // driven class-method lookup below, since "Supervisor" is never a
+  // real `ClassInfo`/`ClassLayout` entry (`Type::Proc`'s own "the
+  // signature travels with the value, not a registry" precedent,
+  // reused — see `emerald-sema`'s `Type::Supervisor`). Sema already
+  // requires the argument to be a literal `Expr::SymbolLit` (so its
+  // spelling is embeddable as a C string constant at compile time,
+  // sidestepping any runtime symbol-to-string reverse lookup) and
+  // already resolved this call's own return type against the tracked
+  // child's real class — codegen here only needs the raw runtime call,
+  // `emerald_supervisor_child` does the rest (including the "no child
+  // named ..." diagnostic for an unnamed/unknown child, Decision log).
+  if local_classes.get(recv_name).map(String::as_str) == Some("Supervisor") && method == "child" {
+    let Some(Spanned {
+      node: Expr::SymbolLit(child_name),
+      ..
+    }) = args.first()
+    else {
+      return Err(
+        "codegen: internal error — `.child(...)` argument is not a symbol literal (sema should have rejected this)"
+          .to_string(),
+      );
+    };
+    let (recv_val, _) = build_expr(
+      context,
+      builder,
+      recv,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let name_ptr = builder
+      .build_global_string_ptr(child_name, "supchildquery")
+      .map_err(|e| e.to_string())?
+      .as_pointer_value();
+    let call = builder
+      .build_call(
+        ctx.actor_funcs.supervisor_child,
+        &[recv_val.into(), name_ptr.into()],
+        "supchildtmp",
+      )
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
+  }
 
   // Plan 45's Decision log: `File` is a separate, hard-coded arm, not
   // plan 12's real module-dispatch mechanism (`File` is never a
@@ -5913,7 +6552,14 @@ fn build_stmt<'a, 'ctx>(
       // Plan 52: an enum-typed local carries its enum name the same
       // way a class-typed local carries its class name — `build_case`
       // consults this to detect an enum scrutinee.
-      if ctx.classes.contains_key(bare_ty) || ctx.enums.contains_key(bare_ty) {
+      // Plan 57: `"Supervisor"` doubles as the side-table for a
+      // `supervise do ... end` local too — never a real `ctx.classes`
+      // entry (see `build_method_call`'s own `sup.child(...)` dispatch
+      // check, which is what actually consults this).
+      if ctx.classes.contains_key(bare_ty)
+        || ctx.enums.contains_key(bare_ty)
+        || bare_ty == "Supervisor"
+      {
         local_classes.insert(name.clone(), bare_ty.to_string());
       }
       if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
@@ -9022,7 +9668,49 @@ fn compile_to_object_impl(
     }
   }
 
-  let actor_trampolines = declare_actor_trampolines(&context, &module, program, &user_func_ids)?;
+  let actor_trampolines = declare_actor_trampolines(
+    &context,
+    &module,
+    program,
+    &user_func_ids,
+    &exc_funcs,
+    &actor_funcs,
+  )?;
+  let mut supervised_classes = HashSet::new();
+  for item in &program.items {
+    let body = match item {
+      Item::Stmt(s) => std::slice::from_ref(s),
+      Item::Function(f) => &f.body[..],
+      _ => continue,
+    };
+    for s in body {
+      collect_supervised_classes_in_stmt(s, &mut supervised_classes);
+    }
+  }
+  for item in &program.items {
+    let methods: &[AstFunction] = match item {
+      Item::Class(c) => &c.methods,
+      Item::Actor(a) => &a.methods,
+      Item::Module(m) => &m.methods,
+      _ => continue,
+    };
+    for m in methods {
+      for s in &m.body {
+        collect_supervised_classes_in_stmt(s, &mut supervised_classes);
+      }
+    }
+  }
+  let supervisor_respawn_thunks = declare_supervisor_respawn_thunks(
+    &context,
+    &module,
+    program,
+    &user_func_ids,
+    &actor_funcs,
+    region_create_fn,
+    region_alloc_fn,
+    &classes,
+    &supervised_classes,
+  )?;
   let actor_names: HashSet<String> = program
     .items
     .iter()
@@ -9086,6 +9774,7 @@ fn compile_to_object_impl(
     actor_funcs,
     actor_trampolines: &actor_trampolines,
     actor_names: &actor_names,
+    supervisor_respawn_thunks: &supervisor_respawn_thunks,
   };
 
   for item in &program.items {
@@ -11771,5 +12460,125 @@ int main(void) {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
 
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // Plan 57 (supervision trees), `leaf-crash-isolation`.
+
+  #[test]
+  fn an_unsupervised_actors_uncaught_raise_does_not_kill_the_compiled_process() {
+    // AC1: a real compiled/linked/run proof, not just the runtime-level
+    // one (`crates/emerald-driver/tests/supervisor_runtime.rs`) — every
+    // compiled actor method's own trampoline now wraps its real call in
+    // the synthetic catch frame this leaf adds.
+    let src = "class Boom\nend\n\nactor Bomb\n  def explode -> Void\n    raise Boom.new()\n  end\nend\n\nactor Survivor\n  def ping -> Void\n    puts \"still alive\"\n  end\nend\n\nb: Bomb = Bomb.spawn()\ns: Survivor = Survivor.spawn()\nb.explode\ns.ping\n";
+    let out = compile_link_run(src);
+    assert_eq!(
+      out, "still alive\n",
+      "the crashing actor's own raise must not produce any output (it never reaches its own \
+       puts, and never kills the process either) — only the sibling actor's real output \
+       should appear: {out:?}"
+    );
+  }
+
+  #[test]
+  fn a_trampolines_catch_frame_appears_exactly_once_per_actor_method_in_the_ir() {
+    // Structural proof, independent of the black-box test above: every
+    // actor method's own trampoline gets its own `push_handler`/
+    // `setjmp` frame — not shared, not skipped for some methods.
+    let src = "actor Bomb\n  def explode -> Void\n  end\n\n  def defuse -> Void\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("actor_trampoline_catch_frame_ir");
+    let obj_path = dir.join("out.o");
+    let ir =
+      compile_to_object_ir_text_for_test(&program, &obj_path).expect("should compile to IR text");
+    std::fs::remove_dir_all(&dir).ok();
+    let catch_blocks = ir.matches("trampoline.catch:").count();
+    assert_eq!(
+      catch_blocks, 2,
+      "a two-method actor must produce exactly two trampoline catch frames:\n{ir}"
+    );
+    assert!(
+      ir.contains("call void @emerald_actor_terminate("),
+      "the catch frame must call emerald_actor_terminate:\n{ir}"
+    );
+  }
+
+  // Plan 57 (supervision trees), `leaf-supervise-declaration` +
+  // `leaf-one-for-one-restart-runtime`.
+
+  // The plan's own worked example (`history/2026-09-09T131000Z-plan-57-
+  // supervision-trees.md`), adapted to this compiler's real, verified
+  // syntax the same way every prior plan's own literal text needed
+  // adapting this session: `Stmt::Let` always requires an explicit
+  // `name: Type = value` annotation (verified against `grammar.
+  // lalrpop`'s own `Stmt` production — there is no bare, annotation-
+  // less `name = value` Let form anywhere in this grammar), so `sup =
+  // supervise do ... end` becomes `sup: Supervisor = supervise do ...
+  // end`, and each spawn inside the block becomes `worker: Worker =
+  // Worker.spawn(0)` rather than the plan's own bare `worker = Worker.
+  // spawn(0)`. `w.send(1)` is likewise not a real method — a supervised
+  // actor's own message method is called BY NAME (`w.handle(1)`,
+  // mirroring plan 55's own `@peer.hit` convention), there is no
+  // generic `.send` dispatch anywhere in this backend. Finally, a
+  // `sync: Worker = sup.child(:worker)` call is threaded between every
+  // send specifically to exploit `emerald_supervisor_child`'s own
+  // documented "waits for the whole mailbox system to quiesce" blocking
+  // contract (`runtime/emerald_runtime.c`) as a real synchronization
+  // barrier — without it, the relative real-time order of `Worker`'s
+  // own output and `Logger`'s own output is genuinely undefined (this
+  // session's own `crates/emerald-driver/tests/supervisor_runtime.rs`
+  // already discovered and documented this scheduler's real, narrower
+  // guarantee: per-actor FIFO only, never a fixed cross-actor
+  // interleaving) — inserting a real blocking sync point after every
+  // send is what makes this test's own exact-output assertion below
+  // sound rather than flaky.
+  const SUPERVISOR_EXAMPLE: &str = "class Boom\nend\n\nactor Worker\n  count: Int64\n\n  def initialize(seed: Int64) -> Void\n    @count = seed\n  end\n\n  def handle(n: Int64) -> Void\n    @count = @count + n\n    if @count == 3\n      raise Boom.new()\n    end\n    puts @count\n  end\nend\n\nactor Logger\n  prefix: String\n\n  def initialize(prefix: String) -> Void\n    @prefix = prefix\n  end\n\n  def handle(n: Int64) -> Void\n    puts @prefix\n  end\nend\n\nsup: Supervisor = supervise do\n  worker: Worker = Worker.spawn(0)\n  logger: Logger = Logger.spawn(\"log\")\nend\n\nw: Worker = sup.child(:worker)\nl: Logger = sup.child(:logger)\n\nw.handle(1)\nsync: Worker = sup.child(:worker)\nw.handle(1)\nsync = sup.child(:worker)\nl.handle(1)\nsync = sup.child(:worker)\nw.handle(1)\nsync = sup.child(:worker)\nw2: Worker = sup.child(:worker)\nl.handle(1)\nsync = sup.child(:worker)\nw2.handle(1)\nsync = sup.child(:worker)\n";
+
+  #[test]
+  fn supervisor_worked_example_compiled_linked_and_run_prints_the_expected_six_lines_in_order() {
+    // AC1 (`leaf-one-for-one-restart-runtime`): normal operation, a
+    // crash that doesn't take the process down, and `one_for_one`
+    // restart, all in one real compiled/linked/run proof.
+    for _ in 0..5 {
+      assert_eq!(
+        compile_link_run(SUPERVISOR_EXAMPLE),
+        "1\n2\nlog\nrestarting Worker\nlog\n1\n"
+      );
+    }
+  }
+
+  #[test]
+  fn supervise_block_codegen_registers_each_tracked_child_with_the_runtime() {
+    // Structural proof, independent of the black-box test above: two
+    // tracked spawns inside one `supervise` block must compile to
+    // exactly two `emerald_supervisor_register_child` calls, plus a
+    // real `emerald_supervisor_create` call and a real per-class
+    // respawn thunk function.
+    let program = emerald_parser::parse(SUPERVISOR_EXAMPLE).expect("should parse");
+    let dir = fresh_temp_dir("supervise_register_child_ir");
+    let obj_path = dir.join("out.o");
+    let ir =
+      compile_to_object_ir_text_for_test(&program, &obj_path).expect("should compile to IR text");
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+      ir.contains("call ptr @emerald_supervisor_create("),
+      "a `supervise do ... end` expression must call emerald_supervisor_create:\n{ir}"
+    );
+    let register_calls = ir
+      .matches("call i64 @emerald_supervisor_register_child(")
+      .count();
+    assert_eq!(
+      register_calls, 2,
+      "two tracked spawns inside one supervise block must produce exactly two \
+       emerald_supervisor_register_child calls:\n{ir}"
+    );
+    assert!(
+      ir.contains("define ptr @Worker__respawn("),
+      "a `Worker__respawn` thunk must be compiled:\n{ir}"
+    );
+    assert!(
+      ir.contains("define ptr @Logger__respawn("),
+      "a `Logger__respawn` thunk must be compiled:\n{ir}"
+    );
   }
 }

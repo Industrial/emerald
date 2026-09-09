@@ -754,6 +754,11 @@ StmtPrimaryExpr: Spanned<Expr> = {
   // already use — not a general user-extensible mechanism.
   <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
   <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },
+  // Plan 57's Decision log: `"do"` is already a real, distinct
+  // terminal (plan 47's own `test "..." do ... end`), so this shares
+  // it rather than inventing a second one — no FIRST-set overlap with
+  // anything else here, since `"supervise"` alone disambiguates.
+  <l:@L> "supervise" "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Supervise(body) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
     if let Some(b) = blk { args.push(b); }
     Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
@@ -1075,6 +1080,9 @@ PrimaryExpr: Spanned<Expr> = {
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
   <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
   <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },
+  // Plan 57's Decision log: see `StmtPrimaryExpr`'s own identical
+  // `"supervise" "do" ... "end"` alternative for the full rationale.
+  <l:@L> "supervise" "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Supervise(body) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   // Plan 55's Decision log: see `StmtPrimaryExpr`'s own identical

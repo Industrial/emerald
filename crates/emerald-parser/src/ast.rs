@@ -264,6 +264,19 @@ pub enum Expr {
   /// every method call on the result still compiles as an ordinary
   /// synchronous call in this plan — only isolation is proven here.
   Spawn(String, Vec<Spanned<Expr>>),
+  /// `supervise do <name> = <Class>.spawn(<args>) ... end` (plan 57's
+  /// Decision log) — a block, reusing plan 34's own established
+  /// mechanism, not a declarative list (`.spawn`'s own argument lists
+  /// are ordinary Emerald expressions, and a block body is the only
+  /// existing shape able to hold a statement sequence with ordinary
+  /// expression arguments). Deliberately NOT a new restricted AST
+  /// shape either — an ordinary `Vec<Spanned<Stmt>>`, the exact same
+  /// list an `if`/`while`/method body already carries; sema (not the
+  /// grammar) restricts it to a flat list of `<name> = <Class>.spawn
+  /// (<args>)` (or a bare, unnamed `<Class>.spawn(<args>)`) statements,
+  /// the same "grammar stays general, sema narrows" discipline plan
+  /// 31 already established for its own restricted-shape leaves.
+  Supervise(Vec<Spanned<Stmt>>),
 }
 
 /// One statement in a block (a function body or the program's top level).

@@ -91,6 +91,18 @@ pub enum Type {
   /// exact-`E`-match check compares this variant's own two `Type`s via
   /// ordinary structural `PartialEq` — no coercion, ever.
   Result(Box<Type>, Box<Type>),
+  /// `Supervisor` (plan 57's Decision log) — the compile-time record of
+  /// which actors a `supervise do ... end` block tracks, keyed by each
+  /// spawn statement's own bound name (`None` for a bare, unnamed
+  /// `.spawn` — Decision log: a real, disclosed narrowing, unreachable
+  /// via `child(name)`, not a panic). Unlike `Type::Class`, which is
+  /// just a name backed by a separate `ClassInfo` registry, there's no
+  /// such registry for a `Supervisor` value — the *source-level*
+  /// annotation is always the bare keyword `Supervisor`, and the real
+  /// per-child class information travels with the value itself, the
+  /// same "signature travels with the value" precedent `Type::Proc`
+  /// already established (see `check_stmt`'s `Let` case).
+  Supervisor(Vec<(Option<String>, Type)>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1439,6 +1451,62 @@ fn infer_expr_type(
       }
       Ok(Type::Class(class_name.clone()))
     }
+    // Plan 57 (supervision trees), `leaf-supervise-declaration`:
+    // `supervise do ... end`'s body is restricted to a flat list of
+    // bound-or-bare `<Class>.spawn(<args>)` statements (Decision log —
+    // any other shape, e.g. `puts "x"`, is a real diagnostic naming the
+    // offending statement, not silently dropped and not a panic).
+    // Every qualifying statement is type-checked by simply delegating
+    // to `Expr::Spawn`'s own arm above (via `infer_expr_type` on its
+    // `value`/the bare expression itself) — no duplicated arg-arity/
+    // type-checking logic. A bound spawn's own declared annotation
+    // must name the exact spawned class (`worker: Worker = Worker.
+    // spawn(...)`, not e.g. `worker: Object = ...`) so codegen's own
+    // `local_classes`-free, purely-syntactic body walk (`build_expr`'s
+    // `Expr::Supervise` arm) never needs to consult a type at all.
+    Expr::Supervise(body) => {
+      let mut children: Vec<(Option<String>, Type)> = Vec::new();
+      for stmt in body {
+        match &stmt.node {
+          Stmt::Let {
+            name,
+            ty,
+            value:
+              value @ Spanned {
+                node: Expr::Spawn(class_name, _),
+                ..
+              },
+          } => {
+            if ty != class_name {
+              return Err(Diagnostic::new(
+                format!(
+                  "`supervise do ... end`: `{name}: {ty} = {class_name}.spawn(...)` — declared type must match the spawned class `{class_name}`"
+                ),
+                stmt.span,
+              ));
+            }
+            let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
+            children.push((Some(name.clone()), actual));
+          }
+          Stmt::Expr(
+            value @ Spanned {
+              node: Expr::Spawn(_, _),
+              ..
+            },
+          ) => {
+            let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
+            children.push((None, actual));
+          }
+          _ => {
+            return Err(Diagnostic::new(
+              "`supervise do ... end` body may only contain `<name>: <Class> = <Class>.spawn(<args>)` or bare `<Class>.spawn(<args>)` statements",
+              stmt.span,
+            ));
+          }
+        }
+      }
+      Ok(Type::Supervisor(children))
+    }
     // Plan 45's Decision log: `File` reuses plan 12's `Name.method(args)`
     // dispatch *shape* but is a separate, hard-coded arm — `File` is
     // never declared via a real `ModuleDef`, so it never populates
@@ -1562,6 +1630,50 @@ fn infer_expr_type(
       } else {
         resolve_type(&iface.return_type_raw, classes)
       }
+    }
+    // Plan 57 (supervision trees): `.child(:name)` on a `Supervisor`-
+    // typed receiver, mirroring `.call`'s own "dispatch is driven
+    // purely by the value's own carried signature, not the `classes`
+    // registry" pattern immediately below (`Type::Supervisor`'s own
+    // doc comment: the tracked-children map travels with the value,
+    // exactly like `Type::Proc`'s own signature) — ordered here, after
+    // the module-dispatch/`Type::Generic` arms above, for the identical
+    // reason `.call` is: a real module or generic-bounded receiver
+    // declaring its own method literally named `child` must still
+    // reach ITS OWN arm first.
+    Expr::MethodCall(recv, method, args) if method == "child" => {
+      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
+      let Type::Supervisor(children) = &recv_ty else {
+        return Err(Diagnostic::new(
+          format!("method call `.child` on non-Supervisor type {recv_ty:?}"),
+          recv.span,
+        ));
+      };
+      let [arg] = &args[..] else {
+        return Err(Diagnostic::new(
+          format!(
+            "`.child` expects exactly 1 argument (a symbol), found {}",
+            args.len()
+          ),
+          expr.span,
+        ));
+      };
+      let Expr::SymbolLit(child_name) = &arg.node else {
+        return Err(Diagnostic::new(
+          "`.child` requires a literal symbol argument (e.g. `sup.child(:worker)`)",
+          arg.span,
+        ));
+      };
+      children
+        .iter()
+        .find(|(n, _)| n.as_deref() == Some(child_name.as_str()))
+        .map(|(_, t)| t.clone())
+        .ok_or_else(|| {
+          Diagnostic::new(
+            format!("supervisor has no tracked child named `{child_name}`"),
+            arg.span,
+          )
+        })
     }
     // `.call` on a `Proc`-typed receiver dispatches against the
     // signature carried directly on `Type::Proc` (plan 10) — everything
@@ -2409,6 +2521,27 @@ fn check_stmt(
         return Err(Diagnostic::new(
           format!(
             "type mismatch in `{name}: Proc = ...`: expected a Proc (lambda literal), found {actual:?}"
+          ),
+          value.span,
+        ));
+      }
+      env.insert(name.clone(), actual);
+      Ok(())
+    }
+    // `Supervisor` is special-cased the same way `Proc` is immediately
+    // above (plan 57's Decision log) — the bare annotation carries no
+    // per-child information (see `Type::Supervisor`'s own doc comment),
+    // so instead of comparing against `resolve_type("Supervisor", ...)`
+    // (which would fail — "Supervisor" is never a real `ClassInfo`),
+    // any actual `Type::Supervisor(_)` is accepted and *that* — the
+    // real tracked-children record inferred from the bound `Expr::
+    // Supervise` — is what's stored in `env`.
+    Stmt::Let { name, ty, value } if ty == "Supervisor" => {
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
+      if !matches!(actual, Type::Supervisor(_)) {
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name}: Supervisor = ...`: expected a `supervise do ... end` block, found {actual:?}"
           ),
           value.span,
         ));
@@ -3712,6 +3845,11 @@ fn expr_moved_read(
     // function needs its own dedicated traversal this plan's own
     // worked examples never exercise (neither uses a lambda at all).
     Expr::Lambda { .. } => Ok(()),
+    // Plan 57: same disclosed gap as `Expr::Lambda` immediately above,
+    // for the identical reason — a `supervise do ... end` body is a
+    // nested `Stmt` list, and this plan's own worked examples never
+    // send a moved-out local as a supervised `.spawn` argument.
+    Expr::Supervise(_) => Ok(()),
   }
 }
 
@@ -6871,5 +7009,75 @@ mod tests {
     let counter = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
     let program = emerald_parser::parse(counter).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 57 (supervision trees).
+
+  /// Shared `Worker`/`Logger` preamble — `after_supervise` supplies the
+  /// `supervise do ...` block's own body PLUS its closing `end` PLUS
+  /// anything that follows, since (unlike `message_safety_program`'s
+  /// fixed-shape `run_body`) most scenarios here need real top-level
+  /// statements after the block itself (e.g. a `.child(...)` query).
+  fn supervisor_program(after_supervise: &str) -> String {
+    format!(
+      "actor Worker\n  count: Int64\n\n  def initialize(seed: Int64) -> Void\n    @count = seed\n  end\nend\n\nactor Logger\n  prefix: String\n\n  def initialize(prefix: String) -> Void\n    @prefix = prefix\n  end\nend\n\nsup: Supervisor = supervise do\n{after_supervise}"
+    )
+  }
+
+  #[test]
+  fn accepts_a_supervise_block_with_named_and_bare_spawns_and_a_named_child_query() {
+    let src = supervisor_program(
+      "  worker: Worker = Worker.spawn(0)\n  Logger.spawn(\"log\")\nend\n\nw: Worker = sup.child(:worker)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_non_spawn_statement_inside_a_supervise_block() {
+    let src = supervisor_program("  puts \"x\"\nend\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a `supervise do ... end` body may only contain spawn statements");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("supervise do ... end")),
+      "diagnostic must name the restricted body shape: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_child_query_for_an_unnamed_bare_spawn() {
+    // AC3 (`leaf-supervise-declaration`): a bare, unnamed `.spawn`
+    // compiles, but is unreachable via `child(name)` — a real,
+    // disclosed narrowing caught at compile time (the tracked-children
+    // map sema builds never gets an entry for it), not a runtime crash.
+    let src =
+      supervisor_program("  Logger.spawn(\"log\")\nend\n\nl: Logger = sup.child(:logger)\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("an unnamed bare spawn must not be reachable via `.child(:logger)`");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("no tracked child named")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_declared_type_that_does_not_match_the_spawned_class() {
+    let src = supervisor_program("  worker: Logger = Worker.spawn(0)\nend\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "`worker: Logger = Worker.spawn(...)` — declared type disagrees with the spawned class",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("declared type must match")),
+      "{errs:?}"
+    );
   }
 }
