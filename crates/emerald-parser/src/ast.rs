@@ -80,6 +80,13 @@ pub enum Expr {
   /// produces `Expr::StringLit`, unchanged, for zero codegen
   /// regression on the overwhelmingly common case.
   Interpolate(Vec<StringPart>),
+  /// `:foo` (plan 44's Decision log) — carries the spelling with the
+  /// leading `:` already stripped, mirroring `decode_string_lit`'s own
+  /// "AST already holds the real value" convention. A genuinely
+  /// separate type/runtime representation from `String`, not an alias —
+  /// see `emerald-sema`'s `Type::Symbol` and `emerald-codegen`'s
+  /// `ValKind::Symbol`.
+  SymbolLit(String),
   Add(Box<Expr>, Box<Expr>),
   Sub(Box<Expr>, Box<Expr>),
   Mul(Box<Expr>, Box<Expr>),

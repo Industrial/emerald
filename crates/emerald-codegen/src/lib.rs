@@ -63,6 +63,11 @@ enum ValKind {
   /// fixed `i64` sentinel (always `0`), real storage/param/return kind,
   /// never compared against anything but another `Nil`.
   Nil,
+  /// Plan 44 — `i64`-backed, exactly like `Int64`/`Nil` above: a
+  /// compile-time-assigned dense integer ID (`Ctx::symbol_table`), not
+  /// a pointer — symbol equality is a plain `icmp` on this kind, never
+  /// a runtime string comparison.
+  Symbol,
 }
 
 fn value_kind_for_type(ty: &str) -> ValKind {
@@ -79,6 +84,7 @@ fn value_kind_for_type(ty: &str) -> ValKind {
     // from the generic `Ptr` bucket (see `ValKind`'s doc comment).
     "String" => ValKind::Str,
     "Nil" => ValKind::Nil,
+    "Symbol" => ValKind::Symbol,
     // `Hash[K, V]` (plan 25) shares the generic `Ptr` bucket — unlike
     // `Array[Elem]`, indexing it needs a key type too, which the
     // side-table `local_classes` (repurposed to hold `"Hash[K, V]"`
@@ -95,7 +101,7 @@ fn value_kind_for_type(ty: &str) -> ValKind {
 /// `make_fn_type`), not a user-input-dependent case.
 fn local_llvm_type<'ctx>(context: &'ctx Context, kind: ValKind) -> BasicTypeEnum<'ctx> {
   match kind {
-    ValKind::Int64 | ValKind::Nil => context.i64_type().into(),
+    ValKind::Int64 | ValKind::Nil | ValKind::Symbol => context.i64_type().into(),
     ValKind::Float64 => context.f64_type().into(),
     ValKind::Ptr | ValKind::Str => context.ptr_type(AddressSpace::default()).into(),
     ValKind::Bool => context.bool_type().into(),
@@ -114,7 +120,9 @@ fn make_fn_type<'ctx>(
     .collect();
   match ret_kind {
     ValKind::Void => context.void_type().fn_type(&param_types, false),
-    ValKind::Int64 | ValKind::Nil => context.i64_type().fn_type(&param_types, false),
+    ValKind::Int64 | ValKind::Nil | ValKind::Symbol => {
+      context.i64_type().fn_type(&param_types, false)
+    }
     ValKind::Float64 => context.f64_type().fn_type(&param_types, false),
     ValKind::Ptr | ValKind::Str => context
       .ptr_type(AddressSpace::default())
@@ -248,6 +256,7 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
     Expr::Int(_)
     | Expr::Float(_)
     | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
     | Expr::InstanceVar(_)
     | Expr::Lambda { .. }
     | Expr::Bool(_)
@@ -472,6 +481,235 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
   }
 }
 
+/// Plan 44's Decision log: a second use of this file's existing
+/// exhaustive `Expr`/`Stmt` walker shape (`collect_idents_in_expr`/
+/// `_stmt` immediately above), substituting "record every distinct
+/// `Expr::SymbolLit` spelling, first occurrence wins" for "record every
+/// `Expr::Ident` reference." Assigns the next unused dense ID
+/// (`table.len() as i64`) to each newly-seen spelling — two `:foo`
+/// occurrences anywhere in the program produce the exact same ID.
+fn collect_symbols_in_expr(expr: &Expr, table: &mut HashMap<String, i64>) {
+  match expr {
+    Expr::SymbolLit(name) => {
+      if !table.contains_key(name) {
+        let id = table.len() as i64;
+        table.insert(name.clone(), id);
+      }
+    }
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::InstanceVar(_)
+    | Expr::Lambda { .. }
+    | Expr::Bool(_)
+    | Expr::Nil => {}
+    Expr::ArrayNew(size) => collect_symbols_in_expr(size, table),
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        collect_symbols_in_expr(k, table);
+        collect_symbols_in_expr(v, table);
+      }
+    }
+    Expr::Add(l, r)
+    | Expr::Sub(l, r)
+    | Expr::Mul(l, r)
+    | Expr::Div(l, r)
+    | Expr::Rem(l, r)
+    | Expr::And(l, r)
+    | Expr::Or(l, r)
+    | Expr::BitAnd(l, r)
+    | Expr::BitOr(l, r)
+    | Expr::BitXor(l, r)
+    | Expr::Shl(l, r)
+    | Expr::Shr(l, r)
+    | Expr::Index(l, r) => {
+      collect_symbols_in_expr(l, table);
+      collect_symbols_in_expr(r, table);
+    }
+    Expr::Neg(e) | Expr::Not(e) | Expr::BitNot(e) => collect_symbols_in_expr(e, table),
+    Expr::Compare(l, _, r) => {
+      collect_symbols_in_expr(l, table);
+      collect_symbols_in_expr(r, table);
+    }
+    Expr::Call(_, args) | Expr::New(_, args) => {
+      for a in args {
+        collect_symbols_in_expr(a, table);
+      }
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        collect_symbols_in_expr(v, table);
+      }
+    }
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
+      collect_symbols_in_expr(recv, table);
+      for a in args {
+        collect_symbols_in_expr(a, table);
+      }
+    }
+    Expr::ArrayLit(elements) => {
+      for e in elements {
+        collect_symbols_in_expr(e, table);
+      }
+    }
+    Expr::Interpolate(parts) => {
+      for part in parts {
+        if let StringPart::Expr(e) = part {
+          collect_symbols_in_expr(e, table);
+        }
+      }
+    }
+  }
+}
+
+fn collect_symbols_in_stmt(stmt: &Stmt, table: &mut HashMap<String, i64>) {
+  match stmt {
+    Stmt::Let { value, .. } => collect_symbols_in_expr(value, table),
+    Stmt::SetField { value, .. } => collect_symbols_in_expr(value, table),
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      collect_symbols_in_expr(array, table);
+      collect_symbols_in_expr(index, table);
+      collect_symbols_in_expr(value, table);
+    }
+    Stmt::Assign { value, .. } => collect_symbols_in_expr(value, table),
+    Stmt::OrAssign { default, .. } => collect_symbols_in_expr(default, table),
+    Stmt::AndAssign { value, .. } => collect_symbols_in_expr(value, table),
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        collect_symbols_in_expr(v, table);
+      }
+    }
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      collect_symbols_in_expr(cond, table);
+      for s in then_branch {
+        collect_symbols_in_stmt(s, table);
+      }
+      if let Some(else_b) = else_branch {
+        for s in else_b {
+          collect_symbols_in_stmt(s, table);
+        }
+      }
+    }
+    Stmt::While { cond, body } => {
+      collect_symbols_in_expr(cond, table);
+      for s in body {
+        collect_symbols_in_stmt(s, table);
+      }
+    }
+    Stmt::Return(Some(e)) => collect_symbols_in_expr(e, table),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => {}
+    Stmt::Expr(e) => collect_symbols_in_expr(e, table),
+    Stmt::Raise(e) => collect_symbols_in_expr(e, table),
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        collect_symbols_in_stmt(s, table);
+      }
+      for rescue in rescues {
+        for s in &rescue.body {
+          collect_symbols_in_stmt(s, table);
+        }
+      }
+      if let Some(ensure_body) = ensure {
+        for s in ensure_body {
+          collect_symbols_in_stmt(s, table);
+        }
+      }
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      collect_symbols_in_expr(scrutinee, table);
+      for (values, body) in arms {
+        for v in values {
+          collect_symbols_in_expr(v, table);
+        }
+        for s in body {
+          collect_symbols_in_stmt(s, table);
+        }
+      }
+      if let Some(else_b) = else_body {
+        for s in else_b {
+          collect_symbols_in_stmt(s, table);
+        }
+      }
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        collect_symbols_in_expr(e, table);
+      }
+      for s in body {
+        collect_symbols_in_stmt(s, table);
+      }
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      collect_symbols_in_expr(start, table);
+      collect_symbols_in_expr(end, table);
+      for s in body {
+        collect_symbols_in_stmt(s, table);
+      }
+    }
+    Stmt::Yield(args) => {
+      for a in args {
+        collect_symbols_in_expr(a, table);
+      }
+    }
+  }
+}
+
+/// Plan 44's Decision log: the whole-program driver — walks every
+/// top-level `Item::Function` body, every `ClassDef` method body, every
+/// `ModuleDef` method body, and every top-level `Item::Stmt`, in
+/// `program.items` order, assigning IDs via `collect_symbols_in_stmt`.
+/// The collector walks every declared function/method regardless of
+/// call reachability (no reachability analysis exists in this compiler
+/// to make that distinction safely) — dead code still gets a real ID.
+fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
+  let mut table = HashMap::new();
+  for item in &program.items {
+    match item {
+      Item::Function(f) => {
+        for s in &f.body {
+          collect_symbols_in_stmt(s, &mut table);
+        }
+      }
+      Item::Class(c) => {
+        for m in &c.methods {
+          for s in &m.body {
+            collect_symbols_in_stmt(s, &mut table);
+          }
+        }
+      }
+      Item::Module(m) => {
+        for f in &m.methods {
+          for s in &f.body {
+            collect_symbols_in_stmt(s, &mut table);
+          }
+        }
+      }
+      Item::Stmt(s) => collect_symbols_in_stmt(s, &mut table),
+      Item::Interface(_) | Item::Require(_) | Item::Error => {}
+    }
+  }
+  table
+}
+
 /// Plan 41's Decision log: resolves a generic call site's own concrete
 /// argument type — a plain local via the walk's own accumulated
 /// `local_classes` (the same side-table `bind_params`/`Stmt::Let`
@@ -627,6 +865,7 @@ fn collect_specializations_in_expr(
     | Expr::Int(_)
     | Expr::Float(_)
     | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
     | Expr::InstanceVar(_)
     | Expr::Lambda { .. }
     | Expr::Bool(_)
@@ -1262,6 +1501,13 @@ struct Ctx<'a, 'ctx> {
   /// (ordinary function/method/lambda bodies never reach a `Stmt::
   /// Yield` — sema already guarantees that).
   yield_target: Option<(&'a [Param], &'a [Stmt])>,
+  /// `{symbol spelling} -> a dense compile-time integer ID` (plan 44's
+  /// Decision log) — every distinct `:foo` spelling anywhere in the
+  /// whole program, assigned in first-occurrence order, mirroring
+  /// `class_tags`' own shape (a single flat table built once before any
+  /// function body compiles). No runtime interning table exists at all
+  /// — the symbol set is closed and fully enumerable at parse time.
+  symbol_table: &'a HashMap<String, i64>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -1646,6 +1892,23 @@ fn build_expr<'ctx>(
         .build_global_string_ptr(s, "strlit")
         .map_err(|e| e.to_string())?;
       Ok((global.as_pointer_value().into(), ValKind::Str))
+    }
+    // Plan 44's Decision log: looked up in the whole-program compile-
+    // time symbol table (`ctx.symbol_table`, built once by `collect_
+    // symbols_in_expr`/`_stmt` before any function body compiles) and
+    // lowered to a plain `i64` constant — the same one-instruction
+    // shape as `Expr::Int`, never a runtime interning lookup. An
+    // internal-error `Err` (never a panic) if somehow missing, which
+    // the pre-pass's completeness should make unreachable.
+    Expr::SymbolLit(name) => {
+      let id = *ctx
+        .symbol_table
+        .get(name)
+        .ok_or_else(|| format!("codegen: internal error — symbol `:{name}` has no assigned ID"))?;
+      Ok((
+        context.i64_type().const_int(id as u64, false).into(),
+        ValKind::Symbol,
+      ))
     }
     // Plan 36: string interpolation — see `build_interpolate` below.
     Expr::Interpolate(parts) => build_interpolate(
@@ -2060,6 +2323,30 @@ fn build_expr<'ctx>(
         (ValKind::Nil, ValKind::Nil) => {
           return Err(format!(
             "codegen: `{op:?}` is not supported on Nil — only `==`/`!=` are"
+          ));
+        }
+        // Plan 44's Decision log: `Symbol == Symbol`/`!=` — a plain
+        // `icmp` on two `i64`s (compile-time-assigned dense IDs), the
+        // same one-instruction shape as the `Nil` arm immediately
+        // above; never leaves the current basic block, unlike `String`
+        // equality's real `emerald_string_eq` call. Ordering
+        // comparisons are declined — a symbol's integer ID is assigned
+        // by arbitrary first-occurrence source order, not by spelling,
+        // so exposing `<`/`>` would silently expose a compiler
+        // implementation detail as a meaningful ordering.
+        (ValKind::Symbol, ValKind::Symbol) if matches!(op, CompareOp::Eq | CompareOp::Ne) => {
+          let pred = if matches!(op, CompareOp::Eq) {
+            IntPredicate::EQ
+          } else {
+            IntPredicate::NE
+          };
+          builder
+            .build_int_compare(pred, l.into_int_value(), r.into_int_value(), "symcmptmp")
+            .map_err(|e| e.to_string())?
+        }
+        (ValKind::Symbol, ValKind::Symbol) => {
+          return Err(format!(
+            "codegen: `{op:?}` is not supported on Symbol — only `==`/`!=` are"
           ));
         }
         // Plan 43's Decision log: a `Nullable(_)` operand (`ValKind::
@@ -5776,6 +6063,10 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   }
   let method_owners = build_method_owners(&class_defs)?;
 
+  // Plan 44: see `Ctx::symbol_table`'s own doc comment — built once,
+  // alongside `class_tags`, before any function body compiles.
+  let symbol_table = collect_program_symbols(program);
+
   // Plan 38: see `Ctx::rescue_tag_sets`'s own doc comment.
   let mut rescue_tag_sets: HashMap<String, Vec<i64>> = HashMap::new();
   for c_name in class_defs.keys() {
@@ -5873,6 +6164,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     block_funcs: &block_funcs,
     func_defs: &func_defs,
     yield_target: None,
+    symbol_table: &symbol_table,
   };
 
   for item in &program.items {
@@ -7004,5 +7296,56 @@ mod tests {
     // `(ValKind::Nil, ValKind::Nil)` codegen case, not the new
     // `Ptr`/`Str`-vs-`Nil` null-pointer-test case this plan adds.
     assert_eq!(compile_link_run(NIL_EXAMPLE), "1\n");
+  }
+
+  // Plan 44 (symbols).
+
+  const SYMBOLS_WORKED_EXAMPLE: &str = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+
+  #[test]
+  fn symbols_worked_example_linked_and_run() {
+    // AC1: real executed proof — a `Hash[Symbol, Int64]` built, read,
+    // and overwritten via symbol keys, plus symbol equality being a
+    // real, cheap comparison (not a string compare).
+    assert_eq!(compile_link_run(SYMBOLS_WORKED_EXAMPLE), "82\n100\n1\n0\n");
+  }
+
+  #[test]
+  fn two_distinct_occurrences_of_the_same_spelling_produce_the_same_id() {
+    // AC2: real proof the whole-program collector assigns one ID per
+    // distinct spelling, not one per occurrence (the opposite,
+    // disclosed choice from plan 19's deliberate *non*-dedup of String
+    // literals) — one `:dup` inside a function body, one at top level;
+    // `==` between them must be true.
+    let src = "def make_dup -> Symbol\n  :dup\nend\n\nif make_dup() == :dup\n  puts 1\nelse\n  puts 0\nend\n";
+    assert_eq!(compile_link_run(src), "1\n");
+  }
+
+  #[test]
+  fn a_symbol_used_only_in_unreachable_code_still_compiles_cleanly() {
+    // AC3: the collector walks every declared function/method
+    // regardless of call reachability — `never_called` is declared but
+    // never invoked from any top-level statement, yet the program must
+    // still compile (no reachability analysis exists to skip it).
+    let src = "def never_called -> Symbol\n  :dead_code\nend\n\nputs 42\n";
+    assert_eq!(compile_link_run(src), "42\n");
+  }
+
+  #[test]
+  fn ordering_comparison_on_two_symbols_errors_not_panics() {
+    // AC4: reached only by directly constructing the AST (the parser
+    // has no `<` grammar path that type-checks two `Symbol` operands
+    // into codegen — sema's `Compare` arm doesn't special-case `Symbol`
+    // at all, so this is a real codegen-level defensive check) —
+    // returns a descriptive `Err`, not a panic.
+    let program = Program {
+      items: vec![Item::Stmt(Stmt::Expr(Expr::Compare(
+        Box::new(Expr::SymbolLit("foo".to_string())),
+        CompareOp::Lt,
+        Box::new(Expr::SymbolLit("bar".to_string())),
+      )))],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_symbol_ordering_should_not_exist.o");
+    assert!(compile_to_object(&program, &out).is_err());
   }
 }

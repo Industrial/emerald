@@ -1989,4 +1989,67 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 5);
   }
+
+  // Plan 44 (symbols).
+
+  #[test]
+  fn symbol_literal_parses_to_expr_symbol_lit() {
+    let src = ":foo\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::SymbolLit("foo".to_string())))
+    );
+  }
+
+  #[test]
+  fn symbol_typed_let_parses() {
+    let src = "x: Symbol = :foo\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Let {
+        name: "x".to_string(),
+        ty: "Symbol".to_string(),
+        value: Expr::SymbolLit("foo".to_string()),
+      })
+    );
+  }
+
+  #[test]
+  fn ordinary_spaced_type_annotation_still_parses_identically() {
+    let src = "x: Int64 = 1\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Let {
+        name: "x".to_string(),
+        ty: "Int64".to_string(),
+        value: Expr::Int(1),
+      })
+    );
+  }
+
+  #[test]
+  fn symbol_keyed_hash_literal_parses() {
+    let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82}\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      *value,
+      Expr::HashLit(vec![
+        (Expr::SymbolLit("alice".to_string()), Expr::Int(90)),
+        (Expr::SymbolLit("bob".to_string()), Expr::Int(82)),
+      ])
+    );
+  }
+
+  #[test]
+  fn symbols_worked_example_parses_end_to_end() {
+    let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(program.items.len(), 6);
+  }
 }

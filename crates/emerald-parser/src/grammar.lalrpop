@@ -623,6 +623,7 @@ StmtPrimaryExpr: Expr = {
   <n:Num> => Expr::Int(n),
   <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
     .map_err(|error| lalrpop_util::ParseError::User { error }),
+  <s:SymbolLitTok> => Expr::SymbolLit(s),
   "true" => Expr::Bool(true),
   "false" => Expr::Bool(false),
   "nil" => Expr::Nil,
@@ -898,6 +899,7 @@ PrimaryExpr: Expr = {
   <n:Num> => Expr::Int(n),
   <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
     .map_err(|error| lalrpop_util::ParseError::User { error }),
+  <s:SymbolLitTok> => Expr::SymbolLit(s),
   "true" => Expr::Bool(true),
   "false" => Expr::Bool(false),
   "nil" => Expr::Nil,
@@ -989,3 +991,16 @@ InstanceVarTok: String = <s:r"@[A-Za-z_][A-Za-z0-9_]*"> => s[1..].to_string();
 // strips the quotes and decodes the two escapes into the literal's real
 // `String` value.
 StringLitTok: String = <s:r#""([^"\\]|\\[n"])*""#> => decode_string_lit(&s);
+
+// Plan 44's Decision log: LALRPOP's tokenizer picks the longest match
+// at a given position — this 6+-character regex wins over the
+// pre-existing bare `":"` literal token (`Stmt`'s `name: Type = ...`,
+// `Param`'s `name: Type`) only when a `:` is immediately followed by an
+// identifier with NO space between them (`x:Int64`, not `x: Int64`) —
+// a real, disclosed, narrow restriction (this codebase's own
+// convention, and every existing example/test fixture, always writes a
+// space there; grepped this session for the collision shape with zero
+// matches), not a silent landmine. Strips the leading `:` in the
+// action, mirroring `decode_string_lit`'s "AST holds the real value"
+// convention.
+SymbolLitTok: String = <s:r":[A-Za-z_][A-Za-z0-9_]*"> => s[1..].to_string();

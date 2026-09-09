@@ -18,6 +18,12 @@ pub enum Type {
   String,
   Boolean,
   Void,
+  /// `:foo` (plan 44's Decision log) — a genuinely separate type from
+  /// `String`, not an alias: every distinct spelling appearing anywhere
+  /// in a compilation unit is enumerable at parse time, so equality is
+  /// a cheap interned-integer compare in codegen (`ValKind::Symbol`),
+  /// not a string compare.
+  Symbol,
   /// Plan 25's Decision log: deliberately narrow — no `T?` nullable-type
   /// system, just a bare, standalone type a `nil` literal produces.
   Nil,
@@ -175,6 +181,7 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "Void" => Ok(Type::Void),
     "Boolean" => Ok(Type::Boolean),
     "Nil" => Ok(Type::Nil),
+    "Symbol" => Ok(Type::Symbol),
     // Plan 43's Decision log: checked before every other compound-string
     // case below (`Array[Elem]?`/`Hash[K, V]?` recurse cleanly through
     // this) — scoped to reference types only (`Class`/`String`/`Array`/
@@ -569,6 +576,12 @@ fn infer_expr_type(
     // Plan 19: a real `Type::String` value at last (the annotation
     // already resolved; nothing could ever produce one before this).
     Expr::StringLit(_) => Ok(Type::String),
+    // Plan 44: `Expr::Compare`'s existing generic `lt != rt` rule
+    // already covers `Symbol == Symbol`/`!=` for free the moment this
+    // produces a real `Type::Symbol` — no `Compare` arm change needed,
+    // the identical "for free" shape plan 19 already established for
+    // `String`.
+    Expr::SymbolLit(_) => Ok(Type::Symbol),
     // Plan 36: a compiler-known stringification set only — `Int64`,
     // `Float64`, `String`, `Boolean` — not a generic, user-extensible
     // `to_s`/`Display` protocol (Decision log: no interface/protocol
@@ -4100,5 +4113,51 @@ mod tests {
     let src = "message: String? = nil\nother: String? = nil\nmessage ||= other\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert!(check_program(&program).is_err());
+  }
+
+  // Plan 44 (symbols).
+
+  #[test]
+  fn accepts_a_symbol_typed_let() {
+    let src = "x: Symbol = :foo\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn symbol_equality_and_inequality_both_type_check_to_boolean() {
+    let src = "if :foo == :foo\n  puts 1\nelse\n  puts 0\nend\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_symbol_compared_against_string() {
+    let src = "if :foo == \"foo\"\n  puts 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Symbol is not String");
+    assert!(errs[0].message.contains("Symbol"));
+    assert!(errs[0].message.contains("String"));
+  }
+
+  #[test]
+  fn rejects_int64_literal_assigned_to_a_symbol_typed_let() {
+    let src = "x: Symbol = 5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn accepts_a_symbol_keyed_hash_literal_matching_its_declared_annotation() {
+    let src = "h: Hash[Symbol, Int64] = {:a => 1, :b => 2}\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_the_symbols_worked_example() {
+    let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 }
