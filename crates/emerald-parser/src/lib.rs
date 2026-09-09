@@ -694,6 +694,83 @@ mod tests {
     );
   }
 
+  // Plan 40 (operator overloading).
+
+  fn operator_method_name(src: &str) -> String {
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    c.methods[0].name.clone()
+  }
+
+  #[test]
+  fn plus_operator_method_parses_to_a_function_named_plus() {
+    let src = "class Vector2\n  def +(other: Vector2) -> Vector2\n    self\n  end\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    assert_eq!(
+      c.methods[0],
+      Function {
+        name: "+".to_string(),
+        params: vec![Param {
+          name: "other".to_string(),
+          ty: "Vector2".to_string(),
+          default: None,
+        }],
+        return_type: "Vector2".to_string(),
+        body: vec![Stmt::Expr(Expr::Ident("self".to_string()))],
+        block_param: None,
+        splat_param: None,
+      }
+    );
+  }
+
+  #[test]
+  fn all_eight_operator_tokens_parse_as_method_names() {
+    assert_eq!(
+      operator_method_name("class C\n  def -(o: C) -> C\n    self\n  end\nend\n"),
+      "-"
+    );
+    assert_eq!(
+      operator_method_name("class C\n  def *(o: C) -> C\n    self\n  end\nend\n"),
+      "*"
+    );
+    assert_eq!(
+      operator_method_name("class C\n  def /(o: C) -> C\n    self\n  end\nend\n"),
+      "/"
+    );
+    assert_eq!(
+      operator_method_name("class C\n  def ==(o: C) -> Boolean\n    true\nend\nend\n"),
+      "=="
+    );
+    assert_eq!(
+      operator_method_name("class C\n  def <=>(o: C) -> Int64\n    0\n  end\nend\n"),
+      "<=>"
+    );
+    assert_eq!(
+      operator_method_name("class C\n  def [](i: Int64) -> Float64\n    1.0\n  end\nend\n"),
+      "[]"
+    );
+    assert_eq!(
+      operator_method_name(
+        "class C\n  def []=(i: Int64, v: Float64) -> Void\n    puts 1\n  end\nend\n"
+      ),
+      "[]="
+    );
+  }
+
+  #[test]
+  fn top_level_operator_named_def_is_a_parse_error() {
+    let src = "def +(a: Int64, b: Int64) -> Int64\n  a + b\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "operator-named methods stay class-body-only"
+    );
+  }
+
   const MODULE_EXAMPLE: &str = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
 
   #[test]

@@ -6,7 +6,8 @@
 //! Line/column-precise diagnostics are `13 diagnostics`'s job.
 
 use emerald_parser::{
-  ClassDef, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt, StringPart,
+  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt,
+  StringPart,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -312,6 +313,16 @@ fn check_numeric_binop(
   self_fields: Option<&HashMap<String, Type>>,
 ) -> Result<Type, Diagnostic> {
   let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+  // Plan 40's Decision log: `Sub`/`Mul`/`Div`/`Rem` all share this
+  // function, so this one branch covers `-`/`*`/`/` (three of this
+  // plan's eight scoped tokens) plus `%` (outside the plan's literal
+  // list, but the plan's own Target state describes routing through
+  // this shared function as-is — a class simply won't have a `%`
+  // method, giving the same "no operator method" diagnostic as any
+  // other undeclared one).
+  if let Type::Class(class_name) = &lt {
+    return resolve_class_operator(op, class_name, rhs, env, sigs, classes, self_fields);
+  }
   let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
   if lt != rt {
     return Err(Diagnostic::new(format!(
@@ -324,6 +335,42 @@ fn check_numeric_binop(
     )));
   }
   Ok(lt)
+}
+
+/// Plan 40's Decision log: routes an operator token (`"+"`, `"-"`,
+/// `"*"`, `"/"`, `"=="`, `"[]"`, `"[]="`, ...) on a class-typed operand
+/// to that class's own declared operator method — mirrors `Expr::
+/// MethodCall`'s own existing arm exactly (a plain `HashMap` lookup by
+/// method name, then the existing `check_args` for arity/type
+/// checking against the method's own declared signature), not a new
+/// dispatch mechanism.
+fn resolve_class_operator(
+  op: &str,
+  class_name: &str,
+  rhs: &Expr,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<Type, Diagnostic> {
+  let info = classes
+    .get(class_name)
+    .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`")))?;
+  let sig = info.methods.get(op).ok_or_else(|| {
+    Diagnostic::new(format!(
+      "class `{class_name}` has no operator method `{op}`"
+    ))
+  })?;
+  check_args(
+    op,
+    std::slice::from_ref(rhs),
+    &sig.params,
+    env,
+    sigs,
+    classes,
+    self_fields,
+  )?;
+  Ok(sig.return_type.clone())
 }
 
 /// `&&`/`||` require both operands `Boolean`, return `Boolean`.
@@ -422,8 +469,15 @@ fn infer_expr_type(
       }
       Ok(Type::String)
     }
+    // Plan 40's Decision log: checked *before* the existing `lt != rt`/
+    // `lt ∉ {Int64, Float64, String}` rule below, which is otherwise
+    // completely unchanged — `1 + 2`/`1.0 + 2.0`/`"a" + "b"` compile to
+    // the identical instructions as before this plan.
     Expr::Add(lhs, rhs) => {
       let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+      if let Type::Class(class_name) = &lt {
+        return resolve_class_operator("+", class_name, rhs, env, sigs, classes, self_fields);
+      }
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
       if lt != rt {
         return Err(Diagnostic::new(format!(
@@ -479,8 +533,36 @@ fn infer_expr_type(
       }
       Ok(Type::Int64)
     }
+    // Plan 40's Decision log: a real, verified gap this plan closes —
+    // two same-class instances used to "type-check" here with no
+    // operator involved at all (codegen then failed with a generic
+    // error), since this arm previously had no restriction beyond
+    // `lt == rt`. `==`/`!=` now require the class to declare `==`
+    // (`!=` reuses the identical lookup and negates the result — Ruby's
+    // own default); any other `CompareOp` on a class operand is an
+    // explicit diagnostic rather than a confusing late codegen failure
+    // (Ruby derives `<`/`>`/`<=`/`>=` from `<=>` via `Comparable`,
+    // which this compiler has no mixin mechanism to reproduce — that
+    // derivation is plan 41's job, once `<=>` is callable).
     Expr::Compare(lhs, op, rhs) => {
       let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+      if let Type::Class(class_name) = &lt {
+        return match op {
+          CompareOp::Eq | CompareOp::Ne => {
+            let ret =
+              resolve_class_operator("==", class_name, rhs, env, sigs, classes, self_fields)?;
+            if ret != Type::Boolean {
+              return Err(Diagnostic::new(format!(
+                "class `{class_name}`'s `==` method must return Boolean, found {ret:?}"
+              )));
+            }
+            Ok(Type::Boolean)
+          }
+          _ => Err(Diagnostic::new(format!(
+            "ordering comparison `{op:?}` is not supported on class `{class_name}` — define `<=>`, not a direct `{op:?}` overload"
+          ))),
+        };
+      }
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
       if lt != rt {
         return Err(Diagnostic::new(format!(
@@ -684,6 +766,11 @@ fn infer_expr_type(
             )));
           }
           Ok(*value_ty)
+        }
+        // Plan 40's Decision log: the third arm of this now-three-way
+        // match — a class declaring a one-parameter `"[]"` method.
+        Type::Class(class_name) => {
+          resolve_class_operator("[]", &class_name, index, env, sigs, classes, self_fields)
         }
         other => Err(Diagnostic::new(format!(
           "`[...]` indexing requires an Array or a Hash, found {other:?}"
@@ -943,6 +1030,25 @@ fn check_set_index(
   let (container, elem_ty, index_expected) = match array_ty {
     Type::Array(elem_ty) => ("array", *elem_ty, Type::Int64),
     Type::Hash(key_ty, value_ty) => ("Hash", *value_ty, *key_ty),
+    // Plan 40's Decision log: sourced from a two-parameter `"[]="`
+    // method's own declared signature (`(index, value) -> Void`) — the
+    // rest of this function's index-type/value-type checking below is
+    // reused completely unchanged for this third case.
+    Type::Class(class_name) => {
+      let info = classes
+        .get(&class_name)
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`")))?;
+      let sig = info.methods.get("[]=").ok_or_else(|| {
+        Diagnostic::new(format!("class `{class_name}` has no operator method `[]=`"))
+      })?;
+      if sig.params.len() != 2 {
+        return Err(Diagnostic::new(format!(
+          "class `{class_name}`'s `[]=` method must take exactly 2 parameters (index, value), found {}",
+          sig.params.len()
+        )));
+      }
+      ("[]=", sig.params[1].clone(), sig.params[0].clone())
+    }
     other => {
       return Err(Diagnostic::new(format!(
         "`[...] = ...` indexing requires an Array or a Hash, found {other:?}"
@@ -3006,5 +3112,84 @@ mod tests {
     let errs =
       check_program(&program).expect_err("splat parameters are not supported on methods yet");
     assert!(errs[0].message.contains("not supported on methods"));
+  }
+
+  // Plan 40 (operator overloading).
+
+  const VECTOR2_EXAMPLE: &str = "class Vector2\n  read x: Float64\n  read y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x, @y + other.y)\n  end\n\n  def ==(other: Vector2) -> Boolean\n    @x == other.x && @y == other.y\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0, 2.0)\nv2: Vector2 = Vector2.new(3.0, 4.0)\nv3: Vector2 = v1 + v2\nputs v3.x\nputs v3.y\nif v1 == v2\n  puts 1\nelse\n  puts 0\nend\nif v1 == v1\n  puts 1\nelse\n  puts 0\nend\n";
+
+  #[test]
+  fn accepts_the_vector2_worked_example() {
+    let program = emerald_parser::parse(VECTOR2_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_plus_on_a_class_with_no_plus_method() {
+    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nv3: Vector2 = v1 + v2\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Vector2 declares no `+` method");
+    assert!(
+      errs[0]
+        .message
+        .contains("class `Vector2` has no operator method `+`")
+    );
+  }
+
+  #[test]
+  fn rejects_operator_call_with_a_mismatched_argument_type() {
+    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x)\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = v1 + 5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`+` expects a Vector2, not an Int64");
+    assert!(errs[0].message.contains("argument 1 to `+`"));
+  }
+
+  #[test]
+  fn rejects_eq_on_a_class_with_no_eq_method() {
+    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nb: Boolean = v1 == v2\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Vector2 declares no `==` method");
+    assert!(
+      errs[0]
+        .message
+        .contains("class `Vector2` has no operator method `==`")
+    );
+  }
+
+  #[test]
+  fn rejects_ordering_comparison_on_a_class() {
+    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nb: Boolean = v1 < v2\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("ordering comparisons on a class are not supported without `<=>`");
+    assert!(errs[0].message.contains("ordering comparison"));
+  }
+
+  const BAG_EXAMPLE: &str = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64, b: Int64, c: Int64) -> Void\n    @data = [a, b, c]\n  end\n\n  def [](i: Int64) -> Int64\n    @data[i]\n  end\n\n  def []=(i: Int64, v: Int64) -> Void\n    @data[i] = v\n  end\nend\n\nb: Bag = Bag.new(10, 20, 30)\nputs b[0] + b[1] + b[2]\nb[1] = 99\nputs b[1]\n";
+
+  #[test]
+  fn accepts_the_bag_index_operator_example_read_and_write() {
+    let program = emerald_parser::parse(BAG_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_index_operator_with_a_mismatched_index_type() {
+    let src = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64) -> Void\n    @data = [a]\n  end\n\n  def [](i: Int64) -> Int64\n    @data[i]\n  end\nend\n\nb: Bag = Bag.new(1)\nx: Int64 = b[\"nope\"]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`[]` expects an Int64 index, not a String");
+    assert!(errs[0].message.contains("argument 1 to `[]`"));
+  }
+
+  #[test]
+  fn rejects_index_write_on_a_class_with_no_index_set_method() {
+    let src = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64) -> Void\n    @data = [a]\n  end\n\n  def [](i: Int64) -> Int64\n    @data[i]\n  end\nend\n\nb: Bag = Bag.new(1)\nb[0] = 5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Bag declares no `[]=` method");
+    assert!(
+      errs[0]
+        .message
+        .contains("class `Bag` has no operator method `[]=`")
+    );
   }
 }

@@ -907,6 +907,29 @@ fn build_numeric_binop<'ctx>(
   float_op: Option<FloatBinOp<'ctx>>,
   name: &str,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  // Plan 40's Decision log: checked before either operand is built —
+  // when the LHS is a class-typed plain local, delegate to the exact
+  // same static `build_method_call` an ordinary `a.foo()` already
+  // uses, with `op_symbol` as the method name and `[rhs]` as the
+  // argument list. Covers `-`/`*`/`/` (three of this plan's eight
+  // scoped tokens) plus `%` (outside the plan's literal list, but
+  // routed identically — see `check_numeric_binop`'s own sema-side
+  // comment).
+  if let Expr::Ident(name) = lhs {
+    if local_classes.contains_key(name) {
+      return build_method_call(
+        context,
+        builder,
+        lhs,
+        op_symbol,
+        std::slice::from_ref(rhs),
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      );
+    }
+  }
   let (l, lk) = build_expr(
     context,
     builder,
@@ -1237,6 +1260,21 @@ fn build_expr<'ctx>(
       local_array_elem_types,
       ctx,
     ),
+    // Plan 40's Decision log: checked before either operand is built —
+    // see `build_numeric_binop`'s identical branch for `-`/`*`/`/`.
+    Expr::Add(lhs, rhs) if matches!(lhs.as_ref(), Expr::Ident(name) if local_classes.contains_key(name)) => {
+      build_method_call(
+        context,
+        builder,
+        lhs,
+        "+",
+        std::slice::from_ref(rhs.as_ref()),
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )
+    }
     Expr::Add(lhs, rhs) => {
       let (l, lk) = build_expr(
         context,
@@ -1494,6 +1532,46 @@ fn build_expr<'ctx>(
         .build_not(v.into_int_value(), "bitnottmp")
         .map_err(|e| e.to_string())?;
       Ok((n.into(), ValKind::Int64))
+    }
+    // Plan 40's Decision log: `==`/`!=` on a class-typed LHS delegate
+    // to the class's own `==` method (a bare local receiver only, per
+    // `build_method_call`'s own existing restriction) — `!=` calls the
+    // identical `==` method and inverts the returned `i1` (Ruby's own
+    // default: no separate `!=` overload token). Sema already rejects
+    // any other `CompareOp` on a class operand, so reaching this arm
+    // with one is an internal-error `Err`, not a panic.
+    Expr::Compare(lhs, op, rhs) if matches!(lhs.as_ref(), Expr::Ident(name) if local_classes.contains_key(name)) =>
+    {
+      if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        return Err(format!(
+          "codegen: internal error — ordering comparison `{op:?}` on a class operand should have been rejected by sema"
+        ));
+      }
+      let (result, kind) = build_method_call(
+        context,
+        builder,
+        lhs,
+        "==",
+        std::slice::from_ref(rhs.as_ref()),
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if kind != ValKind::Bool {
+        return Err(
+          "codegen: internal error — a class's `==` method should return Boolean (sema should have rejected this)"
+            .to_string(),
+        );
+      }
+      if matches!(op, CompareOp::Ne) {
+        let inverted = builder
+          .build_not(result.into_int_value(), "netmp")
+          .map_err(|e| e.to_string())?;
+        Ok((inverted.into(), ValKind::Bool))
+      } else {
+        Ok((result, ValKind::Bool))
+      }
     }
     Expr::Compare(lhs, op, rhs) => {
       let (l, lk) = build_expr(
@@ -1894,6 +1972,9 @@ fn build_method_call<'ctx>(
     let call = builder
       .build_call(fv, &call_args, "modcalltmp")
       .map_err(|e| e.to_string())?;
+    if ret_kind == ValKind::Void {
+      return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+    }
     return Ok((call_result(call)?, ret_kind));
   }
 
@@ -1914,7 +1995,7 @@ fn build_method_call<'ctx>(
       .get(class_name.as_str())
       .and_then(|owners| owners.get(method))
       .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
-    let key = format!("{defining_class}_{method}");
+    let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
     *ctx
       .user_func_ids
       .get(&key)
@@ -1946,6 +2027,12 @@ fn build_method_call<'ctx>(
   let call = builder
     .build_call(fv, &call_args, "methcalltmp")
     .map_err(|e| e.to_string())?;
+  if ret_kind == ValKind::Void {
+    // `[]=`-style Void-returning operator methods are invoked from
+    // `build_set_index` purely for their side effect (see
+    // `build_call_expr`'s identical guard for the free-function case).
+    return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+  }
   Ok((call_result(call)?, ret_kind))
 }
 
@@ -2303,6 +2390,27 @@ fn build_index<'ctx>(
       "codegen: indexing is only supported on a plain local-variable receiver".to_string(),
     );
   };
+  // Plan 40's Decision log: checked *before* `array`/`index` are built
+  // — `local_classes` holds both real class names and `"Hash[K, V]"`
+  // strings (plan 25's Decision log), so a genuine class name is one
+  // `parse_hash_type` can't parse. Delegating this early avoids
+  // double-evaluating `index` (which `build_method_call` independently
+  // builds as its own argument).
+  if let Some(class_name) = local_classes.get(arr_name) {
+    if parse_hash_type(class_name).is_none() {
+      return build_method_call(
+        context,
+        builder,
+        array,
+        "[]",
+        std::slice::from_ref(index),
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      );
+    }
+  }
   let (base, _) = build_expr(
     context,
     builder,
@@ -2384,6 +2492,29 @@ fn build_set_index<'ctx>(
         .to_string(),
     );
   };
+  // Plan 40's Decision log: see `build_index`'s identical early check
+  // — this mirrors it for the write side, delegating to a `"[]="`
+  // method with `[index, value]` as its two arguments. `build_method_
+  // call` needs a real contiguous `&[Expr]` slice, so this clones the
+  // two (non-adjacent in the original `Stmt::SetIndex`) expressions
+  // into one owned, temporary `Vec` — a small, real cost, not a hack.
+  if let Some(class_name) = local_classes.get(arr_name) {
+    if parse_hash_type(class_name).is_none() {
+      let call_args = vec![index.clone(), value.clone()];
+      build_method_call(
+        context,
+        builder,
+        array,
+        "[]=",
+        &call_args,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      return Ok(false);
+    }
+  }
   let (base, _) = build_expr(
     context,
     builder,
@@ -4385,6 +4516,32 @@ fn param_kinds(params: &[Param]) -> Vec<ValKind> {
   params.iter().map(|p| value_kind_for_type(&p.ty)).collect()
 }
 
+/// Plan 40's Decision log: LLVM symbol names for operator methods go
+/// through this defensive ASCII-safe mangling table, not the raw
+/// operator characters — this session did not verify inkwell's/LLVM's
+/// exact escaping behavior for symbol names containing `+`/`[`/`]`/`=`
+/// end-to-end through `compile_to_object`'s object-emission path.
+/// Consulted only at the handful of sites that build a class method's
+/// mangled LLVM symbol/`user_func_ids` key (`declare_user_functions`,
+/// its matching `define_method` lookup, and `build_method_call`'s own
+/// class-method lookup) — every OTHER lookup (`ClassInfo.methods`,
+/// `ctx.method_owners`) keeps using the literal operator-token string,
+/// unaffected. Falls back to `name` unchanged for every ordinary
+/// (non-operator) method name.
+fn mangled_operator_symbol(name: &str) -> &str {
+  match name {
+    "+" => "op_add",
+    "-" => "op_sub",
+    "*" => "op_mul",
+    "/" => "op_div",
+    "==" => "op_eq",
+    "<=>" => "op_cmp",
+    "[]" => "op_index",
+    "[]=" => "op_index_set",
+    other => other,
+  }
+}
+
 /// Plan 39's Decision log: the params list codegen actually uses for a
 /// function's LLVM signature/binding — ordinary params plus, when
 /// `f.splat_param` is declared, one synthetic trailing `Array[Elem]`-
@@ -4713,7 +4870,7 @@ fn declare_user_functions<'ctx>(
           let mut kinds = vec![ValKind::Ptr]; // self
           kinds.extend(param_kinds(&m.params));
           let fn_ty = make_fn_type(context, &kinds, ret_kind);
-          let mangled = format!("{}_{}", c.name, m.name);
+          let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
           let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
           user_func_ids.insert(mangled, (fv, ret_kind));
         }
@@ -4977,7 +5134,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
       Item::Class(c) => {
         let layout = &classes[&c.name];
         for m in &c.methods {
-          let mangled = format!("{}_{}", c.name, m.name);
+          let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
           let (fv, _) = user_func_ids[&mangled];
           define_method(&context, &builder, m, fv, &layout.fields, &gen_ctx)?;
         }
@@ -5908,5 +6065,55 @@ mod tests {
   fn splat_param_with_zero_trailing_arguments_is_a_zero_length_capture() {
     let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all()\n";
     assert_eq!(compile_link_run(src), "0\n");
+  }
+
+  // Plan 40 (operator overloading).
+
+  const VECTOR2_EXAMPLE: &str = "class Vector2\n  read x: Float64\n  read y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x, @y + other.y)\n  end\n\n  def ==(other: Vector2) -> Boolean\n    @x == other.x && @y == other.y\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0, 2.0)\nv2: Vector2 = Vector2.new(3.0, 4.0)\nv3: Vector2 = v1 + v2\nputs v3.x\nputs v3.y\nif v1 == v2\n  puts 1\nelse\n  puts 0\nend\nif v1 == v1\n  puts 1\nelse\n  puts 0\nend\n";
+
+  #[test]
+  fn vector2_worked_example_linked_and_run() {
+    // Real executed proof `+` allocates a genuine new `Vector2` via a
+    // real call into a compiled `Vector2_op_add` function, and `==`
+    // genuinely calls into a compiled `Vector2_op_eq` function rather
+    // than a raw pointer comparison (which would make `v1 == v1`
+    // trivially true via identity but couldn't correctly print `0` for
+    // `v1 == v2` based on field values alone).
+    assert_eq!(compile_link_run(VECTOR2_EXAMPLE), "4\n6\n0\n1\n");
+  }
+
+  // `build_index`/`build_set_index` only support a plain local-variable
+  // receiver (same restriction as `MethodCall`, plan 40's Decision log)
+  // — `@data` itself isn't an `Expr::Ident`, so each method rebinds the
+  // field into a local first, matching this compiler's existing
+  // instance-var-to-local pattern used throughout the test suite.
+  const BAG_EXAMPLE: &str = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64, b: Int64, c: Int64) -> Void\n    @data = [a, b, c]\n  end\n\n  def [](i: Int64) -> Int64\n    d: Array[Int64] = @data\n    d[i]\n  end\n\n  def []=(i: Int64, v: Int64) -> Void\n    d: Array[Int64] = @data\n    d[i] = v\n  end\nend\n\nb: Bag = Bag.new(10, 20, 30)\nputs b[0] + b[1] + b[2]\nb[1] = 99\nputs b[1]\n";
+
+  #[test]
+  fn bag_index_operator_example_read_then_write_then_read_back() {
+    // Real proof `obj[i]`/`obj[i] = v` genuinely delegate to the
+    // class's `[]`/`[]=` methods, analogous to plan 09's own
+    // `ARRAY_EXAMPLE` read-then-write-then-read-back shape.
+    assert_eq!(compile_link_run(BAG_EXAMPLE), "60\n99\n");
+  }
+
+  #[test]
+  fn chained_operator_call_on_a_non_ident_receiver_errors_not_panics() {
+    // `v1 + v2 + v3` — `+` parses left-associatively, so the outer
+    // `+`'s LHS is the nested `Expr::Add(v1, v2)`, not a bare local,
+    // inheriting `build_method_call`'s own pre-existing receiver
+    // restriction verbatim (Decision log) — a descriptive `Err`, not a
+    // panic. The grammar has no generic parenthesized-expression
+    // grouping (only `Array.new(...)` uses parens), so this is written
+    // without explicit parens.
+    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x)\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nv3: Vector2 = Vector2.new(3.0)\nv4: Vector2 = v1 + v2 + v3\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let out = std::env::temp_dir().join("emerald_codegen_chained_operator_should_not_exist.o");
+    assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  #[test]
+  fn plan_08_point_example_still_compiles_and_runs_unchanged() {
+    assert_eq!(compile_link_run(POINT_EXAMPLE), "5\n");
   }
 }

@@ -72,7 +72,7 @@ RequirePath: String = {
 // parameter) — fields and methods have disjoint FIRST sets (`Ident` vs
 // `"def"`), so `Param*` followed by `FuncDef*` is unambiguous.
 ClassDef: ClassDef = {
-  "class" <name:Ident> <superclass:SuperclassClause?> <class_fields:ClassField*> <methods:FuncDef*> "end" => {
+  "class" <name:Ident> <superclass:SuperclassClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
     let mut fields = Vec::new();
     let mut all_methods = Vec::new();
     for (p, synthesized) in class_fields {
@@ -121,6 +121,37 @@ ModuleDef: ModuleDef = {
 
 FuncDef: Function = {
   "def" <name:Ident> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+    name,
+    params: parts.0,
+    return_type,
+    body,
+    block_param: parts.2,
+    splat_param: parts.1,
+  }
+};
+
+// Plan 40's Decision log: operator-named methods are legal only inside
+// a `class ... end` body — `ClassDef`'s own method list is the only
+// caller of `MethodDef`/`MethodName`; `FuncDef`/`ModuleDef` keep
+// requiring a plain `Ident` name, unchanged. `"<=>"` is a genuinely new
+// terminal, added only at this method-*definition* position — no
+// `a <=> b` infix expression syntax exists yet (that's plan 41's job).
+// `Function.name` needs no new AST shape — it's already a plain
+// `String`.
+MethodName: String = {
+  <n:Ident> => n,
+  "+" => "+".to_string(),
+  "-" => "-".to_string(),
+  "*" => "*".to_string(),
+  "/" => "/".to_string(),
+  "==" => "==".to_string(),
+  "<=>" => "<=>".to_string(),
+  "[" "]" => "[]".to_string(),
+  "[" "]" "=" => "[]=".to_string(),
+};
+
+MethodDef: Function = {
+  "def" <name:MethodName> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
