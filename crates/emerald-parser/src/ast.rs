@@ -309,6 +309,39 @@ pub struct Function {
   /// compiled function itself stays fixed-arity. `None` for every
   /// function that doesn't declare one.
   pub splat_param: Option<Param>,
+  /// `[T: Bound]` (plan 41's Decision log) — legal only on a top-level
+  /// function; sema rejects a non-empty `type_params` found on a class
+  /// method or module function with a real diagnostic, and rejects more
+  /// than one entry with a real diagnostic (the grammar's `TypeParamList`
+  /// is a general comma list — the single-type-parameter, bound-only
+  /// restriction is entirely sema's job, not the grammar's). Empty
+  /// `Vec` for every function that doesn't declare one — additive,
+  /// source-compatible with every prior plan.
+  pub type_params: Vec<TypeParam>,
+}
+
+/// `T: Comparable` inside a generic function's `[...]` clause — the bound
+/// is mandatory (plan 41's Decision log: no `def identity[T](x: T)`
+/// unbounded form).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+  pub name: String,
+  pub bound: String,
+}
+
+/// `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
+/// 41's Decision log) — structurally exactly one required method: the
+/// grammar has no `FuncDef*`-style repetition inside `interface ...
+/// end`, so a two-method interface is a parse error, not a silently
+/// accepted-but-unchecked shape. Reuses `Param`'s `{name, ty}` shape for
+/// the method's parameters, the same reuse plan 08 established for class
+/// fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceDef {
+  pub name: String,
+  pub method_name: String,
+  pub params: Vec<Param>,
+  pub return_type: String,
 }
 
 /// A class declaration: fields (reusing `Param`'s `{name, ty}` shape —
@@ -322,6 +355,11 @@ pub struct Function {
 pub struct ClassDef {
   pub name: String,
   pub superclass: Option<String>,
+  /// `implements Comparable` (plan 41's Decision log) — a single
+  /// interface name, checked structurally (conformance, not
+  /// assignability) at class-declaration time. `None` for every class
+  /// that doesn't declare one.
+  pub implements: Option<String>,
   pub fields: Vec<Param>,
   pub methods: Vec<Function>,
 }
@@ -344,6 +382,10 @@ pub enum Item {
   Function(Function),
   Class(ClassDef),
   Module(ModuleDef),
+  /// `interface Comparable ... end` (plan 41's Decision log) — a
+  /// general, user-declarable grammar production, not a fourth
+  /// hardcoded builtin the way `Array`/`Hash`/`Proc` are.
+  Interface(InterfaceDef),
   Stmt(Stmt),
   /// `require <path>` (plan 23's Decision log) — a bare, unquoted,
   /// `/`-separated path (no string-literal syntax dependency), always

@@ -19,8 +19,8 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt,
-  StringPart,
+  ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause,
+  Stmt, StringPart, TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -724,6 +724,7 @@ mod tests {
         body: vec![Stmt::Expr(Expr::Ident("self".to_string()))],
         block_param: None,
         splat_param: None,
+        type_params: Vec::new(),
       }
     );
   }
@@ -1799,5 +1800,87 @@ mod tests {
         ),
       })
     );
+  }
+
+  // Plan 41 (interfaces and generics).
+
+  const INTERFACES_GENERICS_EXAMPLE: &str = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
+
+  #[test]
+  fn worked_example_parses_end_to_end_into_the_expected_ast_shapes() {
+    let program = parse(INTERFACES_GENERICS_EXAMPLE).expect("should parse");
+
+    let Item::Interface(iface) = &program.items[0] else {
+      panic!(
+        "expected item 0 to be the `Comparable` interface, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(iface.name, "Comparable");
+    assert_eq!(iface.method_name, "compare_to");
+    assert_eq!(
+      iface.params,
+      vec![Param {
+        name: "other".to_string(),
+        ty: "Self".to_string(),
+        default: None,
+      }]
+    );
+    assert_eq!(iface.return_type, "Int64");
+
+    let Item::Class(money) = &program.items[1] else {
+      panic!(
+        "expected item 1 to be the `Money` class, got {:?}",
+        program.items[1]
+      );
+    };
+    assert_eq!(money.name, "Money");
+    assert_eq!(money.implements, Some("Comparable".to_string()));
+
+    let Item::Function(max_fn) = &program.items[3] else {
+      panic!(
+        "expected item 3 to be the `max` function, got {:?}",
+        program.items[3]
+      );
+    };
+    assert_eq!(max_fn.name, "max");
+    assert_eq!(
+      max_fn.type_params,
+      vec![TypeParam {
+        name: "T".to_string(),
+        bound: "Comparable".to_string(),
+      }]
+    );
+  }
+
+  #[test]
+  fn multiple_type_parameters_parse_the_grammar_does_not_restrict_the_count() {
+    // Plan 41's Decision log: the grammar's `TypeParamList` is a general
+    // comma list — the single-type-parameter restriction is sema's job.
+    let src = "def bad[T: Comparable, U: Comparable](a: T, b: U) -> T\n  a\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function, got {:?}", program.items[0]);
+    };
+    assert_eq!(f.type_params.len(), 2);
+    assert_eq!(f.type_params[0].name, "T");
+    assert_eq!(f.type_params[1].name, "U");
+  }
+
+  #[test]
+  fn interface_with_a_second_method_before_end_is_a_parse_error_not_a_panic() {
+    // The grammar structurally admits exactly one method — a second
+    // `def` before the outer `end` cannot reduce as this same
+    // production, so this is a real parse error.
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\n  def other_method(x: Int64) -> Int64\nend\n";
+    let errs = parse(src).unwrap_err();
+    assert!(!errs.is_empty());
+  }
+
+  #[test]
+  fn interface_missing_the_inner_arrow_return_type_is_a_parse_error_not_a_panic() {
+    let src = "interface Comparable\n  def compare_to(other: Self)\nend\n";
+    let errs = parse(src).unwrap_err();
+    assert!(!errs.is_empty());
   }
 }

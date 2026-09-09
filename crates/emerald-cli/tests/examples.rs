@@ -70,3 +70,8 @@ fn exceptions_em_prints_expected_sequence() {
 fn modules_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("modules.em"), "42\n");
 }
+
+#[test]
+fn interfaces_generics_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("interfaces_generics.em"), "750\n100\n");
+}

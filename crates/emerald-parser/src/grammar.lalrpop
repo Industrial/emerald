@@ -1,5 +1,6 @@
 use crate::ast::{
-  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt,
+  ClassDef, CompareOp, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
+  RescueClause, Stmt, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -49,6 +50,7 @@ Item: Item = {
   <f:FuncDef> => Item::Function(f),
   <c:ClassDef> => Item::Class(c),
   <m:ModuleDef> => Item::Module(m),
+  <i:InterfaceDef> => Item::Interface(i),
   <s:Stmt> => Item::Stmt(s),
   // Plan 23: reachable only here, at the top-level `Item` rule — never
   // from `Stmt`/`Stmt*`, so `require` inside a function/`if`/`while`
@@ -72,7 +74,7 @@ RequirePath: String = {
 // parameter) — fields and methods have disjoint FIRST sets (`Ident` vs
 // `"def"`), so `Param*` followed by `FuncDef*` is unambiguous.
 ClassDef: ClassDef = {
-  "class" <name:Ident> <superclass:SuperclassClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
+  "class" <name:Ident> <superclass:SuperclassClause?> <implements:ImplementsClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
     let mut fields = Vec::new();
     let mut all_methods = Vec::new();
     for (p, synthesized) in class_fields {
@@ -80,8 +82,16 @@ ClassDef: ClassDef = {
       all_methods.extend(synthesized);
     }
     all_methods.extend(methods);
-    ClassDef { name, superclass, fields, methods: all_methods }
+    ClassDef { name, superclass, implements, fields, methods: all_methods }
   }
+};
+
+// `class Money implements Comparable` (plan 41's Decision log) — a
+// single interface name, not a list; reachable only from `ClassDef`
+// (never `ModuleDef`), enforcing "modules cannot declare `implements`"
+// structurally rather than as a separately-checked sema invariant.
+ImplementsClause: String = {
+  "implements" <i:Ident> => i,
 };
 
 // Plan 33: an opt-in `read <name>: <Type>` field marker synthesizes a
@@ -100,6 +110,7 @@ ClassField: (Param, Vec<Function>) = {
       body: vec![Stmt::Expr(Expr::InstanceVar(p.name.clone()))],
       block_param: None,
       splat_param: None,
+      type_params: Vec::new(),
     };
     (p, vec![accessor])
   },
@@ -120,14 +131,49 @@ ModuleDef: ModuleDef = {
 };
 
 FuncDef: Function = {
-  "def" <name:Ident> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+  "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
     body,
     block_param: parts.2,
     splat_param: parts.1,
+    type_params: type_params.unwrap_or_default(),
   }
+};
+
+// `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
+// 41's Decision log) — structurally exactly one required method: no
+// `FuncDef*`-style repetition inside `interface ... end`, so a second
+// `def` before the outer `end` is a real parse error. Reuses the
+// existing `Params`/`Param` rule for the method's parameter list, the
+// same reuse `ClassField` already makes for class fields.
+InterfaceDef: InterfaceDef = {
+  "interface" <name:Ident> "def" <method_name:Ident> "(" <params:Params> ")" "->" <return_type:TypeName> "end" => {
+    InterfaceDef { name, method_name, params, return_type }
+  }
+};
+
+// `[T: Comparable]` (plan 41's Decision log) — a general comma list at
+// the grammar level; the single-type-parameter, bound-mandatory
+// restriction is entirely sema's job (`TypeParam`'s own bound is
+// mandatory here, but *how many* of them a function may declare is
+// not).
+TypeParamClause: Vec<TypeParam> = {
+  "[" <params:TypeParamList> "]" => params,
+};
+
+TypeParamList: Vec<TypeParam> = {
+  <p:TypeParam> => vec![p],
+  <p:TypeParam> "," <rest:TypeParamList> => {
+    let mut v = vec![p];
+    v.extend(rest);
+    v
+  },
+};
+
+TypeParam: TypeParam = {
+  <name:Ident> ":" <bound:Ident> => TypeParam { name, bound },
 };
 
 // Plan 40's Decision log: operator-named methods are legal only inside
@@ -151,13 +197,20 @@ MethodName: String = {
 };
 
 MethodDef: Function = {
-  "def" <name:MethodName> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+  // Plan 41's Decision log: `[T: Bound]` is grammatically reachable
+  // here too (a class method), even though only a *top-level* function's
+  // `type_params` is ever accepted — sema rejects a non-empty
+  // `type_params` found while registering a class method with a real
+  // "generic methods are not supported" diagnostic, never a panic and
+  // never a silent accept.
+  "def" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
     body,
     block_param: parts.2,
     splat_param: parts.1,
+    type_params: type_params.unwrap_or_default(),
   }
 };
 

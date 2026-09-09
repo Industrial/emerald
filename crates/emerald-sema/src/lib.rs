@@ -38,6 +38,17 @@ pub enum Type {
   /// real signature here always comes from the `Expr::Lambda` a `Proc`
   /// local was bound to (see `check_stmt`'s `Let` case).
   Proc(Vec<Type>, Box<Type>),
+  /// A not-yet-concrete type-parameter reference (plan 41's Decision
+  /// log) — legal only inside the body of the generic function that
+  /// declares it. Carries both the type parameter's own name (`"T"`,
+  /// used purely for diagnostics — e.g. naming which parameter
+  /// disagreed at a call site) and its bound interface's name
+  /// (`"Comparable"`), so a method call on a `Generic`-typed receiver
+  /// (`a.compare_to(b)`) can resolve the interface's required method
+  /// directly from the receiver's own inferred type, without a
+  /// separately threaded "which interface bounds the parameter
+  /// currently in scope" context value.
+  Generic(String, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +109,49 @@ struct ClassInfo {
   /// never inherit) or a class with no `<` clause. This is the class's
   /// OWN declared superclass, not a flattened chain.
   superclass: Option<String>,
+  /// `implements Comparable` (plan 41's Decision log) — `None` for
+  /// every class that doesn't declare one, always `None` for a module
+  /// (the grammar's `ImplementsClause?` is only reachable from
+  /// `ClassDef`).
+  implements: Option<String>,
+}
+
+/// One `interface`'s single required method, kept as raw, unresolved
+/// type-name strings (plan 41's Decision log) — `"Self"` isn't
+/// resolvable via `resolve_type` until substituted with either a
+/// concrete implementing class's name (conformance checking) or the
+/// generic type parameter itself (generic-body checking), so resolving
+/// eagerly at registration time would be premature.
+#[derive(Debug, Clone)]
+struct InterfaceInfo {
+  method_name: String,
+  params_raw: Vec<(String, String)>,
+  return_type_raw: String,
+}
+
+/// A top-level generic function's registration (plan 41's Decision
+/// log) — kept separate from `sigs`/`FunctionSig` (never both at once
+/// for the same name: the ordinary `sigs` pass skips every function
+/// whose `type_params` is non-empty) since its raw parameter/return
+/// type strings need per-call-site substitution before they can be
+/// resolved into real `Type`s at all.
+#[derive(Debug, Clone)]
+struct GenericFunctionSig {
+  type_param: String,
+  bound: String,
+  params_raw: Vec<(String, String)>,
+  return_type_raw: String,
+}
+
+/// Bundles the two registries a generic-aware type check needs beyond
+/// `sigs`/`classes` — threaded as one additional parameter through the
+/// whole `infer_expr_type`/`check_stmt` family (the same additive
+/// pattern `self_fields: Option<&HashMap<...>>` already established),
+/// always present (never `Option`) since it costs nothing to pass an
+/// empty pair of maps through an ordinary, non-generic body.
+struct GenericsCtx<'a> {
+  interfaces: &'a HashMap<String, InterfaceInfo>,
+  generic_sigs: &'a HashMap<String, GenericFunctionSig>,
 }
 
 /// Resolves a type name against `spec/TYPE_SYSTEM.md`'s primitives, then
@@ -153,6 +207,19 @@ fn function_signature(
   f: &Function,
   classes: &HashMap<String, ClassInfo>,
 ) -> Result<FunctionSig, Diagnostic> {
+  // Plan 41's Decision log: the only callers that can ever reach this
+  // with a `type_params`-non-empty `Function` are `build_flattened_
+  // class_info` (a class method) and `module_info` (a module method) —
+  // `check_program`'s own `sigs` registration pass skips a top-level
+  // generic function entirely, routing it through `generic_sigs`
+  // instead. Caught here, before `resolve_type` ever sees a bare `"T"`
+  // and fails with a confusing "unknown type" diagnostic instead.
+  if !f.type_params.is_empty() {
+    return Err(Diagnostic::new(format!(
+      "generic methods are not supported yet (`{}`)",
+      f.name
+    )));
+  }
   let params = f
     .params
     .iter()
@@ -275,6 +342,7 @@ fn build_flattened_class_info(
     methods,
     is_module: false,
     superclass: class_defs[name].superclass.clone(),
+    implements: class_defs[name].implements.clone(),
   })
 }
 
@@ -296,6 +364,7 @@ fn module_info(
     methods,
     is_module: true,
     superclass: None,
+    implements: None,
   })
 }
 
@@ -311,8 +380,9 @@ fn check_numeric_binop(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
-  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
   // Plan 40's Decision log: `Sub`/`Mul`/`Div`/`Rem` all share this
   // function, so this one branch covers `-`/`*`/`/` (three of this
   // plan's eight scoped tokens) plus `%` (outside the plan's literal
@@ -321,9 +391,9 @@ fn check_numeric_binop(
   // method, giving the same "no operator method" diagnostic as any
   // other undeclared one).
   if let Type::Class(class_name) = &lt {
-    return resolve_class_operator(op, class_name, rhs, env, sigs, classes, self_fields);
+    return resolve_class_operator(op, class_name, rhs, env, sigs, classes, self_fields, gctx);
   }
-  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
   if lt != rt {
     return Err(Diagnostic::new(format!(
       "type mismatch: `{op}` requires both operands to have the same type, found {lt:?} and {rt:?}"
@@ -344,6 +414,7 @@ fn check_numeric_binop(
 /// method name, then the existing `check_args` for arity/type
 /// checking against the method's own declared signature), not a new
 /// dispatch mechanism.
+#[allow(clippy::too_many_arguments)]
 fn resolve_class_operator(
   op: &str,
   class_name: &str,
@@ -352,6 +423,7 @@ fn resolve_class_operator(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
   let info = classes
     .get(class_name)
@@ -369,6 +441,7 @@ fn resolve_class_operator(
     sigs,
     classes,
     self_fields,
+    gctx,
   )?;
   Ok(sig.return_type.clone())
 }
@@ -383,14 +456,15 @@ fn check_boolean_binop(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
-  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
   if lt != Type::Boolean {
     return Err(Diagnostic::new(format!(
       "`{op}` requires a Boolean left operand, found {lt:?}"
     )));
   }
-  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
   if rt != Type::Boolean {
     return Err(Diagnostic::new(format!(
       "`{op}` requires a Boolean right operand, found {rt:?}"
@@ -411,14 +485,15 @@ fn check_bitwise_binop(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
-  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+  let lt = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
   if lt != Type::Int64 {
     return Err(Diagnostic::new(format!(
       "`{op}` requires an Int64 left operand, found {lt:?}"
     )));
   }
-  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+  let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
   if rt != Type::Int64 {
     return Err(Diagnostic::new(format!(
       "`{op}` requires an Int64 right operand, found {rt:?}"
@@ -436,6 +511,7 @@ fn infer_expr_type(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
   match expr {
     Expr::Ident(name) => env
@@ -456,7 +532,7 @@ fn infer_expr_type(
     Expr::Interpolate(parts) => {
       for part in parts {
         if let StringPart::Expr(e) = part {
-          let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+          let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
           if !matches!(
             t,
             Type::Int64 | Type::Float64 | Type::String | Type::Boolean
@@ -474,11 +550,11 @@ fn infer_expr_type(
     // completely unchanged — `1 + 2`/`1.0 + 2.0`/`"a" + "b"` compile to
     // the identical instructions as before this plan.
     Expr::Add(lhs, rhs) => {
-      let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+      let lt = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
       if let Type::Class(class_name) = &lt {
-        return resolve_class_operator("+", class_name, rhs, env, sigs, classes, self_fields);
+        return resolve_class_operator("+", class_name, rhs, env, sigs, classes, self_fields, gctx);
       }
-      let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+      let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
       if lt != rt {
         return Err(Diagnostic::new(format!(
           "type mismatch: `+` requires both operands to have the same type, found {lt:?} and {rt:?}"
@@ -494,12 +570,20 @@ fn infer_expr_type(
       }
       Ok(lt)
     }
-    Expr::Sub(lhs, rhs) => check_numeric_binop("-", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::Mul(lhs, rhs) => check_numeric_binop("*", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::Div(lhs, rhs) => check_numeric_binop("/", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::Rem(lhs, rhs) => check_numeric_binop("%", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::Sub(lhs, rhs) => {
+      check_numeric_binop("-", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::Mul(lhs, rhs) => {
+      check_numeric_binop("*", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::Div(lhs, rhs) => {
+      check_numeric_binop("/", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::Rem(lhs, rhs) => {
+      check_numeric_binop("%", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
     Expr::Neg(e) => {
-      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if t != Type::Int64 && t != Type::Float64 {
         return Err(Diagnostic::new(format!(
           "type `{t:?}` does not support unary `-`"
@@ -508,7 +592,7 @@ fn infer_expr_type(
       Ok(t)
     }
     Expr::Not(e) => {
-      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if t != Type::Boolean {
         return Err(Diagnostic::new(format!(
           "`!` requires a Boolean operand, found {t:?}"
@@ -516,16 +600,30 @@ fn infer_expr_type(
       }
       Ok(Type::Boolean)
     }
-    Expr::And(lhs, rhs) => check_boolean_binop("&&", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::Or(lhs, rhs) => check_boolean_binop("||", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::And(lhs, rhs) => {
+      check_boolean_binop("&&", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::Or(lhs, rhs) => {
+      check_boolean_binop("||", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
     // Plan 28: Int64-only bitwise operators.
-    Expr::BitAnd(lhs, rhs) => check_bitwise_binop("&", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::BitOr(lhs, rhs) => check_bitwise_binop("|", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::BitXor(lhs, rhs) => check_bitwise_binop("^", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::Shl(lhs, rhs) => check_bitwise_binop("<<", lhs, rhs, env, sigs, classes, self_fields),
-    Expr::Shr(lhs, rhs) => check_bitwise_binop(">>", lhs, rhs, env, sigs, classes, self_fields),
+    Expr::BitAnd(lhs, rhs) => {
+      check_bitwise_binop("&", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::BitOr(lhs, rhs) => {
+      check_bitwise_binop("|", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::BitXor(lhs, rhs) => {
+      check_bitwise_binop("^", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::Shl(lhs, rhs) => {
+      check_bitwise_binop("<<", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
+    Expr::Shr(lhs, rhs) => {
+      check_bitwise_binop(">>", lhs, rhs, env, sigs, classes, self_fields, gctx)
+    }
     Expr::BitNot(e) => {
-      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if t != Type::Int64 {
         return Err(Diagnostic::new(format!(
           "`~` requires an Int64 operand, found {t:?}"
@@ -545,12 +643,12 @@ fn infer_expr_type(
     // which this compiler has no mixin mechanism to reproduce — that
     // derivation is plan 41's job, once `<=>` is callable).
     Expr::Compare(lhs, op, rhs) => {
-      let lt = infer_expr_type(lhs, env, sigs, classes, self_fields)?;
+      let lt = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
       if let Type::Class(class_name) = &lt {
         return match op {
           CompareOp::Eq | CompareOp::Ne => {
             let ret =
-              resolve_class_operator("==", class_name, rhs, env, sigs, classes, self_fields)?;
+              resolve_class_operator("==", class_name, rhs, env, sigs, classes, self_fields, gctx)?;
             if ret != Type::Boolean {
               return Err(Diagnostic::new(format!(
                 "class `{class_name}`'s `==` method must return Boolean, found {ret:?}"
@@ -563,7 +661,7 @@ fn infer_expr_type(
           ))),
         };
       }
-      let rt = infer_expr_type(rhs, env, sigs, classes, self_fields)?;
+      let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
       if lt != rt {
         return Err(Diagnostic::new(format!(
           "type mismatch: `{op:?}` requires both operands to have the same type, found {lt:?} and {rt:?}"
@@ -582,13 +680,96 @@ fn infer_expr_type(
           args.len()
         )));
       }
-      let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields)?;
+      let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields, gctx)?;
       if arg_ty != Type::Int64 && arg_ty != Type::Float64 && arg_ty != Type::String {
         return Err(Diagnostic::new(format!(
           "`puts` does not support type {arg_ty:?}"
         )));
       }
       Ok(Type::Void)
+    }
+    // Plan 41's Decision log: call-site checking is a separate, later
+    // pass from body-checking, and only it ever touches a real concrete
+    // type — checked before the ordinary `sigs.get(name)` fallback below
+    // since a generic function's own name is never present in `sigs` at
+    // all (the registration pass skips it).
+    Expr::Call(name, args) if gctx.generic_sigs.contains_key(name) => {
+      let g = &gctx.generic_sigs[name];
+      let arg_types = args
+        .iter()
+        .map(|a| infer_expr_type(a, env, sigs, classes, self_fields, gctx))
+        .collect::<Result<Vec<_>, _>>()?;
+      let mut concrete: Option<Type> = None;
+      for (i, (_, raw)) in g.params_raw.iter().enumerate() {
+        if raw != &g.type_param {
+          continue;
+        }
+        let Some(actual) = arg_types.get(i) else {
+          return Err(Diagnostic::new(format!(
+            "`{name}` expects {} argument(s), found {}",
+            g.params_raw.len(),
+            args.len()
+          )));
+        };
+        match &concrete {
+          None => concrete = Some(actual.clone()),
+          Some(c) if c != actual => {
+            return Err(Diagnostic::new(format!(
+              "type parameter `{}` resolved inconsistently in call to `{name}`: `{c:?}` at an earlier argument, `{actual:?}` at argument {}",
+              g.type_param,
+              i + 1
+            )));
+          }
+          Some(_) => {}
+        }
+      }
+      let concrete = concrete.ok_or_else(|| {
+        Diagnostic::new(format!(
+          "internal error: generic function `{name}` never uses its own type parameter `{}`",
+          g.type_param
+        ))
+      })?;
+      let Type::Class(concrete_class) = &concrete else {
+        return Err(Diagnostic::new(format!(
+          "type parameter `{}` in call to `{name}` resolved to non-class type {concrete:?} — only a class implementing `{}` is a legal generic argument",
+          g.type_param, g.bound
+        )));
+      };
+      let class_info = classes
+        .get(concrete_class)
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{concrete_class}`")))?;
+      if class_info.implements.as_deref() != Some(g.bound.as_str()) {
+        return Err(Diagnostic::new(format!(
+          "`{concrete_class}` does not implement `{}`, required by generic function `{name}`'s type parameter `{}`",
+          g.bound, g.type_param
+        )));
+      }
+      let effective_params = g
+        .params_raw
+        .iter()
+        .map(|(_, raw)| {
+          if raw == &g.type_param {
+            Ok(concrete.clone())
+          } else {
+            resolve_type(raw, classes)
+          }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+      check_args(
+        name,
+        args,
+        &effective_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      if g.return_type_raw == g.type_param {
+        Ok(concrete)
+      } else {
+        resolve_type(&g.return_type_raw, classes)
+      }
     }
     Expr::Call(name, args) => {
       let sig = sigs
@@ -607,7 +788,7 @@ fn infer_expr_type(
         } else {
           args.as_slice()
         };
-      check_call_args(name, positional, sig, env, sigs, classes, self_fields)?;
+      check_call_args(name, positional, sig, env, sigs, classes, self_fields, gctx)?;
       Ok(sig.return_type.clone())
     }
     // Plan 39's Decision log: resolved entirely at compile time by
@@ -643,7 +824,7 @@ fn infer_expr_type(
       }
       for (i, slot) in positional.iter().enumerate() {
         let Some(value) = slot else { continue };
-        let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+        let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
         if actual != sig.params[i] {
           return Err(Diagnostic::new(format!(
             "keyword `{}` to `{name}` has type {actual:?}, expected {:?}",
@@ -671,6 +852,7 @@ fn infer_expr_type(
           sigs,
           classes,
           self_fields,
+          gctx,
         )?,
         None if args.is_empty() => {}
         None => {
@@ -697,24 +879,98 @@ fn infer_expr_type(
       let sig = info.methods.get(method).ok_or_else(|| {
         Diagnostic::new(format!("module `{module_name}` has no method `{method}`"))
       })?;
-      check_args(method, args, &sig.params, env, sigs, classes, self_fields)?;
+      check_args(
+        method,
+        args,
+        &sig.params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
       Ok(sig.return_type.clone())
+    }
+    // Plan 41's Decision log: a method call on a `Type::Generic`-typed
+    // receiver — a call inside the body of the generic function that
+    // declares it, before this specific call site's own concrete type
+    // is known — resolves against the bound interface's required
+    // signature, with `Self` substituted with `Type::Generic` itself
+    // (not the `classes` registry, which a `Type::Generic` never
+    // appears in). Guarded syntactically (`env.get(n)`, not a value
+    // this arm has already computed) since match-arm guards can't run
+    // a fallible `infer_expr_type` call.
+    Expr::MethodCall(recv, method, args) if matches!(recv.as_ref(), Expr::Ident(n) if matches!(env.get(n), Some(Type::Generic(_, _)))) =>
+    {
+      let Expr::Ident(recv_name) = recv.as_ref() else {
+        unreachable!()
+      };
+      let Some(Type::Generic(type_param, bound)) = env.get(recv_name) else {
+        unreachable!()
+      };
+      let iface = gctx.interfaces.get(bound).ok_or_else(|| {
+        Diagnostic::new(format!(
+          "internal error: unknown interface `{bound}` bounding type parameter `{type_param}`"
+        ))
+      })?;
+      if *method != iface.method_name {
+        return Err(Diagnostic::new(format!(
+          "type parameter `{type_param}` (bounded by `{bound}`) has no method `{method}` — only `{}` is available",
+          iface.method_name
+        )));
+      }
+      let self_ty = Type::Generic(type_param.clone(), bound.clone());
+      let expected = iface
+        .params_raw
+        .iter()
+        .map(|(_, raw)| {
+          if raw == "Self" {
+            Ok(self_ty.clone())
+          } else {
+            resolve_type(raw, classes)
+          }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+      check_args(
+        method,
+        args,
+        &expected,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      if iface.return_type_raw == "Self" {
+        Ok(self_ty)
+      } else {
+        resolve_type(&iface.return_type_raw, classes)
+      }
     }
     // `.call` on a `Proc`-typed receiver dispatches against the
     // signature carried directly on `Type::Proc` (plan 10) — everything
     // else falls through to the existing `Type::Class` method lookup.
     Expr::MethodCall(recv, method, args) if method == "call" => {
-      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields)?;
+      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
       let Type::Proc(param_types, return_type) = &recv_ty else {
         return Err(Diagnostic::new(format!(
           "method call `.call` on non-Proc type {recv_ty:?}"
         )));
       };
-      check_args("call", args, param_types, env, sigs, classes, self_fields)?;
+      check_args(
+        "call",
+        args,
+        param_types,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
       Ok((**return_type).clone())
     }
     Expr::MethodCall(recv, method, args) => {
-      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields)?;
+      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
       let Type::Class(class_name) = &recv_ty else {
         return Err(Diagnostic::new(format!(
           "method call `.{method}` on non-class type {recv_ty:?}"
@@ -727,7 +983,16 @@ fn infer_expr_type(
         .methods
         .get(method)
         .ok_or_else(|| Diagnostic::new(format!("class `{class_name}` has no method `{method}`")))?;
-      check_args(method, args, &sig.params, env, sigs, classes, self_fields)?;
+      check_args(
+        method,
+        args,
+        &sig.params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
       Ok(sig.return_type.clone())
     }
     Expr::InstanceVar(name) => {
@@ -742,14 +1007,16 @@ fn infer_expr_type(
     // structured type annotation on the literal itself, an empty
     // `[]` has no element type to infer — `Array[T]`'s declared `T`
     // on the enclosing `Let` isn't visible from here.
-    Expr::ArrayLit(elements) => infer_array_lit_type(elements, env, sigs, classes, self_fields),
+    Expr::ArrayLit(elements) => {
+      infer_array_lit_type(elements, env, sigs, classes, self_fields, gctx)
+    }
     // Plan 25: `Hash`'s get/set reuse `Expr::Index`/`Stmt::SetIndex`
     // (see the Decision log) — a `Type::Hash(_, _)` arm sits alongside
     // the existing `Type::Array(_)` one rather than a parallel indexing
     // mechanism.
     Expr::Index(array, index) => {
-      let array_ty = infer_expr_type(array, env, sigs, classes, self_fields)?;
-      let index_ty = infer_expr_type(index, env, sigs, classes, self_fields)?;
+      let array_ty = infer_expr_type(array, env, sigs, classes, self_fields, gctx)?;
+      let index_ty = infer_expr_type(index, env, sigs, classes, self_fields, gctx)?;
       match array_ty {
         Type::Array(elem_ty) => {
           if index_ty != Type::Int64 {
@@ -769,9 +1036,16 @@ fn infer_expr_type(
         }
         // Plan 40's Decision log: the third arm of this now-three-way
         // match — a class declaring a one-parameter `"[]"` method.
-        Type::Class(class_name) => {
-          resolve_class_operator("[]", &class_name, index, env, sigs, classes, self_fields)
-        }
+        Type::Class(class_name) => resolve_class_operator(
+          "[]",
+          &class_name,
+          index,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        ),
         other => Err(Diagnostic::new(format!(
           "`[...]` indexing requires an Array or a Hash, found {other:?}"
         ))),
@@ -781,7 +1055,7 @@ fn infer_expr_type(
       params,
       return_type,
       body,
-    } => infer_lambda_type(params, return_type, body, env, sigs, classes),
+    } => infer_lambda_type(params, return_type, body, env, sigs, classes, gctx),
     // Plan 25: a real `Boolean` value, not just `Compare`'s byproduct.
     Expr::Bool(_) => Ok(Type::Boolean),
     // Plan 25: deliberately narrow — see `Type::Nil`'s doc comment.
@@ -789,9 +1063,9 @@ fn infer_expr_type(
     // A `{}` empty literal has no key/value type to infer — same
     // reasoning `infer_array_lit_type` already applies to `[]` (plan
     // 09's Decision log), applied here for the second container kind.
-    Expr::HashLit(pairs) => infer_hash_lit_type(pairs, env, sigs, classes, self_fields),
+    Expr::HashLit(pairs) => infer_hash_lit_type(pairs, env, sigs, classes, self_fields, gctx),
     Expr::ArrayNew(size) => {
-      let size_ty = infer_expr_type(size, env, sigs, classes, self_fields)?;
+      let size_ty = infer_expr_type(size, env, sigs, classes, self_fields, gctx)?;
       if size_ty != Type::Int64 {
         return Err(Diagnostic::new(format!(
           "`Array.new` size must be Int64, found {size_ty:?}"
@@ -821,23 +1095,24 @@ fn infer_hash_lit_type(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
   let Some(((first_k, first_v), rest)) = pairs.split_first() else {
     return Err(Diagnostic::new(
       "empty hash literals are not supported — the key/value types can't be inferred",
     ));
   };
-  let key_ty = infer_expr_type(first_k, env, sigs, classes, self_fields)?;
-  let value_ty = infer_expr_type(first_v, env, sigs, classes, self_fields)?;
+  let key_ty = infer_expr_type(first_k, env, sigs, classes, self_fields, gctx)?;
+  let value_ty = infer_expr_type(first_v, env, sigs, classes, self_fields, gctx)?;
   for (i, (k, v)) in rest.iter().enumerate() {
-    let kt = infer_expr_type(k, env, sigs, classes, self_fields)?;
+    let kt = infer_expr_type(k, env, sigs, classes, self_fields, gctx)?;
     if kt != key_ty {
       return Err(Diagnostic::new(format!(
         "hash literal pair {} has key type {kt:?}, expected {key_ty:?} (all keys must share one type)",
         i + 2
       )));
     }
-    let vt = infer_expr_type(v, env, sigs, classes, self_fields)?;
+    let vt = infer_expr_type(v, env, sigs, classes, self_fields, gctx)?;
     if vt != value_ty {
       return Err(Diagnostic::new(format!(
         "hash literal pair {} has value type {vt:?}, expected {value_ty:?} (all values must share one type)",
@@ -859,6 +1134,7 @@ fn infer_lambda_type(
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
   let mut lambda_env = env.clone();
   let mut param_types = Vec::with_capacity(params.len());
@@ -883,6 +1159,7 @@ fn infer_lambda_type(
     false,
     false,
     false,
+    gctx,
   )?;
   check_implicit_return(
     body,
@@ -892,6 +1169,7 @@ fn infer_lambda_type(
     None,
     &declared_return,
     "<lambda>",
+    gctx,
   )?;
   Ok(Type::Proc(param_types, Box::new(declared_return)))
 }
@@ -905,15 +1183,16 @@ fn infer_array_lit_type(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
   let Some((first, rest)) = elements.split_first() else {
     return Err(Diagnostic::new(
       "empty array literals are not supported — the element type can't be inferred",
     ));
   };
-  let elem_ty = infer_expr_type(first, env, sigs, classes, self_fields)?;
+  let elem_ty = infer_expr_type(first, env, sigs, classes, self_fields, gctx)?;
   for (i, e) in rest.iter().enumerate() {
-    let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+    let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
     if t != elem_ty {
       return Err(Diagnostic::new(format!(
         "array literal element {} has type {t:?}, expected {elem_ty:?} (all elements must share one type)",
@@ -933,6 +1212,7 @@ fn check_args(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   if args.len() != expected.len() {
     return Err(Diagnostic::new(format!(
@@ -942,7 +1222,7 @@ fn check_args(
     )));
   }
   for (i, (arg, expected_ty)) in args.iter().zip(expected).enumerate() {
-    let actual = infer_expr_type(arg, env, sigs, classes, self_fields)?;
+    let actual = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
     if actual != *expected_ty {
       return Err(Diagnostic::new(format!(
         "argument {} to `{name}` has type {actual:?}, expected {expected_ty:?}",
@@ -970,6 +1250,7 @@ fn check_call_args(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   let required = sig.params.len();
   if sig.splat_elem.is_none() && args.len() > required {
@@ -990,7 +1271,7 @@ fn check_call_args(
   }
   let checked = args.len().min(required);
   for (i, arg) in args.iter().enumerate().take(checked) {
-    let actual = infer_expr_type(arg, env, sigs, classes, self_fields)?;
+    let actual = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
     if actual != sig.params[i] {
       return Err(Diagnostic::new(format!(
         "argument {} to `{name}` has type {actual:?}, expected {:?}",
@@ -1001,7 +1282,7 @@ fn check_call_args(
   }
   if let Some(splat_ty) = &sig.splat_elem {
     for (i, arg) in args.iter().enumerate().skip(required) {
-      let actual = infer_expr_type(arg, env, sigs, classes, self_fields)?;
+      let actual = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
       if actual != *splat_ty {
         return Err(Diagnostic::new(format!(
           "trailing (splat) argument {} to `{name}` has type {actual:?}, expected {splat_ty:?}",
@@ -1024,9 +1305,10 @@ fn check_set_index(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
-  let array_ty = infer_expr_type(array, env, sigs, classes, self_fields)?;
-  let index_ty = infer_expr_type(index, env, sigs, classes, self_fields)?;
+  let array_ty = infer_expr_type(array, env, sigs, classes, self_fields, gctx)?;
+  let index_ty = infer_expr_type(index, env, sigs, classes, self_fields, gctx)?;
   let (container, elem_ty, index_expected) = match array_ty {
     Type::Array(elem_ty) => ("array", *elem_ty, Type::Int64),
     Type::Hash(key_ty, value_ty) => ("Hash", *value_ty, *key_ty),
@@ -1060,7 +1342,7 @@ fn check_set_index(
       "{container} index must be {index_expected:?}, found {index_ty:?}"
     )));
   }
-  let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+  let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
   if actual != elem_ty {
     return Err(Diagnostic::new(format!(
       "type mismatch in {container} assignment: element type is {elem_ty:?}, value has type {actual:?}"
@@ -1083,6 +1365,7 @@ fn check_multi_assign(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   if names.len() != values.len() {
     return Err(Diagnostic::new(format!(
@@ -1093,7 +1376,7 @@ fn check_multi_assign(
   }
   let value_types = values
     .iter()
-    .map(|v| infer_expr_type(v, env, sigs, classes, self_fields))
+    .map(|v| infer_expr_type(v, env, sigs, classes, self_fields, gctx))
     .collect::<Result<Vec<_>, _>>()?;
   for (i, (name, actual)) in names.iter().zip(value_types).enumerate() {
     let declared = env
@@ -1131,6 +1414,7 @@ fn check_stmt(
   // same way `in_loop` gates `break`/`next`.
   in_rescue: bool,
   yields_allowed: bool,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   match stmt {
     // `Proc` is special-cased: the bare annotation carries no signature
@@ -1139,7 +1423,7 @@ fn check_stmt(
     // `Type::Proc(_, _)` is accepted and *that* — the real signature
     // inferred from the bound `Expr::Lambda` — is what's stored in `env`.
     Stmt::Let { name, ty, value } if ty == "Proc" => {
-      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !matches!(actual, Type::Proc(_, _)) {
         return Err(Diagnostic::new(format!(
           "type mismatch in `{name}: Proc = ...`: expected a Proc (lambda literal), found {actual:?}"
@@ -1163,7 +1447,7 @@ fn check_stmt(
           "type mismatch in `{name}: {ty} = Array.new(...)`: `Array.new` produces an Array, not {declared:?}"
         )));
       }
-      let size_ty = infer_expr_type(size, env, sigs, classes, self_fields)?;
+      let size_ty = infer_expr_type(size, env, sigs, classes, self_fields, gctx)?;
       if size_ty != Type::Int64 {
         return Err(Diagnostic::new(format!(
           "`Array.new` size must be Int64, found {size_ty:?}"
@@ -1174,7 +1458,7 @@ fn check_stmt(
     }
     Stmt::Let { name, ty, value } => {
       let declared = resolve_type(ty, classes)?;
-      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if actual != declared {
         return Err(Diagnostic::new(format!(
           "type mismatch in `{name}: {ty} = ...`: declared type {declared:?}, value has type {actual:?}"
@@ -1190,7 +1474,7 @@ fn check_stmt(
         .get(name)
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`")))?;
-      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if actual != declared {
         return Err(Diagnostic::new(format!(
           "type mismatch in `@{name} = ...`: field declared {declared:?}, value has type {actual:?}"
@@ -1202,7 +1486,7 @@ fn check_stmt(
       array,
       index,
       value,
-    } => check_set_index(array, index, value, env, sigs, classes, self_fields),
+    } => check_set_index(array, index, value, env, sigs, classes, self_fields, gctx),
     // Plan 31: `name` must already be bound — this is a reassignment,
     // never a fresh declaration (the Decision log's whole reason this
     // is a distinct `Stmt` from `Let`). Checked against the *existing*
@@ -1213,7 +1497,7 @@ fn check_stmt(
         .get(name)
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
-      let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if actual != declared {
         return Err(Diagnostic::new(format!(
           "type mismatch in `{name} = ...`: `{name}` has type {declared:?}, value has type {actual:?}"
@@ -1222,14 +1506,14 @@ fn check_stmt(
       Ok(())
     }
     Stmt::MultiAssign { names, values } => {
-      check_multi_assign(names, values, env, sigs, classes, self_fields)
+      check_multi_assign(names, values, env, sigs, classes, self_fields, gctx)
     }
     Stmt::If {
       cond,
       then_branch,
       else_branch,
     } => {
-      let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields)?;
+      let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields, gctx)?;
       if cond_ty != Type::Boolean {
         return Err(Diagnostic::new(format!(
           "`if` condition must be Boolean, found {cond_ty:?} (no truthy/falsy coercion — spec/GRAMMAR.md §5)"
@@ -1245,6 +1529,7 @@ fn check_stmt(
         in_loop,
         in_rescue,
         yields_allowed,
+        gctx,
       )?;
       if let Some(else_b) = else_branch {
         check_block(
@@ -1257,12 +1542,13 @@ fn check_stmt(
           in_loop,
           in_rescue,
           yields_allowed,
+          gctx,
         )?;
       }
       Ok(())
     }
     Stmt::While { cond, body } => {
-      let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields)?;
+      let cond_ty = infer_expr_type(cond, env, sigs, classes, self_fields, gctx)?;
       if cond_ty != Type::Boolean {
         return Err(Diagnostic::new(format!(
           "`while` condition must be Boolean, found {cond_ty:?}"
@@ -1278,10 +1564,11 @@ fn check_stmt(
         true,
         in_rescue,
         yields_allowed,
+        gctx,
       )
     }
     Stmt::Return(Some(e)) => {
-      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if t != *return_type {
         return Err(Diagnostic::new(format!(
           "type mismatch: `return` value has type {t:?} but the enclosing function declares {return_type:?}"
@@ -1302,9 +1589,9 @@ fn check_stmt(
       }
       Ok(())
     }
-    Stmt::Expr(e) => infer_expr_type(e, env, sigs, classes, self_fields).map(|_| ()),
+    Stmt::Expr(e) => infer_expr_type(e, env, sigs, classes, self_fields, gctx).map(|_| ()),
     Stmt::Raise(e) => {
-      let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+      let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if !matches!(t, Type::Class(_)) {
         return Err(Diagnostic::new(format!(
           "`raise` requires a class instance, found {t:?}"
@@ -1328,7 +1615,7 @@ fn check_stmt(
         ));
       }
       for a in args {
-        infer_expr_type(a, env, sigs, classes, self_fields)?;
+        infer_expr_type(a, env, sigs, classes, self_fields, gctx)?;
       }
       Ok(())
     }
@@ -1348,6 +1635,7 @@ fn check_stmt(
       in_loop,
       in_rescue,
       yields_allowed,
+      gctx,
     ),
     Stmt::Case {
       scrutinee,
@@ -1365,6 +1653,7 @@ fn check_stmt(
       in_loop,
       in_rescue,
       yields_allowed,
+      gctx,
     ),
     // Plan 30: `elements`'s element type is unified exactly as
     // `infer_array_lit_type` already does for a bare array literal
@@ -1379,7 +1668,8 @@ fn check_stmt(
       // `infer_array_lit_type` returns the literal's own `Array(elem)`
       // type, not the element type `var` should be bound at — unwrap
       // one layer.
-      let Type::Array(elem_ty) = infer_array_lit_type(elements, env, sigs, classes, self_fields)?
+      let Type::Array(elem_ty) =
+        infer_array_lit_type(elements, env, sigs, classes, self_fields, gctx)?
       else {
         unreachable!("infer_array_lit_type always returns Type::Array")
       };
@@ -1394,6 +1684,7 @@ fn check_stmt(
         true,
         in_rescue,
         yields_allowed,
+        gctx,
       )
     }
     // Plan 37: no first-class `Range` value — `start`/`end` are each
@@ -1411,13 +1702,13 @@ fn check_stmt(
       exclusive: _,
       body,
     } => {
-      let start_ty = infer_expr_type(start, env, sigs, classes, self_fields)?;
+      let start_ty = infer_expr_type(start, env, sigs, classes, self_fields, gctx)?;
       if start_ty != Type::Int64 {
         return Err(Diagnostic::new(format!(
           "range start must be Int64, found {start_ty:?}"
         )));
       }
-      let end_ty = infer_expr_type(end, env, sigs, classes, self_fields)?;
+      let end_ty = infer_expr_type(end, env, sigs, classes, self_fields, gctx)?;
       if end_ty != Type::Int64 {
         return Err(Diagnostic::new(format!(
           "range end must be Int64, found {end_ty:?}"
@@ -1434,6 +1725,7 @@ fn check_stmt(
         true,
         in_rescue,
         yields_allowed,
+        gctx,
       )
     }
     // Plan 38: legal only inside a `rescue` clause's own body — see
@@ -1466,8 +1758,9 @@ fn check_case(
   in_loop: bool,
   in_rescue: bool,
   yields_allowed: bool,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
-  let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields)?;
+  let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields, gctx)?;
   if scrutinee_ty != Type::Int64 {
     return Err(Diagnostic::new(format!(
       "`case` scrutinee must be Int64, found {scrutinee_ty:?}"
@@ -1475,7 +1768,7 @@ fn check_case(
   }
   for (values, body) in arms {
     for v in values {
-      let value_ty = infer_expr_type(v, env, sigs, classes, self_fields)?;
+      let value_ty = infer_expr_type(v, env, sigs, classes, self_fields, gctx)?;
       if value_ty != Type::Int64 {
         return Err(Diagnostic::new(format!(
           "`when` value must be Int64, found {value_ty:?}"
@@ -1492,6 +1785,7 @@ fn check_case(
       in_loop,
       in_rescue,
       yields_allowed,
+      gctx,
     )?;
   }
   if let Some(else_b) = else_body {
@@ -1505,6 +1799,7 @@ fn check_case(
       in_loop,
       in_rescue,
       yields_allowed,
+      gctx,
     )?;
   }
   Ok(())
@@ -1534,6 +1829,7 @@ fn check_begin(
   in_loop: bool,
   in_rescue: bool,
   yields_allowed: bool,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   check_block(
     body,
@@ -1545,6 +1841,7 @@ fn check_begin(
     in_loop,
     in_rescue,
     yields_allowed,
+    gctx,
   )?;
   for rescue in rescues {
     if let Some(class_name) = &rescue.class_name {
@@ -1566,6 +1863,7 @@ fn check_begin(
       in_loop,
       true,
       yields_allowed,
+      gctx,
     )?;
   }
   if let Some(ensure_body) = ensure {
@@ -1579,6 +1877,7 @@ fn check_begin(
       in_loop,
       in_rescue,
       yields_allowed,
+      gctx,
     )?;
   }
   Ok(())
@@ -1595,6 +1894,7 @@ fn check_block(
   in_loop: bool,
   in_rescue: bool,
   yields_allowed: bool,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   for stmt in stmts {
     check_stmt(
@@ -1607,6 +1907,7 @@ fn check_block(
       in_loop,
       in_rescue,
       yields_allowed,
+      gctx,
     )?;
   }
   Ok(())
@@ -1615,6 +1916,7 @@ fn check_block(
 /// Checks the final-statement implicit-return rule shared by free
 /// functions and methods (Ruby-style: a body whose last statement is a
 /// bare expression returns that expression's value).
+#[allow(clippy::too_many_arguments)]
 fn check_implicit_return(
   body: &[Stmt],
   env: &HashMap<String, Type>,
@@ -1623,9 +1925,10 @@ fn check_implicit_return(
   self_fields: Option<&HashMap<String, Type>>,
   declared_return: &Type,
   owner_name: &str,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   if let Some(Stmt::Expr(e)) = body.last() {
-    let t = infer_expr_type(e, env, sigs, classes, self_fields)?;
+    let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
     if t != *declared_return {
       return Err(Diagnostic::new(format!(
         "type mismatch in `{owner_name}`: body has type {t:?} but declared return type is {declared_return:?}"
@@ -1639,6 +1942,7 @@ fn check_function_body(
   f: &Function,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   let mut env = HashMap::new();
   for p in &f.params {
@@ -1663,6 +1967,7 @@ fn check_function_body(
     false,
     false,
     f.block_param.is_some(),
+    gctx,
   )?;
   check_implicit_return(
     &f.body,
@@ -1672,6 +1977,7 @@ fn check_function_body(
     None,
     &declared_return,
     &f.name,
+    gctx,
   )
 }
 
@@ -1681,6 +1987,7 @@ fn check_method_body(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   fields: &HashMap<String, Type>,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   // Plan 39's Decision log: default parameter values and splat capture
   // are scoped to plain top-level `def` functions only — a real,
@@ -1713,6 +2020,7 @@ fn check_method_body(
     false,
     false,
     m.block_param.is_some(),
+    gctx,
   )?;
   check_implicit_return(
     &m.body,
@@ -1722,6 +2030,7 @@ fn check_method_body(
     Some(fields),
     &declared_return,
     &format!("{class_name}#{}", m.name),
+    gctx,
   )
 }
 
@@ -1744,22 +2053,28 @@ fn check_block_call_sites(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   func_defs: &HashMap<String, &Function>,
+  gctx: &GenericsCtx,
 ) -> Vec<Diagnostic> {
   let mut diags = Vec::new();
   for item in &program.items {
     match item {
-      Item::Function(f) => scan_block_call_sites(&f.body, sigs, classes, func_defs, &mut diags),
+      Item::Function(f) => {
+        scan_block_call_sites(&f.body, sigs, classes, func_defs, gctx, &mut diags)
+      }
       Item::Class(c) => {
         for m in &c.methods {
-          scan_block_call_sites(&m.body, sigs, classes, func_defs, &mut diags);
+          scan_block_call_sites(&m.body, sigs, classes, func_defs, gctx, &mut diags);
         }
       }
       Item::Module(m) => {
         for f in &m.methods {
-          scan_block_call_sites(&f.body, sigs, classes, func_defs, &mut diags);
+          scan_block_call_sites(&f.body, sigs, classes, func_defs, gctx, &mut diags);
         }
       }
-      Item::Stmt(s) => scan_block_call_site(s, sigs, classes, func_defs, &mut diags),
+      Item::Stmt(s) => scan_block_call_site(s, sigs, classes, func_defs, gctx, &mut diags),
+      // Plan 41: an interface declares one required method signature,
+      // never a body — nothing here can contain a `yield` site.
+      Item::Interface(_) => {}
       // Plan 23: `emerald-driver`'s `resolve_program` (not yet
       // extracted in this codebase) is meant to strip every
       // `Item::Require` before `emerald-sema` ever sees a `Program` —
@@ -1778,10 +2093,11 @@ fn scan_block_call_sites(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   func_defs: &HashMap<String, &Function>,
+  gctx: &GenericsCtx,
   diags: &mut Vec<Diagnostic>,
 ) {
   for s in stmts {
-    scan_block_call_site(s, sigs, classes, func_defs, diags);
+    scan_block_call_site(s, sigs, classes, func_defs, gctx, diags);
   }
 }
 
@@ -1790,13 +2106,14 @@ fn scan_block_call_site(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   func_defs: &HashMap<String, &Function>,
+  gctx: &GenericsCtx,
   diags: &mut Vec<Diagnostic>,
 ) {
   match stmt {
     Stmt::Expr(Expr::Call(name, args)) => {
       let declares_block = sigs.get(name).is_some_and(|s| s.block_param.is_some());
       if declares_block {
-        check_one_block_call_site(name, args, sigs, classes, func_defs, diags);
+        check_one_block_call_site(name, args, sigs, classes, func_defs, gctx, diags);
       }
     }
     Stmt::If {
@@ -1804,36 +2121,36 @@ fn scan_block_call_site(
       else_branch,
       ..
     } => {
-      scan_block_call_sites(then_branch, sigs, classes, func_defs, diags);
+      scan_block_call_sites(then_branch, sigs, classes, func_defs, gctx, diags);
       if let Some(else_b) = else_branch {
-        scan_block_call_sites(else_b, sigs, classes, func_defs, diags);
+        scan_block_call_sites(else_b, sigs, classes, func_defs, gctx, diags);
       }
     }
-    Stmt::While { body, .. } => scan_block_call_sites(body, sigs, classes, func_defs, diags),
+    Stmt::While { body, .. } => scan_block_call_sites(body, sigs, classes, func_defs, gctx, diags),
     Stmt::Begin {
       body,
       rescues,
       ensure,
     } => {
-      scan_block_call_sites(body, sigs, classes, func_defs, diags);
+      scan_block_call_sites(body, sigs, classes, func_defs, gctx, diags);
       for rescue in rescues {
-        scan_block_call_sites(&rescue.body, sigs, classes, func_defs, diags);
+        scan_block_call_sites(&rescue.body, sigs, classes, func_defs, gctx, diags);
       }
       if let Some(ensure_body) = ensure {
-        scan_block_call_sites(ensure_body, sigs, classes, func_defs, diags);
+        scan_block_call_sites(ensure_body, sigs, classes, func_defs, gctx, diags);
       }
     }
     Stmt::Case {
       arms, else_body, ..
     } => {
       for (_, body) in arms {
-        scan_block_call_sites(body, sigs, classes, func_defs, diags);
+        scan_block_call_sites(body, sigs, classes, func_defs, gctx, diags);
       }
       if let Some(else_b) = else_body {
-        scan_block_call_sites(else_b, sigs, classes, func_defs, diags);
+        scan_block_call_sites(else_b, sigs, classes, func_defs, gctx, diags);
       }
     }
-    Stmt::For { body, .. } => scan_block_call_sites(body, sigs, classes, func_defs, diags),
+    Stmt::For { body, .. } => scan_block_call_sites(body, sigs, classes, func_defs, gctx, diags),
     _ => {}
   }
 }
@@ -1844,6 +2161,7 @@ fn check_one_block_call_site(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   func_defs: &HashMap<String, &Function>,
+  gctx: &GenericsCtx,
   diags: &mut Vec<Diagnostic>,
 ) {
   let Some(Expr::Lambda {
@@ -1880,6 +2198,7 @@ fn check_one_block_call_site(
     false,
     false,
     false,
+    gctx,
   ) {
     diags.push(d);
     return;
@@ -1904,6 +2223,7 @@ fn check_one_block_call_site(
     &mut callee_env,
     sigs,
     classes,
+    gctx,
   ) {
     diags.push(d);
   }
@@ -1922,6 +2242,7 @@ fn check_yields_against_block(
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
+  gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   for stmt in stmts {
     match stmt {
@@ -1934,7 +2255,7 @@ fn check_yields_against_block(
           )));
         }
         for (i, (a, want)) in args.iter().zip(expected).enumerate() {
-          let actual = infer_expr_type(a, env, sigs, classes, None)?;
+          let actual = infer_expr_type(a, env, sigs, classes, None, gctx)?;
           if actual != *want {
             return Err(Diagnostic::new(format!(
               "type mismatch in `yield` argument {}: attached block's parameter has type {want:?}, value has type {actual:?}",
@@ -1953,38 +2274,40 @@ fn check_yields_against_block(
         else_branch,
         ..
       } => {
-        check_yields_against_block(then_branch, expected, env, sigs, classes)?;
+        check_yields_against_block(then_branch, expected, env, sigs, classes, gctx)?;
         if let Some(else_b) = else_branch {
-          check_yields_against_block(else_b, expected, env, sigs, classes)?;
+          check_yields_against_block(else_b, expected, env, sigs, classes, gctx)?;
         }
       }
-      Stmt::While { body, .. } => check_yields_against_block(body, expected, env, sigs, classes)?,
+      Stmt::While { body, .. } => {
+        check_yields_against_block(body, expected, env, sigs, classes, gctx)?
+      }
       Stmt::Begin {
         body,
         rescues,
         ensure,
       } => {
-        check_yields_against_block(body, expected, env, sigs, classes)?;
+        check_yields_against_block(body, expected, env, sigs, classes, gctx)?;
         for rescue in rescues {
           if let Some(class_name) = &rescue.class_name {
             if let Ok(t) = resolve_type(class_name, classes) {
               env.insert(rescue.var.clone(), t);
             }
           }
-          check_yields_against_block(&rescue.body, expected, env, sigs, classes)?;
+          check_yields_against_block(&rescue.body, expected, env, sigs, classes, gctx)?;
         }
         if let Some(ensure_body) = ensure {
-          check_yields_against_block(ensure_body, expected, env, sigs, classes)?;
+          check_yields_against_block(ensure_body, expected, env, sigs, classes, gctx)?;
         }
       }
       Stmt::Case {
         arms, else_body, ..
       } => {
         for (_, body) in arms {
-          check_yields_against_block(body, expected, env, sigs, classes)?;
+          check_yields_against_block(body, expected, env, sigs, classes, gctx)?;
         }
         if let Some(else_b) = else_body {
-          check_yields_against_block(else_b, expected, env, sigs, classes)?;
+          check_yields_against_block(else_b, expected, env, sigs, classes, gctx)?;
         }
       }
       Stmt::For {
@@ -1992,10 +2315,12 @@ fn check_yields_against_block(
         elements,
         body,
       } => {
-        if let Ok(Type::Array(elem_ty)) = infer_array_lit_type(elements, env, sigs, classes, None) {
+        if let Ok(Type::Array(elem_ty)) =
+          infer_array_lit_type(elements, env, sigs, classes, None, gctx)
+        {
           env.insert(var.clone(), *elem_ty);
         }
-        check_yields_against_block(body, expected, env, sigs, classes)?;
+        check_yields_against_block(body, expected, env, sigs, classes, gctx)?;
       }
       _ => {}
     }
@@ -2013,6 +2338,28 @@ fn check_yields_against_block(
 /// later in the same `Item*` list to still resolve.
 pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   let mut diags = Vec::new();
+
+  // Plan 41: interfaces register in their own pass, independent of
+  // class/module registration order — an interface's required method
+  // is kept as raw, unresolved type-name strings (`InterfaceInfo`'s
+  // own doc comment), so nothing here needs `classes` populated yet.
+  let mut interfaces: HashMap<String, InterfaceInfo> = HashMap::new();
+  for item in &program.items {
+    if let Item::Interface(idef) = item {
+      interfaces.insert(
+        idef.name.clone(),
+        InterfaceInfo {
+          method_name: idef.method_name.clone(),
+          params_raw: idef
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), p.ty.clone()))
+            .collect(),
+          return_type_raw: idef.return_type.clone(),
+        },
+      );
+    }
+  }
 
   // Modules register into the same two-pass table as classes (plan 12's
   // Decision log) — names first (so a class/module's own fields/methods
@@ -2034,6 +2381,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           methods: HashMap::new(),
           is_module: false,
           superclass: c.superclass.clone(),
+          implements: c.implements.clone(),
         },
       );
     }
@@ -2045,6 +2393,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           methods: HashMap::new(),
           is_module: true,
           superclass: None,
+          implements: None,
         },
       );
     }
@@ -2068,7 +2417,36 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     }
   }
 
+  // Plan 41: checked immediately after a class with `implements.is_some()`
+  // successfully registers its flattened `ClassInfo` (Decision log) — a
+  // class whose OWN registration failed (`classes.get` came back `None`
+  // above) never reaches this at all, matching the established "if
+  // registration failed, skip downstream checks" pattern.
+  for item in &program.items {
+    if let Item::Class(c) = item {
+      if let Some(iface_name) = &c.implements {
+        let Some(info) = classes.get(&c.name) else {
+          continue;
+        };
+        if let Err(d) =
+          check_interface_conformance(&c.name, iface_name, info, &interfaces, &classes)
+        {
+          diags.push(d);
+        }
+      }
+    }
+  }
+
   let mut sigs: HashMap<String, FunctionSig> = HashMap::new();
+  // Plan 41: a top-level function whose `type_params` is non-empty is a
+  // generic function — it never enters `sigs` at all (Decision log: the
+  // ordinary `sigs` pass skips it entirely, so its name is never present
+  // in both registries at once). Exactly one type parameter is required;
+  // two or more is a real registration-time diagnostic, and the offending
+  // function's name is tracked here so the later body-check loop skips
+  // it too (already diagnosed once, not silently, not twice).
+  let mut generic_sigs: HashMap<String, GenericFunctionSig> = HashMap::new();
+  let mut bad_generic_fns: HashSet<String> = HashSet::new();
   // Plan 34: raw `Function`s keyed by name, alongside `sigs` — a
   // block-attaching call site needs the callee's actual body (to
   // re-walk its `Stmt::Yield` sites), not just its signature.
@@ -2076,14 +2454,43 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   for item in &program.items {
     if let Item::Function(f) = item {
       func_defs.insert(f.name.clone(), f);
-      match function_signature(f, &classes) {
-        Ok(sig) => {
-          sigs.insert(f.name.clone(), sig);
+      if f.type_params.is_empty() {
+        match function_signature(f, &classes) {
+          Ok(sig) => {
+            sigs.insert(f.name.clone(), sig);
+          }
+          Err(d) => diags.push(d),
         }
-        Err(d) => diags.push(d),
+      } else if f.type_params.len() != 1 {
+        diags.push(Diagnostic::new(format!(
+          "generic function `{}` declares {} type parameters — multiple type parameters are not supported",
+          f.name,
+          f.type_params.len()
+        )));
+        bad_generic_fns.insert(f.name.clone());
+      } else {
+        let tp = &f.type_params[0];
+        generic_sigs.insert(
+          f.name.clone(),
+          GenericFunctionSig {
+            type_param: tp.name.clone(),
+            bound: tp.bound.clone(),
+            params_raw: f
+              .params
+              .iter()
+              .map(|p| (p.name.clone(), p.ty.clone()))
+              .collect(),
+            return_type_raw: f.return_type.clone(),
+          },
+        );
       }
     }
   }
+
+  let gctx = GenericsCtx {
+    interfaces: &interfaces,
+    generic_sigs: &generic_sigs,
+  };
 
   // Declared once, outside the loop: top-level statements share one
   // environment across the whole program in order (`x: Int64 = 10` then
@@ -2091,8 +2498,17 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   let mut top_env: HashMap<String, Type> = HashMap::new();
   for item in &program.items {
     match item {
+      Item::Function(f) if !f.type_params.is_empty() => {
+        if bad_generic_fns.contains(&f.name) {
+          continue;
+        }
+        let g = &generic_sigs[&f.name];
+        if let Err(d) = check_generic_function_body(f, g, &sigs, &classes, &gctx) {
+          diags.push(d);
+        }
+      }
       Item::Function(f) => {
-        if let Err(d) = check_function_body(f, &sigs, &classes) {
+        if let Err(d) = check_function_body(f, &sigs, &classes, &gctx) {
           diags.push(d);
         }
       }
@@ -2101,7 +2517,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           continue;
         };
         for m in &c.methods {
-          if let Err(d) = check_method_body(&c.name, m, &sigs, &classes, &info.fields) {
+          if let Err(d) = check_method_body(&c.name, m, &sigs, &classes, &info.fields, &gctx) {
             diags.push(d);
           }
         }
@@ -2110,7 +2526,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // 12's Decision log) — no `self`, no `@field` access.
       Item::Module(m) => {
         for f in &m.methods {
-          if let Err(d) = check_function_body(f, &sigs, &classes) {
+          if let Err(d) = check_function_body(f, &sigs, &classes, &gctx) {
             diags.push(d);
           }
         }
@@ -2129,10 +2545,15 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           false,
           false,
           false,
+          &gctx,
         ) {
           diags.push(d);
         }
       }
+      // Plan 41: a general, user-declarable grammar production (Decision
+      // log) — nothing left to do here beyond the two registration
+      // passes above; an interface has no body of its own to check.
+      Item::Interface(_) => {}
       // Plan 23: see `check_block_call_sites`'s own `Item::Require`
       // arm — a no-op here too, for the same reason.
       Item::Require(_) => {}
@@ -2144,9 +2565,111 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     }
   }
 
-  diags.extend(check_block_call_sites(program, &sigs, &classes, &func_defs));
+  diags.extend(check_block_call_sites(
+    program, &sigs, &classes, &func_defs, &gctx,
+  ));
 
   if diags.is_empty() { Ok(()) } else { Err(diags) }
+}
+
+/// Plan 41's Decision log: substitutes every `"Self"` in the interface's
+/// raw parameter/return-type strings with `class_name` itself, resolves
+/// the substituted strings, and compares the result *exactly* (invariant,
+/// not covariant — same discipline as plan 32's override check) against
+/// `info.methods.get(&iface.method_name)` — the class's already-
+/// **flattened** method table, so an interface requirement satisfied by
+/// an *inherited* method is accepted for free.
+fn check_interface_conformance(
+  class_name: &str,
+  iface_name: &str,
+  info: &ClassInfo,
+  interfaces: &HashMap<String, InterfaceInfo>,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<(), Diagnostic> {
+  let iface = interfaces.get(iface_name).ok_or_else(|| {
+    Diagnostic::new(format!(
+      "class `{class_name}` declares `implements {iface_name}`, but no interface named `{iface_name}` is declared"
+    ))
+  })?;
+  let expected_params = iface
+    .params_raw
+    .iter()
+    .map(|(_, raw)| resolve_type(if raw == "Self" { class_name } else { raw }, classes))
+    .collect::<Result<Vec<_>, _>>()?;
+  let expected_return = resolve_type(
+    if iface.return_type_raw == "Self" {
+      class_name
+    } else {
+      &iface.return_type_raw
+    },
+    classes,
+  )?;
+  let Some(actual) = info.methods.get(&iface.method_name) else {
+    return Err(Diagnostic::new(format!(
+      "class `{class_name}` declares `implements {iface_name}` but does not define required method `{}`",
+      iface.method_name
+    )));
+  };
+  if actual.params != expected_params || actual.return_type != expected_return {
+    return Err(Diagnostic::new(format!(
+      "class `{class_name}`'s `{}` does not match interface `{iface_name}`'s required signature: expected {expected_params:?} -> {expected_return:?}, found {:?} -> {:?}",
+      iface.method_name, actual.params, actual.return_type
+    )));
+  }
+  Ok(())
+}
+
+/// Plan 41's Decision log: a generic function's body is type-checked
+/// exactly **once**, statically, before any concrete type is known — a
+/// parameter (or return type) whose declared type name equals the
+/// function's own type parameter is bound to `Type::Generic(name, bound)`
+/// directly (bypassing `resolve_type`, which cannot resolve a bare
+/// `"T"`), so a method call on it resolves against the bound interface's
+/// required signature (`infer_expr_type`'s `Expr::MethodCall` arm), not
+/// against the `classes` registry.
+fn check_generic_function_body(
+  f: &Function,
+  g: &GenericFunctionSig,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  gctx: &GenericsCtx,
+) -> Result<(), Diagnostic> {
+  let mut env = HashMap::new();
+  for p in &f.params {
+    let t = if p.ty == g.type_param {
+      Type::Generic(g.type_param.clone(), g.bound.clone())
+    } else {
+      resolve_type(&p.ty, classes)?
+    };
+    env.insert(p.name.clone(), t);
+  }
+  let declared_return = if f.return_type == g.type_param {
+    Type::Generic(g.type_param.clone(), g.bound.clone())
+  } else {
+    resolve_type(&f.return_type, classes)?
+  };
+  check_block(
+    &f.body,
+    &mut env,
+    sigs,
+    classes,
+    None,
+    &declared_return,
+    false,
+    false,
+    f.block_param.is_some(),
+    gctx,
+  )?;
+  check_implicit_return(
+    &f.body,
+    &env,
+    sigs,
+    classes,
+    None,
+    &declared_return,
+    &f.name,
+    gctx,
+  )
 }
 
 #[cfg(test)]
@@ -3190,6 +3713,105 @@ mod tests {
       errs[0]
         .message
         .contains("class `Bag` has no operator method `[]=`")
+    );
+  }
+
+  // Plan 41 (interfaces and generics).
+
+  const COMPARABLE_MAX_EXAMPLE: &str = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
+
+  #[test]
+  fn accepts_the_comparable_max_worked_example() {
+    let program = emerald_parser::parse(COMPARABLE_MAX_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_implements_with_no_matching_method_defined() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Money never defines compare_to");
+    assert!(errs[0].message.contains("Money"));
+    assert!(errs[0].message.contains("Comparable"));
+    assert!(errs[0].message.contains("compare_to"));
+  }
+
+  #[test]
+  fn rejects_implements_with_a_mismatched_method_signature() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Boolean\n    true\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("compare_to returns the wrong type");
+    assert!(errs[0].message.contains("does not match interface"));
+  }
+
+  #[test]
+  fn rejects_implements_naming_an_undefined_interface() {
+    let src = "class Money implements NotAnInterface\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("NotAnInterface is never declared");
+    assert!(errs[0].message.contains("NotAnInterface"));
+  }
+
+  #[test]
+  fn accepts_conformance_satisfied_by_an_inherited_method() {
+    // Real proof conformance is checked against the flattened method
+    // table, not just the class's own declared methods (plan 32's
+    // contribution) — `Dog` declares no `describe` of its own at all.
+    // Uses a `Self`-free interface method deliberately: `Self`
+    // substitutes to the *leaf* class declaring `implements` (invariant,
+    // not covariant — see the Decision log), so an ancestor's own
+    // `Self`-typed method (typed at the ancestor's own name) would
+    // conflict with that leaf substitution on a completely separate
+    // axis this AC isn't testing.
+    let src = "interface Describable\n  def describe(label: String) -> Int64\nend\n\nclass Animal\n  read age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def describe(label: String) -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal implements Describable\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn generic_function_body_type_checks_once_against_the_bound_interface() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\ndef describe[T: Comparable](a: T, b: T) -> Int64\n  a.compare_to(b)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_generic_call_with_inconsistent_type_parameter_arguments() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nd1: Distance = Distance.new(100)\nboom: Money = max(m1, d1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`T` resolves to both Money and Distance");
+    assert!(errs[0].message.contains("inconsistently"));
+  }
+
+  #[test]
+  fn rejects_a_generic_call_whose_concrete_type_does_not_implement_the_bound() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Widget\n  read id: Int64\n\n  def initialize(id: Int64) -> Void\n    @id = id\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nw1: Widget = Widget.new(1)\nw2: Widget = Widget.new(2)\nboom: Widget = max(w1, w2)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Widget does not implement Comparable");
+    assert!(errs[0].message.contains("does not implement"));
+  }
+
+  #[test]
+  fn rejects_multiple_type_parameters_at_registration_time() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\ndef bad[T: Comparable, U: Comparable](a: T, b: U) -> T\n  a\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("two type parameters are not supported");
+    assert!(
+      errs[0]
+        .message
+        .contains("multiple type parameters are not supported")
+    );
+  }
+
+  #[test]
+  fn rejects_generic_methods_on_a_class() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Box\n  def pick[T: Comparable](a: T, b: T) -> T\n    a\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("generic methods are not supported");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("generic methods are not supported"))
     );
   }
 }

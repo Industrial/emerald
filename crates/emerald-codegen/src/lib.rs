@@ -461,6 +461,386 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
   }
 }
 
+/// Plan 41's Decision log: resolves a generic call site's own concrete
+/// argument type — a plain local via the walk's own accumulated
+/// `local_classes` (the same side-table `bind_params`/`Stmt::Let`
+/// codegen already builds incrementally), or a direct `ClassName.new(
+/// ...)` literal. Anything else (a nested call's return value, a
+/// method-call result, ...) is out of scope for this plan's own worked
+/// example — sema has already accepted the whole program, so a shape
+/// this can't resolve is a real, disclosed codegen gap (AC4), not a
+/// miscompile.
+fn resolve_arg_concrete_class<'a>(
+  arg: &'a Expr,
+  local_classes: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+  match arg {
+    Expr::Ident(name) => local_classes.get(name).map(String::as_str),
+    Expr::New(class_name, _) => Some(class_name.as_str()),
+    _ => None,
+  }
+}
+
+/// Shared by `collect_generic_specializations`'s program-wide collection
+/// pass and each individual call site's own codegen (`build_call_expr`),
+/// so the two can never disagree about which mangled symbol a given
+/// call resolves to.
+fn mangled_generic_call_symbol(
+  name: &str,
+  g: &AstFunction,
+  args: &[Expr],
+  local_classes: &HashMap<String, String>,
+) -> Result<String, String> {
+  let type_param = g
+    .type_params
+    .first()
+    .ok_or_else(|| format!("codegen: internal error — `{name}` has no type parameter"))?;
+  let mut concrete: Option<&str> = None;
+  for (i, p) in g.params.iter().enumerate() {
+    if p.ty == type_param.name {
+      if let Some(c) = args
+        .get(i)
+        .and_then(|a| resolve_arg_concrete_class(a, local_classes))
+      {
+        concrete = Some(c);
+      }
+    }
+  }
+  let concrete = concrete.ok_or_else(|| {
+    format!(
+      "codegen: could not resolve generic function `{name}`'s type parameter `{}` to a concrete class at this call site",
+      type_param.name
+    )
+  })?;
+  Ok(mangled_generic_symbol(name, concrete))
+}
+
+fn mangled_generic_symbol(fn_name: &str, concrete_class: &str) -> String {
+  format!("{fn_name}$${concrete_class}")
+}
+
+/// The initial `local_classes` a function/method body's collection walk
+/// starts from — every class-typed parameter, mirroring `bind_params`'s
+/// own `classes.contains_key(p.ty.as_str())` bookkeeping exactly, minus
+/// the actual LLVM binding (this is a pure-AST pass, no `Builder`).
+fn param_local_classes(
+  params: &[Param],
+  classes: &HashMap<String, ClassLayout>,
+) -> HashMap<String, String> {
+  params
+    .iter()
+    .filter(|p| classes.contains_key(p.ty.as_str()))
+    .map(|p| (p.name.clone(), p.ty.clone()))
+    .collect()
+}
+
+/// Plan 41's Decision log: a program-wide AST walk (the same style as
+/// `collect_idents_in_expr`/`collect_idents_in_stmt`) collecting every
+/// distinct `(generic function name, concrete class name)` pair actually
+/// called anywhere in the whole program — one compiled LLVM function is
+/// emitted per entry here, and no others.
+fn collect_generic_specializations(
+  program: &Program,
+  generic_fns: &HashMap<String, &AstFunction>,
+  classes: &HashMap<String, ClassLayout>,
+) -> HashMap<String, HashSet<String>> {
+  let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+  for item in &program.items {
+    match item {
+      Item::Function(f) => {
+        let mut local_classes = param_local_classes(&f.params, classes);
+        for s in &f.body {
+          collect_specializations_in_stmt(s, generic_fns, &mut local_classes, classes, &mut out);
+        }
+      }
+      Item::Class(c) => {
+        for m in &c.methods {
+          let mut local_classes = param_local_classes(&m.params, classes);
+          for s in &m.body {
+            collect_specializations_in_stmt(s, generic_fns, &mut local_classes, classes, &mut out);
+          }
+        }
+      }
+      Item::Module(m) => {
+        for f in &m.methods {
+          let mut local_classes = param_local_classes(&f.params, classes);
+          for s in &f.body {
+            collect_specializations_in_stmt(s, generic_fns, &mut local_classes, classes, &mut out);
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  // Top-level statements share one flat environment across the whole
+  // program in source order (mirrors `emerald-sema`'s own `top_env`
+  // threading in `check_program`) — one shared, accumulating
+  // `local_classes` across the whole `Item::Stmt` sequence, not a fresh
+  // one per statement.
+  let mut top_local_classes: HashMap<String, String> = HashMap::new();
+  for item in &program.items {
+    if let Item::Stmt(s) = item {
+      collect_specializations_in_stmt(s, generic_fns, &mut top_local_classes, classes, &mut out);
+    }
+  }
+  out
+}
+
+fn collect_specializations_in_expr(
+  expr: &Expr,
+  generic_fns: &HashMap<String, &AstFunction>,
+  local_classes: &HashMap<String, String>,
+  out: &mut HashMap<String, HashSet<String>>,
+) {
+  if let Expr::Call(name, args) = expr {
+    if let Some(g) = generic_fns.get(name) {
+      if let Some(type_param) = g.type_params.first() {
+        for (i, p) in g.params.iter().enumerate() {
+          if p.ty == type_param.name {
+            if let Some(concrete) = args
+              .get(i)
+              .and_then(|a| resolve_arg_concrete_class(a, local_classes))
+            {
+              out
+                .entry(name.clone())
+                .or_default()
+                .insert(concrete.to_string());
+            }
+          }
+        }
+      }
+    }
+  }
+  match expr {
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::InstanceVar(_)
+    | Expr::Lambda { .. }
+    | Expr::Bool(_)
+    | Expr::Nil => {}
+    Expr::ArrayNew(size) => collect_specializations_in_expr(size, generic_fns, local_classes, out),
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        collect_specializations_in_expr(k, generic_fns, local_classes, out);
+        collect_specializations_in_expr(v, generic_fns, local_classes, out);
+      }
+    }
+    Expr::Add(l, r)
+    | Expr::Sub(l, r)
+    | Expr::Mul(l, r)
+    | Expr::Div(l, r)
+    | Expr::Rem(l, r)
+    | Expr::And(l, r)
+    | Expr::Or(l, r)
+    | Expr::BitAnd(l, r)
+    | Expr::BitOr(l, r)
+    | Expr::BitXor(l, r)
+    | Expr::Shl(l, r)
+    | Expr::Shr(l, r)
+    | Expr::Index(l, r) => {
+      collect_specializations_in_expr(l, generic_fns, local_classes, out);
+      collect_specializations_in_expr(r, generic_fns, local_classes, out);
+    }
+    Expr::Neg(e) | Expr::Not(e) | Expr::BitNot(e) => {
+      collect_specializations_in_expr(e, generic_fns, local_classes, out)
+    }
+    Expr::Compare(l, _, r) => {
+      collect_specializations_in_expr(l, generic_fns, local_classes, out);
+      collect_specializations_in_expr(r, generic_fns, local_classes, out);
+    }
+    Expr::Call(_, args) | Expr::New(_, args) => {
+      for a in args {
+        collect_specializations_in_expr(a, generic_fns, local_classes, out);
+      }
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        collect_specializations_in_expr(v, generic_fns, local_classes, out);
+      }
+    }
+    Expr::MethodCall(recv, _, args) => {
+      collect_specializations_in_expr(recv, generic_fns, local_classes, out);
+      for a in args {
+        collect_specializations_in_expr(a, generic_fns, local_classes, out);
+      }
+    }
+    Expr::ArrayLit(elements) => {
+      for e in elements {
+        collect_specializations_in_expr(e, generic_fns, local_classes, out);
+      }
+    }
+    Expr::Interpolate(parts) => {
+      for part in parts {
+        if let StringPart::Expr(e) = part {
+          collect_specializations_in_expr(e, generic_fns, local_classes, out);
+        }
+      }
+    }
+  }
+}
+
+fn collect_specializations_in_stmt(
+  stmt: &Stmt,
+  generic_fns: &HashMap<String, &AstFunction>,
+  local_classes: &mut HashMap<String, String>,
+  classes: &HashMap<String, ClassLayout>,
+  out: &mut HashMap<String, HashSet<String>>,
+) {
+  match stmt {
+    Stmt::Let { name, ty, value } => {
+      collect_specializations_in_expr(value, generic_fns, local_classes, out);
+      if classes.contains_key(ty.as_str()) {
+        local_classes.insert(name.clone(), ty.clone());
+      }
+    }
+    Stmt::SetField { value, .. } => {
+      collect_specializations_in_expr(value, generic_fns, local_classes, out)
+    }
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      collect_specializations_in_expr(array, generic_fns, local_classes, out);
+      collect_specializations_in_expr(index, generic_fns, local_classes, out);
+      collect_specializations_in_expr(value, generic_fns, local_classes, out);
+    }
+    Stmt::Assign { value, .. } => {
+      collect_specializations_in_expr(value, generic_fns, local_classes, out)
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        collect_specializations_in_expr(v, generic_fns, local_classes, out);
+      }
+    }
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      collect_specializations_in_expr(cond, generic_fns, local_classes, out);
+      for s in then_branch {
+        collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+      }
+      if let Some(else_b) = else_branch {
+        for s in else_b {
+          collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+        }
+      }
+    }
+    Stmt::While { cond, body } => {
+      collect_specializations_in_expr(cond, generic_fns, local_classes, out);
+      for s in body {
+        collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+      }
+    }
+    Stmt::Return(Some(e)) => collect_specializations_in_expr(e, generic_fns, local_classes, out),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => {}
+    Stmt::Expr(e) => collect_specializations_in_expr(e, generic_fns, local_classes, out),
+    Stmt::Raise(e) => collect_specializations_in_expr(e, generic_fns, local_classes, out),
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+      }
+      for rescue in rescues {
+        for s in &rescue.body {
+          collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+        }
+      }
+      if let Some(ensure_body) = ensure {
+        for s in ensure_body {
+          collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+        }
+      }
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      collect_specializations_in_expr(scrutinee, generic_fns, local_classes, out);
+      for (values, body) in arms {
+        for v in values {
+          collect_specializations_in_expr(v, generic_fns, local_classes, out);
+        }
+        for s in body {
+          collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+        }
+      }
+      if let Some(else_b) = else_body {
+        for s in else_b {
+          collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+        }
+      }
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        collect_specializations_in_expr(e, generic_fns, local_classes, out);
+      }
+      for s in body {
+        collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+      }
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      collect_specializations_in_expr(start, generic_fns, local_classes, out);
+      collect_specializations_in_expr(end, generic_fns, local_classes, out);
+      for s in body {
+        collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+      }
+    }
+    Stmt::Yield(args) => {
+      for a in args {
+        collect_specializations_in_expr(a, generic_fns, local_classes, out);
+      }
+    }
+  }
+}
+
+/// Plan 41's Decision log: textually substitutes `concrete_class` for
+/// the function's own type parameter in its `params`/`return_type`
+/// strings, producing a fully concrete `Function` AST that the
+/// *existing*, unmodified single-function codegen path (`define_user_
+/// function`) can compile exactly as if it had been written by hand for
+/// this one concrete type — 100% reuse of the non-generic machinery.
+fn substitute_generic_function(
+  f: &AstFunction,
+  type_param: &str,
+  concrete_class: &str,
+) -> AstFunction {
+  let substitute = |ty: &str| -> String {
+    if ty == type_param {
+      concrete_class.to_string()
+    } else {
+      ty.to_string()
+    }
+  };
+  AstFunction {
+    name: f.name.clone(),
+    params: f
+      .params
+      .iter()
+      .map(|p| Param {
+        name: p.name.clone(),
+        ty: substitute(&p.ty),
+        default: p.default.clone(),
+      })
+      .collect(),
+    return_type: substitute(&f.return_type),
+    body: f.body.clone(),
+    block_param: f.block_param.clone(),
+    splat_param: f.splat_param.clone(),
+    type_params: Vec::new(),
+  }
+}
+
 fn free_vars_in_lambda(params: &[Param], body: &[Stmt]) -> Vec<String> {
   let mut referenced = Vec::new();
   let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
@@ -2161,6 +2541,40 @@ fn build_call_expr<'ctx>(
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  // Plan 41's Decision log: a generic function's bare name is never
+  // registered in `user_func_ids` at all — its call sites resolve their
+  // own concrete argument type the same way `collect_generic_
+  // specializations` did (a plain local via `local_classes`, or a
+  // direct `ClassName.new(...)` literal), form the matching mangled
+  // symbol, and emit a direct call against it, identical call-emission
+  // code to every non-generic call below.
+  if let Some(g) = ctx
+    .func_defs
+    .get(name)
+    .filter(|f| !f.type_params.is_empty())
+  {
+    let mangled = mangled_generic_call_symbol(name, g, args, local_classes)?;
+    let (fv, ret_kind) = *ctx.user_func_ids.get(&mangled).ok_or_else(|| {
+      format!("codegen: no compiled specialization `{mangled}` for generic function `{name}`")
+    })?;
+    let arg_vals = build_call_arg_vals(
+      context,
+      builder,
+      name,
+      args,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(fv, &arg_vals, "calltmp")
+      .map_err(|e| e.to_string())?;
+    if ret_kind == ValKind::Void {
+      return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+    }
+    return Ok((call_result(call)?, ret_kind));
+  }
   let (fv, ret_kind) = *ctx.user_func_ids.get(name).ok_or_else(|| {
     format!("codegen: unsupported call to `{name}` (not a compiled user function)")
   })?;
@@ -4858,6 +5272,12 @@ fn declare_user_functions<'ctx>(
       // dead code with no valid body to give it (`yield` means nothing
       // outside a specific attachment).
       Item::Function(f) if f.block_param.is_some() => {}
+      // Plan 41's Decision log: the bare generic name is never
+      // registered as a callable LLVM symbol at all — `compile_to_
+      // object`'s own monomorphization pass declares one mangled
+      // symbol (`max$$Money`) per distinct concrete instantiation
+      // actually called anywhere in the whole program instead.
+      Item::Function(f) if !f.type_params.is_empty() => {}
       Item::Function(f) => {
         let ret_kind = value_kind_for_type(&f.return_type);
         let fn_ty = make_fn_type(context, &param_kinds(&effective_params(f)), ret_kind);
@@ -4885,6 +5305,9 @@ fn declare_user_functions<'ctx>(
         }
       }
       Item::Stmt(_) => {}
+      // Plan 41: nothing to declare — an interface has no body of its
+      // own to compile.
+      Item::Interface(_) => {}
       // Plan 23: nothing to declare — `compile_to_object`'s own
       // per-item loop is where a `Program` that still contains an
       // unresolved `Item::Require` (meaning `emerald-driver`'s
@@ -5073,12 +5496,20 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   // Plan 39: EVERY top-level free function, keyed by name — see
   // `Ctx::func_defs`'s own doc comment.
   let mut func_defs: HashMap<String, &AstFunction> = HashMap::new();
+  // Plan 41: every top-level GENERIC free function, keyed by name — a
+  // subset of `func_defs` (a generic function's name is always present
+  // in both), consulted only by `collect_generic_specializations`'s
+  // program-wide collection pass below.
+  let mut generic_fns: HashMap<String, &AstFunction> = HashMap::new();
   for item in &program.items {
     if let Item::Function(f) = item {
       if f.block_param.is_some() {
         block_funcs.insert(f.name.clone(), f);
       }
       func_defs.insert(f.name.clone(), f);
+      if !f.type_params.is_empty() {
+        generic_fns.insert(f.name.clone(), f);
+      }
     }
   }
 
@@ -5092,8 +5523,31 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     .collect();
 
   let lambda_infos = collect_lambda_infos(program)?;
-  let user_func_ids = declare_user_functions(&context, &module, program, &classes);
+  let mut user_func_ids = declare_user_functions(&context, &module, program, &classes);
   let lambda_func_ids = declare_lambda_functions(&context, &module, program, &lambda_infos);
+
+  // Plan 41's Decision log: one specialization cache entry per distinct
+  // `(generic function, concrete type)` pair actually called anywhere in
+  // the whole program — declared here, before `gen_ctx` borrows `user_
+  // func_ids` immutably, so every call site's own lookup below finds its
+  // mangled symbol already present.
+  let generic_specializations = collect_generic_specializations(program, &generic_fns, &classes);
+  for (fn_name, concrete_classes) in &generic_specializations {
+    let f = generic_fns[fn_name.as_str()];
+    let type_param = &f.type_params[0].name;
+    for concrete_class in concrete_classes {
+      let substituted = substitute_generic_function(f, type_param, concrete_class);
+      let ret_kind = value_kind_for_type(&substituted.return_type);
+      let fn_ty = make_fn_type(
+        &context,
+        &param_kinds(&effective_params(&substituted)),
+        ret_kind,
+      );
+      let mangled = mangled_generic_symbol(fn_name, concrete_class);
+      let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
+      user_func_ids.insert(mangled, (fv, ret_kind));
+    }
+  }
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -5127,6 +5581,10 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
       // Plan 34: never declared in `user_func_ids` above — see
       // `declare_user_functions`'s matching arm.
       Item::Function(f) if f.block_param.is_some() => {}
+      // Plan 41: never declared under its own bare name — see
+      // `declare_user_functions`'s matching arm; each of its
+      // specializations is defined separately, below.
+      Item::Function(f) if !f.type_params.is_empty() => {}
       Item::Function(f) => {
         let (fv, _) = user_func_ids[&f.name];
         define_user_function(&context, &builder, f, fv, &gen_ctx)?;
@@ -5172,6 +5630,9 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
         }
       }
       Item::Stmt(_) => {}
+      // Plan 41: an interface declares one required method signature,
+      // never a body — nothing here to compile.
+      Item::Interface(_) => {}
       // Plan 23's Decision log: reaching codegen with an unresolved
       // `Item::Require` means `emerald-driver`'s resolution step (plan
       // 17, not yet extracted in this codebase) was skipped or is
@@ -5183,6 +5644,22 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
         ));
       }
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
+    }
+  }
+
+  // Plan 41's Decision log: each specialization compiles the *existing*,
+  // unmodified single-function codegen path (`define_user_function`)
+  // against a fully concrete, textually substituted `Function` — 100%
+  // reuse of the non-generic machinery, just fed a synthesized AST
+  // instead of one straight from the parser.
+  for (fn_name, concrete_classes) in &generic_specializations {
+    let f = generic_fns[fn_name.as_str()];
+    let type_param = &f.type_params[0].name;
+    for concrete_class in concrete_classes {
+      let substituted = substitute_generic_function(f, type_param, concrete_class);
+      let mangled = mangled_generic_symbol(fn_name, concrete_class);
+      let (fv, _) = user_func_ids[&mangled];
+      define_user_function(&context, &builder, &substituted, fv, &gen_ctx)?;
     }
   }
 
@@ -5869,6 +6346,7 @@ mod tests {
           body: vec![Stmt::Yield(vec![Expr::Ident("n".into())])],
           block_param: Some("blk".into()),
           splat_param: None,
+          type_params: Vec::new(),
         }),
         Item::Stmt(Stmt::Expr(Expr::Call("repeat".into(), vec![Expr::Int(3)]))),
       ],
@@ -6115,5 +6593,70 @@ mod tests {
   #[test]
   fn plan_08_point_example_still_compiles_and_runs_unchanged() {
     assert_eq!(compile_link_run(POINT_EXAMPLE), "5\n");
+  }
+
+  // Plan 41 (interfaces and generics).
+
+  const INTERFACES_GENERICS_EXAMPLE: &str = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
+
+  #[test]
+  fn interfaces_generics_worked_example_linked_and_run() {
+    // AC1: real executed proof both specializations (`max$$Money`,
+    // `max$$Distance`) are independently correct and take *opposite*
+    // control-flow branches inside what is, textually, one shared
+    // function body — `m1.compare_to(m2) = -250 < 0` falls through to
+    // `return b` (750 cents); `d1.compare_to(d2) = 58 >= 0` takes
+    // `return a` (100 meters).
+    assert_eq!(compile_link_run(INTERFACES_GENERICS_EXAMPLE), "750\n100\n");
+  }
+
+  #[test]
+  fn exactly_two_specializations_are_emitted_no_bare_generic_symbol() {
+    // AC2/AC3: real proof from the compiled object file's own raw
+    // bytes — the mangled symbols `max$$Money`/`max$$Distance` are
+    // present (each object-format symbol table entry is a
+    // null-terminated string, so the exact-match search below can't be
+    // fooled by `max$$Money` itself containing `max` as a
+    // *non-null-terminated* prefix), and the bare `max` symbol is never
+    // emitted at all — implicitly, since the worked-example test above
+    // already proves each specialization independently produces the
+    // correct result over a different field layout, every call resolves
+    // to a direct, statically-resolved LLVM `call`, not an indirect one.
+    let program = emerald_parser::parse(INTERFACES_GENERICS_EXAMPLE).expect("should parse");
+    let out = std::env::temp_dir().join("emerald_codegen_interfaces_generics_symbols.o");
+    compile_to_object(&program, &out).expect("should compile");
+    let obj_bytes = std::fs::read(&out).expect("object file should exist");
+    std::fs::remove_file(&out).ok();
+    assert!(
+      obj_bytes
+        .windows(b"max$$Money\0".len())
+        .any(|w| w == b"max$$Money\0"),
+      "missing the `max$$Money` specialization symbol"
+    );
+    assert!(
+      obj_bytes
+        .windows(b"max$$Distance\0".len())
+        .any(|w| w == b"max$$Distance\0"),
+      "missing the `max$$Distance` specialization symbol"
+    );
+    assert!(
+      !obj_bytes.windows(b"max\0".len()).any(|w| w == b"max\0"),
+      "the bare generic name must never be a callable LLVM symbol"
+    );
+  }
+
+  #[test]
+  fn generic_call_with_an_unresolvable_concrete_type_errors_not_panics() {
+    // AC4: an unsupported/malformed shape reaching codegen directly — no
+    // argument position bound to `T` is a plain local/`ClassName.new(
+    // ...)` literal `collect_generic_specializations`/`build_call_expr`
+    // can resolve a concrete type from (both arguments are themselves
+    // call results) — defensively returns a descriptive `Err`, not a
+    // panic, same AC standard as every prior codegen plan.
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\ndef make_money(cents: Int64) -> Money\n  Money.new(cents)\nend\n\nboom: Money = max(make_money(500), make_money(750))\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let out =
+      std::env::temp_dir().join("emerald_codegen_unresolvable_generic_call_should_not_exist.o");
+    assert!(compile_to_object(&program, &out).is_err());
   }
 }
