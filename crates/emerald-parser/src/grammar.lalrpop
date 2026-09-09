@@ -454,6 +454,21 @@ Stmt: Spanned<Stmt> = {
     arms,
     else_body,
   }},
+  // Plan 53's Decision log: a small, dedicated `Result[T, E]`
+  // destructuring form, deliberately independent of plan 52's
+  // `CaseArm`/`CasePattern` mechanism above — disambiguated from it by
+  // the very next token after `"when"` (`"Ok"`/`"Err"` are reserved-
+  // keyword terminals, categorically distinct from both `Num`
+  // (`CaseValues`) and `Ident` (plan 52's `Variant` pattern), so there
+  // is no FIRST-set overlap to resolve). Both arms mandatory, fixed
+  // order, no `else`.
+  <l:@L> "case" <scrutinee:Expr> "when" "Ok" "(" <ok_var:Ident> ")" <ok_body:Stmt*> "when" "Err" "(" <err_var:Ident> ")" <err_body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::MatchResult {
+    scrutinee,
+    ok_var,
+    ok_body,
+    err_var,
+    err_body,
+  }},
   // Assignment to an instance variable (`@x = value`), an array index
   // (`arr[i] = value`), or a plain local (`x = value`, plan 31's
   // Decision log). All three are just `Expr` on the left — `CallExpr`'s
@@ -675,6 +690,7 @@ StmtUnaryExpr: Spanned<Expr> = {
 
 StmtCallExpr: Spanned<Expr> = {
   <l:@L> <base:StmtCallExpr> "[" <idx:Expr> "]" <r:@R> => Spanned { span: (l, r), node: Expr::Index(Box::new(base), Box::new(idx)) },
+  <l:@L> <base:StmtCallExpr> "?" <r:@R> => Spanned { span: (l, r), node: Expr::Try(Box::new(base)) },
   StmtPrimaryExpr,
 };
 
@@ -705,6 +721,11 @@ StmtPrimaryExpr: Spanned<Expr> = {
   <l:@L> <name:Ident> "(" <kwargs:CallKwArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::CallKw(name, kwargs) },
   <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
+  // Plan 53's Decision log: `Ok`/`Err` are literal-keyword-headed
+  // constructor productions, the same convention `Array`/`Hash`/`Proc`
+  // already use — not a general user-extensible mechanism.
+  <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
+  <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
     if let Some(b) = blk { args.push(b); }
     Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
@@ -969,6 +990,11 @@ UnaryExpr: Spanned<Expr> = {
 // recursive rule means there is only ever one derivation for `arr[i]`.
 CallExpr: Spanned<Expr> = {
   <l:@L> <base:CallExpr> "[" <idx:Expr> "]" <r:@R> => Spanned { span: (l, r), node: Expr::Index(Box::new(base), Box::new(idx)) },
+  // Plan 53's Decision log: `expr?` parses anywhere an `Expr` can —
+  // sema, not the grammar, restricts it to a `Let`/`Assign` value
+  // (the same `ArrayNew`-precedent split this compiler already uses
+  // for "needs the consumer's expected type" shapes).
+  <l:@L> <base:CallExpr> "?" <r:@R> => Spanned { span: (l, r), node: Expr::Try(Box::new(base)) },
   PrimaryExpr,
 };
 
@@ -1001,6 +1027,8 @@ PrimaryExpr: Spanned<Expr> = {
   // lookahead token.
   <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
+  <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
+  <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
@@ -1095,6 +1123,10 @@ TypeName: String = {
   <name:Ident> => name,
   "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
   "Hash" "[" <k:Ident> "," <v:Ident> "]" => format!("Hash[{k}, {v}]"),
+  // Plan 53's Decision log: `Result[T, E]`, the identical `,`-split
+  // compound-string convention `Hash[K, V]` already uses — `resolve_type`
+  // is the thing that turns this into a real `Type::Result`.
+  "Result" "[" <t:Ident> "," <e:Ident> "]" => format!("Result[{t}, {e}]"),
   "Proc" => "Proc".to_string(),
   <base:TypeName> "?" => format!("{base}?"),
   // Plan 39's Decision log: `"(" T1 "," T2 [, ...] ")"`, mirroring

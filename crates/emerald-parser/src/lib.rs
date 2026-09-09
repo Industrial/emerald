@@ -218,6 +218,16 @@ fn rewrite_stmt(stmt: &mut Spanned<Stmt>, name: &str, source: &str) {
       rewrite_expr(end, name, source);
       rewrite_stmts(body, name, source);
     }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      rewrite_expr(scrutinee, name, source);
+      rewrite_stmts(ok_body, name, source);
+      rewrite_stmts(err_body, name, source);
+    }
   }
 }
 
@@ -315,6 +325,7 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
         rewrite_expr(e, name, source);
       }
     }
+    Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => rewrite_expr(e, name, source),
   }
 }
 
@@ -2862,5 +2873,96 @@ mod tests {
     assert!(matches!(program.items[0], Item::Enum(_)));
     assert!(matches!(program.items[1], Item::Stmt(_)));
     assert!(matches!(program.items[2], Item::Stmt(_)));
+  }
+
+  // Plan 53 (Result type and error propagation).
+
+  #[test]
+  fn ok_and_err_construction_parse_to_their_own_expr_variants() {
+    let program = parse("x: Result[Int64, String] = Ok(42)\n").expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(ty, "Result[Int64, String]");
+    assert_eq!(value.node, Expr::Ok(Box::new(s(Expr::Int(42)))));
+
+    let program = parse("y: Result[Int64, String] = Err(\"bad\")\n").expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      value.node,
+      Expr::Err(Box::new(s(Expr::StringLit("bad".to_string()))))
+    );
+  }
+
+  #[test]
+  fn postfix_try_parses_to_expr_try() {
+    let program = parse("n: Int64 = parse_int(s)?\n").expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      value.node,
+      Expr::Try(Box::new(s(Expr::Call(
+        "parse_int".to_string(),
+        vec![s(Expr::Ident("s".to_string()))]
+      ))))
+    );
+  }
+
+  #[test]
+  fn ok_err_match_form_parses_to_stmt_match_result() {
+    let src = "case result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node:
+        Stmt::MatchResult {
+          ok_var,
+          ok_body,
+          err_var,
+          err_body,
+          ..
+        },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!(
+        "expected a MatchResult statement, got {:?}",
+        program.items[0]
+      );
+    };
+    assert_eq!(ok_var, "v");
+    assert_eq!(err_var, "e");
+    assert_eq!(ok_body.len(), 1);
+    assert_eq!(err_body.len(), 1);
+  }
+
+  #[test]
+  fn plan_53_worked_example_parses_end_to_end() {
+    let src = "def parse_int(s: String) -> Result[Int64, String]\n  if is_valid_int(s)\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"21\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    let program = parse(src).expect("worked example should parse");
+    assert!(matches!(program.items[0], Item::Function(_)));
+    assert!(matches!(program.items[1], Item::Function(_)));
+    assert!(matches!(program.items[2], Item::Stmt(_)));
+    assert!(matches!(
+      program.items[3],
+      Item::Stmt(Spanned {
+        node: Stmt::MatchResult { .. },
+        ..
+      })
+    ));
   }
 }

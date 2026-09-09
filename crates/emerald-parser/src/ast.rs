@@ -241,6 +241,21 @@ pub enum Expr {
   /// function's declared return type is `Type::Tuple` of matching
   /// arity and per-position types.
   TupleLit(Vec<Spanned<Expr>>),
+  /// `Ok(value)` (plan 53's Decision log) — a `Result[T, E]` constructor,
+  /// checked only in the three expected-type-providing positions
+  /// (`Let`'s declared type, `Assign`'s recorded type, `Return`'s
+  /// threaded return type) since `infer_expr_type` carries no
+  /// expected-type parameter anywhere in this compiler.
+  Ok(Box<Spanned<Expr>>),
+  /// `Err(value)` — `Result[T, E]`'s other constructor, same
+  /// expected-type-position restriction as `Ok` above.
+  Err(Box<Spanned<Expr>>),
+  /// `expr?` (plan 53's Decision log) — legal ONLY as a `Stmt::Let`'s or
+  /// `Stmt::Assign`'s direct value, inside a function whose own declared
+  /// return type is `Result[_, E]` for an exactly-matching `E`. Unwraps
+  /// `Ok`'s payload in place; on `Err`, immediately returns the same
+  /// `Result` value from the enclosing function, unchanged.
+  Try(Box<Spanned<Expr>>),
 }
 
 /// One statement in a block (a function body or the program's top level).
@@ -393,6 +408,20 @@ pub enum Stmt {
   AndAssign {
     name: String,
     value: Spanned<Expr>,
+  },
+  /// `case scrutinee when Ok(ok_var) ok_body when Err(err_var) err_body
+  /// end` (plan 53's Decision log) — a small, dedicated destructuring
+  /// form for `Result[T, E]`, deliberately independent of plan 52's
+  /// `Stmt::Case`/`CasePattern` mechanism (see that plan's own Decision
+  /// log for why). Both arms are mandatory, fixed order (`Ok` then
+  /// `Err`), no `else`. `ok_var`/`err_var` are bound only inside their
+  /// own arm's body, at the scrutinee's real, statically-known `T`/`E`.
+  MatchResult {
+    scrutinee: Spanned<Expr>,
+    ok_var: String,
+    ok_body: Vec<Spanned<Stmt>>,
+    err_var: String,
+    err_body: Vec<Spanned<Stmt>>,
   },
 }
 

@@ -84,6 +84,13 @@ pub enum Type {
   /// CLOSED set of variants, named by the enum's own declaration, the
   /// deliberate opposite of `Type::Class`'s open, extensible hierarchy.
   Enum(String),
+  /// `Result[T, E]` (plan 53's Decision log) — a hardcoded, compiler-
+  /// native compound type, generalizing plan 42's `Pair[K, V]`
+  /// precedent. `Ok`/`Err` construction is checked only in the three
+  /// expected-type-providing positions (`Let`/`Assign`/`Return`); `?`'s
+  /// exact-`E`-match check compares this variant's own two `Type`s via
+  /// ordinary structural `PartialEq` — no coercion, ever.
+  Result(Box<Type>, Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +293,20 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
       let k_ty = resolve_type(k_name, classes)?;
       let v_ty = resolve_type(v_name, classes)?;
       Ok(Type::Hash(Box::new(k_ty), Box::new(v_ty)))
+    }
+    // Plan 53's Decision log: `"Result[T, E]"` — the identical `,
+    // `-split convention `Hash[K, V]` above already ships.
+    other if other.starts_with("Result[") && other.ends_with(']') => {
+      let inner = &other["Result[".len()..other.len() - 1];
+      let (t_name, e_name) = inner.split_once(", ").ok_or_else(|| {
+        Diagnostic::new(
+          format!("malformed Result type annotation `{other}`"),
+          (0, 0),
+        )
+      })?;
+      let t_ty = resolve_type(t_name, classes)?;
+      let e_ty = resolve_type(e_name, classes)?;
+      Ok(Type::Result(Box::new(t_ty), Box::new(e_ty)))
     }
     // A bare `Proc` annotation carries no signature (see `Type::Proc`'s
     // doc comment) — this opaque placeholder is only ever reached outside
@@ -1126,6 +1147,30 @@ fn infer_expr_type(
         resolve_type(&g.return_type_raw, classes)
       }
     }
+    // Plan 53's Decision log: `is_valid_int`/`parse_digits` are
+    // compiler-known intrinsic builtins, checked before the ordinary
+    // function-signature lookup below the same way every other
+    // hardcoded-name `Expr::Call` case in this file already is.
+    Expr::Call(name, args) if name == "is_valid_int" || name == "parse_digits" => {
+      if args.len() != 1 {
+        return Err(Diagnostic::new(
+          format!("`{name}` expects 1 argument, found {}", args.len()),
+          expr.span,
+        ));
+      }
+      let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields, gctx)?;
+      if arg_ty != Type::String {
+        return Err(Diagnostic::new(
+          format!("`{name}` expects a String argument, found {arg_ty:?}"),
+          args[0].span,
+        ));
+      }
+      Ok(if name == "is_valid_int" {
+        Type::Boolean
+      } else {
+        Type::Int64
+      })
+    }
     // Plan 52's Decision log: `Circle(2.0)` parses as an ordinary
     // `Expr::Call` (no new grammar production — the parser can't tell
     // "call a function" from "construct a variant" apart at all) — a
@@ -1668,6 +1713,29 @@ fn infer_expr_type(
         .collect::<Result<Vec<_>, _>>()?;
       Ok(Type::Tuple(types))
     }
+    // Plan 53's Decision log: `Ok`/`Err` are checked only in the three
+    // expected-type-providing positions (`Let`'s declared type,
+    // `Assign`'s recorded type, `Return`'s threaded return type) —
+    // `check_stmt` special-cases all three *before* ever calling
+    // `infer_expr_type` on one of these nodes directly. Reached here at
+    // all means neither of those special cases fired — a real,
+    // disclosed diagnostic, not a silent best-effort guess, since
+    // `infer_expr_type` has no expected-type parameter to resolve
+    // `Result[T, E]`'s type parameters from.
+    Expr::Ok(_) | Expr::Err(_) => Err(Diagnostic::new(
+      "cannot infer `Result[T, E]`'s type parameters without a declared expected type here — `Ok`/`Err` are only supported directly as a `let`, assignment, or `return` value",
+      expr.span,
+    )),
+    // Plan 53's Decision log: `?` is restricted to exactly two
+    // syntactic positions (a `Stmt::Let`'s or `Stmt::Assign`'s direct
+    // value) — `check_stmt` special-cases both *before* ever calling
+    // `infer_expr_type` on a `Try` node directly. Reached here at all
+    // means `?` was used somewhere else (nested inside a binary
+    // operator, as a bare call argument, as a `Return`'s value, etc.).
+    Expr::Try(_) => Err(Diagnostic::new(
+      "`?` is only supported directly as a `let` or assignment value in v1",
+      expr.span,
+    )),
   }
 }
 
@@ -2093,6 +2161,94 @@ fn check_multi_assign(
   Ok(())
 }
 
+/// Plan 53's Decision log: `Ok`/`Err` construction, checked only where
+/// an expected `Result[T, E]` type is already on hand — this helper is
+/// shared by all three call sites (`Let`, `Assign`, `Return`) rather
+/// than duplicated three times.
+fn check_result_construction(
+  declared: &Type,
+  value: &Spanned<Expr>,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
+) -> Result<(), Diagnostic> {
+  let Type::Result(t_ty, e_ty) = declared else {
+    return Err(Diagnostic::new(
+      format!(
+        "`Ok`/`Err` construction requires a declared `Result[T, E]` type, found {declared:?}"
+      ),
+      value.span,
+    ));
+  };
+  match &value.node {
+    Expr::Ok(inner) => {
+      let actual = infer_expr_type(inner, env, sigs, classes, self_fields, gctx)?;
+      if !is_assignable(&actual, t_ty) {
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `Ok(...)`: declared `T` is {t_ty:?}, value has type {actual:?}"
+          ),
+          inner.span,
+        ));
+      }
+      Ok(())
+    }
+    Expr::Err(inner) => {
+      let actual = infer_expr_type(inner, env, sigs, classes, self_fields, gctx)?;
+      if !is_assignable(&actual, e_ty) {
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `Err(...)`: declared `E` is {e_ty:?}, value has type {actual:?}"
+          ),
+          inner.span,
+        ));
+      }
+      Ok(())
+    }
+    _ => unreachable!("caller only invokes this for Expr::Ok/Expr::Err"),
+  }
+}
+
+/// Plan 53's Decision log: `?`'s legality/exact-`E`-match check, reusing
+/// the already-threaded `return_type` — no new parameter added to
+/// `check_stmt`'s own signature. Returns the unwrapped `T`; the caller
+/// (`Let`/`Assign`) still checks that against its own target type,
+/// exactly like every other value-producing expression already does.
+fn check_try(
+  inner: &Spanned<Expr>,
+  return_type: &Type,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
+) -> Result<Type, Diagnostic> {
+  let Type::Result(_, ret_e_ty) = return_type else {
+    return Err(Diagnostic::new(
+      "`?` may only be used inside a function whose own declared return type is `Result[T, E]`",
+      inner.span,
+    ));
+  };
+  let inner_ty = infer_expr_type(inner, env, sigs, classes, self_fields, gctx)?;
+  let Type::Result(t_ty, e_ty) = &inner_ty else {
+    return Err(Diagnostic::new(
+      format!("`?` requires a `Result[T, E]`-typed expression, found {inner_ty:?}"),
+      inner.span,
+    ));
+  };
+  if e_ty.as_ref() != ret_e_ty.as_ref() {
+    return Err(Diagnostic::new(
+      format!(
+        "`?`'s error type {e_ty:?} does not match the enclosing function's declared error type {ret_e_ty:?} — no automatic conversion"
+      ),
+      inner.span,
+    ));
+  }
+  Ok((**t_ty).clone())
+}
+
 /// Type-checks one statement, threading a mutable local-variable
 /// environment and the enclosing function's declared return type (used to
 /// check every `return <expr>`, not just a trailing one). `in_loop` gates
@@ -2166,6 +2322,44 @@ fn check_stmt(
       env.insert(name.clone(), declared);
       Ok(())
     }
+    // Plan 53's Decision log: `Ok`/`Err` construction, one of the three
+    // expected-type-providing positions — a `Let`'s own declared type.
+    Stmt::Let {
+      name,
+      ty,
+      value: value @ Spanned {
+        node: Expr::Ok(_) | Expr::Err(_),
+        ..
+      },
+    } => {
+      let declared = resolve_type(ty, classes)?;
+      check_result_construction(&declared, value, env, sigs, classes, self_fields, gctx)?;
+      env.insert(name.clone(), declared);
+      Ok(())
+    }
+    // Plan 53's Decision log: `n: T = parse_int(s)?` — the `Let` half
+    // of `?`'s two legal syntactic positions.
+    Stmt::Let {
+      name,
+      ty,
+      value: Spanned {
+        node: Expr::Try(inner),
+        ..
+      },
+    } => {
+      let unwrapped = check_try(inner, return_type, env, sigs, classes, self_fields, gctx)?;
+      let declared = resolve_type(ty, classes)?;
+      if !is_assignable(&unwrapped, &declared) {
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name}: {ty} = ...?`: declared type {declared:?}, unwrapped value has type {unwrapped:?}"
+          ),
+          inner.span,
+        ));
+      }
+      env.insert(name.clone(), declared);
+      Ok(())
+    }
     Stmt::Let { name, ty, value } => {
       let declared = resolve_type(ty, classes)?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
@@ -2212,6 +2406,46 @@ fn check_stmt(
     // is a distinct `Stmt` from `Let`). Checked against the *existing*
     // binding's type, same "no implicit conversion" rule `Let` and
     // every other assignment shape here already enforces.
+    // Plan 53's Decision log: `Ok`/`Err` construction, one of the three
+    // expected-type-providing positions — an `Assign`'s already-
+    // recorded type.
+    Stmt::Assign {
+      name,
+      value: value @ Spanned {
+        node: Expr::Ok(_) | Expr::Err(_),
+        ..
+      },
+    } => {
+      let declared = env
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
+      check_result_construction(&declared, value, env, sigs, classes, self_fields, gctx)
+    }
+    // Plan 53's Decision log: `name = parse_int(s)?` — the `Assign`
+    // half of `?`'s two legal syntactic positions.
+    Stmt::Assign {
+      name,
+      value: Spanned {
+        node: Expr::Try(inner),
+        ..
+      },
+    } => {
+      let unwrapped = check_try(inner, return_type, env, sigs, classes, self_fields, gctx)?;
+      let declared = env
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
+      if !is_assignable(&unwrapped, &declared) {
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name} = ...?`: `{name}` has type {declared:?}, unwrapped value has type {unwrapped:?}"
+          ),
+          inner.span,
+        ));
+      }
+      Ok(())
+    }
     Stmt::Assign { name, value } => {
       let declared = env
         .get(name)
@@ -2353,6 +2587,15 @@ fn check_stmt(
         gctx,
       )
     }
+    // Plan 53's Decision log: `Ok`/`Err` construction, the third of the
+    // three expected-type-providing positions — a `Return`'s already-
+    // threaded `return_type`.
+    Stmt::Return(Some(
+      e @ Spanned {
+        node: Expr::Ok(_) | Expr::Err(_),
+        ..
+      },
+    )) => check_result_construction(return_type, e, env, sigs, classes, self_fields, gctx),
     Stmt::Return(Some(e)) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&t, return_type) {
@@ -2533,6 +2776,31 @@ fn check_stmt(
       }
       Ok(())
     }
+    // Plan 53's Decision log: `case scrutinee when Ok(v) ... when
+    // Err(e) ... end` — a small, dedicated form, independent of plan
+    // 52's `Stmt::Case`/`CasePattern` mechanism.
+    Stmt::MatchResult {
+      scrutinee,
+      ok_var,
+      ok_body,
+      err_var,
+      err_body,
+    } => check_match_result(
+      scrutinee,
+      ok_var,
+      ok_body,
+      err_var,
+      err_body,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+      in_rescue,
+      yields_allowed,
+      gctx,
+    ),
   }
 }
 
@@ -2699,6 +2967,71 @@ fn check_case(
       gctx,
     )?;
   }
+  Ok(())
+}
+
+/// Plan 53's Decision log: `case scrutinee when Ok(v) ... when Err(e)
+/// ... end` — a fixed, two-armed `Result[T, E]` destructuring form.
+/// Unlike plan 38's bare-`rescue` case (no universal root class to
+/// type an unnamed binding at), `Result`'s `T`/`E` are always
+/// statically known here, so both `ok_var`/`err_var` are real, usable
+/// bindings — each type-checked against a *cloned* extension of `env`,
+/// discarded once its own arm's body is checked, mirroring plan 52's
+/// own per-arm-scoped pattern bindings exactly.
+#[allow(clippy::too_many_arguments)]
+fn check_match_result(
+  scrutinee: &Spanned<Expr>,
+  ok_var: &str,
+  ok_body: &[Spanned<Stmt>],
+  err_var: &str,
+  err_body: &[Spanned<Stmt>],
+  env: &mut HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  return_type: &Type,
+  in_loop: bool,
+  in_rescue: bool,
+  yields_allowed: bool,
+  gctx: &GenericsCtx,
+) -> Result<(), Diagnostic> {
+  let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields, gctx)?;
+  let Type::Result(t_ty, e_ty) = &scrutinee_ty else {
+    return Err(Diagnostic::new(
+      format!(
+        "`case ... when Ok(...) when Err(...)` requires a `Result[T, E]` scrutinee, found {scrutinee_ty:?}"
+      ),
+      scrutinee.span,
+    ));
+  };
+  let mut ok_env = env.clone();
+  ok_env.insert(ok_var.to_string(), (**t_ty).clone());
+  check_block(
+    ok_body,
+    &mut ok_env,
+    sigs,
+    classes,
+    self_fields,
+    return_type,
+    in_loop,
+    in_rescue,
+    yields_allowed,
+    gctx,
+  )?;
+  let mut err_env = env.clone();
+  err_env.insert(err_var.to_string(), (**e_ty).clone());
+  check_block(
+    err_body,
+    &mut err_env,
+    sigs,
+    classes,
+    self_fields,
+    return_type,
+    in_loop,
+    in_rescue,
+    yields_allowed,
+    gctx,
+  )?;
   Ok(())
 }
 
@@ -5570,6 +5903,118 @@ mod tests {
     let src = "enum Shape = Circle(Float64)\n\ncircle: Shape = Circle(2.0)\ncase circle\nwhen 1\n  puts 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("enum scrutinee can't use a value pattern");
+    assert!(!errs.is_empty());
+  }
+
+  // Plan 53 (Result type and error propagation).
+
+  #[test]
+  fn resolve_type_parses_result_t_e_directly() {
+    let classes = HashMap::new();
+    let ty = resolve_type("Result[Int64, String]", &classes).expect("should resolve");
+    assert_eq!(
+      ty,
+      Type::Result(Box::new(Type::Int64), Box::new(Type::String))
+    );
+  }
+
+  const RESULT_WORKED_EXAMPLE: &str = "def parse_int(s: String) -> Result[Int64, String]\n  if is_valid_int(s)\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"21\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+
+  #[test]
+  fn accepts_the_result_worked_example() {
+    let program = emerald_parser::parse(RESULT_WORKED_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_ok_with_the_wrong_t() {
+    let src = "def f -> Result[Int64, String]\n  return Ok(\"wrong\")\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Ok(\"wrong\") does not match declared T=Int64");
+    assert!(errs.iter().any(|d| d.message.contains("Ok")));
+  }
+
+  #[test]
+  fn rejects_err_with_the_wrong_e() {
+    let src = "def f -> Result[Int64, String]\n  return Err(42)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Err(42) does not match declared E=String");
+    assert!(errs.iter().any(|d| d.message.contains("Err")));
+  }
+
+  #[test]
+  fn rejects_ok_used_as_a_bare_call_argument() {
+    let src = "def f(x: Int64) -> Int64\n  x\nend\n\nputs f(Ok(1))\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("Ok(1) with no enclosing expected-type position can't infer T/E");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.to_lowercase().contains("infer"))
+    );
+  }
+
+  #[test]
+  fn rejects_try_whose_e_does_not_match_the_enclosing_return_type() {
+    let src = "class IoError\nend\n\ndef parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\ndef try_parse(s: String) -> Result[Int64, IoError]\n  n: Int64 = parse_int(s)?\n  return Ok(IoError.new())\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("Result[Int64, String]? inside a Result[Int64, IoError] function — E mismatch");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.to_lowercase().contains("error type"))
+    );
+  }
+
+  #[test]
+  fn rejects_try_outside_a_result_returning_function() {
+    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\nn: Int64 = parse_int(\"x\")?\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("`?` at the top level has no Result-typed return_type");
+    assert!(!errs.is_empty());
+  }
+
+  #[test]
+  fn rejects_try_used_outside_a_let_or_assign_value() {
+    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  return Ok(1 + parse_int(s)?)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("`?` nested inside a binary operator is not supported");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("let") || d.message.contains("assignment"))
+    );
+  }
+
+  #[test]
+  fn accepts_ok_err_match_form_with_correctly_typed_bindings() {
+    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\nresult: Result[Int64, String] = parse_int(\"x\")\ncase result\nwhen Ok(v)\n  n: Int64 = v\n  puts n\nwhen Err(e)\n  s: String = e\n  puts s\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_ok_binding_referenced_in_the_err_arm() {
+    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\nresult: Result[Int64, String] = parse_int(\"x\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts v\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`v` is bound only inside the Ok arm, not visible in the Err arm");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.to_lowercase().contains("undefined"))
+    );
+  }
+
+  #[test]
+  fn rejects_match_result_over_a_non_result_scrutinee() {
+    let src = "n: Int64 = 1\ncase n\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("an Int64 scrutinee is not Result[T, E]-typed");
     assert!(!errs.is_empty());
   }
 }

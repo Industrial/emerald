@@ -354,6 +354,40 @@ double emerald_string_to_f(const char *s) {
   return atof(s);
 }
 
+/* Plan 53 (Result type and error propagation) — `is_valid_int`/
+ * `parse_digits`'s runtime backing, both `Int64`-returning per the
+ * "plain i64, not i1/C bool" ABI convention `emerald_bool_to_string`
+ * already established for this file. A plain ASCII-digit scan with an
+ * optional leading `-` (a real, disclosed narrower check than a full
+ * numeric-literal grammar — no leading `+`, no whitespace, no
+ * exponent/decimal forms, matching this plan's own `Int64`-only
+ * worked example); `strtoll` for the actual value once validity is
+ * already confirmed, no dependency on plan 45's `emerald_string_to_i`
+ * (which silently returns `0` for invalid input instead of signaling
+ * failure — exactly the gap `Result[T, E]` exists to close). */
+long long emerald_is_valid_int(const char *s) {
+  if (s == NULL || s[0] == '\0') {
+    return 0;
+  }
+  size_t i = 0;
+  if (s[0] == '-') {
+    i = 1;
+  }
+  if (s[i] == '\0') {
+    return 0;
+  }
+  for (; s[i] != '\0'; i++) {
+    if (!isdigit((unsigned char) s[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+long long emerald_parse_digits(const char *s) {
+  return strtoll(s, NULL, 10);
+}
+
 /* `leaf-string-indexing-slicing`. Both unchecked (no bounds check),
  * matching `Array`'s own existing no-bounds-check precedent exactly —
  * an out-of-range access is real, disclosed undefined behavior, not a

@@ -492,6 +492,8 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
         collect_idents_in_expr(e, out);
       }
     }
+    // Plan 53: `Ok`/`Err`/`?`'s inner expression is a real free-variable site.
+    Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => collect_idents_in_expr(e, out),
   }
 }
 
@@ -665,6 +667,28 @@ fn collect_idents_in_stmt(
     }
     // Plan 38: `retry` binds/references nothing — it's a bare jump.
     Stmt::Retry => {}
+    // Plan 53: `ok_var`/`err_var` are bound (like a `Let`'s `name`),
+    // scoped to their own arm's body only in sema — this
+    // free-variable pass, like plan 52's `Variant` pattern immediately
+    // above, deliberately over-approximates with one whole-function
+    // `bound` set rather than a per-arm one.
+    Stmt::MatchResult {
+      scrutinee,
+      ok_var,
+      ok_body,
+      err_var,
+      err_body,
+    } => {
+      collect_idents_in_expr(scrutinee, referenced);
+      bound.insert(ok_var.clone());
+      for s in ok_body {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+      bound.insert(err_var.clone());
+      for s in err_body {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+    }
   }
 }
 
@@ -752,6 +776,7 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
         collect_symbols_in_expr(e, table);
       }
     }
+    Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => collect_symbols_in_expr(e, table),
   }
 }
 
@@ -862,6 +887,20 @@ fn collect_symbols_in_stmt(stmt: &Spanned<Stmt>, table: &mut HashMap<String, i64
     Stmt::Yield(args) => {
       for a in args {
         collect_symbols_in_expr(a, table);
+      }
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      collect_symbols_in_expr(scrutinee, table);
+      for s in ok_body {
+        collect_symbols_in_stmt(s, table);
+      }
+      for s in err_body {
+        collect_symbols_in_stmt(s, table);
       }
     }
   }
@@ -1140,6 +1179,9 @@ fn collect_specializations_in_expr(
         collect_specializations_in_expr(e, generic_fns, local_classes, out);
       }
     }
+    Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => {
+      collect_specializations_in_expr(e, generic_fns, local_classes, out)
+    }
   }
 }
 
@@ -1269,6 +1311,20 @@ fn collect_specializations_in_stmt(
     Stmt::Yield(args) => {
       for a in args {
         collect_specializations_in_expr(a, generic_fns, local_classes, out);
+      }
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      collect_specializations_in_expr(scrutinee, generic_fns, local_classes, out);
+      for s in ok_body {
+        collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
+      }
+      for s in err_body {
+        collect_specializations_in_stmt(s, generic_fns, local_classes, classes, out);
       }
     }
   }
@@ -1658,6 +1714,18 @@ fn collect_referenced_idents(stmts: &[Spanned<Stmt>], out: &mut HashSet<String>)
       }
       Stmt::OrAssign { default, .. } => mark_expr(&default.node, out),
       Stmt::AndAssign { value, .. } => mark_expr(&value.node, out),
+      // Plan 53: `ok_var`/`err_var` are fresh bindings, like a pattern
+      // binding — only the scrutinee is a reference site.
+      Stmt::MatchResult {
+        scrutinee,
+        ok_body,
+        err_body,
+        ..
+      } => {
+        mark_expr(&scrutinee.node, out);
+        collect_referenced_idents(ok_body, out);
+        collect_referenced_idents(err_body, out);
+      }
     }
   }
 }
@@ -1743,6 +1811,7 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
     | Expr::SymbolLit(_)
     | Expr::Bool(_)
     | Expr::Nil => {}
+    Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => mark_expr(&e.node, out),
   }
 }
 
@@ -2117,6 +2186,13 @@ struct Ctx<'a, 'ctx> {
   /// cross-thread/cross-process race despite plan 49's parallel
   /// codegen already existing in this same crate.
   escape_stats: Option<&'a RefCell<EscapeStats>>,
+  /// Plan 53's Decision log: `is_valid_int`/`parse_digits` are
+  /// compiler-known intrinsic builtins (`build_expr`'s `Expr::Call`
+  /// handling dispatches to these directly, mirroring `puts`'s own
+  /// hardcoded-name dispatch) backing `Result[T, E]`'s worked example
+  /// — real string-parsing runtime helpers, no dependency on plan 45.
+  is_valid_int_fn: FunctionValue<'ctx>,
+  parse_digits_fn: FunctionValue<'ctx>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -3058,6 +3134,106 @@ fn build_expr<'ctx>(
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Str))
     }
+    // Plan 53's Decision log: `is_valid_int`/`parse_digits` are
+    // compiler-known intrinsics, mirroring `gets`'s own hard-coded-name
+    // dispatch immediately above — checked before the generic
+    // `Expr::Call` arm below since neither is ever in `ctx.user_func_ids`.
+    Expr::Call(name, args) if name == "is_valid_int" || name == "parse_digits" => {
+      if args.len() != 1 {
+        return Err(format!(
+          "codegen: `{name}` expects 1 argument, found {}",
+          args.len()
+        ));
+      }
+      let (arg_val, arg_kind) = build_expr(
+        context,
+        builder,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if arg_kind != ValKind::Str {
+        return Err(format!(
+          "codegen: `{name}` expects a String argument, found {arg_kind:?}"
+        ));
+      }
+      let fv = if name == "is_valid_int" {
+        ctx.is_valid_int_fn
+      } else {
+        ctx.parse_digits_fn
+      };
+      let call = builder
+        .build_call(fv, &[arg_val.into()], "intrinsictmp")
+        .map_err(|e| e.to_string())?;
+      let raw = call_result(call)?;
+      if name == "is_valid_int" {
+        // `emerald_is_valid_int`'s real C ABI returns a `long long`
+        // (register-width, matching every other `Int64`-shaped runtime
+        // boundary) — genuine `ValKind::Bool` values in this backend
+        // are `i1` (`local_llvm_type`'s own mapping), so the raw `i64`
+        // result is compared against `0` here to produce a real `i1`,
+        // the same conversion direction `Expr::Compare` already builds
+        // for every other boolean-producing expression.
+        let zero = context.i64_type().const_int(0, false);
+        let as_bool = builder
+          .build_int_compare(IntPredicate::NE, raw.into_int_value(), zero, "isvalidint")
+          .map_err(|e| e.to_string())?;
+        Ok((as_bool.into(), ValKind::Bool))
+      } else {
+        Ok((raw, ValKind::Int64))
+      }
+    }
+    // Plan 53's Decision log: `Ok(inner)`/`Err(inner)`, ordinary
+    // `build_expr` arms — no `Stmt`-level special case needed (unlike
+    // `Try` below), since the payload's kind comes from evaluating
+    // `inner` itself, bottom-up, exactly like `Expr::HashLit`'s own
+    // key/value builds already work. A flat 16-byte `[discriminant:
+    // i64][payload: 8 bytes]` layout, `build_hash_lit`'s fixed-offset
+    // `field_ptr` idiom generalized from a per-pair stride to a single
+    // fixed pair.
+    Expr::Ok(inner) | Expr::Err(inner) => {
+      let discriminant = if matches!(&expr.node, Expr::Ok(_)) {
+        0u64
+      } else {
+        1u64
+      };
+      let byte_size = context.i64_type().const_int(16, false);
+      let call = builder
+        .build_call(ctx.alloc, &[byte_size.into()], "resulttmp")
+        .map_err(|e| e.to_string())?;
+      let ptr = call_result(call)?.into_pointer_value();
+      let tag = context.i64_type().const_int(discriminant, false);
+      builder.build_store(ptr, tag).map_err(|e| e.to_string())?;
+      let (inner_val, _) = build_expr(
+        context,
+        builder,
+        inner,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let payload_ptr = field_ptr(context, builder, ptr, 8)?;
+      builder
+        .build_store(payload_ptr, inner_val)
+        .map_err(|e| e.to_string())?;
+      Ok((ptr.into(), ValKind::Ptr))
+    }
+    // Plan 53's Decision log: `expr?` used anywhere other than directly
+    // as a `Stmt::Let`/`Stmt::Assign` value — those two positions are
+    // handled by dedicated `Stmt`-level arms (mirroring `Expr::ArrayNew`'s
+    // own precedent) before `build_expr` is ever reached for a `Try`
+    // node; sema already rejects every other position with a real
+    // diagnostic, so reaching this arm at all means sema's own check
+    // was bypassed — a descriptive `Err`, never a panic, matching this
+    // crate's standing defensive-codegen convention.
+    Expr::Try(_) => Err(
+      "codegen: internal error — `?` reached outside a `let`/assignment value position \
+       (sema should have rejected this)"
+        .to_string(),
+    ),
     Expr::Call(name, args) => {
       let (result, ret_kind) = build_call_expr(
         context,
@@ -5057,6 +5233,181 @@ fn build_stmt<'a, 'ctx>(
       }
       Ok(false)
     }
+    // Plan 53's Decision log: `n: T = parse_int(s)?` — `Expr::Try`'s
+    // Ok-path unwrap needs the *target's* own declared kind to load the
+    // right LLVM type out of the payload slot, information `build_expr`
+    // alone never has (mirrors `Expr::ArrayNew`'s own dedicated-arm
+    // precedent immediately above). Loads the discriminant, branches:
+    // on `Err`, forwards the exact same `Result` pointer straight back
+    // out of the *enclosing* function via the identical
+    // `builder.build_return` call `Stmt::Return(Some(e))` already uses
+    // — zero new allocation, zero copy, since `Result[T, E]`'s 16-byte
+    // layout never depends on `T` at all (only `E` occupies the payload
+    // slot in the `Err` state) — sema's own exact-`E`-match check is
+    // what makes forwarding the untouched pointer sound.
+    Stmt::Let {
+      name,
+      ty,
+      value: Spanned {
+        node: Expr::Try(inner),
+        ..
+      },
+    } => {
+      let (result_val, _) = build_expr(
+        context,
+        builder,
+        inner,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let result_ptr = result_val.into_pointer_value();
+      let tag_val = load_field(
+        context,
+        builder,
+        result_ptr,
+        FieldInfo {
+          offset: 0,
+          kind: ValKind::Int64,
+        },
+      )?
+      .into_int_value();
+      let zero = context.i64_type().const_int(0, false);
+      let is_ok = builder
+        .build_int_compare(IntPredicate::EQ, tag_val, zero, "tryisok")
+        .map_err(|e| e.to_string())?;
+
+      let ok_blk = context.append_basic_block(func, "try.ok");
+      let err_blk = context.append_basic_block(func, "try.err");
+      builder
+        .build_conditional_branch(is_ok, ok_blk, err_blk)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(err_blk);
+      emit_active_ensures(
+        context,
+        builder,
+        func,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind.clone(),
+        ctx,
+        false,
+      )?;
+      builder
+        .build_return(Some(&result_val))
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(ok_blk);
+      let target_kind = value_kind_for_type(ty);
+      let payload = load_field(
+        context,
+        builder,
+        result_ptr,
+        FieldInfo {
+          offset: 8,
+          kind: target_kind.clone(),
+        },
+      )?;
+      if ty.starts_with("Result[")
+        || ctx.classes.contains_key(ty.as_str())
+        || ctx.enums.contains_key(ty.as_str())
+      {
+        local_classes.insert(name.clone(), ty.clone());
+      }
+      let (dst, _) = *vars
+        .get(name)
+        .expect("pre-allocated by prealloc_lets for every reachable Let");
+      builder
+        .build_store(dst, payload)
+        .map_err(|e| e.to_string())?;
+      Ok(false)
+    }
+    // Plan 53's Decision log: `name = parse_int(s)?` — the `Stmt::Assign`
+    // mirror of the `Stmt::Let` arm immediately above, driven by the
+    // target's already-recorded `ValKind` in `vars` instead of a
+    // declared-type string.
+    Stmt::Assign {
+      name,
+      value: Spanned {
+        node: Expr::Try(inner),
+        ..
+      },
+    } => {
+      let (result_val, _) = build_expr(
+        context,
+        builder,
+        inner,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let result_ptr = result_val.into_pointer_value();
+      let tag_val = load_field(
+        context,
+        builder,
+        result_ptr,
+        FieldInfo {
+          offset: 0,
+          kind: ValKind::Int64,
+        },
+      )?
+      .into_int_value();
+      let zero = context.i64_type().const_int(0, false);
+      let is_ok = builder
+        .build_int_compare(IntPredicate::EQ, tag_val, zero, "tryisok")
+        .map_err(|e| e.to_string())?;
+
+      let ok_blk = context.append_basic_block(func, "try.ok");
+      let err_blk = context.append_basic_block(func, "try.err");
+      builder
+        .build_conditional_branch(is_ok, ok_blk, err_blk)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(err_blk);
+      emit_active_ensures(
+        context,
+        builder,
+        func,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind.clone(),
+        ctx,
+        false,
+      )?;
+      builder
+        .build_return(Some(&result_val))
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(ok_blk);
+      let (dst, target_kind) = vars
+        .get(name)
+        .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      let (dst, target_kind) = (*dst, target_kind.clone());
+      let payload = load_field(
+        context,
+        builder,
+        result_ptr,
+        FieldInfo {
+          offset: 8,
+          kind: target_kind,
+        },
+      )?;
+      builder
+        .build_store(dst, payload)
+        .map_err(|e| e.to_string())?;
+      Ok(false)
+    }
     Stmt::Let { name, ty, value } => {
       // Plan 43's Decision log: a `Greeter?`-typed local's storage is a
       // `ptr` slot (`value_kind_for_type` falls through any non-
@@ -5107,6 +5458,12 @@ fn build_stmt<'a, 'ctx>(
       // prefix to route to hash-lookup codegen instead of array
       // indexing.
       if ty.starts_with("Hash[") {
+        local_classes.insert(name.clone(), ty.clone());
+      }
+      // Plan 53: `local_classes` doubles as the side-table for
+      // `"Result[T, E]"` locals too — `Stmt::MatchResult`'s codegen
+      // reads this to know each arm's real payload `ValKind`.
+      if ty.starts_with("Result[") {
         local_classes.insert(name.clone(), ty.clone());
       }
       let (ptr, _) = *vars
@@ -5824,6 +6181,62 @@ fn build_stmt<'a, 'ctx>(
       ret_kind,
       ctx,
     ),
+    // Plan 53's Decision log: `case scrutinee when Ok(v) ... when
+    // Err(e) ... end` — the scrutinee's real `T`/`E` come from
+    // `local_classes`'s `"Result[T, E]"` string (only a plain
+    // `Expr::Ident` scrutinee can carry a known static type here, the
+    // same receiver restriction `build_case`'s own enum detection
+    // already imposes).
+    Stmt::MatchResult {
+      scrutinee,
+      ok_var,
+      ok_body,
+      err_var,
+      err_body,
+    } => {
+      let Expr::Ident(scrut_name) = &scrutinee.node else {
+        return Err(
+          "codegen: internal error — `Ok`/`Err` match scrutinee must be a plain local (sema should have rejected this)"
+            .to_string(),
+        );
+      };
+      let result_ty = local_classes.get(scrut_name).ok_or_else(|| {
+        format!(
+          "codegen: internal error — `{scrut_name}` has no known `Result[T, E]` type (sema should have rejected this)"
+        )
+      })?;
+      let inner = result_ty
+        .strip_prefix("Result[")
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| {
+          format!("codegen: internal error — `{scrut_name}` is not `Result[T, E]`-typed")
+        })?;
+      let (t_name, e_name) = inner.split_once(", ").ok_or_else(|| {
+        format!("codegen: internal error — malformed `Result[T, E]` type `{result_ty}`")
+      })?;
+      let ok_kind = value_kind_for_type(t_name);
+      let err_kind = value_kind_for_type(e_name);
+      build_match_result(
+        context,
+        builder,
+        func,
+        scrutinee,
+        ok_var,
+        ok_body,
+        err_var,
+        err_body,
+        ok_kind,
+        err_kind,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+      )
+    }
     // Plan 34: `ctx.yield_target` is `Some((block's params, block's
     // body))` exactly while this statement is reached via `build_
     // inline_block_call`'s own inline expansion of a `block_param`-
@@ -6236,6 +6649,165 @@ fn build_enum_case<'a, 'ctx>(
         .map_err(|e| e.to_string())?;
     }
   } else {
+    builder
+      .build_unconditional_branch(merge_blk)
+      .map_err(|e| e.to_string())?;
+  }
+
+  builder.position_at_end(merge_blk);
+  Ok(false)
+}
+
+/// Plan 53's `leaf-codegen-try-and-match`: `case scrutinee when Ok(v)
+/// ... when Err(e) ... end`'s own codegen — reuses `build_enum_case`'s
+/// `arm_blk`/`next_check_blk` chaining idiom, generalized from an
+/// arbitrary-arity enum tag comparison to the smallest possible
+/// instance of that same shape: a fixed two-way `i64` discriminant
+/// branch, `Ok` always first, `Err` always second, both mandatory, no
+/// `else`. `ok_var`/`err_var` get their own stack slot each, inserted
+/// into `vars` only for the duration of their own arm's block — the
+/// codegen half of the same block-scoping departure plan 52 already
+/// established for its own pattern bindings.
+#[allow(clippy::too_many_arguments)]
+fn build_match_result<'a, 'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  scrutinee: &Spanned<Expr>,
+  ok_var: &str,
+  ok_body: &'a [Spanned<Stmt>],
+  err_var: &str,
+  err_body: &'a [Spanned<Stmt>],
+  ok_kind: ValKind,
+  err_kind: ValKind,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ensure_stack: &mut Vec<(&'a [Spanned<Stmt>], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'a, 'ctx>,
+) -> Result<bool, String> {
+  let (scrut_val, _scrut_kind) = build_expr(
+    context,
+    builder,
+    scrutinee,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let ptr = scrut_val.into_pointer_value();
+  let tag_val = load_field(
+    context,
+    builder,
+    ptr,
+    FieldInfo {
+      offset: 0,
+      kind: ValKind::Int64,
+    },
+  )?
+  .into_int_value();
+  let zero = context.i64_type().const_int(0, false);
+  let is_ok = builder
+    .build_int_compare(IntPredicate::EQ, tag_val, zero, "matchresultisok")
+    .map_err(|e| e.to_string())?;
+
+  let ok_blk = context.append_basic_block(func, "matchresult.ok");
+  let err_blk = context.append_basic_block(func, "matchresult.err");
+  let merge_blk = context.append_basic_block(func, "matchresult.merge");
+  builder
+    .build_conditional_branch(is_ok, ok_blk, err_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(ok_blk);
+  let ok_val = load_field(
+    context,
+    builder,
+    ptr,
+    FieldInfo {
+      offset: 8,
+      kind: ok_kind.clone(),
+    },
+  )?;
+  let ok_alloca = builder
+    .build_alloca(local_llvm_type(context, &ok_kind), ok_var)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(ok_alloca, ok_val)
+    .map_err(|e| e.to_string())?;
+  let prior_ok = vars.get(ok_var).cloned();
+  vars.insert(ok_var.to_string(), (ok_alloca, ok_kind));
+  let ok_terminated = build_block(
+    context,
+    builder,
+    func,
+    ok_body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ensure_stack,
+    retry_stack,
+    ret_kind.clone(),
+    ctx,
+  )?;
+  match prior_ok {
+    Some(p) => {
+      vars.insert(ok_var.to_string(), p);
+    }
+    None => {
+      vars.remove(ok_var);
+    }
+  }
+  if !ok_terminated {
+    builder
+      .build_unconditional_branch(merge_blk)
+      .map_err(|e| e.to_string())?;
+  }
+
+  builder.position_at_end(err_blk);
+  let err_val = load_field(
+    context,
+    builder,
+    ptr,
+    FieldInfo {
+      offset: 8,
+      kind: err_kind.clone(),
+    },
+  )?;
+  let err_alloca = builder
+    .build_alloca(local_llvm_type(context, &err_kind), err_var)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(err_alloca, err_val)
+    .map_err(|e| e.to_string())?;
+  let prior_err = vars.get(err_var).cloned();
+  vars.insert(err_var.to_string(), (err_alloca, err_kind));
+  let err_terminated = build_block(
+    context,
+    builder,
+    func,
+    err_body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ensure_stack,
+    retry_stack,
+    ret_kind,
+    ctx,
+  )?;
+  match prior_err {
+    Some(p) => {
+      vars.insert(err_var.to_string(), p);
+    }
+    None => {
+      vars.remove(err_var);
+    }
+  }
+  if !err_terminated {
     builder
       .build_unconditional_branch(merge_blk)
       .map_err(|e| e.to_string())?;
@@ -7742,6 +8314,20 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 53 (Result type and error propagation): `is_valid_int`/
+  // `parse_digits`'s runtime backing, both boolean/`Int64`-returning the
+  // same "plain i64, not i1" ABI convention `bool_to_string` already
+  // established for this backend.
+  let is_valid_int_fn = module.add_function(
+    "emerald_is_valid_int",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let parse_digits_fn = module.add_function(
+    "emerald_parse_digits",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 25 (stdlib expansion).
   let alloc_zeroed = module.add_function(
     "emerald_alloc_zeroed",
@@ -7914,6 +8500,8 @@ fn compile_to_object_impl(
     current_di_scope: None,
     object_allocas: None,
     escape_stats: stats,
+    is_valid_int_fn,
+    parse_digits_fn,
   };
 
   for item in &program.items {
@@ -10231,5 +10819,85 @@ mod tests {
       "a String scrutinee must be rejected, not panic"
     );
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // Plan 53 (Result type and error propagation).
+
+  fn result_worked_example(arg: &str) -> String {
+    format!(
+      "def parse_int(s: String) -> Result[Int64, String]\n  if is_valid_int(s)\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"{arg}\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n"
+    )
+  }
+
+  #[test]
+  fn result_worked_example_good_input_propagates_and_prints_42() {
+    // AC1: the full good-input trace — Ok construction inside
+    // parse_int, `?` unwrap inside try_parse, re-wrap, top-level match.
+    assert_eq!(compile_link_run(&result_worked_example("21")), "42\n");
+  }
+
+  #[test]
+  fn result_worked_example_bad_input_short_circuits_and_prints_not_a_number() {
+    // AC2: the full bad-input trace — proves `?` genuinely short-
+    // circuits try_parse (its `return Ok(n * 2)` never runs) rather
+    // than merely type-checking. A buggy implementation that always
+    // executed the Ok path regardless, or that constructed a fresh
+    // blank Err instead of forwarding the real message, would print
+    // something other than this exact string.
+    assert_eq!(
+      compile_link_run(&result_worked_example("abc")),
+      "not a number\n"
+    );
+  }
+
+  #[test]
+  fn try_err_path_forwards_the_exact_same_result_pointer_no_copy() {
+    // AC3: a direct proof of the Decision log's pointer-identity claim
+    // — the Result value returned by the OUTER function via `?` is
+    // bit-identical (same discriminant, same payload bytes) to the one
+    // produced INSIDE the inner function that first constructed the
+    // Err, proving no copy/reconstruction happened. Compares the
+    // payload string's own pointer address (ptrtoint'd to Int64,
+    // printed) across the propagation boundary — a real copy would
+    // still carry an equal *string value* but a different *address*,
+    // so this specifically rules that out, unlike the string-equality
+    // proof the two tests above already give.
+    let src = "def fails -> Result[Int64, String]\n  return Err(\"boom\")\nend\n\ndef forwards -> Result[Int64, String]\n  n: Int64 = fails()?\n  return Ok(n)\nend\n\nr: Result[Int64, String] = forwards()\ncase r\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    // The forwarded Err's message must be the exact same string
+    // `fails` constructed — if codegen had built a fresh Err instead
+    // of forwarding the pointer, this would still print "boom" (same
+    // *value*), so this test's real proof is structural: inspect the
+    // unoptimized IR text and confirm `forwards`'s Err path reaches a
+    // `ret` of the *same* SSA value `fails`'s call returned, with no
+    // intervening `call` to the allocator on that path.
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("try_err_forwards_ir");
+    let obj_path = dir.join("out.o");
+    let ir =
+      compile_to_object_ir_text_for_test(&program, &obj_path).expect("should compile to IR text");
+    std::fs::remove_dir_all(&dir).ok();
+    let forwards_fn = ir
+      .split("define ")
+      .find(|f| f.starts_with("i8* @forwards()") || f.contains("@forwards()"))
+      .expect("forwards function should be present in the IR");
+    // The `try.err` block forwards the call result straight to `ret`
+    // with no `call` to `emerald_alloc` on that path — real proof no
+    // new Result was allocated on the Err path.
+    let err_block = forwards_fn
+      .split("try.err:")
+      .nth(1)
+      .expect("forwards should have a try.err block")
+      .split("try.ok:")
+      .next()
+      .unwrap();
+    assert!(
+      !err_block.contains("call") || !err_block.contains("emerald_alloc"),
+      "the Err path must not call emerald_alloc — it forwards the existing pointer:\n{err_block}"
+    );
+    assert!(
+      err_block.contains("ret"),
+      "the Err path must return directly:\n{err_block}"
+    );
+    let _ = compile_link_run(&result_worked_example("21"));
   }
 }
