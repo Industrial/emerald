@@ -5,7 +5,9 @@
 //! don't carry spans) — diagnostics are function/call-scoped text.
 //! Line/column-precise diagnostics are `13 diagnostics`'s job.
 
-use emerald_parser::{ClassDef, Expr, Function, Item, ModuleDef, Param, Program, Stmt, StringPart};
+use emerald_parser::{
+  ClassDef, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt, StringPart,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,6 +735,7 @@ fn infer_lambda_type(
     &declared_return,
     false,
     false,
+    false,
   )?;
   check_implicit_return(
     body,
@@ -895,6 +898,12 @@ fn check_stmt(
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  // Plan 38: mirrors `in_loop` exactly — threaded through every
+  // `check_block`/`check_stmt` call unchanged, forced `true` only by
+  // `check_begin` for each `RescueClause.body` (never for the `begin`'s
+  // own try `body` or its `ensure` body). Gates `retry`'s legality the
+  // same way `in_loop` gates `break`/`next`.
+  in_rescue: bool,
   yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
   match stmt {
@@ -1008,6 +1017,7 @@ fn check_stmt(
         self_fields,
         return_type,
         in_loop,
+        in_rescue,
         yields_allowed,
       )?;
       if let Some(else_b) = else_branch {
@@ -1019,6 +1029,7 @@ fn check_stmt(
           self_fields,
           return_type,
           in_loop,
+          in_rescue,
           yields_allowed,
         )?;
       }
@@ -1039,6 +1050,7 @@ fn check_stmt(
         self_fields,
         return_type,
         true,
+        in_rescue,
         yields_allowed,
       )
     }
@@ -1096,20 +1108,19 @@ fn check_stmt(
     }
     Stmt::Begin {
       body,
-      rescue_type,
-      rescue_var,
-      rescue_body,
+      rescues,
+      ensure,
     } => check_begin(
       body,
-      rescue_type,
-      rescue_var,
-      rescue_body,
+      rescues,
+      ensure,
       env,
       sigs,
       classes,
       self_fields,
       return_type,
       in_loop,
+      in_rescue,
       yields_allowed,
     ),
     Stmt::Case {
@@ -1126,6 +1137,7 @@ fn check_stmt(
       self_fields,
       return_type,
       in_loop,
+      in_rescue,
       yields_allowed,
     ),
     // Plan 30: `elements`'s element type is unified exactly as
@@ -1154,6 +1166,7 @@ fn check_stmt(
         self_fields,
         return_type,
         true,
+        in_rescue,
         yields_allowed,
       )
     }
@@ -1193,8 +1206,18 @@ fn check_stmt(
         self_fields,
         return_type,
         true,
+        in_rescue,
         yields_allowed,
       )
+    }
+    // Plan 38: legal only inside a `rescue` clause's own body — see
+    // `check_begin`, which forces `in_rescue = true` only there, never
+    // for the `begin`'s own try `body` or its `ensure` body.
+    Stmt::Retry => {
+      if !in_rescue {
+        return Err(Diagnostic::new("`retry` outside of a rescue body"));
+      }
+      Ok(())
     }
   }
 }
@@ -1215,6 +1238,7 @@ fn check_case(
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  in_rescue: bool,
   yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
   let scrutinee_ty = infer_expr_type(scrutinee, env, sigs, classes, self_fields)?;
@@ -1240,6 +1264,7 @@ fn check_case(
       self_fields,
       return_type,
       in_loop,
+      in_rescue,
       yields_allowed,
     )?;
   }
@@ -1252,28 +1277,36 @@ fn check_case(
       self_fields,
       return_type,
       in_loop,
+      in_rescue,
       yields_allowed,
     )?;
   }
   Ok(())
 }
 
-/// `begin body rescue Type => e rescue_body end`. Flat scoping, same as
-/// everything else in this compiler (plan 07's Decision log) —
-/// `rescue_var` joins the same environment an `if`/`while` body's `Let`s
-/// already flow into, not a fresh scope.
+/// `begin body rescue Type => e ... [rescue => e2 ...] [ensure ...] end`
+/// (plan 38's Decision log). Flat scoping, same as everything else in
+/// this compiler (plan 07's Decision log) — each typed clause's `var`
+/// joins the same environment an `if`/`while` body's `Let`s already
+/// flow into, not a fresh scope. A bare clause's `var` is never
+/// inserted into `env` at all (no universal root class exists to type
+/// it at — any reference inside that clause's body falls through to
+/// the ordinary "undefined variable" diagnostic). `in_rescue` is
+/// forced `true` only for each `RescueClause.body` — left unchanged
+/// for the try `body` and the `ensure` body, so `retry` is illegal in
+/// both, matching Ruby's own restriction.
 #[allow(clippy::too_many_arguments)]
 fn check_begin(
   body: &[Stmt],
-  rescue_type: &str,
-  rescue_var: &str,
-  rescue_body: &[Stmt],
+  rescues: &[RescueClause],
+  ensure: &Option<Vec<Stmt>>,
   env: &mut HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  in_rescue: bool,
   yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
   check_block(
@@ -1284,25 +1317,45 @@ fn check_begin(
     self_fields,
     return_type,
     in_loop,
+    in_rescue,
     yields_allowed,
   )?;
-  let rescue_ty = resolve_type(rescue_type, classes)?;
-  if !matches!(rescue_ty, Type::Class(_)) {
-    return Err(Diagnostic::new(format!(
-      "`rescue {rescue_type}` must name a class, found {rescue_ty:?}"
-    )));
+  for rescue in rescues {
+    if let Some(class_name) = &rescue.class_name {
+      let rescue_ty = resolve_type(class_name, classes)?;
+      if !matches!(rescue_ty, Type::Class(_)) {
+        return Err(Diagnostic::new(format!(
+          "`rescue {class_name}` must name a class, found {rescue_ty:?}"
+        )));
+      }
+      env.insert(rescue.var.clone(), rescue_ty);
+    }
+    check_block(
+      &rescue.body,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+      true,
+      yields_allowed,
+    )?;
   }
-  env.insert(rescue_var.to_string(), rescue_ty);
-  check_block(
-    rescue_body,
-    env,
-    sigs,
-    classes,
-    self_fields,
-    return_type,
-    in_loop,
-    yields_allowed,
-  )
+  if let Some(ensure_body) = ensure {
+    check_block(
+      ensure_body,
+      env,
+      sigs,
+      classes,
+      self_fields,
+      return_type,
+      in_loop,
+      in_rescue,
+      yields_allowed,
+    )?;
+  }
+  Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1314,6 +1367,7 @@ fn check_block(
   self_fields: Option<&HashMap<String, Type>>,
   return_type: &Type,
   in_loop: bool,
+  in_rescue: bool,
   yields_allowed: bool,
 ) -> Result<(), Diagnostic> {
   for stmt in stmts {
@@ -1325,6 +1379,7 @@ fn check_block(
       self_fields,
       return_type,
       in_loop,
+      in_rescue,
       yields_allowed,
     )?;
   }
@@ -1372,6 +1427,7 @@ fn check_function_body(
     None,
     &declared_return,
     false,
+    false,
     f.block_param.is_some(),
   )?;
   check_implicit_return(
@@ -1404,6 +1460,7 @@ fn check_method_body(
     classes,
     Some(fields),
     &declared_return,
+    false,
     false,
     m.block_param.is_some(),
   )?;
@@ -1504,10 +1561,17 @@ fn scan_block_call_site(
     }
     Stmt::While { body, .. } => scan_block_call_sites(body, sigs, classes, func_defs, diags),
     Stmt::Begin {
-      body, rescue_body, ..
+      body,
+      rescues,
+      ensure,
     } => {
       scan_block_call_sites(body, sigs, classes, func_defs, diags);
-      scan_block_call_sites(rescue_body, sigs, classes, func_defs, diags);
+      for rescue in rescues {
+        scan_block_call_sites(&rescue.body, sigs, classes, func_defs, diags);
+      }
+      if let Some(ensure_body) = ensure {
+        scan_block_call_sites(ensure_body, sigs, classes, func_defs, diags);
+      }
     }
     Stmt::Case {
       arms, else_body, ..
@@ -1563,6 +1627,7 @@ fn check_one_block_call_site(
     classes,
     None,
     &Type::Void,
+    false,
     false,
     false,
   ) {
@@ -1646,15 +1711,21 @@ fn check_yields_against_block(
       Stmt::While { body, .. } => check_yields_against_block(body, expected, env, sigs, classes)?,
       Stmt::Begin {
         body,
-        rescue_type,
-        rescue_var,
-        rescue_body,
+        rescues,
+        ensure,
       } => {
         check_yields_against_block(body, expected, env, sigs, classes)?;
-        if let Ok(t) = resolve_type(rescue_type, classes) {
-          env.insert(rescue_var.clone(), t);
+        for rescue in rescues {
+          if let Some(class_name) = &rescue.class_name {
+            if let Ok(t) = resolve_type(class_name, classes) {
+              env.insert(rescue.var.clone(), t);
+            }
+          }
+          check_yields_against_block(&rescue.body, expected, env, sigs, classes)?;
         }
-        check_yields_against_block(rescue_body, expected, env, sigs, classes)?;
+        if let Some(ensure_body) = ensure {
+          check_yields_against_block(ensure_body, expected, env, sigs, classes)?;
+        }
       }
       Stmt::Case {
         arms, else_body, ..
@@ -1805,6 +1876,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           &classes,
           None,
           &Type::Void,
+          false,
           false,
           false,
         ) {
@@ -2613,6 +2685,60 @@ mod tests {
   fn accepts_break_and_next_inside_a_range_for_in() {
     let src =
       "for i in 1..5\n  if i == 3\n    break\n  end\n  if i == 2\n    next\n  end\n  puts i\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 38 (full exception model).
+
+  const FULL_EXCEPTION_EXAMPLE: &str = "class NotFoundError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\nclass TimeoutError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise TimeoutError.new(7)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
+
+  #[test]
+  fn accepts_the_full_worked_example_two_typed_rescues_and_ensure() {
+    let program = emerald_parser::parse(FULL_EXCEPTION_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_referencing_a_bare_rescue_bound_name_inside_its_own_body() {
+    let src = "begin\n  puts 1\nrescue => e\n  puts e\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a bare rescue's bound name must never enter env — no universal root class");
+    assert!(errs[0].message.contains("undefined variable"));
+  }
+
+  #[test]
+  fn rejects_retry_at_top_level() {
+    let src = "retry\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject top-level retry");
+    assert!(errs[0].message.contains("retry"));
+  }
+
+  #[test]
+  fn rejects_retry_inside_a_begin_try_body() {
+    // A bare `rescue => e` avoids needing any class declared — this
+    // test is purely about where `retry` is (il)legal, unrelated to a
+    // typed clause's own class-resolution.
+    let src = "begin\n  retry\nrescue => e\n  puts 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("must reject retry inside the begin's own try body, not just top level");
+    assert!(errs[0].message.contains("retry"));
+  }
+
+  #[test]
+  fn rejects_retry_inside_an_ensure_body() {
+    let src = "begin\n  puts 1\nrescue => e\n  puts 2\nensure\n  retry\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject retry inside an ensure body");
+    assert!(errs[0].message.contains("retry"));
+  }
+
+  #[test]
+  fn accepts_retry_inside_a_rescue_clause_body() {
+    let src = "begin\n  puts 1\nrescue => e\n  retry\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }

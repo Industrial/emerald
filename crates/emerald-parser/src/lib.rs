@@ -19,7 +19,8 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt, StringPart,
+  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt,
+  StringPart,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -532,9 +533,8 @@ mod tests {
 
     let Item::Stmt(Stmt::Begin {
       body,
-      rescue_type,
-      rescue_var,
-      rescue_body,
+      rescues,
+      ensure,
     }) = &program.items[2]
     else {
       panic!(
@@ -542,8 +542,10 @@ mod tests {
         program.items[2]
       );
     };
-    assert_eq!(rescue_type, "MyError");
-    assert_eq!(rescue_var, "e");
+    assert_eq!(rescues.len(), 1);
+    assert_eq!(rescues[0].class_name, Some("MyError".to_string()));
+    assert_eq!(rescues[0].var, "e");
+    assert_eq!(ensure, &None);
     assert_eq!(
       body,
       &vec![Stmt::Expr(Expr::Call(
@@ -552,8 +554,8 @@ mod tests {
       ))]
     );
     assert_eq!(
-      rescue_body,
-      &vec![Stmt::Expr(Expr::Call(
+      rescues[0].body,
+      vec![Stmt::Expr(Expr::Call(
         "puts".into(),
         vec![Expr::MethodCall(
           Box::new(Expr::Ident("e".into())),
@@ -562,6 +564,56 @@ mod tests {
         )]
       ))]
     );
+  }
+
+  // Plan 38 (full exception model).
+
+  #[test]
+  fn begin_with_multiple_rescues_and_ensure_parses_in_source_order() {
+    let src = "begin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Begin {
+      rescues, ensure, ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a begin statement");
+    };
+    assert_eq!(rescues.len(), 2);
+    assert_eq!(rescues[0].class_name, Some("NotFoundError".to_string()));
+    assert_eq!(rescues[1].class_name, Some("TimeoutError".to_string()));
+    assert_eq!(
+      ensure,
+      &Some(vec![Stmt::Expr(Expr::Call(
+        "puts".into(),
+        vec![Expr::StringLit("cleanup".into())]
+      ))])
+    );
+  }
+
+  #[test]
+  fn begin_with_bare_rescue_and_no_ensure_parses() {
+    let src = "begin\n  puts 1\nrescue => e\n  puts 2\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Begin {
+      rescues, ensure, ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a begin statement");
+    };
+    assert_eq!(rescues.len(), 1);
+    assert_eq!(rescues[0].class_name, None);
+    assert_eq!(rescues[0].var, "e");
+    assert_eq!(ensure, &None);
+  }
+
+  #[test]
+  fn retry_parses_to_stmt_retry_wherever_a_stmt_is_legal() {
+    let src = "begin\n  puts 1\nrescue => e\n  retry\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Begin { rescues, .. }) = &program.items[0] else {
+      panic!("expected a begin statement");
+    };
+    assert_eq!(rescues[0].body, vec![Stmt::Retry]);
   }
 
   const MODULE_EXAMPLE: &str = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";

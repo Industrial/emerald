@@ -20,10 +20,11 @@
 //! change for well-typed Emerald programs.
 
 use emerald_parser::{
-  ClassDef, CompareOp, Expr, Function as AstFunction, Item, ModuleDef, Param, Program, Stmt,
-  StringPart,
+  ClassDef, CompareOp, Expr, Function as AstFunction, Item, ModuleDef, Param, Program,
+  RescueClause, Stmt, StringPart,
 };
 use inkwell::AddressSpace;
+use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -365,16 +366,22 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
     Stmt::Raise(e) => collect_idents_in_expr(e, referenced),
     Stmt::Begin {
       body,
-      rescue_var,
-      rescue_body,
-      ..
+      rescues,
+      ensure,
     } => {
       for s in body {
         collect_idents_in_stmt(s, referenced, bound);
       }
-      bound.insert(rescue_var.clone());
-      for s in rescue_body {
-        collect_idents_in_stmt(s, referenced, bound);
+      for rescue in rescues {
+        bound.insert(rescue.var.clone());
+        for s in &rescue.body {
+          collect_idents_in_stmt(s, referenced, bound);
+        }
+      }
+      if let Some(ensure_body) = ensure {
+        for s in ensure_body {
+          collect_idents_in_stmt(s, referenced, bound);
+        }
       }
     }
     Stmt::Case {
@@ -439,6 +446,8 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
         collect_idents_in_stmt(s, referenced, bound);
       }
     }
+    // Plan 38: `retry` binds/references nothing — it's a bare jump.
+    Stmt::Retry => {}
   }
 }
 
@@ -549,15 +558,26 @@ fn collect_lets(stmts: &[Stmt], out: &mut Vec<(String, ValKind)>) {
           collect_lets(else_b, out);
         }
       }
+      // Plan 38: only a TYPED clause's `var` gets a slot — a bare
+      // clause's `var` is never stored into anything (per the sema
+      // leaf, it's never bound in `env` either; see `build_begin`'s
+      // own multi-rescue chaining). `ensure`'s own `Let`s need hoisting
+      // too, same as `body`/each rescue's own `body`.
       Stmt::Begin {
         body,
-        rescue_var,
-        rescue_body,
-        ..
+        rescues,
+        ensure,
       } => {
         collect_lets(body, out);
-        out.push((rescue_var.clone(), ValKind::Ptr));
-        collect_lets(rescue_body, out);
+        for rescue in rescues {
+          if rescue.class_name.is_some() {
+            out.push((rescue.var.clone(), ValKind::Ptr));
+          }
+          collect_lets(&rescue.body, out);
+        }
+        if let Some(ensure_body) = ensure {
+          collect_lets(ensure_body, out);
+        }
       }
       Stmt::Case {
         arms, else_body, ..
@@ -616,6 +636,67 @@ struct ExceptionRuntimeFuncs<'ctx> {
   raise: FunctionValue<'ctx>,
 }
 
+/// Plan 38: does `stmt` (at any nesting depth) contain a `Stmt::Retry`?
+/// Used to decide whether `compile_to_object` must skip optimization
+/// for correctness (see its own call site's Decision-log comment).
+fn stmt_contains_retry(stmt: &Stmt) -> bool {
+  match stmt {
+    Stmt::Retry => true,
+    Stmt::If {
+      then_branch,
+      else_branch,
+      ..
+    } => {
+      then_branch.iter().any(stmt_contains_retry)
+        || else_branch
+          .as_ref()
+          .is_some_and(|b| b.iter().any(stmt_contains_retry))
+    }
+    Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ForRange { body, .. } => {
+      body.iter().any(stmt_contains_retry)
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      body.iter().any(stmt_contains_retry)
+        || rescues
+          .iter()
+          .any(|r| r.body.iter().any(stmt_contains_retry))
+        || ensure
+          .as_ref()
+          .is_some_and(|b| b.iter().any(stmt_contains_retry))
+    }
+    Stmt::Case {
+      arms, else_body, ..
+    } => {
+      arms
+        .iter()
+        .any(|(_, body)| body.iter().any(stmt_contains_retry))
+        || else_body
+          .as_ref()
+          .is_some_and(|b| b.iter().any(stmt_contains_retry))
+    }
+    _ => false,
+  }
+}
+
+/// Plan 38: does `program` use `retry` anywhere — in a free function, a
+/// method, or a top-level statement?
+fn program_uses_retry(program: &Program) -> bool {
+  fn body_uses_retry(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_contains_retry)
+  }
+  program.items.iter().any(|item| match item {
+    Item::Function(f) => body_uses_retry(&f.body),
+    Item::Class(c) => c.methods.iter().any(|m| body_uses_retry(&m.body)),
+    Item::Module(m) => m.methods.iter().any(|m| body_uses_retry(&m.body)),
+    Item::Stmt(s) => stmt_contains_retry(s),
+    _ => false,
+  })
+}
+
 fn declare_exception_runtime_funcs<'ctx>(
   context: &'ctx Context,
   module: &Module<'ctx>,
@@ -630,6 +711,20 @@ fn declare_exception_runtime_funcs<'ctx>(
     i32_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 38: `setjmp` can return TWICE (once directly, once via a
+  // later `longjmp`) — a fact real C compilers know only because
+  // `<setjmp.h>` marks it specially; since this backend declares
+  // `setjmp` as an ordinary external function at the LLVM IR level
+  // (bypassing Clang's C frontend entirely), that attribute is never
+  // attached automatically. Without it, LLVM's optimizer is free to
+  // assume the call returns once — sound for plan 11's original
+  // straight-line (no loop back to before the call) usage, but a real
+  // miscompile once plan 38's `retry` introduces a genuine control-flow
+  // loop back to `begin.retry`'s own `setjmp` call (verified this
+  // session: omitting this attribute produces a binary that hangs).
+  let returns_twice_id = Attribute::get_named_enum_kind_id("returns_twice");
+  let returns_twice_attr = context.create_enum_attribute(returns_twice_id, 0);
+  setjmp.add_attribute(AttributeLoc::Function, returns_twice_attr);
   let push_handler = module.add_function(
     "emerald_push_handler",
     ptr_ty.fn_type(&[], false),
@@ -680,6 +775,10 @@ fn declare_exception_runtime_funcs<'ctx>(
 
 /// The header/exit blocks of the innermost enclosing loop, for `break`
 /// (jump to `exit`) / `next` (jump back to `header`) to target.
+/// `Copy` (plan 38): `Stmt::Break`/`Stmt::Next` need to read the target
+/// out of `loop_stack` before separately re-borrowing it mutably to
+/// duplicate-emit `ensure_stack`.
+#[derive(Clone, Copy)]
 struct LoopTargets<'ctx> {
   header: BasicBlock<'ctx>,
   exit: BasicBlock<'ctx>,
@@ -709,11 +808,15 @@ struct Ctx<'a, 'ctx> {
   lambda_func_ids: &'a HashMap<String, (FunctionValue<'ctx>, ValKind)>,
   lambda_infos: &'a HashMap<String, LambdaInfo>,
   /// `{class name} -> a stable integer tag (declaration order)` —
-  /// `rescue`'s matching mechanism, standing in for RTTI. Still
-  /// exact-tag equality even after plan 32 added inheritance —
-  /// upgrading `rescue` to subtype-aware matching is real, disclosed
-  /// future work (plan 32's Decision log), not implemented here.
+  /// `rescue`'s matching mechanism, standing in for RTTI.
   class_tags: &'a HashMap<String, i64>,
+  /// `{class name T} -> tags of every class that either *is* T or
+  /// descends from it` (plan 38's Decision log) — what makes `rescue`
+  /// subtype-aware: a clause naming a superclass matches any raised
+  /// subclass too, not just an exact-tag match. Precomputed once, for
+  /// the whole compiled program, from the same chain representation
+  /// plan 32's own `resolve_class_chain` already builds.
+  rescue_tag_sets: &'a HashMap<String, Vec<i64>>,
   /// `{class name} -> {method name} -> defining class name}` (plan 32's
   /// Decision log) — resolves which ancestor's compiled `{Class}_
   /// {method}` symbol a call actually targets, since only the class
@@ -2243,19 +2346,23 @@ fn build_lambda_let<'ctx>(
 /// index bump entirely and infinite-loop), and a per-iteration
 /// `Expr::Index`-shaped load bound to `var`.
 #[allow(clippy::too_many_arguments)]
-fn build_for<'ctx>(
+fn build_for<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
   var: &str,
   elements: &[Expr],
-  body: &[Stmt],
+  body: &'a [Stmt],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
+  // own doc comment for the full rationale.
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
   // Built directly (not via `build_array_lit`) so the first element's
   // real `ValKind` is captured in the same pass — calling `build_expr`
@@ -2347,6 +2454,8 @@ fn build_for<'ctx>(
     local_classes,
     local_array_elem_types,
     loop_stack,
+    ensure_stack,
+    retry_stack,
     ret_kind,
     ctx,
   )?;
@@ -2392,7 +2501,7 @@ fn build_for<'ctx>(
 /// it up from `vars` instead of inserting a fresh one. `start`/`end`
 /// are each evaluated exactly once, before the loop begins.
 #[allow(clippy::too_many_arguments)]
-fn build_for_range<'ctx>(
+fn build_for_range<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
@@ -2400,13 +2509,17 @@ fn build_for_range<'ctx>(
   start: &Expr,
   end: &Expr,
   exclusive: bool,
-  body: &[Stmt],
+  body: &'a [Stmt],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
+  // own doc comment for the full rationale.
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
   let (start_val, start_kind) = build_expr(
     context,
@@ -2501,6 +2614,8 @@ fn build_for_range<'ctx>(
     local_classes,
     local_array_elem_types,
     loop_stack,
+    ensure_stack,
+    retry_stack,
     ret_kind,
     ctx,
   )?;
@@ -2558,18 +2673,22 @@ fn build_for_range<'ctx>(
 /// design (this plan's own Decision log's heavier alternative) —
 /// neither is attempted here.
 #[allow(clippy::too_many_arguments)]
-fn build_inline_block_call<'ctx>(
+fn build_inline_block_call<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  callee: &AstFunction,
-  args: &[Expr],
+  callee: &'a AstFunction,
+  args: &'a [Expr],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
+  // own doc comment for the full rationale.
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
   let Some(Expr::Lambda {
     params: blk_params,
@@ -2652,9 +2771,80 @@ fn build_inline_block_call<'ctx>(
     local_classes,
     local_array_elem_types,
     loop_stack,
+    ensure_stack,
+    retry_stack,
     ret_kind,
     &inline_ctx,
   )
+}
+
+/// Plan 38: duplicate-emits every currently-active `begin`'s `ensure`
+/// body, innermost first — called by every real exit out of a guarded
+/// region (`Return`/`Break`/`Next`/`Raise`) right before that
+/// statement's own terminator, since this backend has no
+/// `invoke`/`landingpad`/unwind-table mechanism to attach a single
+/// shared cleanup label to (Decision log). A snapshot of the current
+/// `ensure_stack` is taken first (just copying the `&[Stmt]` pointers,
+/// not the bodies themselves) so each duplicate-emit call can still
+/// legitimately re-borrow `ensure_stack` mutably (needed because a
+/// nested `begin` inside an ensure body is, in principle, still
+/// well-formed code).
+///
+/// `ensure_stack`'s entries each carry a `raise_visible: bool` tag:
+/// `true` only for an entry pushed while compiling a `rescue` clause's
+/// own body (where a `Stmt::Raise` is a genuine re-raise, leaving this
+/// `begin`), `false` while compiling its try `body` (where a
+/// `Stmt::Raise` targets this SAME `begin`'s own handler and stays
+/// within it — `build_begin`'s own 3 exit points already duplicate
+/// this `begin`'s `ensure` correctly on every path a raise there can
+/// actually take, so `Stmt::Raise` must not double it, hence
+/// `raise_only` below). `Stmt::Return`/`Break`/`Next` ignore the tag
+/// and always see every entry — those are unconditional jumps that
+/// bypass the `setjmp`/`longjmp` mechanism entirely, genuinely leaving
+/// every enclosing `begin` regardless of which region they're
+/// lexically inside.
+#[allow(clippy::too_many_arguments)]
+fn emit_active_ensures<'a, 'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'a, 'ctx>,
+  // `true` only for `Stmt::Raise` — skips every entry whose own
+  // `raise_visible` tag is `false` (see `ensure_stack`'s own doc
+  // comment above). `false` for `Return`/`Break`/`Next`, which see
+  // every entry regardless of its tag.
+  raise_only: bool,
+) -> Result<(), String> {
+  let ensure_bodies: Vec<&'a [Stmt]> = ensure_stack
+    .iter()
+    .rev()
+    .filter(|(_, raise_visible)| !raise_only || *raise_visible)
+    .map(|(body, _)| *body)
+    .collect();
+  for ensure_body in ensure_bodies {
+    build_block(
+      context,
+      builder,
+      func,
+      ensure_body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ensure_stack,
+      retry_stack,
+      ret_kind,
+      ctx,
+    )?;
+  }
+  Ok(())
 }
 
 /// Emits one statement. Returns `true` if the statement emitted a
@@ -2662,17 +2852,29 @@ fn build_inline_block_call<'ctx>(
 /// `raise`'s unreachable) — callers must not emit further instructions
 /// into the current block afterward.
 #[allow(clippy::too_many_arguments)]
-fn build_stmt<'ctx>(
+fn build_stmt<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  stmt: &Stmt,
+  stmt: &'a Stmt,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  // Plan 38: the active `begin`'s `ensure` body slice(s), innermost
+  // last — `Return`/`Break`/`Next`/`Raise` duplicate-emit every entry
+  // here (innermost-first) before their own terminator, since this
+  // backend has no `invoke`/`landingpad`/unwind-table mechanism to
+  // attach a single shared cleanup label to (see plan 38's Decision
+  // log). `retry` deliberately never consults this.
+  // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
+  // own doc comment for the full rationale.
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  // Plan 38: the active `begin`'s `begin.retry` block, innermost last
+  // — `Stmt::Retry` branches to `retry_stack.last()`.
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
   match stmt {
     Stmt::Let {
@@ -2858,6 +3060,8 @@ fn build_stmt<'ctx>(
         local_classes,
         local_array_elem_types,
         loop_stack,
+        ensure_stack,
+        retry_stack,
         ret_kind,
         ctx,
       )
@@ -2896,26 +3100,82 @@ fn build_stmt<'ctx>(
         local_array_elem_types,
         ctx,
       )?;
+      emit_active_ensures(
+        context,
+        builder,
+        func,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+        false,
+      )?;
       builder.build_return(Some(&v)).map_err(|e| e.to_string())?;
       Ok(true)
     }
     Stmt::Return(None) => {
+      emit_active_ensures(
+        context,
+        builder,
+        func,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+        false,
+      )?;
       builder.build_return(None).map_err(|e| e.to_string())?;
       Ok(true)
     }
     Stmt::Break => {
-      let target = loop_stack
+      let target = *loop_stack
         .last()
         .ok_or("codegen: `break` outside of a loop")?;
+      emit_active_ensures(
+        context,
+        builder,
+        func,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+        false,
+      )?;
       builder
         .build_unconditional_branch(target.exit)
         .map_err(|e| e.to_string())?;
       Ok(true)
     }
     Stmt::Next => {
-      let target = loop_stack
+      let target = *loop_stack
         .last()
         .ok_or("codegen: `next` outside of a loop")?;
+      emit_active_ensures(
+        context,
+        builder,
+        func,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+        false,
+      )?;
       builder
         .build_unconditional_branch(target.header)
         .map_err(|e| e.to_string())?;
@@ -2956,6 +3216,8 @@ fn build_stmt<'ctx>(
         local_classes,
         local_array_elem_types,
         loop_stack,
+        ensure_stack,
+        retry_stack,
         ret_kind,
         ctx,
       )?;
@@ -2989,6 +3251,8 @@ fn build_stmt<'ctx>(
           local_classes,
           local_array_elem_types,
           loop_stack,
+          ensure_stack,
+          retry_stack,
           ret_kind,
           ctx,
         )?;
@@ -3043,6 +3307,8 @@ fn build_stmt<'ctx>(
         local_classes,
         local_array_elem_types,
         loop_stack,
+        ensure_stack,
+        retry_stack,
         ret_kind,
         ctx,
       )?;
@@ -3073,6 +3339,8 @@ fn build_stmt<'ctx>(
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ensure_stack,
+      retry_stack,
       ret_kind,
       ctx,
     ),
@@ -3097,35 +3365,61 @@ fn build_stmt<'ctx>(
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ensure_stack,
+      retry_stack,
       ret_kind,
       ctx,
     ),
-    Stmt::Raise(e) => build_raise(
-      context,
-      builder,
-      e,
-      vars,
-      local_classes,
-      local_array_elem_types,
-      ctx,
-    ),
+    // Plan 38: a `raise` inside a TRY body targets this SAME `begin`'s
+    // own handler and stays within it — `build_begin`'s own 3 exit
+    // points already duplicate this `begin`'s `ensure` correctly on
+    // every path such a raise can actually take, so this must not
+    // double it (`raise_only: true` skips those entries). A `raise`
+    // re-raising from inside a `rescue_body`, though, genuinely does
+    // leave this `begin` (Decision log) — its own `ensure` entry is
+    // tagged `raise_visible` for exactly that reason.
+    Stmt::Raise(e) => {
+      emit_active_ensures(
+        context,
+        builder,
+        func,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+        true,
+      )?;
+      build_raise(
+        context,
+        builder,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )
+    }
     Stmt::Begin {
       body,
-      rescue_type,
-      rescue_var,
-      rescue_body,
+      rescues,
+      ensure,
     } => build_begin(
       context,
       builder,
       func,
       body,
-      rescue_type,
-      rescue_var,
-      rescue_body,
+      rescues,
+      ensure,
       vars,
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ensure_stack,
+      retry_stack,
       ret_kind,
       ctx,
     ),
@@ -3144,6 +3438,8 @@ fn build_stmt<'ctx>(
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ensure_stack,
+      retry_stack,
       ret_kind,
       ctx,
     ),
@@ -3198,10 +3494,28 @@ fn build_stmt<'ctx>(
         local_classes,
         local_array_elem_types,
         loop_stack,
+        ensure_stack,
+        retry_stack,
         ret_kind,
         &block_ctx,
       )?;
       Ok(false)
+    }
+    // Plan 38: branches straight to the innermost active `begin`'s
+    // `begin.retry` block (pushed by `build_begin` for the duration of
+    // compiling each of its `rescue` clauses) — a real `Err`, not a
+    // panic, if reached with no active `begin` (defends a sema-
+    // bypassing direct codegen call, same as every other function
+    // here). Deliberately does NOT consult `ensure_stack` (Decision
+    // log — `retry` doesn't exit the `begin` construct at all).
+    Stmt::Retry => {
+      let target = retry_stack
+        .last()
+        .ok_or("codegen: `retry` outside of a rescue body")?;
+      builder
+        .build_unconditional_branch(*target)
+        .map_err(|e| e.to_string())?;
+      Ok(true)
     }
   }
 }
@@ -3213,19 +3527,23 @@ fn build_stmt<'ctx>(
 /// `or` over `i1`s, equivalent to logical or), falling through to
 /// `else_body` (or nothing) if no arm matches.
 #[allow(clippy::too_many_arguments)]
-fn build_case<'ctx>(
+fn build_case<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
   scrutinee: &Expr,
-  arms: &[(Vec<Expr>, Vec<Stmt>)],
-  else_body: &Option<Vec<Stmt>>,
+  arms: &'a [(Vec<Expr>, Vec<Stmt>)],
+  else_body: &'a Option<Vec<Stmt>>,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
+  // own doc comment for the full rationale.
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
   let (scrut_val, scrut_kind) = build_expr(
     context,
@@ -3291,6 +3609,8 @@ fn build_case<'ctx>(
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ensure_stack,
+      retry_stack,
       ret_kind,
       ctx,
     )?;
@@ -3314,6 +3634,8 @@ fn build_case<'ctx>(
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ensure_stack,
+      retry_stack,
       ret_kind,
       ctx,
     )?;
@@ -3406,33 +3728,44 @@ fn build_raise<'ctx>(
   Ok(true)
 }
 
-/// `begin body rescue Type => e rescue_body end`. Pushes a handler,
-/// calls `setjmp` *directly*, and branches on the result: zero means
-/// this is the normal first pass through (run `body`), nonzero means a
-/// `longjmp` landed here — the landing pad then compares the caught
-/// class tag against `rescue_type`'s, binding `rescue_var` and running
-/// `rescue_body` on a match, or re-raising to the next-outer handler
-/// otherwise.
+/// `begin body rescue T1 => e1 ... [rescue => eN ...] [ensure ...] end`
+/// (plan 38's Decision log). Wraps the handler-push+`setjmp` sequence
+/// in a dedicated `begin.retry` block, pushed onto `retry_stack` for
+/// the duration of compiling every `rescue` clause's body, so `retry`
+/// has something to re-attempt from. Chains `rescues` via the same
+/// `arm_blk`/`next_check_blk` idiom `build_case` already uses for its
+/// `when` arms (source order; subtype-aware — see
+/// `Ctx::rescue_tag_sets`); a bare clause matches unconditionally,
+/// binding nothing. `ensure`'s body (possibly empty — `build_block` on
+/// `&[]` is a real no-op) is duplicate-emitted at all three real exit
+/// points: normal fallthrough, each matched clause's own fallthrough,
+/// and the mismatch-exhausted re-raise path.
 #[allow(clippy::too_many_arguments)]
-fn build_begin<'ctx>(
+fn build_begin<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  body: &[Stmt],
-  rescue_type: &str,
-  rescue_var: &str,
-  rescue_body: &[Stmt],
+  body: &'a [Stmt],
+  rescues: &'a [RescueClause],
+  ensure: &'a Option<Vec<Stmt>>,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
+  // own doc comment for the full rationale.
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
-  let rescue_tag = *ctx
-    .class_tags
-    .get(rescue_type)
-    .ok_or_else(|| format!("codegen: unknown class `{rescue_type}` in `rescue`"))?;
+  let ensure_body: &'a [Stmt] = ensure.as_deref().unwrap_or(&[]);
+
+  let retry_blk = context.append_basic_block(func, "begin.retry");
+  builder
+    .build_unconditional_branch(retry_blk)
+    .map_err(|e| e.to_string())?;
+  builder.position_at_end(retry_blk);
 
   let push_call = builder
     .build_call(ctx.exc_funcs.push_handler, &[], "pushhandler")
@@ -3451,20 +3784,30 @@ fn build_begin<'ctx>(
   let setjmp_call = builder
     .build_call(ctx.exc_funcs.setjmp, &[jmpbuf_ptr.into()], "setjmpres")
     .map_err(|e| e.to_string())?;
+  // `returns_twice` also needs attaching at the call site, not just the
+  // callee declaration (LLVM keeps call-site and declaration-site
+  // attribute lists separate) — see `declare_exception_runtime_funcs`'s
+  // own comment for the full rationale.
+  let returns_twice_id = Attribute::get_named_enum_kind_id("returns_twice");
+  let returns_twice_attr = context.create_enum_attribute(returns_twice_id, 0);
+  setjmp_call.add_attribute(AttributeLoc::Function, returns_twice_attr);
   let setjmp_result = call_result(setjmp_call)?.into_int_value();
 
   let try_blk = context.append_basic_block(func, "begin.try");
-  let rescue_blk = context.append_basic_block(func, "begin.rescue");
+  let rescue_entry_blk = context.append_basic_block(func, "begin.rescue");
   let merge_blk = context.append_basic_block(func, "begin.merge");
   let zero = context.i32_type().const_int(0, false);
   let is_first_pass = builder
     .build_int_compare(IntPredicate::EQ, setjmp_result, zero, "isfirstpass")
     .map_err(|e| e.to_string())?;
   builder
-    .build_conditional_branch(is_first_pass, try_blk, rescue_blk)
+    .build_conditional_branch(is_first_pass, try_blk, rescue_entry_blk)
     .map_err(|e| e.to_string())?;
 
   builder.position_at_end(try_blk);
+  // `raise_visible: false` — a raise here targets this SAME `begin`'s
+  // own handler (see `ensure_stack`'s doc comment).
+  ensure_stack.push((ensure_body, false));
   let try_terminated = build_block(
     context,
     builder,
@@ -3474,19 +3817,37 @@ fn build_begin<'ctx>(
     local_classes,
     local_array_elem_types,
     loop_stack,
+    ensure_stack,
+    retry_stack,
     ret_kind,
     ctx,
   )?;
+  ensure_stack.pop();
   if !try_terminated {
     builder
       .build_call(ctx.exc_funcs.pop_handler, &[], "pophandler")
       .map_err(|e| e.to_string())?;
+    // Exit point 1/3: normal fallthrough.
+    build_block(
+      context,
+      builder,
+      func,
+      ensure_body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ensure_stack,
+      retry_stack,
+      ret_kind,
+      ctx,
+    )?;
     builder
       .build_unconditional_branch(merge_blk)
       .map_err(|e| e.to_string())?;
   }
 
-  builder.position_at_end(rescue_blk);
+  builder.position_at_end(rescue_entry_blk);
   let tag_call = builder
     .build_call(
       ctx.exc_funcs.handler_tag,
@@ -3495,20 +3856,124 @@ fn build_begin<'ctx>(
     )
     .map_err(|e| e.to_string())?;
   let caught_tag = call_result(tag_call)?.into_int_value();
-  let expected_tag = context.i64_type().const_int(rescue_tag as u64, true);
-  let tag_matches = builder
-    .build_int_compare(IntPredicate::EQ, caught_tag, expected_tag, "tagmatches")
-    .map_err(|e| e.to_string())?;
 
-  let match_blk = context.append_basic_block(func, "begin.match");
-  let mismatch_blk = context.append_basic_block(func, "begin.mismatch");
-  builder
-    .build_conditional_branch(tag_matches, match_blk, mismatch_blk)
-    .map_err(|e| e.to_string())?;
+  retry_stack.push(retry_blk);
+  let mut next_check_blk = rescue_entry_blk;
+  for rescue in rescues {
+    builder.position_at_end(next_check_blk);
+    let arm_blk = context.append_basic_block(func, "begin.match");
+    let this_next_check_blk = context.append_basic_block(func, "begin.next");
 
-  // Caught, but it isn't this `rescue`'s type — free this handler and
-  // propagate to the next-outer one.
-  builder.position_at_end(mismatch_blk);
+    match &rescue.class_name {
+      Some(class_name) => {
+        let tags = ctx
+          .rescue_tag_sets
+          .get(class_name.as_str())
+          .ok_or_else(|| format!("codegen: unknown class `{class_name}` in `rescue`"))?;
+        let mut cond: Option<IntValue> = None;
+        for &tag in tags {
+          let expected = context.i64_type().const_int(tag as u64, true);
+          let eq = builder
+            .build_int_compare(IntPredicate::EQ, caught_tag, expected, "tagmatches")
+            .map_err(|e| e.to_string())?;
+          cond = Some(match cond {
+            None => eq,
+            Some(prev) => builder
+              .build_or(prev, eq, "tagor")
+              .map_err(|e| e.to_string())?,
+          });
+        }
+        let cond =
+          cond.expect("a class's own tag set always contains at least its own tag (itself)");
+        builder
+          .build_conditional_branch(cond, arm_blk, this_next_check_blk)
+          .map_err(|e| e.to_string())?;
+      }
+      // A bare `rescue => e` matches unconditionally (Decision log).
+      None => {
+        builder
+          .build_unconditional_branch(arm_blk)
+          .map_err(|e| e.to_string())?;
+      }
+    }
+
+    builder.position_at_end(arm_blk);
+    let exc_ptr_call = builder
+      .build_call(
+        ctx.exc_funcs.handler_exception_ptr,
+        &[handler_ptr.into()],
+        "matchexc",
+      )
+      .map_err(|e| e.to_string())?;
+    let match_exc_ptr = call_result(exc_ptr_call)?;
+    builder
+      .build_call(
+        ctx.exc_funcs.free_handler,
+        &[handler_ptr.into()],
+        "freehandler",
+      )
+      .map_err(|e| e.to_string())?;
+
+    // A bare clause's `var` is never stored into anything — per the
+    // sema leaf, it was never bound in `env` either, and per
+    // `collect_lets`, it was never allocated a slot (Decision log).
+    if let Some(class_name) = &rescue.class_name {
+      let (rescue_var_ptr, _) = *vars
+        .get(&rescue.var)
+        .expect("pre-allocated by prealloc_lets for every typed RescueClause's var");
+      builder
+        .build_store(rescue_var_ptr, match_exc_ptr)
+        .map_err(|e| e.to_string())?;
+      local_classes.insert(rescue.var.clone(), class_name.clone());
+    }
+
+    // `raise_visible: true` — a raise here is a genuine re-raise,
+    // leaving this `begin` (see `ensure_stack`'s doc comment).
+    ensure_stack.push((ensure_body, true));
+    let rescue_terminated = build_block(
+      context,
+      builder,
+      func,
+      &rescue.body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ensure_stack,
+      retry_stack,
+      ret_kind,
+      ctx,
+    )?;
+    ensure_stack.pop();
+    if !rescue_terminated {
+      // Exit point 2/3: a matched clause's own fallthrough.
+      build_block(
+        context,
+        builder,
+        func,
+        ensure_body,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        loop_stack,
+        ensure_stack,
+        retry_stack,
+        ret_kind,
+        ctx,
+      )?;
+      builder
+        .build_unconditional_branch(merge_blk)
+        .map_err(|e| e.to_string())?;
+    }
+
+    next_check_blk = this_next_check_blk;
+  }
+  retry_stack.pop();
+
+  // Caught, but it matched none of this `begin`'s clauses — free this
+  // handler and propagate to the next-outer one. Exit point 3/3
+  // (Decision log's own "easy exit to silently miss").
+  builder.position_at_end(next_check_blk);
   let exc_ptr_call = builder
     .build_call(
       ctx.exc_funcs.handler_exception_ptr,
@@ -3524,6 +3989,20 @@ fn build_begin<'ctx>(
       "freehandler",
     )
     .map_err(|e| e.to_string())?;
+  build_block(
+    context,
+    builder,
+    func,
+    ensure_body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ensure_stack,
+    retry_stack,
+    ret_kind,
+    ctx,
+  )?;
   builder
     .build_call(
       ctx.exc_funcs.raise,
@@ -3532,49 +4011,6 @@ fn build_begin<'ctx>(
     )
     .map_err(|e| e.to_string())?;
   builder.build_unreachable().map_err(|e| e.to_string())?;
-
-  builder.position_at_end(match_blk);
-  let exc_ptr_call2 = builder
-    .build_call(
-      ctx.exc_funcs.handler_exception_ptr,
-      &[handler_ptr.into()],
-      "matchexc",
-    )
-    .map_err(|e| e.to_string())?;
-  let match_exc_ptr = call_result(exc_ptr_call2)?;
-  builder
-    .build_call(
-      ctx.exc_funcs.free_handler,
-      &[handler_ptr.into()],
-      "freehandler2",
-    )
-    .map_err(|e| e.to_string())?;
-
-  let (rescue_var_ptr, _) = *vars
-    .get(rescue_var)
-    .expect("pre-allocated by prealloc_lets for every Begin's rescue_var");
-  builder
-    .build_store(rescue_var_ptr, match_exc_ptr)
-    .map_err(|e| e.to_string())?;
-  local_classes.insert(rescue_var.to_string(), rescue_type.to_string());
-
-  let rescue_terminated = build_block(
-    context,
-    builder,
-    func,
-    rescue_body,
-    vars,
-    local_classes,
-    local_array_elem_types,
-    loop_stack,
-    ret_kind,
-    ctx,
-  )?;
-  if !rescue_terminated {
-    builder
-      .build_unconditional_branch(merge_blk)
-      .map_err(|e| e.to_string())?;
-  }
 
   builder.position_at_end(merge_blk);
   Ok(false)
@@ -3586,17 +4022,21 @@ fn build_begin<'ctx>(
 /// same list is unreachable and must not be emitted into an
 /// already-terminated LLVM block.
 #[allow(clippy::too_many_arguments)]
-fn build_block<'ctx>(
+fn build_block<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  stmts: &[Stmt],
+  stmts: &'a [Stmt],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  // Each entry's `bool` is `raise_visible` — see `emit_active_ensures`'s
+  // own doc comment for the full rationale.
+  ensure_stack: &mut Vec<(&'a [Stmt], bool)>,
+  retry_stack: &mut Vec<BasicBlock<'ctx>>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
   for stmt in stmts {
     let terminated = build_stmt(
@@ -3608,6 +4048,8 @@ fn build_block<'ctx>(
       local_classes,
       local_array_elem_types,
       loop_stack,
+      ensure_stack,
+      retry_stack,
       ret_kind,
       ctx,
     )?;
@@ -3624,18 +4066,20 @@ fn build_block<'ctx>(
 /// has its value returned, matching `emerald-sema`'s implicit-return
 /// check.
 #[allow(clippy::too_many_arguments)]
-fn build_function_body<'ctx>(
+fn build_function_body<'a, 'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
   func: FunctionValue<'ctx>,
-  body: &[Stmt],
+  body: &'a [Stmt],
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
   ret_kind: ValKind,
-  ctx: &Ctx<'_, 'ctx>,
+  ctx: &Ctx<'a, 'ctx>,
 ) -> Result<(), String> {
   let mut loop_stack = Vec::new();
+  let mut ensure_stack: Vec<(&'a [Stmt], bool)> = Vec::new();
+  let mut retry_stack = Vec::new();
   let Some((last, init)) = body.split_last() else {
     builder.build_return(None).map_err(|e| e.to_string())?;
     return Ok(());
@@ -3650,6 +4094,8 @@ fn build_function_body<'ctx>(
     local_classes,
     local_array_elem_types,
     &mut loop_stack,
+    &mut ensure_stack,
+    &mut retry_stack,
     ret_kind,
     ctx,
   )?;
@@ -3680,6 +4126,8 @@ fn build_function_body<'ctx>(
         local_classes,
         local_array_elem_types,
         &mut loop_stack,
+        &mut ensure_stack,
+        &mut retry_stack,
         ret_kind,
         ctx,
       )?;
@@ -3947,6 +4395,8 @@ fn define_main<'ctx>(
   prealloc_lets(context, builder, &decls, &mut vars)?;
 
   let mut loop_stack = Vec::new();
+  let mut ensure_stack = Vec::new();
+  let mut retry_stack = Vec::new();
   let terminated = build_block(
     context,
     builder,
@@ -3956,6 +4406,8 @@ fn define_main<'ctx>(
     &mut local_classes,
     &mut local_array_elem_types,
     &mut loop_stack,
+    &mut ensure_stack,
+    &mut retry_stack,
     ValKind::Int64, // main's own AST-level "return kind" is never consulted -- top-level has no `return`
     gen_ctx,
   )?;
@@ -4187,6 +4639,19 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   }
   let method_owners = build_method_owners(&class_defs)?;
 
+  // Plan 38: see `Ctx::rescue_tag_sets`'s own doc comment.
+  let mut rescue_tag_sets: HashMap<String, Vec<i64>> = HashMap::new();
+  for c_name in class_defs.keys() {
+    let chain = resolve_class_chain(c_name, &class_defs)?;
+    let c_tag = class_tags[c_name];
+    for ancestor in &chain {
+      rescue_tag_sets
+        .entry(ancestor.clone())
+        .or_default()
+        .push(c_tag);
+    }
+  }
+
   // Plan 34: every `block_param`-declaring free function, keyed by
   // name — see `Ctx::block_funcs`'s own doc comment.
   let mut block_funcs: HashMap<String, &AstFunction> = HashMap::new();
@@ -4227,6 +4692,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     lambda_func_ids: &lambda_func_ids,
     lambda_infos: &lambda_infos,
     class_tags: &class_tags,
+    rescue_tag_sets: &rescue_tag_sets,
     method_owners: &method_owners,
     exc_funcs,
     module_names: &module_names,
@@ -4305,6 +4771,30 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   define_main(&context, &builder, main_fn, program, &gen_ctx)?;
 
   module.verify().map_err(|e| e.to_string())?;
+
+  // Plan 38: `setjmp`'s `returns_twice` attribute (see
+  // `declare_exception_runtime_funcs`'s own comment) tells LLVM's
+  // optimizer the call may resume execution a second time via
+  // `longjmp` — but a `retry`-capable `begin` calls `setjmp` again
+  // from a genuine control-flow LOOP back to it (`begin.retry`),
+  // something no other construct in this compiler does. Verified this
+  // session: even with `returns_twice` correctly attached, the full
+  // `default<O3>` pipeline still miscompiles a `retry` loop into a
+  // program that hangs at runtime (very likely `mem2reg`/SROA
+  // promoting a local variable's `alloca` into a register value that
+  // doesn't survive the `longjmp` correctly — the exact class of bug C
+  // programmers avoid with `volatile`, which this backend has no
+  // per-variable equivalent of). Skipping optimization entirely for a
+  // program that uses `retry` anywhere is the safe, disclosed
+  // workaround: `alloca`+`load`/`store`-based IR is always correct on
+  // its own (mem2reg is a pure optimization, not required for
+  // correctness), just slower — an acceptable, real tradeoff for a
+  // rare, non-hot-path exception-recovery construct.
+  if program_uses_retry(program) {
+    return target_machine
+      .write_to_file(&module, FileType::Object, out_path)
+      .map_err(|e| e.to_string());
+  }
 
   let pass_options = inkwell::passes::PassBuilderOptions::create();
   module
@@ -5033,5 +5523,82 @@ mod tests {
   fn reverse_range_for_in_is_a_well_typed_zero_iteration_loop() {
     let src = "for i in 5..1\n  puts i\nend\n";
     assert_eq!(compile_link_run(src), "");
+  }
+
+  // Plan 38 (full exception model).
+
+  const FULL_EXCEPTION_WORKED_EXAMPLE: &str = "class NotFoundError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\nclass TimeoutError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise TimeoutError.new(7)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
+
+  #[test]
+  fn full_exception_worked_example_linked_and_run() {
+    // Real distinguishing proof: raising `TimeoutError` is NOT caught
+    // by the first (`NotFoundError`) clause, IS caught by the second
+    // (ordering), and `ensure` always runs afterward.
+    assert_eq!(
+      compile_link_run(FULL_EXCEPTION_WORKED_EXAMPLE),
+      "7\ncleanup\n"
+    );
+  }
+
+  #[test]
+  fn ensure_runs_on_the_non_exceptional_path() {
+    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nbegin\n  puts 1\nrescue Foo => f\n  puts 0\nensure\n  puts 2\nend\n";
+    assert_eq!(compile_link_run(src), "1\n2\n");
+  }
+
+  #[test]
+  fn ensure_runs_on_the_mismatch_exhausted_reraise_path_of_an_inner_begin() {
+    // The raised type matches neither the inner clause but does match
+    // the outer one — proving `ensure` fires on the mismatch-exhausted
+    // path, in the correct order (inner's `ensure` before the outer
+    // clause's own output).
+    let src = "class WrongType\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nclass RightType\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\nbegin\n  begin\n    raise RightType.new(5)\n  rescue WrongType => w\n    puts 0\n  ensure\n    puts \"inner\"\n  end\nrescue RightType => r\n  puts r.code\nensure\n  puts \"outer\"\nend\n";
+    assert_eq!(compile_link_run(src), "inner\n5\nouter\n");
+  }
+
+  #[test]
+  fn return_inside_a_matched_rescue_still_runs_ensure_first() {
+    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise Foo.new(1)\n  end\n  return x\nend\n\ndef f(x: Int64) -> Int64\n  begin\n    puts risky(x)\n  rescue Foo => e\n    return 9\n  ensure\n    puts \"cleanup\"\n  end\n  return 0\nend\n\nputs f(999)\n";
+    assert_eq!(compile_link_run(src), "cleanup\n9\n");
+  }
+
+  #[test]
+  fn subtype_aware_rescue_catches_a_raised_subclass_reusing_the_animal_dog_hierarchy() {
+    let src = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise Dog.new(7, 1)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue Animal => a\n  puts a.age\nend\n";
+    assert_eq!(compile_link_run(src), "7\n");
+  }
+
+  #[test]
+  fn bare_rescue_after_a_typed_mismatch_still_catches_unconditionally() {
+    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nclass Bar\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise Foo.new(1)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue Bar => b\n  puts 0\nrescue => e\n  puts 1\nend\n";
+    assert_eq!(compile_link_run(src), "1\n");
+  }
+
+  #[test]
+  fn retry_re_attempts_the_begin_until_it_succeeds() {
+    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nattempts: Int64 = 0\n\nbegin\n  attempts = attempts + 1\n  if attempts < 3\n    raise Foo.new(1)\n  end\nrescue Foo => e\n  retry\nend\nputs attempts\n";
+    assert_eq!(compile_link_run(src), "3\n");
+  }
+
+  #[test]
+  fn retry_does_not_re_trigger_the_enclosing_ensure_per_attempt() {
+    // `ensure` must print exactly once (after the third, successful
+    // attempt), not once per attempt.
+    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nattempts: Int64 = 0\n\nbegin\n  attempts = attempts + 1\n  if attempts < 3\n    raise Foo.new(1)\n  end\nrescue Foo => e\n  retry\nensure\n  puts \"cleanup\"\nend\nputs attempts\n";
+    assert_eq!(compile_link_run(src), "cleanup\n3\n");
+  }
+
+  #[test]
+  fn retry_with_no_enclosing_rescue_body_errors_not_panics() {
+    // Defensive-only: bypasses sema (which would already reject this)
+    // to prove codegen alone rejects a `retry` with an empty
+    // `retry_stack` with a descriptive `Err`, not a panic.
+    let program = Program {
+      items: vec![Item::Stmt(Stmt::Retry)],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_bare_retry_should_not_exist.o");
+    let result = compile_to_object(&program, &out);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("retry"));
   }
 }

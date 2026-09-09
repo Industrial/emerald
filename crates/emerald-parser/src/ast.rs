@@ -189,14 +189,18 @@ pub enum Stmt {
   /// `11`'s Decision log: in practice always a direct `ClassName.new(args)`
   /// call, the only shape codegen supports).
   Raise(Expr),
-  /// `begin body rescue Type => e rescue_body end` — a single typed
-  /// handler (plan `11`'s Decision log: no `ensure`, no multiple
-  /// `rescue` clauses, no bare catch-all yet).
+  /// `begin body rescue Type => e ... [rescue => e2 ...] [ensure ...]
+  /// end` (plan 38's Decision log) — one or more `rescue` clauses tried
+  /// in source order (subtype-aware: a clause naming a superclass
+  /// matches any raised subclass), an optional trailing `ensure` that
+  /// always runs, on every exit path (normal fallthrough, a matched
+  /// `rescue` clause's own fallthrough, and the mismatch-exhausted
+  /// re-raise path alike). Generalizes plan 11's original single-typed-
+  /// clause, no-`ensure` shape (`rescues.len() == 1`, `ensure: None`).
   Begin {
     body: Vec<Stmt>,
-    rescue_type: String,
-    rescue_var: String,
-    rescue_body: Vec<Stmt>,
+    rescues: Vec<RescueClause>,
+    ensure: Option<Vec<Stmt>>,
   },
   /// `case scrutinee when v1, v2 ... when v3 ... else ... end` (plan
   /// 20's Decision log): value-match via the same `CompareOp::Eq`
@@ -244,6 +248,24 @@ pub enum Stmt {
     exclusive: bool,
     body: Vec<Stmt>,
   },
+  /// `retry` (plan 38's Decision log) — legal only inside a `rescue`
+  /// clause's own body (not the `begin`'s try body, not `ensure`),
+  /// re-attempts the enclosing `begin` construct from scratch. Does
+  /// not run the enclosing `ensure` on its way back — it doesn't exit
+  /// the `begin` construct at all, unlike `Return`/`Break`/`Next`/
+  /// `Raise`.
+  Retry,
+}
+
+/// One `rescue` clause of a `Stmt::Begin` (plan 38's Decision log).
+/// `class_name: None` is a bare `rescue => e` catch-all — matches
+/// unconditionally, and `var` is never bound in `env` (no universal
+/// root class exists to type it at).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RescueClause {
+  pub class_name: Option<String>,
+  pub var: String,
+  pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

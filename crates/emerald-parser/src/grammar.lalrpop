@@ -1,4 +1,6 @@
-use crate::ast::{ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, Stmt};
+use crate::ast::{
+  ClassDef, CompareOp, Expr, Function, Item, ModuleDef, Param, Program, RescueClause, Stmt,
+};
 use crate::ast::decode_string_lit;
 use crate::interpolate;
 
@@ -220,16 +222,20 @@ Stmt: Stmt = {
   // can start an Expr either way — a real, disclosed narrowing versus
   // Ruby's own bare zero-arg `yield`, not attempted here.
   "yield" <args:YieldArgs> => Stmt::Yield(args),
-  // A single typed handler (plan 11's Decision log — no `ensure`, no
-  // multiple `rescue` clauses yet). `"rescue"` can't start a `Stmt`, so
-  // `body`'s `Stmt*` unambiguously stops there, the same way `"end"`/
-  // `"else"` already terminate other `Stmt*` blocks.
-  "begin" <body:Stmt*> "rescue" <rescue_type:Ident> "=>" <rescue_var:Ident> <rescue_body:Stmt*> "end" => Stmt::Begin {
+  // Plan 38: one or more `rescue` clauses (subtype-aware matching,
+  // source order — sema/codegen's job, not the grammar's), an optional
+  // trailing `ensure`. `"rescue"`/`"ensure"` can't start a `Stmt`, so
+  // `body`'s `Stmt*` unambiguously stops at the next `"rescue"`, the
+  // same way `"end"`/`"else"` already terminate other `Stmt*` blocks.
+  "begin" <body:Stmt*> <rescues:RescueClause+> <ensure:EnsureClause?> "end" => Stmt::Begin {
     body,
-    rescue_type,
-    rescue_var,
-    rescue_body,
+    rescues,
+    ensure,
   },
+  // Plan 38: legal only inside a `rescue` clause's own body — sema's
+  // job, not the grammar's, exactly like `break`/`next`'s in-loop
+  // restriction.
+  "retry" => Stmt::Retry,
   // Plan 20: value-match, not `spec/GRAMMAR.md`'s eventual `===`
   // dispatch (see the Decision log). `"when"` can't start a `Stmt`, so
   // `CaseArm`'s own trailing `Stmt*` unambiguously stops at the next
@@ -541,6 +547,27 @@ CaseValues: Vec<Expr> = {
 
 CaseArm: (Vec<Expr>, Vec<Stmt>) = {
   "when" <values:CaseValues> <body:Stmt*> => (values, body)
+};
+
+// Plan 38: a typed clause binds `var` at `class_name`'s type; a bare
+// clause (no `class_name`) matches unconditionally and never binds
+// `var` in `env` at all (Decision log — no universal root class exists
+// to type it at).
+RescueClause: RescueClause = {
+  "rescue" <c:Ident> "=>" <v:Ident> <b:Stmt*> => RescueClause {
+    class_name: Some(c),
+    var: v,
+    body: b,
+  },
+  "rescue" "=>" <v:Ident> <b:Stmt*> => RescueClause {
+    class_name: None,
+    var: v,
+    body: b,
+  },
+};
+
+EnsureClause: Vec<Stmt> = {
+  "ensure" <b:Stmt*> => b,
 };
 
 // Plan 18's precedence ladder, loosest to tightest: `||` -> `&&` ->
