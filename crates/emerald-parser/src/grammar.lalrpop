@@ -47,7 +47,21 @@ Item: Item = {
   <c:ClassDef> => Item::Class(c),
   <m:ModuleDef> => Item::Module(m),
   <s:Stmt> => Item::Stmt(s),
+  // Plan 23: reachable only here, at the top-level `Item` rule — never
+  // from `Stmt`/`Stmt*`, so `require` inside a function/`if`/`while`
+  // body is a real parse error, not silently accepted.
+  "require" <path:RequirePath> => Item::Require(path),
   ! => { errors.push(<>); Item::Error },
+};
+
+// `foo/bar/baz` — reuses `Ident` and the already-declared `"/"`
+// terminal (division's own token) rather than inventing a new regex
+// that would overlap `Ident`'s own pattern and risk lexer ambiguity
+// (plan 23's Decision log calls for a bare, unquoted, `/`-separated
+// path — this gets that without a new terminal at all).
+RequirePath: String = {
+  <first:Ident> => first,
+  <first:Ident> "/" <rest:RequirePath> => format!("{first}/{rest}"),
 };
 
 // A class body's field declarations reuse the `Param` rule directly

@@ -3700,6 +3700,13 @@ fn declare_user_functions<'ctx>(
         }
       }
       Item::Stmt(_) => {}
+      // Plan 23: nothing to declare — `compile_to_object`'s own
+      // per-item loop is where a `Program` that still contains an
+      // unresolved `Item::Require` (meaning `emerald-driver`'s
+      // resolution step, plan 17, was skipped or is missing entirely —
+      // not yet extracted in this codebase) produces a real, descriptive
+      // `Err` instead of silently compiling an incomplete program.
+      Item::Require(_) => {}
       // Plan 26: `emerald_parser::parse`/`parse_named` only ever
       // returns `Ok(program)` with zero recovered errors, meaning no
       // `Item::Error` in `program.items` — codegen never receives one.
@@ -3938,6 +3945,16 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
         }
       }
       Item::Stmt(_) => {}
+      // Plan 23's Decision log: reaching codegen with an unresolved
+      // `Item::Require` means `emerald-driver`'s resolution step (plan
+      // 17, not yet extracted in this codebase) was skipped or is
+      // missing — a real, descriptive `Err`, not a silent partial
+      // compile.
+      Item::Require(path) => {
+        return Err(format!(
+          "codegen: unresolved `require {path}` — internal driver bug (emerald-driver's resolution step should have stripped this before codegen)"
+        ));
+      }
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
     }
   }
@@ -4605,5 +4622,23 @@ mod tests {
     };
     let out = std::env::temp_dir().join("emerald_codegen_missing_block_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  // Plan 23 (multi-file compilation).
+
+  #[test]
+  fn unresolved_require_errors_not_panics() {
+    // `emerald-driver`'s resolution step (plan 17) isn't extracted in
+    // this codebase yet — an `Item::Require` reaching codegen means
+    // that step was skipped, a real internal-bug case codegen
+    // defensively rejects rather than silently compiling an incomplete
+    // program.
+    let program = Program {
+      items: vec![Item::Require("helpers".into())],
+    };
+    let out = std::env::temp_dir().join("emerald_codegen_unresolved_require_should_not_exist.o");
+    let result = compile_to_object(&program, &out);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("require"));
   }
 }

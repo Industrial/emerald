@@ -1392,6 +1392,13 @@ fn check_block_call_sites(
         }
       }
       Item::Stmt(s) => scan_block_call_site(s, sigs, classes, func_defs, &mut diags),
+      // Plan 23: `emerald-driver`'s `resolve_program` (not yet
+      // extracted in this codebase) is meant to strip every
+      // `Item::Require` before `emerald-sema` ever sees a `Program` —
+      // a no-op here, not an error, since a `require`-bearing `Program`
+      // reaching this far is a real, disclosed gap this plan names
+      // rather than papering over with a fabricated driver crate.
+      Item::Require(_) => {}
       Item::Error => {}
     }
   }
@@ -1743,6 +1750,9 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           diags.push(d);
         }
       }
+      // Plan 23: see `check_block_call_sites`'s own `Item::Require`
+      // arm — a no-op here too, for the same reason.
+      Item::Require(_) => {}
       // Plan 26's Decision log: `emerald_parser::parse`/`parse_named`
       // returns `Ok(program)` only when zero errors were recovered —
       // `program.items` then contains no `Item::Error` by construction,
@@ -2474,5 +2484,19 @@ mod tests {
     let errs = check_program(&program)
       .expect_err("must reject `yield` in a function with no block parameter");
     assert!(errs[0].message.contains("yield"));
+  }
+
+  // Plan 23 (multi-file compilation).
+
+  #[test]
+  fn item_require_is_a_no_op_in_sema() {
+    // `emerald-driver`'s resolution step (plan 17) isn't extracted in
+    // this codebase yet, so a `Program` still containing `Item::
+    // Require` is real, disclosed, in-scope input here — sema treats
+    // it as a no-op rather than panicking or rejecting the whole
+    // program.
+    let src = "require helpers\nputs 1\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 }

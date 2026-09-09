@@ -1101,6 +1101,31 @@ mod tests {
     parse(src).expect("plan 34's worked example must parse cleanly");
   }
 
+  // Plan 23 (multi-file compilation).
+
+  #[test]
+  fn require_single_segment_parses() {
+    let src = "require helpers\n";
+    let program = parse(src).unwrap();
+    assert_eq!(program.items[0], Item::Require("helpers".to_string()));
+  }
+
+  #[test]
+  fn require_multi_segment_path_parses() {
+    let src = "require utils/math\n";
+    let program = parse(src).unwrap();
+    assert_eq!(program.items[0], Item::Require("utils/math".to_string()));
+  }
+
+  #[test]
+  fn require_inside_a_function_body_is_a_parse_error() {
+    let src = "def f -> Void\n  require helpers\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "`require` must be rejected inside a function body"
+    );
+  }
+
   // Plan 33 (field-access sugar).
 
   #[test]

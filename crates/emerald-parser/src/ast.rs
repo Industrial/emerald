@@ -267,6 +267,18 @@ pub enum Item {
   Class(ClassDef),
   Module(ModuleDef),
   Stmt(Stmt),
+  /// `require <path>` (plan 23's Decision log) — a bare, unquoted,
+  /// `/`-separated path (no string-literal syntax dependency), always
+  /// relative to the *containing* file, `.em` implied. Reachable only
+  /// from `Program`'s top-level `Item*` rule, never from `Stmt*` — a
+  /// `require` inside a function body is a real parse error, not
+  /// silently accepted. `emerald-driver`'s `resolve_program` (plan 17,
+  /// not yet extracted in this codebase) is meant to strip every
+  /// `Item::Require` before handing a `Program` to `emerald-sema`/
+  /// `emerald-codegen` — until that driver exists, one reaching either
+  /// crate is a real, disclosed gap: sema treats it as a no-op, codegen
+  /// returns a descriptive `Err` rather than silently ignoring it.
+  Require(String),
   /// A top-level construct LALRPOP's `!` error-recovery mechanism
   /// resynchronized past (plan 26's Decision log) — a real parse error
   /// was recorded for it. Never appears in a `Program` `parse`/
