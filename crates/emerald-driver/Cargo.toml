@@ -9,6 +9,7 @@ emerald-parser = { path = "../emerald-parser" }
 emerald-sema = { path = "../emerald-sema" }
 emerald-codegen = { path = "../emerald-codegen" }
 id_effect = "0.4"
+blake3 = "1.8"
 
 [build-dependencies]
 cc = "1"

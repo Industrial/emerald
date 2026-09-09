@@ -5,13 +5,46 @@
 //! `emerald <file>` already uses (see this leaf's own Decision log for
 //! the real, disclosed per-line latency cost that trades for).
 
+use emerald_driver::cache::{CacheReporter, QueryCache, SilentReporter, VerboseReporter};
 use emerald_parser::{Expr, Item, Spanned, Stmt};
 use std::io::{self, BufRead, Write};
 use std::process::{self, Command};
 
-pub fn run() {
+/// Plan 48's `leaf-verbose-flag-and-consumer-wiring`: `--history-cache
+/// <dir>` points the session's `QueryCache` at a stable, reusable
+/// directory instead of a throwaway per-process-group temp one — the
+/// mechanism the plan's own Decision log's transcript-replay bullet
+/// depends on (replaying an *unmodified* transcript twice against the
+/// same `--history-cache` directory hits every previously-seen line's
+/// `check`/`codegen` cache). Passing `--history-cache` also enables
+/// `[cache] ... HIT|MISS` reporting to stderr; without it, the session
+/// still caches (so re-submitting the exact same line against the
+/// exact same prelude is a real, if narrow, hit — see the Decision
+/// log), just silently, against an ephemeral temp directory freed with
+/// the session.
+fn history_cache_dir(args: &[String]) -> Option<std::path::PathBuf> {
+  args
+    .iter()
+    .position(|a| a == "--history-cache")
+    .and_then(|i| args.get(i + 1))
+    .map(std::path::PathBuf::from)
+}
+
+pub fn run(args: &[String]) {
   println!("Emerald REPL — each line is compiled and run fresh against the session so far.");
   let mut prelude = String::new();
+
+  let history_dir = history_cache_dir(args);
+  let verbose = history_dir.is_some();
+  let cache_root = history_dir
+    .unwrap_or_else(|| std::env::temp_dir().join(format!("emerald-repl-cache-{}", process::id())));
+  let cache = QueryCache::new(cache_root.clone());
+  let reporter: Box<dyn CacheReporter> = if verbose {
+    Box::new(VerboseReporter)
+  } else {
+    Box::new(SilentReporter)
+  };
+
   let stdin = io::stdin();
   let mut lines = stdin.lock().lines();
 
@@ -28,7 +61,15 @@ pub fn run() {
     if line.is_empty() {
       continue;
     }
-    handle_line(&mut prelude, line);
+    handle_line(&mut prelude, line, &cache, reporter.as_ref());
+  }
+
+  // The ephemeral default (no `--history-cache`) is a real per-process
+  // temp directory (`QueryCache::codegen_query` persists real `.o`
+  // bytes to disk, not just an in-memory map) — freed with the
+  // session, matching the REPL's own subprocess-per-line model.
+  if !verbose {
+    std::fs::remove_dir_all(&cache_root).ok();
   }
 }
 
@@ -38,7 +79,7 @@ pub fn run() {
 /// compiles-and-runs it once without ever touching `prelude` (a
 /// transient expression — auto-printed via a literal `puts(...)`
 /// source-text wrap, unless it's already a bare `puts` call).
-fn handle_line(prelude: &mut String, line: &str) {
+fn handle_line(prelude: &mut String, line: &str, cache: &QueryCache, reporter: &dyn CacheReporter) {
   let program = match emerald_parser::parse(line) {
     Ok(p) => p,
     Err(errs) => {
@@ -67,7 +108,7 @@ fn handle_line(prelude: &mut String, line: &str) {
 
   if !is_transient {
     let candidate = format!("{prelude}{line}\n");
-    if let Ok(stdout) = compile_and_run(&candidate) {
+    if let Ok(stdout) = compile_and_run(&candidate, cache, reporter) {
       print!("{stdout}");
       io::stdout().flush().ok();
       prelude.push_str(line);
@@ -98,19 +139,27 @@ fn handle_line(prelude: &mut String, line: &str) {
     format!("puts {line}")
   };
   let candidate = format!("{prelude}{wrapped_line}\n");
-  if let Ok(stdout) = compile_and_run(&candidate) {
+  if let Ok(stdout) = compile_and_run(&candidate, cache, reporter) {
     print!("{stdout}");
     io::stdout().flush().ok();
   }
   // A transient expression's text is never appended to `prelude`.
 }
 
-/// Compiles+links+runs `candidate` via the ordinary `emerald_driver::
-/// compile` pipeline. `Err(())` means a diagnostic was already printed
-/// to stderr — the caller has nothing further to do.
-fn compile_and_run(candidate: &str) -> Result<String, ()> {
+/// Compiles+links+runs `candidate` via `emerald_driver::compile_cached`
+/// (plan 48) instead of the plain `compile` — every REPL line goes
+/// through the session's own `QueryCache` (an ephemeral per-session
+/// temp directory by default, or `--history-cache <dir>`'s stable one
+/// — see this module's own Decision-log comment on `run`). `Err(())`
+/// means a diagnostic was already printed to stderr — the caller has
+/// nothing further to do.
+fn compile_and_run(
+  candidate: &str,
+  cache: &QueryCache,
+  reporter: &dyn CacheReporter,
+) -> Result<String, ()> {
   let out_path = std::env::temp_dir().join(format!("emerald_repl_{}.out", process::id()));
-  let result = emerald_driver::compile(candidate, "<repl>", &out_path);
+  let result = emerald_driver::compile_cached(candidate, "<repl>", &out_path, cache, reporter);
   match result {
     Ok(()) => {
       let output = Command::new(&out_path).output();

@@ -113,11 +113,11 @@ fn main() {
   match args.get(1).map(String::as_str) {
     Some("new") => cmd_new(&args),
     Some("build") => {
-      cmd_build();
+      cmd_build(&args);
     }
-    Some("run") => cmd_run(),
+    Some("run") => cmd_run(&args),
     Some("test") => test_runner::run(&args),
-    Some("repl") => repl::run(),
+    Some("repl") => repl::run(&args),
     Some("update") => {
       eprintln!(
         "error: `emerald update` is not supported yet — edit the dependency's \
@@ -129,14 +129,33 @@ fn main() {
     // Plan 47's Decision log: zero args (a bare `emerald`) enters the
     // REPL too — `run_legacy` below already requires a real
     // `args.get(1)` source-file argument, so this arm must come first.
-    None => repl::run(),
+    None => repl::run(&args),
     _ => run_legacy(&args),
   }
 }
 
+/// Plan 48's `leaf-verbose-flag-and-consumer-wiring`: `.emerald/cache/`
+/// is a sibling of plan 46's own `.emerald/deps/` convention — reusing
+/// the established `.emerald/` namespace rather than inventing a
+/// second one. Relative to `cwd` for every cache-aware call site
+/// (`run_legacy`'s single-file mode included), so two invocations from
+/// the same directory share the same cache.
+fn cache_root() -> PathBuf {
+  std::env::current_dir()
+    .unwrap_or_else(|_| PathBuf::from("."))
+    .join(".emerald")
+    .join("cache")
+}
+
+fn verbose_cache_requested(args: &[String]) -> bool {
+  args.iter().any(|a| a == "--verbose-cache")
+}
+
 fn run_legacy(args: &[String]) {
   let Some(source_path) = args.get(1) else {
-    eprintln!("usage: emerald <source.em> [-o <output>]  |  emerald new/build/run <name>");
+    eprintln!(
+      "usage: emerald <source.em> [-o <output>] [--verbose-cache]  |  emerald new/build/run <name>"
+    );
     process::exit(2);
   };
 
@@ -152,7 +171,18 @@ fn run_legacy(args: &[String]) {
     process::exit(1);
   });
 
-  if let Err(e) = emerald_driver::compile(&source, source_path, &output_path) {
+  // Plan 48: `--verbose-cache` is strictly additive and opt-in — with
+  // no such flag, this is the exact `emerald_driver::compile` call
+  // every prior plan's test already proves, unchanged.
+  let result = if verbose_cache_requested(args) {
+    let cache = emerald_driver::cache::QueryCache::new(cache_root());
+    let reporter = emerald_driver::cache::VerboseReporter;
+    emerald_driver::compile_cached(&source, source_path, &output_path, &cache, &reporter)
+  } else {
+    emerald_driver::compile(&source, source_path, &output_path)
+  };
+
+  if let Err(e) = result {
     report_driver_error(e, Some((source_path, &source)));
     process::exit(1);
   }
@@ -208,7 +238,7 @@ fn load_manifest_or_exit(dir: &Path) -> Manifest {
 /// `Program` to `emerald_driver::compile_program`. Returns the path to
 /// the linked binary — never returns on failure (matches
 /// `run_legacy`'s own exit-on-error shape).
-fn cmd_build() -> PathBuf {
+fn cmd_build(args: &[String]) -> PathBuf {
   let cwd = std::env::current_dir().unwrap_or_else(|e| {
     eprintln!("error: cannot read current directory: {e}");
     process::exit(1);
@@ -234,13 +264,33 @@ fn cmd_build() -> PathBuf {
   );
 
   let entry_path = cwd.join(&manifest.package.entry);
-  let program = require::resolve_program(&entry_path).unwrap_or_else(|e| {
+  // Plan 48: `resolve_program_with_hashes` is `resolve_program`'s own
+  // superset (unconditionally used — a pure function with no side
+  // effects, so calling it costs nothing when `--verbose-cache` is
+  // absent); only the cache-aware branch below actually reaches for
+  // the per-file hashes it also returns.
+  let (program, hashes) = require::resolve_program_with_hashes(&entry_path).unwrap_or_else(|e| {
     report_error(CliError::Require(e));
     process::exit(1);
   });
 
   let output_path = cwd.join(&manifest.package.name);
-  if let Err(e) = emerald_driver::compile_program(program, &output_path) {
+  let result = if verbose_cache_requested(args) {
+    let cache = emerald_driver::cache::QueryCache::new(cache_root());
+    let reporter = emerald_driver::cache::VerboseReporter;
+    let key = cache.key_for_many(&hashes.iter().map(|(_, h)| *h).collect::<Vec<_>>());
+    emerald_driver::compile_program_cached(
+      program,
+      key,
+      &manifest.package.entry,
+      &output_path,
+      &cache,
+      &reporter,
+    )
+  } else {
+    emerald_driver::compile_program(program, &output_path)
+  };
+  if let Err(e) = result {
     // No single coherent source string exists for a `require`-spliced
     // `Program` (see `report_driver_error`'s own doc comment) — plain
     // text, unchanged.
@@ -252,8 +302,8 @@ fn cmd_build() -> PathBuf {
   output_path
 }
 
-fn cmd_run() {
-  let output_path = cmd_build();
+fn cmd_run(args: &[String]) {
+  let output_path = cmd_build(args);
   let status = Command::new(&output_path).status().unwrap_or_else(|e| {
     eprintln!("error: failed to run `{}`: {e}", output_path.display());
     process::exit(1);

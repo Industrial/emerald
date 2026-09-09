@@ -21,6 +21,9 @@ use id_effect::{Effect, run_blocking};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
+pub mod cache;
+use cache::{CacheKey, CacheReporter, QueryCache, raw_hash};
+
 // Plan 21's Decision log: `emerald-lsp` keeps depending only on this
 // crate, never directly on `emerald-parser`/`emerald-sema` (the same
 // boundary plan 17's `leaf-lsp-server` already established) — this
@@ -87,30 +90,40 @@ static RUNTIME_ARCHIVE: &[u8] = include_bytes!(env!("EMERALD_RUNTIME_ARCHIVE"));
 /// file and the extracted runtime archive are both removed once
 /// linking is attempted, success or failure.
 fn link_stage(obj_path: PathBuf, output_path: PathBuf) -> Effect<(), DriverError, ()> {
-  Effect::new(move |_env: &mut ()| {
-    let runtime_archive_path =
-      std::env::temp_dir().join(format!("libemerald_runtime_{}.a", process::id()));
-    if let Err(e) = std::fs::write(&runtime_archive_path, RUNTIME_ARCHIVE) {
-      std::fs::remove_file(&obj_path).ok();
-      return Err(DriverError::Link(format!(
-        "failed to extract the embedded runtime archive: {e}"
-      )));
-    }
-    let link_result = Command::new("cc")
-      .arg("-no-pie")
-      .arg(&obj_path)
-      .arg(&runtime_archive_path)
-      .arg("-o")
-      .arg(&output_path)
-      .status();
+  Effect::new(move |_env: &mut ()| link(obj_path.clone(), output_path.clone()))
+}
+
+/// Plan 48: `link_stage`'s own body, factored into a plain function so
+/// the new `*_cached` entry points (which don't build an `Effect`
+/// pipeline for their already-cached parse/check/codegen stages) can
+/// still call it directly — `link_stage` above is now a thin `Effect`
+/// wrapper over this, not a second implementation. Never cached (see
+/// the plan's own Decision log: caching `cc` would need its own key
+/// surface and artifact store for a stage that's a small fraction of
+/// total build time compared to LLVM codegen).
+fn link(obj_path: PathBuf, output_path: PathBuf) -> Result<(), DriverError> {
+  let runtime_archive_path =
+    std::env::temp_dir().join(format!("libemerald_runtime_{}.a", process::id()));
+  if let Err(e) = std::fs::write(&runtime_archive_path, RUNTIME_ARCHIVE) {
     std::fs::remove_file(&obj_path).ok();
-    std::fs::remove_file(&runtime_archive_path).ok();
-    match link_result {
-      Ok(status) if status.success() => Ok(()),
-      Ok(_) => Err(DriverError::Link("linking failed".to_string())),
-      Err(e) => Err(DriverError::Link(format!("failed to invoke cc: {e}"))),
-    }
-  })
+    return Err(DriverError::Link(format!(
+      "failed to extract the embedded runtime archive: {e}"
+    )));
+  }
+  let link_result = Command::new("cc")
+    .arg("-no-pie")
+    .arg(&obj_path)
+    .arg(&runtime_archive_path)
+    .arg("-o")
+    .arg(&output_path)
+    .status();
+  std::fs::remove_file(&obj_path).ok();
+  std::fs::remove_file(&runtime_archive_path).ok();
+  match link_result {
+    Ok(status) if status.success() => Ok(()),
+    Ok(_) => Err(DriverError::Link("linking failed".to_string())),
+    Err(e) => Err(DriverError::Link(format!("failed to invoke cc: {e}"))),
+  }
 }
 
 /// Parses and type-checks `source` in memory — no codegen, no link,
@@ -189,6 +202,81 @@ pub fn compile_program(program: Program, output_path: &Path) -> Result<(), Drive
     .flat_map(move |program| codegen_stage(program, obj_path, None))
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
   run_blocking(pipeline, ())
+}
+
+// Plan 48's `leaf-query-cache-core`/`leaf-require-graph-cache-keys`:
+// cached siblings of `check`/`compile`/`compile_program` above. Every
+// one of `check`/`compile`/`compile_program` is left completely
+// unchanged — no cache-related flag means the exact pre-this-plan code
+// path, by construction, satisfying `leaf-verbose-flag-and-consumer-
+// wiring`'s AC4 regression requirement trivially. These `_cached`
+// variants are additive, opt-in entry points `emerald-cli` reaches
+// only when `--verbose-cache`/`--history-cache` is actually passed.
+
+/// The cached sibling of `check` — parses and type-checks `source` via
+/// `cache`'s memoized queries instead of calling `emerald_parser`/
+/// `emerald_sema` unconditionally.
+pub fn check_cached(
+  source: &str,
+  name: &str,
+  cache: &QueryCache,
+  reporter: &dyn CacheReporter,
+) -> Result<(), DriverError> {
+  let program = cache
+    .parse_query(name, source, reporter)
+    .map_err(DriverError::Parse)?;
+  let key = cache.key_for(raw_hash(source.as_bytes()));
+  cache
+    .type_check_query(key, &program, name, reporter)
+    .map_err(DriverError::Sema)
+}
+
+/// The cached sibling of `compile` — parse/check/codegen all go
+/// through `cache`; `link_stage`'s own `cc` invocation is never
+/// cached (see the plan's own Decision log).
+pub fn compile_cached(
+  source: &str,
+  name: &str,
+  output_path: &Path,
+  cache: &QueryCache,
+  reporter: &dyn CacheReporter,
+) -> Result<(), DriverError> {
+  let program = cache
+    .parse_query(name, source, reporter)
+    .map_err(DriverError::Parse)?;
+  let key = cache.key_for(raw_hash(source.as_bytes()));
+  cache
+    .type_check_query(key, &program, name, reporter)
+    .map_err(DriverError::Sema)?;
+  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  cache
+    .codegen_query(key, &program, &obj_path, name, reporter)
+    .map_err(DriverError::Codegen)?;
+  link(obj_path, output_path.to_path_buf())
+}
+
+/// The cached sibling of `compile_program` — for a multi-file
+/// `require`-spliced program, `key` must already be the merged
+/// hash-of-hashes `emerald-cli`'s `require.rs` computes over the
+/// visited files' own content hashes (`QueryCache::key_for_many`) —
+/// this function has no source text of its own to hash, matching
+/// `compile_program`'s own already-parsed-`Program` shape.
+pub fn compile_program_cached(
+  program: Program,
+  key: CacheKey,
+  label: &str,
+  output_path: &Path,
+  cache: &QueryCache,
+  reporter: &dyn CacheReporter,
+) -> Result<(), DriverError> {
+  cache
+    .type_check_query(key, &program, label, reporter)
+    .map_err(DriverError::Sema)?;
+  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  cache
+    .codegen_query(key, &program, &obj_path, label, reporter)
+    .map_err(DriverError::Codegen)?;
+  link(obj_path, output_path.to_path_buf())
 }
 
 #[cfg(test)]
