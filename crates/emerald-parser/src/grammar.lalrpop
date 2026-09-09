@@ -1181,6 +1181,13 @@ TypeName: String = {
   <name:Ident> => name,
   "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
   "Hash" "[" <k:Ident> "," <v:Ident> "]" => format!("Hash[{k}, {v}]"),
+  // Plan 42's Decision log: `Pair[K, V]` — the identical compound-
+  // string convention `Hash[K, V]` above already uses. Never source-
+  // constructible as a VALUE (only `Hash[K,V].each`'s own generated
+  // Proc argument ever produces one), but its TYPE annotation must
+  // still parse — it's the only way to declare a `Hash.each` Proc's
+  // own parameter type.
+  "Pair" "[" <k:Ident> "," <v:Ident> "]" => format!("Pair[{k}, {v}]"),
   // Plan 53's Decision log: `Result[T, E]`, the identical `,`-split
   // compound-string convention `Hash[K, V]` already uses — `resolve_type`
   // is the thing that turns this into a real `Type::Result`.

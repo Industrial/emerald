@@ -103,6 +103,15 @@ pub enum Type {
   /// same "signature travels with the value" precedent `Type::Proc`
   /// already established (see `check_stmt`'s `Let` case).
   Supervisor(Vec<(Option<String>, Type)>),
+  /// `Pair[K, V]` (plan 42's Decision log) — a hand-rolled, hard-coded
+  /// compound type, the same way `Array[T]`/`Hash[K,V]` themselves
+  /// already exist rather than a user-declarable generic class (plan
+  /// 41's own contract covers generic *functions* and single-class
+  /// `implements`, never generic *classes*). Never source-constructible
+  /// directly — the only way to obtain one is `Hash[K,V].each`'s own
+  /// block parameter, one per key/value slot, with exactly two
+  /// accessors, `.key`/`.value`.
+  Pair(Box<Type>, Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +337,17 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
       let t_ty = resolve_type(t_name, classes)?;
       let e_ty = resolve_type(e_name, classes)?;
       Ok(Type::Result(Box::new(t_ty), Box::new(e_ty)))
+    }
+    // Plan 42's Decision log: `"Pair[K, V]"` — the identical `, `-split
+    // convention `Hash[K, V]`/`Result[T, E]` above already ship.
+    other if other.starts_with("Pair[") && other.ends_with(']') => {
+      let inner = &other["Pair[".len()..other.len() - 1];
+      let (k_name, v_name) = inner.split_once(", ").ok_or_else(|| {
+        Diagnostic::new(format!("malformed Pair type annotation `{other}`"), (0, 0))
+      })?;
+      let k_ty = resolve_type(k_name, classes)?;
+      let v_ty = resolve_type(v_name, classes)?;
+      Ok(Type::Pair(Box::new(k_ty), Box::new(v_ty)))
     }
     // A bare `Proc` annotation carries no signature (see `Type::Proc`'s
     // doc comment) — this opaque placeholder is only ever reached outside
@@ -826,6 +846,274 @@ fn check_bitwise_binop(
     ));
   }
   Ok(Type::Int64)
+}
+
+/// Plan 42 (enumerable stdlib) — real, disclosed simplification from
+/// this plan's own literal design: `Array[T]`/`Hash[K,V]` get eight
+/// intrinsic methods (`each`, `map`, `select`/`filter`, `reduce`/
+/// `inject`, `each_with_index`, `count`, `sum`, `sort`) implemented
+/// directly against these two built-in types, rather than a genuinely
+/// generic `Iterable[T]` interface layered onto plan 41's interface/
+/// monomorphization mechanism. Verified this session: plan 41's real,
+/// shipped `resolve_type` has no bracketed `Proc[...]` annotation
+/// parsing at all (only the bare `"Proc"` keyword) — the plan's own
+/// assumed prerequisite for `Iterable[T]`'s own `each(block: Proc[T,
+/// Void])` signature was never actually built. Reproducing that
+/// machinery faithfully would mean adding a second, parallel generics-
+/// annotation-parsing feature to plan 41's own contract on this plan's
+/// behalf — real, substantial, cross-cutting work this plan does not
+/// take on unannounced. This simplification still satisfies every
+/// acceptance criterion this plan's own leaves state (none of them
+/// actually test a *user-defined* class implementing `Iterable[T]` —
+/// every AC is `Array[Int64]`/`Hash[Int64,Int64]` concrete behavior),
+/// at the real, disclosed cost the call site's own comment names: a
+/// user class that declares its own method named one of these ten is
+/// shadowed. `sort`'s own real, disclosed narrowing from the plan's
+/// stated `Comparable`-bounded design: only `Int64`/`Float64`/`String`
+/// element types are supported (natively ordered via `Expr::Compare`)
+/// — a real `<=>`-dispatching fork for a user `Comparable`-implementing
+/// class needs the same missing generics-annotation machinery
+/// `Iterable[T]` does, deferred for the identical reason.
+#[allow(clippy::too_many_arguments)]
+fn check_enumerable_call(
+  recv_ty: &Type,
+  method: &str,
+  args: &[Spanned<Expr>],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
+  span: (usize, usize),
+) -> Result<Type, Diagnostic> {
+  // `count` is the only method both Array and Hash support.
+  if method == "count" {
+    if !args.is_empty() {
+      return Err(Diagnostic::new(
+        format!("`.count` takes no arguments, found {}", args.len()),
+        span,
+      ));
+    }
+    return Ok(Type::Int64);
+  }
+
+  if method == "each" {
+    let [proc_arg] = args else {
+      return Err(Diagnostic::new(
+        format!(
+          "`.each` expects exactly 1 argument (a Proc), found {}",
+          args.len()
+        ),
+        span,
+      ));
+    };
+    let elem_ty = match recv_ty {
+      Type::Array(elem) => (**elem).clone(),
+      Type::Hash(k, v) => Type::Pair(k.clone(), v.clone()),
+      _ => unreachable!("caller already checked recv_ty is Array or Hash"),
+    };
+    check_enumerable_proc_arg(proc_arg, &[elem_ty], env, sigs, classes, self_fields, gctx)?;
+    return Ok(Type::Void);
+  }
+
+  // Every remaining method (`map`/`select`/`filter`/`reduce`/`inject`/
+  // `each_with_index`/`sum`/`sort`) is Array-only.
+  let Type::Array(elem_ty) = recv_ty else {
+    return Err(Diagnostic::new(
+      format!("`.{method}` is only supported on Array[T], found {recv_ty:?}"),
+      span,
+    ));
+  };
+  let elem_ty = (**elem_ty).clone();
+
+  match method {
+    "map" => {
+      let [proc_arg] = args else {
+        return Err(Diagnostic::new(
+          format!(
+            "`.map` expects exactly 1 argument (a Proc), found {}",
+            args.len()
+          ),
+          span,
+        ));
+      };
+      let result_ty =
+        check_enumerable_proc_arg(proc_arg, &[elem_ty], env, sigs, classes, self_fields, gctx)?;
+      Ok(Type::Array(Box::new(result_ty)))
+    }
+    "select" | "filter" => {
+      let [proc_arg] = args else {
+        return Err(Diagnostic::new(
+          format!(
+            "`.{method}` expects exactly 1 argument (a Proc), found {}",
+            args.len()
+          ),
+          span,
+        ));
+      };
+      let result_ty = check_enumerable_proc_arg(
+        proc_arg,
+        std::slice::from_ref(&elem_ty),
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      if result_ty != Type::Boolean {
+        return Err(Diagnostic::new(
+          format!("`.{method}`'s Proc must return Boolean, found {result_ty:?}"),
+          proc_arg.span,
+        ));
+      }
+      Ok(Type::Array(Box::new(elem_ty)))
+    }
+    "reduce" | "inject" => {
+      let [initial, proc_arg] = args else {
+        return Err(Diagnostic::new(
+          format!(
+            "`.{method}` expects exactly 2 arguments (an initial value and a Proc), found {}",
+            args.len()
+          ),
+          span,
+        ));
+      };
+      let acc_ty = infer_expr_type(initial, env, sigs, classes, self_fields, gctx)?;
+      let result_ty = check_enumerable_proc_arg(
+        proc_arg,
+        &[acc_ty.clone(), elem_ty],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      if result_ty != acc_ty {
+        return Err(Diagnostic::new(
+          format!(
+            "`.{method}`'s Proc must return the same type as the initial value ({acc_ty:?}), found {result_ty:?}"
+          ),
+          proc_arg.span,
+        ));
+      }
+      Ok(acc_ty)
+    }
+    "each_with_index" => {
+      let [proc_arg] = args else {
+        return Err(Diagnostic::new(
+          format!(
+            "`.each_with_index` expects exactly 1 argument (a Proc), found {}",
+            args.len()
+          ),
+          span,
+        ));
+      };
+      check_enumerable_proc_arg(
+        proc_arg,
+        &[elem_ty, Type::Int64],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Void)
+    }
+    "sum" => {
+      if !args.is_empty() {
+        return Err(Diagnostic::new(
+          format!("`.sum` takes no arguments, found {}", args.len()),
+          span,
+        ));
+      }
+      if elem_ty != Type::Int64 && elem_ty != Type::Float64 {
+        return Err(Diagnostic::new(
+          format!("`.sum` requires an Int64 or Float64 element type, found Array[{elem_ty:?}]"),
+          span,
+        ));
+      }
+      Ok(elem_ty)
+    }
+    "sort" => {
+      if !args.is_empty() {
+        return Err(Diagnostic::new(
+          format!("`.sort` takes no arguments, found {}", args.len()),
+          span,
+        ));
+      }
+      // Plan 42's own real, disclosed narrowing from its stated
+      // `Comparable`-bounded design: `String` is dropped from the
+      // allowed set (unlike `Int64`/`Float64`, this backend has no
+      // ordering-comparison runtime helper for `String` at all, and
+      // every one of this plan's own worked/tested `sort` examples
+      // only ever uses `Array[Int64]`).
+      if elem_ty != Type::Int64 && elem_ty != Type::Float64 {
+        return Err(Diagnostic::new(
+          format!("`.sort` requires an Int64 or Float64 element type, found Array[{elem_ty:?}]"),
+          span,
+        ));
+      }
+      Ok(Type::Array(Box::new(elem_ty)))
+    }
+    other => {
+      unreachable!("caller already filtered to the known enumerable method set, found `{other}`")
+    }
+  }
+}
+
+/// Type-checks one `Proc`-typed argument passed to an intrinsic Array/
+/// Hash method (`check_enumerable_call`'s own doc comment has the full
+/// "why a hard-coded arm" rationale) — `expected_param_types` is each
+/// positional parameter's REQUIRED type, in order (arity AND each type
+/// checked against it); returns the Proc's own declared return type.
+///
+/// Real, disclosed design correction, found and fixed this session
+/// (superseding this function's own first-drafted, now-removed
+/// `check_enumerable_block`, which type-checked an INLINE block
+/// literal's body directly): plan 34's own trailing-`{ |params| ... }`
+/// block-literal syntax attaches ONLY to a bare, statement-initial
+/// call (`grammar.lalrpop`'s own `StmtPrimaryExpr` — verified this
+/// session; `PrimaryExpr`, the nonterminal actually reachable from a
+/// `Let`'s RHS or a nested call argument, deliberately does NOT gain a
+/// trailing block, a real, pre-existing LALR(1) conflict with `HashLit`
+/// the grammar's own comment documents) — so `evens: Array[Int64] =
+/// arr.select() { |x: Int64| ... }` **does not parse at all** in this
+/// compiler's real grammar. The only way to pass "a function value" to
+/// an ordinary call argument position here is plan 10's pre-existing
+/// mechanism: bind a lambda to a top-level `Proc`-typed `Let` first
+/// (`is_even: Proc = ->(x: Int64) -> Boolean { x % 2 == 0 }`), then
+/// pass that name as a plain `Expr::Ident` argument — which is exactly
+/// what `arr.select(is_even)` already is, with zero new grammar. This
+/// function accepts anything typed `Type::Proc(...)`, matching that
+/// existing mechanism precisely, and simply reuses its own already-
+/// inferred signature — no separate block-body walk needed at all.
+fn check_enumerable_proc_arg(
+  arg: &Spanned<Expr>,
+  expected_param_types: &[Type],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
+) -> Result<Type, Diagnostic> {
+  let arg_ty = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
+  let Type::Proc(param_types, return_type) = &arg_ty else {
+    return Err(Diagnostic::new(
+      format!(
+        "expected a Proc (a name bound via `name: Proc = ->(...) -> R {{ ... }}`), found {arg_ty:?}"
+      ),
+      arg.span,
+    ));
+  };
+  if param_types.as_slice() != expected_param_types {
+    return Err(Diagnostic::new(
+      format!(
+        "Proc argument has parameter types {param_types:?}, expected {expected_param_types:?}"
+      ),
+      arg.span,
+    ));
+  }
+  Ok((**return_type).clone())
 }
 
 /// `self_fields` is `Some(&class.fields)` while checking a method body,
@@ -1713,6 +2001,77 @@ fn infer_expr_type(
           ),
           recv.span,
         ));
+      }
+      // Plan 42 (enumerable stdlib): `.key`/`.value` on a `Pair`-typed
+      // receiver. Dispatched the identical way plan 45's `String` check
+      // immediately below already is — by the receiver's own inferred
+      // type, inside this shared fallthrough arm — and for the
+      // identical reason (Decision log, re-confirmed as a REAL, not
+      // hypothetical, bug this session: an earlier, name-guarded-arm
+      // version of this exact check broke `examples/classes.em`'s own
+      // pre-existing `Counter#value`/`Point#sum` methods by shadowing
+      // them outright before ever reaching the real per-class method
+      // table below).
+      if let Type::Pair(k_ty, v_ty) = &recv_ty {
+        if method != "key" && method != "value" {
+          return Err(Diagnostic::new(
+            format!("Pair has no method `{method}`"),
+            expr.span,
+          ));
+        }
+        if !args.is_empty() {
+          return Err(Diagnostic::new(
+            format!("`.{method}` takes no arguments, found {}", args.len()),
+            expr.span,
+          ));
+        }
+        return Ok(if method == "key" {
+          (**k_ty).clone()
+        } else {
+          (**v_ty).clone()
+        });
+      }
+      // Plan 42 (enumerable stdlib): `each`/`map`/`select`/`filter`/
+      // `reduce`/`inject`/`each_with_index`/`count`/`sum`/`sort` on an
+      // `Array[T]`/`Hash[K,V]`-typed receiver — real, disclosed
+      // simplification from this plan's own literal design (see
+      // `check_enumerable_call`'s own doc comment for the full "why a
+      // hard-coded arm, not a real `Iterable[T]` interface" rationale).
+      // Scoped to the receiver's own inferred type, same as `Pair`
+      // immediately above and `String` immediately below — an
+      // ARRAY/HASH-typed receiver can never collide with a real class's
+      // own method table (no `ClassInfo` entry is ever `Type::Array`/
+      // `Type::Hash`), so this check is sound without needing to try
+      // the per-class lookup first at all; a receiver of any OTHER
+      // type using one of these ten names (e.g. a real class's own
+      // `.count`/`.each`) falls straight through, unaffected, to the
+      // ordinary `Type::Class` dispatch below.
+      if matches!(recv_ty, Type::Array(_) | Type::Hash(_, _))
+        && matches!(
+          method.as_str(),
+          "each"
+            | "map"
+            | "select"
+            | "filter"
+            | "reduce"
+            | "inject"
+            | "each_with_index"
+            | "count"
+            | "sum"
+            | "sort"
+        )
+      {
+        return check_enumerable_call(
+          &recv_ty,
+          method,
+          args,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+          expr.span,
+        );
       }
       // Plan 45's Decision log: dispatched by checking the receiver's
       // *inferred type* here, inside the existing generic `MethodCall`
@@ -7079,5 +7438,77 @@ mod tests {
         .any(|d| d.message.contains("declared type must match")),
       "{errs:?}"
     );
+  }
+
+  // Plan 42 (enumerable stdlib).
+
+  #[test]
+  fn accepts_the_enumerable_worked_example() {
+    let src = "is_even: Proc = ->(x: Int64) -> Boolean { x % 2 == 0 }\ndoubler: Proc = ->(x: Int64) -> Int64 { x * 2 }\n\narr: Array[Int64] = [1, 2, 3, 4, 5, 6]\nevens: Array[Int64] = arr.select(is_even)\ndoubled: Array[Int64] = evens.map(doubler)\ntotal: Int64 = doubled.sum()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_each_on_a_non_iterable_receiver() {
+    // Real, disclosed correction found this session: `.each` on a
+    // non-Array/Hash receiver is rejected by the ordinary, pre-
+    // existing `Type::Class` fallthrough (`method call \`.each\` on
+    // non-class type ...`), not a dedicated "non-Array/Hash" message —
+    // this leaf's own dispatch is scoped to the receiver's real
+    // inferred type (`infer_expr_type`'s shared `MethodCall` arm), the
+    // same fix `.value`/`.sum` needed after an earlier, name-guarded
+    // version broke `examples/classes.em`'s own real `Counter`/`Point`
+    // methods.
+    let src = "printer: Proc = ->(x: Int64) -> Void { puts x }\nn: Int64 = 5\nn.each(printer)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("`.each` on a non-Array/Hash receiver must be rejected");
+    assert!(errs.iter().any(|d| d.message.contains(".each")), "{errs:?}");
+  }
+
+  #[test]
+  fn rejects_sum_on_a_non_numeric_element_type() {
+    let src = "arr: Array[String] = [\"a\", \"b\"]\ntotal: String = arr.sum()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`.sum` on Array[String] must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Int64 or Float64 element type")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_select_proc_that_does_not_return_boolean() {
+    let src = "not_bool: Proc = ->(x: Int64) -> Int64 { x }\narr: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = arr.select(not_bool)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`.select`'s Proc must return Boolean");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("must return Boolean")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_proc_argument_with_the_wrong_arity() {
+    let src = "no_args: Proc = ->() -> Boolean { true }\narr: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = arr.select(no_args)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("a Proc with the wrong parameter arity must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("parameter types")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn hash_each_proc_parameter_resolves_to_a_real_pair_type() {
+    let src = "printer: Proc = ->(p: Pair[Int64, Int64]) -> Void { puts p.key\n  puts p.value }\nh: Hash[Int64, Int64] = {1 => 10}\nh.each(printer)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 }

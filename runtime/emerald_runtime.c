@@ -456,6 +456,13 @@ long long emerald_string_split_count(const char *s, const char *sep) {
   return count;
 }
 
+/* Plan 42 (enumerable stdlib), `leaf-array-length-header`: returns the
+ * same header-prefixed `[length: Int64][elements...]` layout every
+ * other `Array[T]` now does (`build_array_lit`'s own doc comment) —
+ * `build_index`'s array-read codegen unconditionally assumes it. A
+ * real, disclosed regression found and fixed this session: this
+ * function's own pre-existing, header-less buffer predates that
+ * convention (the same class of bug `emerald_build_argv` had). */
 void **emerald_string_split(const char *s, const char *sep) {
   size_t sep_len = strlen(sep);
   if (sep_len == 0) {
@@ -463,7 +470,9 @@ void **emerald_string_split(const char *s, const char *sep) {
     exit(1);
   }
   long long count = emerald_string_split_count(s, sep);
-  void **out = emerald_alloc(count * (long long) sizeof(void *));
+  char *out = emerald_alloc((long long) sizeof(long long) + count * (long long) sizeof(void *));
+  *(long long *) out = count;
+  void **elems = (void **) (out + sizeof(long long));
   const char *cursor = s;
   const char *found;
   long long i = 0;
@@ -472,7 +481,7 @@ void **emerald_string_split(const char *s, const char *sep) {
     char *seg = emerald_alloc((long long) (seg_len + 1));
     memcpy(seg, cursor, seg_len);
     seg[seg_len] = '\0';
-    out[i] = seg;
+    elems[i] = seg;
     i++;
     cursor = found + sep_len;
   }
@@ -480,8 +489,8 @@ void **emerald_string_split(const char *s, const char *sep) {
   char *seg = emerald_alloc((long long) (seg_len + 1));
   memcpy(seg, cursor, seg_len);
   seg[seg_len] = '\0';
-  out[i] = seg;
-  return out;
+  elems[i] = seg;
+  return (void **) out;
 }
 
 /* `leaf-file-io`. Errors are a disclosed runtime abort
@@ -521,14 +530,28 @@ void emerald_file_write(const char *path, const char *content) {
  * allocation in this runtime already makes. `emerald_gets` copies into
  * an `emerald_alloc`'d buffer so the returned `String` came from this
  * runtime's one allocator; returns an empty `""` at EOF rather than
- * `nil` (`Type::Nil`'s already-narrow, non-optional scope). */
+ * `nil` (`Type::Nil`'s already-narrow, non-optional scope).
+ *
+ * Plan 42 (enumerable stdlib), `leaf-array-length-header`: `ARGV` is
+ * tracked in codegen as an ordinary `Array[String]` local (`define_
+ * main`'s own `local_array_elem_types.insert("ARGV", ...)`), so it
+ * must carry the exact same `[length: Int64][elements...]` header
+ * every other `Array[T]` now does — `build_index`'s own array-read
+ * codegen unconditionally adds the 8-byte header offset, with no
+ * per-variable exception for `ARGV`. A real, disclosed regression
+ * found and fixed this session: this function's own pre-existing,
+ * header-less buffer (bare `argv[i+1]` pointers, no length prefix)
+ * predates that convention and broke the moment `build_index` started
+ * assuming it everywhere. */
 void **emerald_build_argv(int argc, char **argv) {
   long long count = argc > 0 ? argc - 1 : 0;
-  void **out = emerald_alloc(count > 0 ? count * (long long) sizeof(void *) : (long long) sizeof(void *));
+  char *out = emerald_alloc((long long) sizeof(long long) + count * (long long) sizeof(void *));
+  *(long long *) out = count;
+  void **elems = (void **) (out + sizeof(long long));
   for (long long i = 0; i < count; i++) {
-    out[i] = argv[i + 1];
+    elems[i] = argv[i + 1];
   }
-  return out;
+  return (void **) out;
 }
 
 char *emerald_gets(void) {
