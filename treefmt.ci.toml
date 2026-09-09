@@ -17,6 +17,13 @@ excludes = [
   "**/.git/**",
   ".cursor/**",
   ".vscode/**",
+  # Plan 24: tree-sitter's own generated output (grammar.json,
+  # node-types.json) — checked in verbatim as the tree-sitter CLI emits
+  # it, the same convention as a compiled TextMate grammar (plan 17).
+  # The javascript formatter's `*.json` glob would otherwise reformat
+  # these into a different byte-for-byte shape than `tree-sitter
+  # generate` produces, fighting that tool on every regeneration.
+  "tree-sitter-emerald/src/**",
 ]
 
 # Exit with error if any changes were made during execution
