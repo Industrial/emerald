@@ -185,6 +185,12 @@ struct FunctionSig {
   /// (`eval_const_bool`) has the callee's `requires` clauses in hand
   /// without needing a second lookup back into the raw `Program`.
   requires: Vec<Contract>,
+  /// Plan 63's `leaf-sema-purity-check`: mirrors `Function.is_pure` so
+  /// `check_purity`'s call-graph walk can look up whether a *callee*
+  /// (by name, via `sigs`) claims purity without a second pass back
+  /// into the raw `Program` — the same "carry it alongside the
+  /// signature" precedent `requires` above already set for plan 62.
+  is_pure: bool,
 }
 
 /// Shared by classes and modules (plan 12's Decision log — modules reuse
@@ -518,6 +524,7 @@ fn build_generic_class_info(
         defaults,
         splat_elem,
         requires: m.requires.clone(),
+        is_pure: m.is_pure,
       },
     );
   }
@@ -1143,6 +1150,7 @@ fn function_signature(
     defaults,
     splat_elem,
     requires: f.requires.clone(),
+    is_pure: f.is_pure,
   })
 }
 
@@ -5385,6 +5393,1451 @@ fn expr_moved_read(
   }
 }
 
+/// Plan 63's `leaf-sema-purity-check`: identifies one `pure`-claimed
+/// top-level function (`Function`) or one `pure`-claimed method
+/// (`Method(class_or_module_name, method_name)`) — the call graph's
+/// node type. Two functions/methods with the same name in different
+/// classes are genuinely distinct nodes; a bare top-level function and
+/// a same-named method are also genuinely distinct (`sigs` vs.
+/// `classes[_].methods` are already two separate namespaces
+/// everywhere else in this file).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PureNode {
+  Function(String),
+  Method(String, String),
+}
+
+fn pure_node_display_name(node: &PureNode) -> String {
+  match node {
+    PureNode::Function(name) => name.clone(),
+    PureNode::Method(owner, name) => format!("{owner}#{name}"),
+  }
+}
+
+/// One `pure`-claimed function/method, gathered once up front so the
+/// SCC/verification passes below never need to re-walk `program.items`.
+struct PureCandidate<'a> {
+  node: PureNode,
+  f: &'a Function,
+  self_fields: Option<&'a HashMap<String, Type>>,
+}
+
+/// Rebuilds the exact `env`/`declared_return` `check_function_body`/
+/// `check_method_body` already built and successfully checked this
+/// body against, earlier in `check_program` — re-running `check_block`
+/// here (ignoring its `Result`, since that earlier, identical call is
+/// this pass's own precondition for even being reached) is cheaper
+/// than threading a second, `pure`-specific environment-tracking
+/// scheme through this file, and keeps `check_purity_expr`'s own
+/// actor-receiver detection on the exact same "`Ident` receiver found
+/// in `env`" mechanism `check_message_safety_expr_stmt` already
+/// established (see its own doc comment) rather than a second,
+/// independently-maintained copy.
+fn rebuild_purity_env(
+  f: &Function,
+  self_fields: Option<&HashMap<String, Type>>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  gctx: &GenericsCtx,
+) -> (HashMap<String, Type>, Type) {
+  let mut env = HashMap::new();
+  for p in &f.params {
+    if let Ok(t) = resolve_type(&p.ty, classes) {
+      env.insert(p.name.clone(), t);
+    }
+  }
+  if self_fields.is_none() {
+    if let Some(p) = &f.splat_param {
+      if let Ok(elem_ty) = resolve_type(&p.ty, classes) {
+        env.insert(p.name.clone(), Type::Array(Box::new(elem_ty)));
+      }
+    }
+  }
+  let declared_return = if self_fields.is_some() {
+    resolve_type(&f.return_type, classes).unwrap_or(Type::Void)
+  } else {
+    resolve_return_type(&f.return_type, classes).unwrap_or(Type::Void)
+  };
+  let _ = check_block(
+    &f.body,
+    &mut env,
+    sigs,
+    classes,
+    self_fields,
+    &declared_return,
+    false,
+    false,
+    f.block_param.is_some(),
+    gctx,
+  );
+  (env, declared_return)
+}
+
+/// A plain DFS-based Tarjan SCC pass (Decision log: no existing SCC
+/// utility anywhere in this file, and the call graph is small enough
+/// that a new Cargo dependency isn't justified). `strongconnect` is a
+/// nested `fn`, not a closure, specifically so `adjacency` (never
+/// mutated) and the five pieces of mutable DFS state can be borrowed
+/// independently across the recursive call — a closure capturing
+/// `&mut self`-style state hits the classic "recursing while holding a
+/// borrow of the same struct" conflict; separate parameters don't.
+/// Returns each SCC's member indices, in an order where a component
+/// only ever calls into components that already appear EARLIER in the
+/// returned `Vec` — Tarjan's own finishing order already gives this
+/// for free (a callee's component is always fully explored, and thus
+/// already pushed onto `result`, before its caller's own component
+/// closes), which is exactly the "callees' components decided before
+/// their callers'" processing order `check_purity` needs.
+fn tarjan_scc(adjacency: &[Vec<usize>]) -> Vec<Vec<usize>> {
+  let n = adjacency.len();
+  let mut index_counter = 0usize;
+  let mut indices: Vec<Option<usize>> = vec![None; n];
+  let mut lowlinks: Vec<usize> = vec![0; n];
+  let mut on_stack: Vec<bool> = vec![false; n];
+  let mut stack: Vec<usize> = Vec::new();
+  let mut result: Vec<Vec<usize>> = Vec::new();
+
+  #[allow(clippy::too_many_arguments)]
+  fn strongconnect(
+    v: usize,
+    adjacency: &[Vec<usize>],
+    index_counter: &mut usize,
+    indices: &mut [Option<usize>],
+    lowlinks: &mut [usize],
+    on_stack: &mut [bool],
+    stack: &mut Vec<usize>,
+    result: &mut Vec<Vec<usize>>,
+  ) {
+    indices[v] = Some(*index_counter);
+    lowlinks[v] = *index_counter;
+    *index_counter += 1;
+    stack.push(v);
+    on_stack[v] = true;
+    for &w in &adjacency[v] {
+      if indices[w].is_none() {
+        strongconnect(
+          w,
+          adjacency,
+          index_counter,
+          indices,
+          lowlinks,
+          on_stack,
+          stack,
+          result,
+        );
+        lowlinks[v] = lowlinks[v].min(lowlinks[w]);
+      } else if on_stack[w] {
+        lowlinks[v] = lowlinks[v].min(indices[w].expect("w has an index — just checked Some"));
+      }
+    }
+    if lowlinks[v] == indices[v].expect("v was just assigned Some above") {
+      let mut scc = Vec::new();
+      loop {
+        let w = stack.pop().expect("v itself is still on the stack");
+        on_stack[w] = false;
+        scc.push(w);
+        if w == v {
+          break;
+        }
+      }
+      result.push(scc);
+    }
+  }
+
+  for v in 0..n {
+    if indices[v].is_none() {
+      strongconnect(
+        v,
+        adjacency,
+        &mut index_counter,
+        &mut indices,
+        &mut lowlinks,
+        &mut on_stack,
+        &mut stack,
+        &mut result,
+      );
+    }
+  }
+  result
+}
+
+/// Structural-only walk collecting call-graph edges — every `Expr::
+/// Call`/`Expr::CallKw`/`Expr::MethodCall` target that itself resolves
+/// to another entry in `node_index` becomes an edge in `out`. Never
+/// fails, never flags a violation (that's `check_purity_expr`'s job,
+/// once the SCC processing order below is known) — this pass only
+/// needs to know WHICH other `pure`-claimed nodes a body's calls can
+/// reach, not whether any of them are legal.
+fn collect_purity_edges_stmt(
+  stmt: &Spanned<Stmt>,
+  node_index: &HashMap<PureNode, usize>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  out: &mut HashSet<usize>,
+) {
+  match &stmt.node {
+    Stmt::Let { value, .. }
+    | Stmt::SetField { value, .. }
+    | Stmt::Assign { value, .. }
+    | Stmt::OrAssign { default: value, .. }
+    | Stmt::AndAssign { value, .. } => {
+      collect_purity_edges_expr(value, node_index, env, classes, out)
+    }
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      collect_purity_edges_expr(array, node_index, env, classes, out);
+      collect_purity_edges_expr(index, node_index, env, classes, out);
+      collect_purity_edges_expr(value, node_index, env, classes, out);
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        collect_purity_edges_expr(v, node_index, env, classes, out);
+      }
+    }
+    Stmt::Return(Some(e)) | Stmt::Raise(e) => {
+      collect_purity_edges_expr(e, node_index, env, classes, out)
+    }
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => {}
+    Stmt::Yield(args) => {
+      for a in args {
+        collect_purity_edges_expr(a, node_index, env, classes, out);
+      }
+    }
+    Stmt::Expr(e) => collect_purity_edges_expr(e, node_index, env, classes, out),
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      collect_purity_edges_expr(cond, node_index, env, classes, out);
+      for s in then_branch {
+        collect_purity_edges_stmt(s, node_index, env, classes, out);
+      }
+      if let Some(eb) = else_branch {
+        for s in eb {
+          collect_purity_edges_stmt(s, node_index, env, classes, out);
+        }
+      }
+    }
+    Stmt::While { cond, body } => {
+      collect_purity_edges_expr(cond, node_index, env, classes, out);
+      for s in body {
+        collect_purity_edges_stmt(s, node_index, env, classes, out);
+      }
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        collect_purity_edges_expr(e, node_index, env, classes, out);
+      }
+      for s in body {
+        collect_purity_edges_stmt(s, node_index, env, classes, out);
+      }
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      collect_purity_edges_expr(start, node_index, env, classes, out);
+      collect_purity_edges_expr(end, node_index, env, classes, out);
+      for s in body {
+        collect_purity_edges_stmt(s, node_index, env, classes, out);
+      }
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      collect_purity_edges_expr(scrutinee, node_index, env, classes, out);
+      for (_, arm_body) in arms {
+        for s in arm_body {
+          collect_purity_edges_stmt(s, node_index, env, classes, out);
+        }
+      }
+      if let Some(eb) = else_body {
+        for s in eb {
+          collect_purity_edges_stmt(s, node_index, env, classes, out);
+        }
+      }
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        collect_purity_edges_stmt(s, node_index, env, classes, out);
+      }
+      for r in rescues {
+        for s in &r.body {
+          collect_purity_edges_stmt(s, node_index, env, classes, out);
+        }
+      }
+      if let Some(eb) = ensure {
+        for s in eb {
+          collect_purity_edges_stmt(s, node_index, env, classes, out);
+        }
+      }
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      collect_purity_edges_expr(scrutinee, node_index, env, classes, out);
+      for s in ok_body {
+        collect_purity_edges_stmt(s, node_index, env, classes, out);
+      }
+      for s in err_body {
+        collect_purity_edges_stmt(s, node_index, env, classes, out);
+      }
+    }
+  }
+}
+
+/// `recv`'s callable owner name, resolved the same two ways
+/// `check_purity_expr`'s own `MethodCall` arm resolves it: an
+/// `Ident` bound in `env` to `Type::Class(n)` (an ordinary local/
+/// param), or an `Ident` naming a module directly (modules are never
+/// bound in `env` — there's no instance to bind). Shared by the edge
+/// collector and the real checker so the two can never disagree about
+/// which `MethodCall` sites are even candidates for a `pure`-relevant
+/// dispatch.
+fn purity_method_owner<'a>(
+  recv: &Spanned<Expr>,
+  env: &HashMap<String, Type>,
+  classes: &'a HashMap<String, ClassInfo>,
+) -> Option<&'a str> {
+  let Expr::Ident(recv_name) = &recv.node else {
+    return None;
+  };
+  if let Some(Type::Class(class_name)) = env.get(recv_name) {
+    return classes.get_key_value(class_name).map(|(k, _)| k.as_str());
+  }
+  if classes.get(recv_name).is_some_and(|c| c.is_module) {
+    return classes.get_key_value(recv_name).map(|(k, _)| k.as_str());
+  }
+  None
+}
+
+fn collect_purity_edges_expr(
+  expr: &Spanned<Expr>,
+  node_index: &HashMap<PureNode, usize>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  out: &mut HashSet<usize>,
+) {
+  match &expr.node {
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::Bool(_)
+    | Expr::Nil
+    | Expr::InstanceVar(_) => {}
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b) => {
+      collect_purity_edges_expr(a, node_index, env, classes, out);
+      collect_purity_edges_expr(b, node_index, env, classes, out);
+    }
+    Expr::Compare(a, _, b) => {
+      collect_purity_edges_expr(a, node_index, env, classes, out);
+      collect_purity_edges_expr(b, node_index, env, classes, out);
+    }
+    Expr::Neg(a)
+    | Expr::Not(a)
+    | Expr::BitNot(a)
+    | Expr::ArrayNew(a)
+    | Expr::Ok(a)
+    | Expr::Err(a)
+    | Expr::Try(a)
+    | Expr::Comptime(a) => collect_purity_edges_expr(a, node_index, env, classes, out),
+    Expr::Call(name, args) => {
+      if let Some(&idx) = node_index.get(&PureNode::Function(name.clone())) {
+        out.insert(idx);
+      }
+      for a in args {
+        collect_purity_edges_expr(a, node_index, env, classes, out);
+      }
+    }
+    Expr::CallKw(name, kwargs) => {
+      if let Some(&idx) = node_index.get(&PureNode::Function(name.clone())) {
+        out.insert(idx);
+      }
+      for (_, v) in kwargs {
+        collect_purity_edges_expr(v, node_index, env, classes, out);
+      }
+    }
+    Expr::New(_, args) | Expr::Spawn(_, args) => {
+      for a in args {
+        collect_purity_edges_expr(a, node_index, env, classes, out);
+      }
+    }
+    Expr::MethodCall(recv, method, args) | Expr::SafeCall(recv, method, args) => {
+      if let Some(owner) = purity_method_owner(recv, env, classes) {
+        if let Some(&idx) = node_index.get(&PureNode::Method(owner.to_string(), method.clone())) {
+          out.insert(idx);
+        }
+      }
+      collect_purity_edges_expr(recv, node_index, env, classes, out);
+      for a in args {
+        collect_purity_edges_expr(a, node_index, env, classes, out);
+      }
+    }
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for e in elems {
+        collect_purity_edges_expr(e, node_index, env, classes, out);
+      }
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        collect_purity_edges_expr(k, node_index, env, classes, out);
+        collect_purity_edges_expr(v, node_index, env, classes, out);
+      }
+    }
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          collect_purity_edges_expr(e, node_index, env, classes, out);
+        }
+      }
+    }
+    // Mirrors `expr_moved_read`'s own identical `Lambda`/`Supervise`
+    // arms (plan 56's Decision log) — a disclosed gap, not an
+    // oversight: a lambda/`supervise` body is a nested `Stmt` list
+    // this plan's own worked examples never put a `pure`-relevant call
+    // inside.
+    Expr::Lambda { .. } | Expr::Supervise(_) => {}
+    Expr::Remote { addr, name, .. } => {
+      collect_purity_edges_expr(addr, node_index, env, classes, out);
+      collect_purity_edges_expr(name, node_index, env, classes, out);
+    }
+  }
+}
+
+/// `Expr::Call`/`Expr::CallKw`'s shared target-legality check (Decision
+/// log, forbidden categories 1/3/5 for a *plain*-call callee — `puts`/
+/// `gets`, an `extern "C"` declaration, and an ordinary/rejected
+/// non-`pure` function, in that priority order). `cycle_members`/
+/// `verified_pure` are exactly `check_purity`'s own per-component
+/// state — a fellow member of the SCC currently being checked is
+/// provisionally assumed pure (Decision log's cycle rule); anything
+/// already accepted by an earlier-processed component is genuinely
+/// pure; anything else that IS `pure`-claimed but not (yet) verified
+/// has already failed (or belongs to a not-yet-reached component,
+/// which cannot happen given `check_purity`'s reverse-topological
+/// processing order).
+fn check_purity_call_target(
+  name: &str,
+  span: (usize, usize),
+  cycle_members: &HashSet<usize>,
+  node_index: &HashMap<PureNode, usize>,
+  sigs: &HashMap<String, FunctionSig>,
+  extern_fn_names: &HashSet<String>,
+  verified_pure: &HashSet<usize>,
+) -> Result<(), Diagnostic> {
+  if name == "puts" || name == "gets" {
+    return Err(Diagnostic::new(
+      format!("a `pure` function may not call `{name}` — it performs I/O"),
+      span,
+    ));
+  }
+  if extern_fn_names.contains(name) {
+    return Err(Diagnostic::new(
+      format!(
+        "a `pure` function may not call `{name}` — it is an `extern \"C\"` FFI declaration, never provably pure"
+      ),
+      span,
+    ));
+  }
+  // `FunctionSig.is_pure` (`function_signature`, mirroring `Function.
+  // is_pure`) is the actual decision point here, not `node_index`
+  // membership directly — every `pure`-claimed top-level function is
+  // both a `sigs` entry with `is_pure: true` AND a `node_index`
+  // candidate by construction (`check_purity`'s own candidate-
+  // gathering loop), so the two never disagree; reading it straight
+  // from `sigs` is what lets a call site resolve a callee's claim
+  // without a second lookup back into the raw `Program` (Decision
+  // log, forbidden category 5).
+  if let Some(sig) = sigs.get(name) {
+    if !sig.is_pure {
+      return Err(Diagnostic::new(
+        format!("a `pure` function may not call `{name}` — it is not marked `pure`"),
+        span,
+      ));
+    }
+    let idx = node_index[&PureNode::Function(name.to_string())];
+    if cycle_members.contains(&idx) || verified_pure.contains(&idx) {
+      return Ok(());
+    }
+    return Err(Diagnostic::new(
+      format!("a `pure` function may not call `{name}` — it is not itself provably `pure`"),
+      span,
+    ));
+  }
+  // Every `Expr::Call` ordinary type-checking already accepted resolves
+  // to a `sigs` entry — this arm is unreachable in practice, kept only
+  // as a permissive (not panicking) fallback.
+  Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_purity_stmt(
+  stmt: &Spanned<Stmt>,
+  cycle_members: &HashSet<usize>,
+  node_index: &HashMap<PureNode, usize>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  sigs: &HashMap<String, FunctionSig>,
+  extern_fn_names: &HashSet<String>,
+  verified_pure: &HashSet<usize>,
+) -> Result<(), Diagnostic> {
+  match &stmt.node {
+    // Decision log, forbidden category 4 — the only two mutation
+    // mechanisms this whole compiler has, both forbidden outright.
+    Stmt::SetField { .. } => Err(Diagnostic::new(
+      "a `pure` function may not write a field (`@x = ...`) — field mutation is forbidden inside a `pure` function",
+      stmt.span,
+    )),
+    Stmt::SetIndex { .. } => Err(Diagnostic::new(
+      "a `pure` function may not write an index (`arr[i] = ...`) — index mutation is forbidden inside a `pure` function",
+      stmt.span,
+    )),
+    Stmt::Let { value, .. }
+    | Stmt::Assign { value, .. }
+    | Stmt::OrAssign { default: value, .. }
+    | Stmt::AndAssign { value, .. } => check_purity_expr(
+      value,
+      cycle_members,
+      node_index,
+      env,
+      classes,
+      sigs,
+      extern_fn_names,
+      verified_pure,
+    ),
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        check_purity_expr(
+          v,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Stmt::Return(Some(e)) | Stmt::Raise(e) => check_purity_expr(
+      e,
+      cycle_members,
+      node_index,
+      env,
+      classes,
+      sigs,
+      extern_fn_names,
+      verified_pure,
+    ),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => Ok(()),
+    Stmt::Yield(args) => {
+      for a in args {
+        check_purity_expr(
+          a,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Stmt::Expr(e) => check_purity_expr(
+      e,
+      cycle_members,
+      node_index,
+      env,
+      classes,
+      sigs,
+      extern_fn_names,
+      verified_pure,
+    ),
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      check_purity_expr(
+        cond,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for s in then_branch {
+        check_purity_stmt(
+          s,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      if let Some(eb) = else_branch {
+        for s in eb {
+          check_purity_stmt(
+            s,
+            cycle_members,
+            node_index,
+            env,
+            classes,
+            sigs,
+            extern_fn_names,
+            verified_pure,
+          )?;
+        }
+      }
+      Ok(())
+    }
+    Stmt::While { cond, body } => {
+      check_purity_expr(
+        cond,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for s in body {
+        check_purity_stmt(
+          s,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        check_purity_expr(
+          e,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      for s in body {
+        check_purity_stmt(
+          s,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      check_purity_expr(
+        start,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      check_purity_expr(
+        end,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for s in body {
+        check_purity_stmt(
+          s,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      check_purity_expr(
+        scrutinee,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for (_, arm_body) in arms {
+        for s in arm_body {
+          check_purity_stmt(
+            s,
+            cycle_members,
+            node_index,
+            env,
+            classes,
+            sigs,
+            extern_fn_names,
+            verified_pure,
+          )?;
+        }
+      }
+      if let Some(eb) = else_body {
+        for s in eb {
+          check_purity_stmt(
+            s,
+            cycle_members,
+            node_index,
+            env,
+            classes,
+            sigs,
+            extern_fn_names,
+            verified_pure,
+          )?;
+        }
+      }
+      Ok(())
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        check_purity_stmt(
+          s,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      for r in rescues {
+        for s in &r.body {
+          check_purity_stmt(
+            s,
+            cycle_members,
+            node_index,
+            env,
+            classes,
+            sigs,
+            extern_fn_names,
+            verified_pure,
+          )?;
+        }
+      }
+      if let Some(eb) = ensure {
+        for s in eb {
+          check_purity_stmt(
+            s,
+            cycle_members,
+            node_index,
+            env,
+            classes,
+            sigs,
+            extern_fn_names,
+            verified_pure,
+          )?;
+        }
+      }
+      Ok(())
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      check_purity_expr(
+        scrutinee,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for s in ok_body {
+        check_purity_stmt(
+          s,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      for s in err_body {
+        check_purity_stmt(
+          s,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+  }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_purity_expr(
+  expr: &Spanned<Expr>,
+  cycle_members: &HashSet<usize>,
+  node_index: &HashMap<PureNode, usize>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  sigs: &HashMap<String, FunctionSig>,
+  extern_fn_names: &HashSet<String>,
+  verified_pure: &HashSet<usize>,
+) -> Result<(), Diagnostic> {
+  match &expr.node {
+    // Decision log, forbidden category 1: `ARGV`/`ARGC` are ordinary
+    // pre-seeded locals at codegen time, not literals — nothing about
+    // a `pure` function's own *type* distinguishes "reads `ARGV`" from
+    // "reads a genuinely constant global," so this closes the gap by
+    // name.
+    Expr::Ident(name) if name == "ARGV" || name == "ARGC" => Err(Diagnostic::new(
+      format!(
+        "a `pure` function may not read `{name}` — its value can vary with how the compiled binary was invoked"
+      ),
+      expr.span,
+    )),
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::Bool(_)
+    | Expr::Nil
+    | Expr::InstanceVar(_) => Ok(()),
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b) => {
+      check_purity_expr(
+        a,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      check_purity_expr(
+        b,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )
+    }
+    Expr::Compare(a, _, b) => {
+      check_purity_expr(
+        a,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      check_purity_expr(
+        b,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )
+    }
+    Expr::Neg(a)
+    | Expr::Not(a)
+    | Expr::BitNot(a)
+    | Expr::ArrayNew(a)
+    | Expr::Ok(a)
+    | Expr::Err(a)
+    | Expr::Try(a)
+    | Expr::Comptime(a) => check_purity_expr(
+      a,
+      cycle_members,
+      node_index,
+      env,
+      classes,
+      sigs,
+      extern_fn_names,
+      verified_pure,
+    ),
+    Expr::Call(name, args) => {
+      check_purity_call_target(
+        name,
+        expr.span,
+        cycle_members,
+        node_index,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for a in args {
+        check_purity_expr(
+          a,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Expr::CallKw(name, kwargs) => {
+      check_purity_call_target(
+        name,
+        expr.span,
+        cycle_members,
+        node_index,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for (_, v) in kwargs {
+        check_purity_expr(
+          v,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    // `.new(...)` is "trivially fresh" the same way plan 56's own
+    // `check_message_arg` bucket 2 already treats it — allocating a
+    // new instance isn't itself a forbidden construct; only `.spawn`
+    // (below) is.
+    Expr::New(_, args) => {
+      for a in args {
+        check_purity_expr(
+          a,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    // Decision log, forbidden category 2 — unconditional, no receiver
+    // check needed (there's nothing conditional about creating an
+    // actor).
+    Expr::Spawn(_, _) => Err(Diagnostic::new(
+      "a `pure` function may not call `.spawn` — creating a new actor is forbidden inside a `pure` function",
+      expr.span,
+    )),
+    Expr::MethodCall(recv, method, args) => {
+      if let Expr::Ident(recv_name) = &recv.node {
+        if recv_name == "File" {
+          // Decision log, forbidden category 1 — `File.read`/`File.
+          // write`, `Expr::MethodCall` whose receiver is literally
+          // `Expr::Ident("File")` (plan 45).
+          return Err(Diagnostic::new(
+            format!("a `pure` function may not call `File.{method}` — it performs I/O"),
+            expr.span,
+          ));
+        }
+      }
+      if let Some(owner) = purity_method_owner(recv, env, classes) {
+        if classes.get(owner).is_some_and(|c| c.is_actor) {
+          // Decision log, forbidden category 2 — a cross-actor
+          // message send (`pure` is never legal on an actor method
+          // itself, so every receiver this arm can ever see is a
+          // genuinely different actor, never `self`).
+          return Err(Diagnostic::new(
+            format!(
+              "a `pure` function may not send a message to an actor (`{owner}.{method}(...)`) — this is a message send, forbidden inside a `pure` function"
+            ),
+            expr.span,
+          ));
+        }
+        // `FunctionSig.is_pure` here too (`ClassInfo.methods`'s own
+        // `HashMap<String, FunctionSig>`, `build_flattened_class_info`)
+        // — the exact same lookup a bare top-level call already uses
+        // (Decision log, forbidden category 5's own stated design),
+        // not a second, `node_index`-only decision.
+        if let Some(method_sig) = classes.get(owner).and_then(|c| c.methods.get(method)) {
+          if !method_sig.is_pure {
+            return Err(Diagnostic::new(
+              format!(
+                "a `pure` function may not call `{owner}#{method}` — it is not marked `pure`"
+              ),
+              expr.span,
+            ));
+          }
+          let target = PureNode::Method(owner.to_string(), method.clone());
+          let idx = node_index[&target];
+          if !cycle_members.contains(&idx) && !verified_pure.contains(&idx) {
+            return Err(Diagnostic::new(
+              format!(
+                "a `pure` function may not call `{owner}#{method}` — it is not itself provably `pure`"
+              ),
+              expr.span,
+            ));
+          }
+        }
+      }
+      check_purity_expr(
+        recv,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for a in args {
+        check_purity_expr(
+          a,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    // Plan 43: only ever legal on a nullable receiver — never an
+    // actor-typed one (`env`'s `Type::Class` lookup above is the only
+    // path to an actor receiver at all), so no cross-actor-send check
+    // applies here.
+    Expr::SafeCall(recv, _method, args) => {
+      check_purity_expr(
+        recv,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      for a in args {
+        check_purity_expr(
+          a,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for e in elems {
+        check_purity_expr(
+          e,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        check_purity_expr(
+          k,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+        check_purity_expr(
+          v,
+          cycle_members,
+          node_index,
+          env,
+          classes,
+          sigs,
+          extern_fn_names,
+          verified_pure,
+        )?;
+      }
+      Ok(())
+    }
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          check_purity_expr(
+            e,
+            cycle_members,
+            node_index,
+            env,
+            classes,
+            sigs,
+            extern_fn_names,
+            verified_pure,
+          )?;
+        }
+      }
+      Ok(())
+    }
+    // Mirrors `expr_moved_read`'s own identical `Lambda`/`Supervise`
+    // arms (plan 56's Decision log) — same disclosed gap, cited above
+    // in `collect_purity_edges_expr`.
+    Expr::Lambda { .. } | Expr::Supervise(_) => Ok(()),
+    Expr::Remote { addr, name, .. } => {
+      check_purity_expr(
+        addr,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )?;
+      check_purity_expr(
+        name,
+        cycle_members,
+        node_index,
+        env,
+        classes,
+        sigs,
+        extern_fn_names,
+        verified_pure,
+      )
+    }
+  }
+}
+
+/// Plan 63's `leaf-sema-purity-check`: `pure` is a real, whole-program
+/// checked property, not a naming convention (Decision log) — this is
+/// the only place `Function.is_pure`/`FunctionSig.is_pure` are ever
+/// consulted beyond straight field-copying. Runs once from
+/// `check_program`, after every `check_function_body`/`check_method_
+/// body` call has already run for the whole program (mirrors exactly
+/// when plan 56's `check_message_safety` already runs relative to
+/// ordinary type-checking) — `sigs`/`classes` are the finished,
+/// trustworthy registries `check_program` built once at its own top,
+/// never mutated here. A generic class's own monomorphized
+/// instantiations (plan 58) are a disclosed gap: they're never
+/// literal `program.items` entries, so a `pure` method declared on a
+/// generic class template is registered as a candidate (via its
+/// template `Item::Class`) but its actually-instantiated, substituted
+/// bodies are not separately re-verified here — the same scope plan
+/// 61's `comptime` similarly never extended to generic instantiation.
+fn check_purity(
+  program: &Program,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  gctx: &GenericsCtx,
+) -> Result<(), Vec<Diagnostic>> {
+  let mut diags = Vec::new();
+
+  // Decision log, forbidden category 3 — collected the same way plan
+  // 61's `comptime_fns` is, so `check_purity_call_target` can name an
+  // extern call specifically rather than folding it into the generic
+  // "not marked `pure`" message every other ordinary function gets.
+  let extern_fn_names: HashSet<String> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Extern(block) => Some(block.fns.iter().map(|f| f.name.clone())),
+      _ => None,
+    })
+    .flatten()
+    .collect();
+
+  let mut candidates: Vec<PureCandidate> = Vec::new();
+  for item in &program.items {
+    match item {
+      Item::Function(f) if f.is_pure => {
+        if !f.type_params.is_empty() {
+          diags.push(Diagnostic::new(
+            format!(
+              "generic functions cannot be marked `pure` yet (`{}`)",
+              f.name
+            ),
+            (0, 0),
+          ));
+          continue;
+        }
+        candidates.push(PureCandidate {
+          node: PureNode::Function(f.name.clone()),
+          f,
+          self_fields: None,
+        });
+      }
+      Item::Module(m) => {
+        for f in &m.methods {
+          if f.is_pure {
+            candidates.push(PureCandidate {
+              node: PureNode::Method(m.name.clone(), f.name.clone()),
+              f,
+              self_fields: None,
+            });
+          }
+        }
+      }
+      Item::Class(c) => {
+        let Some(info) = classes.get(&c.name) else {
+          continue;
+        };
+        for m in &c.methods {
+          if m.is_pure {
+            candidates.push(PureCandidate {
+              node: PureNode::Method(c.name.clone(), m.name.clone()),
+              f: m,
+              self_fields: Some(&info.fields),
+            });
+          }
+        }
+      }
+      // Decision log's own eligibility rule: `pure` is rejected on an
+      // actor method outright, "before doing anything else" — no
+      // candidate is ever built for it, and this pass returns as soon
+      // as this loop finishes if any such diagnostic was raised (AC8:
+      // independent of what that method's body contains).
+      Item::Actor(a) => {
+        for m in &a.methods {
+          if m.is_pure {
+            diags.push(Diagnostic::new(
+              format!(
+                "`pure` is not supported on an actor method (`{}#{}`) — an actor's own fields are already protected by its single-writer mailbox discipline, a different mechanism `pure` does not layer its checked guarantee on top of",
+                a.name, m.name
+              ),
+              (0, 0),
+            ));
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  if !diags.is_empty() {
+    return Err(diags);
+  }
+  if candidates.is_empty() {
+    return Ok(());
+  }
+
+  let node_index: HashMap<PureNode, usize> = candidates
+    .iter()
+    .enumerate()
+    .map(|(i, c)| (c.node.clone(), i))
+    .collect();
+
+  let envs: Vec<(HashMap<String, Type>, Type)> = candidates
+    .iter()
+    .map(|c| rebuild_purity_env(c.f, c.self_fields, sigs, classes, gctx))
+    .collect();
+
+  let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); candidates.len()];
+  for (i, c) in candidates.iter().enumerate() {
+    let mut edges = HashSet::new();
+    collect_purity_edges(&c.f.body, &node_index, &envs[i].0, classes, &mut edges);
+    adjacency[i] = edges.into_iter().collect();
+  }
+
+  let components = tarjan_scc(&adjacency);
+  let mut verified_pure: HashSet<usize> = HashSet::new();
+
+  for component in &components {
+    let cycle_members: HashSet<usize> = component.iter().copied().collect();
+    let results: Vec<(usize, Result<(), Diagnostic>)> = component
+      .iter()
+      .map(|&idx| {
+        let c = &candidates[idx];
+        let r = check_purity_body(
+          &c.f.body,
+          &cycle_members,
+          &node_index,
+          &envs[idx].0,
+          classes,
+          sigs,
+          &extern_fn_names,
+          &verified_pure,
+        );
+        (idx, r)
+      })
+      .collect();
+    let component_ok = results.iter().all(|(_, r)| r.is_ok());
+    if component_ok {
+      for &idx in component {
+        verified_pure.insert(idx);
+      }
+    } else {
+      for (idx, r) in results {
+        match r {
+          Err(d) => diags.push(d),
+          // This member has no violation of its own — it's rejected
+          // solely because a fellow member of its mutually-recursive
+          // (or self-recursive-and-otherwise-clean, impossible here
+          // since a lone clean self-recursive node always passes on
+          // its own) SCC failed (Decision log's cycle rule: the whole
+          // component stands or falls together).
+          Ok(()) => diags.push(Diagnostic::new(
+            format!(
+              "`{}` cannot be verified `pure` — it belongs to a mutually-recursive purity group with a member that is not itself provably `pure`",
+              pure_node_display_name(&candidates[idx].node)
+            ),
+            (0, 0),
+          )),
+        }
+      }
+    }
+  }
+
+  if diags.is_empty() { Ok(()) } else { Err(diags) }
+}
+
+fn collect_purity_edges(
+  body: &[Spanned<Stmt>],
+  node_index: &HashMap<PureNode, usize>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  out: &mut HashSet<usize>,
+) {
+  for stmt in body {
+    collect_purity_edges_stmt(stmt, node_index, env, classes, out);
+  }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_purity_body(
+  body: &[Spanned<Stmt>],
+  cycle_members: &HashSet<usize>,
+  node_index: &HashMap<PureNode, usize>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  sigs: &HashMap<String, FunctionSig>,
+  extern_fn_names: &HashSet<String>,
+  verified_pure: &HashSet<usize>,
+) -> Result<(), Diagnostic> {
+  for stmt in body {
+    check_purity_stmt(
+      stmt,
+      cycle_members,
+      node_index,
+      env,
+      classes,
+      sigs,
+      extern_fn_names,
+      verified_pure,
+    )?;
+  }
+  Ok(())
+}
+
 /// Plan 61's Decision log: a concrete, enumerated ALLOW-list, not an
 /// implicit "everything except the ban-list" — a node kind absent from
 /// both the allow-list and the ban-list below is still rejected (via
@@ -6926,6 +8379,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           defaults: vec![None; f.params.len()],
           splat_elem: None,
           requires: Vec::new(),
+          // Plan 63's Decision log, forbidden category 3: an extern
+          // "C" FFI call is never provably pure — no `pure` keyword
+          // is even grammatically reachable on an `ExternFn`, so this
+          // is always `false`, never read from user source.
+          is_pure: false,
         },
       );
     }
@@ -7086,6 +8544,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           is_comptime: false,
           requires: Vec::new(),
           ensures: Vec::new(),
+          is_pure: false,
         };
         if let Err(d) = check_function_body(&synthetic, &sigs, &classes, &gctx) {
           diags.push(d);
@@ -7111,6 +8570,15 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   ));
 
   diags.extend(check_comptime_positions(program));
+
+  // Plan 63's `leaf-sema-purity-check` — runs last, after every
+  // `check_function_body`/`check_method_body` call above has already
+  // used `sigs`/`classes` to type-check the whole program (Decision
+  // log: mirrors exactly when plan 56's `check_message_safety` already
+  // runs relative to ordinary type-checking).
+  if let Err(purity_diags) = check_purity(program, &sigs, &classes, &gctx) {
+    diags.extend(purity_diags);
+  }
 
   if diags.is_empty() { Ok(()) } else { Err(diags) }
 }
@@ -9775,6 +11243,7 @@ end
         line: 0,
       }],
       ensures: Vec::new(),
+      is_pure: false,
     });
     let errs = check_program(&program).expect_err("contracts on a method must be rejected");
     assert!(
@@ -9845,6 +11314,134 @@ end
       check_program(&program),
       Ok(()),
       "a clause referencing any non-literal-bound identifier must be skipped, not partially folded"
+    );
+  }
+
+  // Plan 63's `leaf-sema-purity-check`.
+
+  #[test]
+  fn a_self_recursive_pure_function_is_accepted() {
+    let src = "pure def fib(n: Int64) -> Int64\n  if n < 2\n    n\n  else\n    fib(n - 1) + fib(n - 2)\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "self-recursion is the size-one cyclic-component case, accepted under the cycle rule"
+    );
+  }
+
+  #[test]
+  fn genuine_mutual_recursion_both_pure_claimed_is_accepted_together() {
+    let src = "pure def is_even(n: Int64) -> Boolean\n  if n == 0\n    true\n  else\n    is_odd(n - 1)\n  end\nend\n\npure def is_odd(n: Int64) -> Boolean\n  if n == 0\n    false\n  else\n    is_even(n - 1)\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "a genuine mutual-recursion pair, both `pure`-claimed, must be accepted as one component"
+    );
+  }
+
+  #[test]
+  fn a_mutual_recursion_pair_where_one_member_calls_puts_is_rejected_as_a_whole_component() {
+    let src = "pure def is_even(n: Int64) -> Boolean\n  if n == 0\n    true\n  else\n    is_odd(n - 1)\n  end\nend\n\npure def is_odd(n: Int64) -> Boolean\n  puts n\n  if n == 0\n    false\n  else\n    is_even(n - 1)\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a component with one I/O-performing member must be rejected");
+    assert_eq!(
+      errs.len(),
+      2,
+      "both mutually-recursive members must get their own diagnostic"
+    );
+    assert!(
+      errs.iter().any(|d| d.message.contains("puts")),
+      "the member that actually calls `puts` must have its own diagnostic naming it: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_pure_function_calling_puts_is_rejected_naming_puts() {
+    let src = "pure def bad(x: Int64) -> Int64\n  puts x\n  return x\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("a `pure` function performing I/O must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("puts") && d.span != (0, 0)),
+      "the diagnostic must name `puts` and carry a real span: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_pure_function_sending_to_an_actor_is_rejected_naming_the_send() {
+    let src = "actor Worker\n  def run(n: Int64) -> Void\n    puts n\n  end\nend\n\npure def bad2(w: Worker) -> Void\n  w.run(5)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("a `pure` function sending a message must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("actor") || d.message.contains("message")),
+      "the diagnostic must name the cross-actor send: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_pure_function_setting_a_field_is_rejected() {
+    let src =
+      "class Counter\n  n: Int64\n\n  pure def bump() -> Void\n    @n = @n + 1\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("a `pure` method mutating a field must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("field")),
+      "the diagnostic must name the field mutation: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_pure_function_setting_an_index_is_rejected() {
+    let src = "pure def bad(arr: Array[Int64]) -> Void\n  arr[0] = 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("a `pure` function mutating an index must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("index")),
+      "the diagnostic must name the index mutation: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_pure_function_calling_an_ordinary_function_is_rejected_naming_the_callee() {
+    let src = "def helper(x: Int64) -> Int64\n  return x + 1\nend\n\npure def bad(x: Int64) -> Int64\n  return helper(x)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a `pure` function calling a non-`pure` function must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("helper")),
+      "the diagnostic must name the non-`pure` callee: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn pure_declared_on_an_actor_method_is_rejected_at_registration() {
+    let src = "actor Worker\n  pure def run(n: Int64) -> Void\n    puts n\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`pure` on an actor method must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("actor method")),
+      "the diagnostic must name the actor-method restriction: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn an_ordinary_program_using_pure_nowhere_typechecks_identically() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  return a + b\nend\n\nputs add(2, 3)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "`check_purity` must be a strict no-op over a program that never writes the word `pure`"
     );
   }
 }

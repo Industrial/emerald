@@ -1128,6 +1128,7 @@ mod tests {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       }
     );
   }
@@ -3520,6 +3521,53 @@ mod tests {
   #[test]
   fn a_requires_clause_on_a_class_method_is_a_real_parse_error_not_a_sema_diagnostic() {
     let src = "class Point\n  x: Int64\n\n  def get_x() -> Int64\n    requires true\n    return @x\n  end\nend\n";
+    assert!(parse(src).is_err());
+  }
+
+  #[test]
+  fn pure_def_parses_with_is_pure_true() {
+    let src = "pure def square(x: Int64) -> Int64\n  return x * x\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function");
+    };
+    assert!(f.is_pure);
+  }
+
+  #[test]
+  fn an_ordinary_def_parses_with_is_pure_false() {
+    let src = "def square(x: Int64) -> Int64\n  return x * x\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function");
+    };
+    assert!(!f.is_pure);
+  }
+
+  #[test]
+  fn pure_def_parses_identically_inside_a_class_body() {
+    let src = "class Point\n  x: Int64\n\n  pure def get_x() -> Int64\n    return @x\n  end\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    assert!(c.methods[0].is_pure);
+  }
+
+  #[test]
+  fn pure_and_comptime_compose_on_the_same_function() {
+    let src = "pure comptime def square(x: Int64) -> Int64\n  return x * x\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function");
+    };
+    assert!(f.is_pure);
+    assert!(f.is_comptime);
+  }
+
+  #[test]
+  fn pure_used_as_an_ordinary_identifier_is_a_real_parse_error() {
+    let src = "pure: Int64 = 1\n";
     assert!(parse(src).is_err());
   }
 }

@@ -610,6 +610,7 @@ fn instantiate_generic_class_defs(
       is_comptime: false,
       requires: Vec::new(),
       ensures: Vec::new(),
+      is_pure: m.is_pure,
     })
     .collect();
 
@@ -2001,6 +2002,7 @@ fn substitute_generic_function(
     // stays correct-by-construction rather than correct-by-coincidence.
     requires: f.requires.clone(),
     ensures: f.ensures.clone(),
+    is_pure: f.is_pure,
   }
 }
 
@@ -13543,6 +13545,7 @@ fn compile_to_object_impl(
           is_comptime: false,
           requires: Vec::new(),
           ensures: Vec::new(),
+          is_pure: false,
         })
         .collect::<Vec<_>>(),
       _ => Vec::new(),
@@ -14241,6 +14244,7 @@ fn assertion_error_class_item() -> Item {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       },
       AstFunction {
         name: "message".to_string(),
@@ -14255,6 +14259,7 @@ fn assertion_error_class_item() -> Item {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       },
     ],
     type_params: Vec::new(),
@@ -14307,6 +14312,7 @@ fn remote_actor_error_class_item() -> Item {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       },
       AstFunction {
         name: "message".to_string(),
@@ -14321,6 +14327,7 @@ fn remote_actor_error_class_item() -> Item {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       },
     ],
     type_params: Vec::new(),
@@ -14380,6 +14387,7 @@ fn contract_violation_class_item() -> Item {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       },
       AstFunction {
         name: "message".to_string(),
@@ -14394,6 +14402,7 @@ fn contract_violation_class_item() -> Item {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       },
     ],
     type_params: Vec::new(),
@@ -14509,6 +14518,7 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
       is_comptime: false,
       requires: Vec::new(),
       ensures: Vec::new(),
+      is_pure: false,
     }));
 
     harness_stmts.push(syn(Stmt::Begin {
@@ -15322,6 +15332,7 @@ mod tests {
           is_comptime: false,
           requires: Vec::new(),
           ensures: Vec::new(),
+          is_pure: false,
         }),
         Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
           "repeat".into(),
@@ -16435,6 +16446,44 @@ mod tests {
   #[test]
   fn actor_worked_example_compiled_linked_and_run_prints_2_and_101() {
     assert_eq!(compile_link_run(COUNTER_ACTOR_EXAMPLE), "2\n101\n");
+  }
+
+  // Plan 63 (purity annotations), `leaf-concurrency-proof` — the plan's
+  // own opening worked example, verbatim: `fib` is `pure`, two `Worker`
+  // actors each call it from an independently scheduled cross-actor
+  // `run` send with zero source-level synchronization around the
+  // shared call. Relative order is deliberately NOT asserted (AC1's own
+  // wording, citing plan 55's identical `Spinner` proof) — only that
+  // both `fib(30) = 832040` and `fib(31) = 1346269` are printed, each
+  // exactly once. The real wall-clock-overlap proof (`EMERALD_WORKERS=1`
+  // vs. default pool, margin-based) lives in `crates/emerald-cli/tests/
+  // purity.rs`, reusing plan 55's own `leaf-worked-concurrency-proof`
+  // technique verbatim, since only a real freshly-run process (not this
+  // in-process `compile_link_run` helper) can time two independent OS
+  // processes' worker pool sizes.
+  // Written with explicit `return`s throughout (the same style
+  // `ARITHMETIC_EXAMPLE`'s own `factorial` already uses), not the
+  // plan's own illustrative bare `if ... else ... end` value-yielding
+  // shorthand — a real, disclosed adaptation: that shape hits a
+  // pre-existing, unrelated `build_function_body` codegen gap (a
+  // terminal `If` with no explicit `return` in either branch leaves
+  // its `if.merge` block without a terminator), never exercised by any
+  // other compiled-and-run worked example in this file either. `pure`
+  // itself is unaffected either way — `check_purity` only inspects
+  // `Stmt`/`Expr` shapes, never how a value is returned.
+  const FIB_WORKER_EXAMPLE: &str = "pure def fib(n: Int64) -> Int64\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nactor Worker\n  def run(n: Int64) -> Void\n    puts fib(n)\n  end\nend\n\nw1: Worker = Worker.spawn()\nw2: Worker = Worker.spawn()\nw1.run(30)\nw2.run(31)\n";
+
+  #[test]
+  fn fib_worker_worked_example_prints_both_fib_results_exactly_once_each() {
+    let stdout = compile_link_run(FIB_WORKER_EXAMPLE);
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(
+      lines,
+      vec!["1346269", "832040"],
+      "both fib(30)=832040 and fib(31)=1346269 must print, each exactly once, in either \
+       order: {stdout:?}"
+    );
   }
 
   #[test]

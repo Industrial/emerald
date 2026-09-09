@@ -138,6 +138,7 @@ ClassField: (Param, Vec<Function>) = {
       is_comptime: false,
       requires: Vec::new(),
       ensures: Vec::new(),
+      is_pure: false,
     };
     (p, vec![accessor])
   },
@@ -198,7 +199,7 @@ ActorDef: ActorDef = {
 // `ensures` in sema regardless (see the Decision log for why the
 // grammar-level fence is simpler here).
 FuncDef: Function = {
-  <comptime:"comptime"?> "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <contracts:ContractClause*> <body:Stmt*> "end" => {
+  <is_pure:"pure"?> <comptime:"comptime"?> "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <contracts:ContractClause*> <body:Stmt*> "end" => {
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     for (is_requires, c) in contracts {
@@ -215,6 +216,7 @@ FuncDef: Function = {
       is_comptime: comptime.is_some(),
       requires,
       ensures,
+      is_pure: is_pure.is_some(),
     }
   }
 };
@@ -361,7 +363,7 @@ MethodDef: Function = {
   // `type_params` found while registering a class method with a real
   // "generic methods are not supported" diagnostic, never a panic and
   // never a silent accept.
-  <comptime:"comptime"?> "def" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+  <is_pure:"pure"?> <comptime:"comptime"?> "def" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
@@ -376,6 +378,11 @@ MethodDef: Function = {
     // "reachable, sema-rejected" precedent.
     requires: Vec::new(),
     ensures: Vec::new(),
+    // Plan 63's Decision log: `pure` IS grammatically reachable here
+    // (a class/actor method) — sema's whole-call-graph purity checker
+    // is what rejects it specifically on an actor method, the same
+    // "grammar stays general, sema narrows" cut `type_params` uses.
+    is_pure: is_pure.is_some(),
   }
 };
 

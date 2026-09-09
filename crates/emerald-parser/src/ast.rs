@@ -259,6 +259,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
       is_comptime: false,
       requires: Vec::new(),
       ensures: Vec::new(),
+      is_pure: false,
     };
 
     let Item::Class(c) = &mut program.items[i] else {
@@ -278,6 +279,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
         is_comptime: false,
         requires: Vec::new(),
         ensures: Vec::new(),
+        is_pure: false,
       });
     }
     c.methods.push(eq_fn);
@@ -757,6 +759,17 @@ pub struct Function {
   /// already established, applied here in reverse — adding meaning to
   /// an existing shape rather than restricting one).
   pub ensures: Vec<Contract>,
+  /// `pure def ...`/`pure def ... end` inside a class/module (plan 63's
+  /// Decision log) — `false` for every pre-existing declaration,
+  /// additive and source-compatible. Grammatically reachable on a
+  /// top-level function, a module function, AND a class/actor method
+  /// (`FuncDef`/`MethodDef` both gain the identical optional `"pure"?`
+  /// prefix) — deliberately left general at the grammar level; `emerald-
+  /// sema`'s own whole-call-graph purity checker is what rejects it on
+  /// an actor method specifically (the same "grammar stays general,
+  /// sema narrows" discipline `type_params`/`is_comptime`/`requires`/
+  /// `ensures` already established).
+  pub is_pure: bool,
 }
 
 /// `T: Comparable` inside a generic function's or generic class's `[...]`
