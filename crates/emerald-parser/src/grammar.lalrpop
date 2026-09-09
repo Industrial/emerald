@@ -1,7 +1,7 @@
 use crate::ast::{
-  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, ExternBlock,
-  ExternFn, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned,
-  Stmt, TypeParam,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant,
+  ExternBlock, ExternFn, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
+  RescueClause, Spanned, Stmt, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -136,6 +136,8 @@ ClassField: (Param, Vec<Function>) = {
       splat_param: None,
       type_params: Vec::new(),
       is_comptime: false,
+      requires: Vec::new(),
+      ensures: Vec::new(),
     };
     (p, vec![accessor])
   },
@@ -184,17 +186,48 @@ ActorDef: ActorDef = {
 // on a module method with a real "comptime functions must be top-level"
 // diagnostic, mirroring `type_params`'s own top-level-only precedent
 // (`MethodDef`'s identical mirror below) exactly.
+// Plan 62's Decision log: `<contracts:ContractClause*>` slots in between
+// `-> TypeName` and `Stmt*` — the one open slot `FuncDef`'s own
+// production has, with no FIRST-set overlap to disambiguate ("requires"/
+// "ensures" are brand-new reserved keywords, the same "reserve a new
+// keyword the same LALR(1) way class/def/interface/actor already are"
+// idiom this file's own comments describe for every prior reserved
+// word). Reachable only here, never from `MethodDef` — a real, stricter
+// cut than `type_params`'s own "grammatically reachable on methods,
+// sema-rejected" precedent, since methods reject a non-empty `requires`/
+// `ensures` in sema regardless (see the Decision log for why the
+// grammar-level fence is simpler here).
 FuncDef: Function = {
-  <comptime:"comptime"?> "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
-    name,
-    params: parts.0,
-    return_type,
-    body,
-    block_param: parts.2,
-    splat_param: parts.1,
-    type_params: type_params.unwrap_or_default(),
-    is_comptime: comptime.is_some(),
+  <comptime:"comptime"?> "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <contracts:ContractClause*> <body:Stmt*> "end" => {
+    let mut requires = Vec::new();
+    let mut ensures = Vec::new();
+    for (is_requires, c) in contracts {
+      if is_requires { requires.push(c); } else { ensures.push(c); }
+    }
+    Function {
+      name,
+      params: parts.0,
+      return_type,
+      body,
+      block_param: parts.2,
+      splat_param: parts.1,
+      type_params: type_params.unwrap_or_default(),
+      is_comptime: comptime.is_some(),
+      requires,
+      ensures,
+    }
   }
+};
+
+// `true` tags a `requires` clause, `false` an `ensures` clause — `Contract.
+// text`/`line` are filled in later, by `emerald_parser::lib.rs`'s own
+// `fill_contract_text` post-parse pass (mirrors plan 47's identical `loc`-
+// capture technique — this grammar action only has the raw `Spanned<Expr>`
+// to work with, not `source`, which LALRPOP's own generated parser entry
+// point has no parameter slot for).
+ContractClause: (bool, Contract) = {
+  "requires" <e:Expr> => (true, Contract { expr: e, text: String::new(), line: 0 }),
+  "ensures" <e:Expr> => (false, Contract { expr: e, text: String::new(), line: 0 }),
 };
 
 // `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
@@ -337,6 +370,12 @@ MethodDef: Function = {
     splat_param: parts.1,
     type_params: type_params.unwrap_or_default(),
     is_comptime: comptime.is_some(),
+    // Plan 62's Decision log: `requires`/`ensures` are grammatically
+    // unreachable on a method at all — no `ContractClause*` slot exists
+    // in this production, a stricter cut than `type_params`'s own
+    // "reachable, sema-rejected" precedent.
+    requires: Vec::new(),
+    ensures: Vec::new(),
   }
 };
 

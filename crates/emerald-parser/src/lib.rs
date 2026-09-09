@@ -19,9 +19,9 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, ExternBlock,
-  ExternFn, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
-  StringPart, TypeParam, expand_derives,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
+  ExternBlock, ExternFn, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause,
+  Spanned, Stmt, StringPart, TypeParam, expand_derives,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -101,6 +101,28 @@ fn line_at(source: &str, offset: usize) -> usize {
     .iter()
     .filter(|&&b| b == b'\n')
     .count()
+}
+
+/// Plan 62's Decision log: mirrors `rewrite_assert_locations`'s own
+/// technique exactly — a small, targeted post-parse pass over the
+/// freshly-built `Program`, not a generic `Spanned` walk. Slices
+/// `source[expr.span.0..expr.span.1]` into `Contract.text` and computes
+/// `Contract.line` the same way plan 47's own `loc` does (`line_at`,
+/// counting `\n` bytes). Scoped to top-level `Item::Function` only — the
+/// one production `requires`/`ensures` are grammatically reachable from
+/// (see `grammar.lalrpop`'s own `FuncDef`-only `ContractClause*`
+/// placement) — so no other `Item`/`Stmt` variant needs visiting here at
+/// all, unlike `rewrite_assert_locations`'s own whole-program walk.
+fn fill_contract_text(items: &mut [Item], source: &str) {
+  for item in items {
+    if let Item::Function(f) = item {
+      for c in f.requires.iter_mut().chain(f.ensures.iter_mut()) {
+        let (start, end) = c.expr.span;
+        c.text = source[start..end].to_string();
+        c.line = line_at(source, start);
+      }
+    }
+  }
 }
 
 fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
@@ -355,6 +377,7 @@ pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
   match result {
     Ok(mut program) if errors.is_empty() => {
       rewrite_assert_locations(&mut program.items, name, src);
+      fill_contract_text(&mut program.items, src);
       Ok(program)
     }
     Ok(_) => {
@@ -1103,6 +1126,8 @@ mod tests {
         splat_param: None,
         type_params: Vec::new(),
         is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
       }
     );
   }
@@ -3444,5 +3469,57 @@ mod tests {
     let before = program.clone();
     crate::expand_derives(&mut program).expect("should be a no-op");
     assert_eq!(program, before);
+  }
+
+  // Plan 62 (design-by-contract).
+
+  #[test]
+  fn requires_and_ensures_clauses_parse_with_the_expected_ast_shape_and_text() {
+    let src = "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function");
+    };
+    assert_eq!(f.requires.len(), 1);
+    assert_eq!(
+      f.requires[0].expr.node,
+      Expr::Compare(
+        Box::new(s(Expr::Ident("b".to_string()))),
+        CompareOp::Ne,
+        Box::new(s(Expr::Int(0))),
+      )
+    );
+    assert_eq!(f.requires[0].text, "b != 0");
+    assert_eq!(f.ensures.len(), 1);
+    assert_eq!(f.ensures[0].text, "result * b <= a");
+  }
+
+  #[test]
+  fn a_function_with_no_contracts_parses_with_both_lists_empty() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  return a + b\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function");
+    };
+    assert!(f.requires.is_empty());
+    assert!(f.ensures.is_empty());
+  }
+
+  #[test]
+  fn requires_used_as_an_ordinary_identifier_is_a_real_parse_error() {
+    let src = "requires: Int64 = 1\n";
+    assert!(parse(src).is_err());
+  }
+
+  #[test]
+  fn ensures_used_as_an_ordinary_identifier_is_a_real_parse_error() {
+    let src = "ensures: Int64 = 1\n";
+    assert!(parse(src).is_err());
+  }
+
+  #[test]
+  fn a_requires_clause_on_a_class_method_is_a_real_parse_error_not_a_sema_diagnostic() {
+    let src = "class Point\n  x: Int64\n\n  def get_x() -> Int64\n    requires true\n    return @x\n  end\nend\n";
+    assert!(parse(src).is_err());
   }
 }

@@ -257,6 +257,8 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
       splat_param: None,
       type_params: Vec::new(),
       is_comptime: false,
+      requires: Vec::new(),
+      ensures: Vec::new(),
     };
 
     let Item::Class(c) = &mut program.items[i] else {
@@ -274,6 +276,8 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
         splat_param: None,
         type_params: Vec::new(),
         is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
       });
     }
     c.methods.push(eq_fn);
@@ -674,6 +678,22 @@ pub struct RescueClause {
   pub body: Vec<Spanned<Stmt>>,
 }
 
+/// `requires <expr>` / `ensures <expr>` on a function signature (plan
+/// 62's Decision log) — a small, dedicated struct rather than a bare
+/// `Spanned<Expr>`, because a runtime contract-violation message needs
+/// the clause's own real source text and this codebase has no
+/// unparser. `text` is filled in by a small, targeted post-parse pass
+/// over the freshly-built `Program` (`emerald_parser::lib::rs`'s own
+/// `fill_contract_text`, mirroring plan 47's identical `loc`-capture
+/// technique) — a fresh `Contract` straight out of the grammar action
+/// always has an empty `text`/`line: 0` placeholder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Contract {
+  pub expr: Spanned<Expr>,
+  pub text: String,
+  pub line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
   pub name: String,
@@ -718,6 +738,25 @@ pub struct Function {
   /// `comptime` call site also reaches it (see `leaf-comptime-const-
   /// context-integration`'s Decision log).
   pub is_comptime: bool,
+  /// `requires <expr>` clauses (plan 62's Decision log) — empty `Vec`
+  /// for every function that doesn't declare one, additive and
+  /// source-compatible, mirroring `type_params`'/`is_comptime`'s own
+  /// precedent. Grammatically reachable only on a top-level `FuncDef`,
+  /// never a `MethodDef` — a real, disclosed narrower cut than
+  /// `type_params`'s own "grammatically reachable on methods, sema-
+  /// rejected" precedent (see this plan's own Decision log for why a
+  /// stricter grammar-level fence is the simpler choice here).
+  pub requires: Vec<Contract>,
+  /// `ensures <expr>` clauses — same shape/precedent as `requires`
+  /// immediately above. `expr` may reference the pseudo-identifier
+  /// `result` (the function's own about-to-be-returned value) — this
+  /// needs no grammar support at all: `result` parses as an ordinary
+  /// `Expr::Ident("result")`, given meaning only by `emerald-sema`'s
+  /// own `env` construction while checking an `ensures` clause (the
+  /// same "grammar stays general, sema narrows" discipline plan 31
+  /// already established, applied here in reverse — adding meaning to
+  /// an existing shape rather than restricting one).
+  pub ensures: Vec<Contract>,
 }
 
 /// `T: Comparable` inside a generic function's or generic class's `[...]`

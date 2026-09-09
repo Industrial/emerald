@@ -13,8 +13,8 @@
 //! `Spanned<T>` doc comment for why that's the cheaper edit.
 
 use emerald_parser::{
-  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, Expr, Function, Item, ModuleDef,
-  Param, Program, RescueClause, Spanned, Stmt, StringPart,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, Expr, Function, Item,
+  ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -180,6 +180,11 @@ struct FunctionSig {
   /// beyond `params.len()` must have this type. `None` for every
   /// function that doesn't declare one.
   splat_elem: Option<Type>,
+  /// Plan 62's `leaf-sema-static-provability`: carried alongside the
+  /// ordinary signature so a call site's own static-provability check
+  /// (`eval_const_bool`) has the callee's `requires` clauses in hand
+  /// without needing a second lookup back into the raw `Program`.
+  requires: Vec<Contract>,
 }
 
 /// Shared by classes and modules (plan 12's Decision log — modules reuse
@@ -512,6 +517,7 @@ fn build_generic_class_info(
         param_names,
         defaults,
         splat_elem,
+        requires: m.requires.clone(),
       },
     );
   }
@@ -1136,6 +1142,7 @@ fn function_signature(
     param_names,
     defaults,
     splat_elem,
+    requires: f.requires.clone(),
   })
 }
 
@@ -3396,7 +3403,209 @@ fn check_call_args(
       }
     }
   }
+  check_requires_static_provability(name, args, sig, call_span)?;
   Ok(())
+}
+
+/// Plan 62's `leaf-sema-static-provability`: catches exactly one narrow
+/// case — a `requires` clause whose every free parameter-identifier is
+/// bound, at THIS call site, to a bare literal argument, folding to
+/// `Some(false)`. Wired only into `check_call_args` (`Expr::Call`'s own
+/// checker) — never `check_args` (`Expr::New`/module-method calls), per
+/// the Decision log's explicit method/non-function scoping.
+fn check_requires_static_provability(
+  name: &str,
+  args: &[Spanned<Expr>],
+  sig: &FunctionSig,
+  call_span: (usize, usize),
+) -> Result<(), Diagnostic> {
+  if sig.requires.is_empty() {
+    return Ok(());
+  }
+  let bindings: HashMap<&str, &Expr> = sig
+    .param_names
+    .iter()
+    .zip(args.iter())
+    .filter(|(_, a)| {
+      matches!(
+        &a.node,
+        Expr::Int(_) | Expr::Float(_) | Expr::StringLit(_) | Expr::Bool(_)
+      )
+    })
+    .map(|(pname, a)| (pname.as_str(), &a.node))
+    .collect();
+  if bindings.is_empty() {
+    return Ok(());
+  }
+  for c in &sig.requires {
+    if eval_const_bool(&c.expr.node, &bindings) == Some(false) {
+      let mut used: Vec<&str> = Vec::new();
+      collect_const_bool_idents(&c.expr.node, &mut used);
+      let literal_args = used
+        .into_iter()
+        .filter_map(|n| {
+          bindings
+            .get(n)
+            .map(|e| format!("{n} = {}", format_literal_expr(e)))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+      return Err(Diagnostic::new(
+        format!(
+          "contract violation provable at compile time: `{name}`'s requires `{}` is false for the literal arguments given at this call site ({literal_args})",
+          c.text
+        ),
+        call_span,
+      ));
+    }
+  }
+  Ok(())
+}
+
+fn format_literal_expr(e: &Expr) -> String {
+  match e {
+    Expr::Int(n) => n.to_string(),
+    Expr::Float(f) => f.to_string(),
+    Expr::StringLit(s) => format!("{s:?}"),
+    Expr::Bool(b) => b.to_string(),
+    _ => "?".to_string(),
+  }
+}
+
+/// Free identifiers reachable through exactly `eval_const_bool`'s own
+/// closed grammar — used only to name which literal-bound parameters a
+/// failed clause actually referenced in its own violation message
+/// (`divide`'s worked example: `requires b != 0` names only `b`, not
+/// `a`, even when both happen to be literal at the call site).
+fn collect_const_bool_idents<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
+  match expr {
+    Expr::Ident(name) => out.push(name.as_str()),
+    Expr::Int(_) | Expr::Float(_) | Expr::StringLit(_) | Expr::Bool(_) => {}
+    Expr::Neg(a) | Expr::Not(a) => collect_const_bool_idents(&a.node, out),
+    Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b) => {
+      collect_const_bool_idents(&a.node, out);
+      collect_const_bool_idents(&b.node, out);
+    }
+    Expr::Compare(a, _, b) => {
+      collect_const_bool_idents(&a.node, out);
+      collect_const_bool_idents(&b.node, out);
+    }
+    _ => {}
+  }
+}
+
+/// Plan 62's `leaf-sema-static-provability`: a small, new, purpose-built
+/// evaluator — verified this session that no general constant-folding
+/// mechanism exists anywhere in `emerald-sema`/`emerald-codegen` today
+/// (see the Decision log). Returns `None` the instant it hits anything
+/// outside this closed grammar (an `Ident` not present in `bindings`, a
+/// method/field/index access, etc.) — never a panic, never a guessed
+/// answer.
+#[derive(Debug, Clone, PartialEq)]
+enum ConstLit {
+  Int(i64),
+  Float(f64),
+  Str(String),
+  Bool(bool),
+}
+
+fn eval_const_lit(expr: &Expr, bindings: &HashMap<&str, &Expr>) -> Option<ConstLit> {
+  match expr {
+    Expr::Int(n) => Some(ConstLit::Int(*n)),
+    Expr::Float(f) => Some(ConstLit::Float(*f)),
+    Expr::StringLit(s) => Some(ConstLit::Str(s.clone())),
+    Expr::Bool(b) => Some(ConstLit::Bool(*b)),
+    Expr::Ident(name) => eval_const_lit(bindings.get(name.as_str())?, bindings),
+    Expr::Neg(a) => match eval_const_lit(&a.node, bindings)? {
+      ConstLit::Int(x) => Some(ConstLit::Int(-x)),
+      ConstLit::Float(x) => Some(ConstLit::Float(-x)),
+      _ => None,
+    },
+    Expr::Not(a) => match eval_const_lit(&a.node, bindings)? {
+      ConstLit::Bool(b) => Some(ConstLit::Bool(!b)),
+      _ => None,
+    },
+    Expr::And(a, b) => match (
+      eval_const_lit(&a.node, bindings)?,
+      eval_const_lit(&b.node, bindings)?,
+    ) {
+      (ConstLit::Bool(x), ConstLit::Bool(y)) => Some(ConstLit::Bool(x && y)),
+      _ => None,
+    },
+    Expr::Or(a, b) => match (
+      eval_const_lit(&a.node, bindings)?,
+      eval_const_lit(&b.node, bindings)?,
+    ) {
+      (ConstLit::Bool(x), ConstLit::Bool(y)) => Some(ConstLit::Bool(x || y)),
+      _ => None,
+    },
+    Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) | Expr::Rem(a, b) => {
+      let av = eval_const_lit(&a.node, bindings)?;
+      let bv = eval_const_lit(&b.node, bindings)?;
+      eval_const_arith(expr, av, bv)
+    }
+    Expr::Compare(a, op, b) => {
+      let av = eval_const_lit(&a.node, bindings)?;
+      let bv = eval_const_lit(&b.node, bindings)?;
+      eval_const_compare(*op, &av, &bv)
+    }
+    _ => None,
+  }
+}
+
+fn eval_const_arith(expr: &Expr, a: ConstLit, b: ConstLit) -> Option<ConstLit> {
+  match (a, b) {
+    (ConstLit::Int(x), ConstLit::Int(y)) => Some(ConstLit::Int(match expr {
+      Expr::Add(..) => x.checked_add(y)?,
+      Expr::Sub(..) => x.checked_sub(y)?,
+      Expr::Mul(..) => x.checked_mul(y)?,
+      Expr::Div(..) if y != 0 => x.checked_div(y)?,
+      Expr::Rem(..) if y != 0 => x.checked_rem(y)?,
+      _ => return None,
+    })),
+    (ConstLit::Float(x), ConstLit::Float(y)) => Some(ConstLit::Float(match expr {
+      Expr::Add(..) => x + y,
+      Expr::Sub(..) => x - y,
+      Expr::Mul(..) => x * y,
+      Expr::Div(..) => x / y,
+      Expr::Rem(..) => x % y,
+      _ => return None,
+    })),
+    _ => None,
+  }
+}
+
+fn eval_const_compare(op: CompareOp, a: &ConstLit, b: &ConstLit) -> Option<ConstLit> {
+  let ordering = match (a, b) {
+    (ConstLit::Int(x), ConstLit::Int(y)) => x.partial_cmp(y),
+    (ConstLit::Float(x), ConstLit::Float(y)) => x.partial_cmp(y),
+    (ConstLit::Str(x), ConstLit::Str(y)) => x.partial_cmp(y),
+    (ConstLit::Bool(x), ConstLit::Bool(y)) if matches!(op, CompareOp::Eq | CompareOp::Ne) => {
+      x.partial_cmp(y)
+    }
+    _ => return None,
+  }?;
+  Some(ConstLit::Bool(match op {
+    CompareOp::Lt => ordering.is_lt(),
+    CompareOp::Gt => ordering.is_gt(),
+    CompareOp::Le => ordering.is_le(),
+    CompareOp::Ge => ordering.is_ge(),
+    CompareOp::Eq => ordering.is_eq(),
+    CompareOp::Ne => ordering.is_ne(),
+  }))
+}
+
+fn eval_const_bool(expr: &Expr, bindings: &HashMap<&str, &Expr>) -> Option<bool> {
+  match eval_const_lit(expr, bindings)? {
+    ConstLit::Bool(b) => Some(b),
+    _ => None,
+  }
 }
 
 /// `arr[i] = value` — array element must be Int64-indexed and the RHS
@@ -5676,6 +5885,53 @@ fn scan_comptime_position_expr(expr: &Spanned<Expr>, diags: &mut Vec<Diagnostic>
   }
 }
 
+/// Plan 62's Decision log: `f.requires[i].expr` type-checks against the
+/// existing, unmodified params-only `env` (`requires` is a property of
+/// the arguments a caller supplies); `f.ensures[i].expr` type-checks
+/// against a *clone* of that same `env` with one extra entry, `"result"
+/// -> declared_return`, inserted first — no grammar/AST support needed
+/// for the pseudo-identifier `result` at all, it's an ordinary `Expr::
+/// Ident` given meaning only by this one extra `env` entry. Both require
+/// `Type::Boolean` back via the existing, unmodified `infer_expr_type`.
+fn check_contracts(
+  f: &Function,
+  env: &HashMap<String, Type>,
+  declared_return: &Type,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  gctx: &GenericsCtx,
+) -> Result<(), Diagnostic> {
+  for c in &f.requires {
+    let ty = infer_expr_type(&c.expr, env, sigs, classes, None, gctx)?;
+    if ty != Type::Boolean {
+      return Err(Diagnostic::new(
+        format!(
+          "`{}`'s `requires {}` must be Boolean, found {ty:?}",
+          f.name, c.text
+        ),
+        c.expr.span,
+      ));
+    }
+  }
+  if !f.ensures.is_empty() {
+    let mut ensures_env = env.clone();
+    ensures_env.insert("result".to_string(), declared_return.clone());
+    for c in &f.ensures {
+      let ty = infer_expr_type(&c.expr, &ensures_env, sigs, classes, None, gctx)?;
+      if ty != Type::Boolean {
+        return Err(Diagnostic::new(
+          format!(
+            "`{}`'s `ensures {}` must be Boolean, found {ty:?}",
+            f.name, c.text
+          ),
+          c.expr.span,
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
 fn check_function_body(
   f: &Function,
   sigs: &HashMap<String, FunctionSig>,
@@ -5695,6 +5951,7 @@ fn check_function_body(
     env.insert(p.name.clone(), Type::Array(Box::new(elem_ty)));
   }
   let declared_return = resolve_return_type(&f.return_type, classes)?;
+  check_contracts(f, &env, &declared_return, sigs, classes, gctx)?;
   check_block(
     &f.body,
     &mut env,
@@ -5763,6 +6020,20 @@ fn check_method_body(
     return Err(Diagnostic::new(
       format!(
         "tuple return types are not supported on methods yet (`{class_name}#{}`)",
+        m.name
+      ),
+      (0, 0),
+    ));
+  }
+  // Plan 62's Decision log: defense in depth — `requires`/`ensures` are
+  // already grammatically unreachable on a `MethodDef` (no `ContractClause*`
+  // slot exists in that production at all), so this can only ever fire
+  // against a hand-constructed AST, not real source text. Mirrors the
+  // three checks immediately above exactly.
+  if !m.requires.is_empty() || !m.ensures.is_empty() {
+    return Err(Diagnostic::new(
+      format!(
+        "contracts are not supported on methods yet (`{class_name}#{}`)",
         m.name
       ),
       (0, 0),
@@ -6654,6 +6925,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           param_names: f.params.iter().map(|p| p.name.clone()).collect(),
           defaults: vec![None; f.params.len()],
           splat_elem: None,
+          requires: Vec::new(),
         },
       );
     }
@@ -6812,6 +7084,8 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           splat_param: None,
           type_params: Vec::new(),
           is_comptime: false,
+          requires: Vec::new(),
+          ensures: Vec::new(),
         };
         if let Err(d) = check_function_body(&synthetic, &sigs, &classes, &gctx) {
           diags.push(d);
@@ -6910,6 +7184,22 @@ fn check_generic_function_body(
   classes: &HashMap<String, ClassInfo>,
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
+  // Plan 62's Decision log: a `type_params`-bearing function is compiled
+  // via whole-program monomorphization and never reaches `check_
+  // function_body` at all (the top-level dispatch loop routes it here
+  // instead) — this is the one real place that dispatch decision can be
+  // observed, so this is where the "not supported on generic functions
+  // yet" diagnostic has to live, even though `requires`/`ensures`
+  // themselves are otherwise entirely `check_function_body`'s concern.
+  if !f.requires.is_empty() || !f.ensures.is_empty() {
+    return Err(Diagnostic::new(
+      format!(
+        "contracts are not supported on generic functions yet (`{}`)",
+        f.name
+      ),
+      (0, 0),
+    ));
+  }
   let mut env = HashMap::new();
   for p in &f.params {
     let t = if p.ty == g.type_param {
@@ -9416,6 +9706,145 @@ end
         .iter()
         .any(|d| d.message.contains("cannot be used again")),
       "{errs:?}"
+    );
+  }
+
+  // Plan 62 (design-by-contract).
+
+  const DIVIDE_SRC: &str = "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b\nend\n";
+
+  #[test]
+  fn divide_worked_example_type_checks_ok() {
+    let src = format!("{DIVIDE_SRC}\ny: Int64 = 10\nz: Int64 = 2\nputs divide(y, z)\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn a_non_boolean_requires_clause_is_rejected_naming_the_clause_and_type() {
+    let src = "def bad(a: Int64) -> Int64\n  requires a\n  return a\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("a non-Boolean requires must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("requires") && d.message.contains("Int64")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn an_ensures_clause_referencing_an_undeclared_identifier_is_rejected() {
+    let src = "def bad2(a: Int64) -> Int64\n  ensures unknown_name\n  return a\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("an undeclared identifier must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("unknown_name")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn ensures_result_resolves_to_the_declared_return_type() {
+    let src = "def ok(a: Int64) -> Int64\n  ensures result >= 0\n  return a\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn requires_on_a_class_method_via_a_hand_constructed_ast_is_rejected() {
+    let mut program =
+      emerald_parser::parse("class Point\n  x: Int64\nend\n").expect("should parse");
+    let Item::Class(c) = &mut program.items[0] else {
+      panic!("expected a class");
+    };
+    c.methods.push(Function {
+      name: "get_x".to_string(),
+      params: Vec::new(),
+      return_type: "Int64".to_string(),
+      body: vec![Spanned::synthetic(Stmt::Return(Some(Spanned::synthetic(
+        Expr::Int(0),
+      ))))],
+      block_param: None,
+      splat_param: None,
+      type_params: Vec::new(),
+      is_comptime: false,
+      requires: vec![Contract {
+        expr: Spanned::synthetic(Expr::Bool(true)),
+        text: "true".to_string(),
+        line: 0,
+      }],
+      ensures: Vec::new(),
+    });
+    let errs = check_program(&program).expect_err("contracts on a method must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("not supported on methods yet")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn requires_on_a_generic_function_is_rejected() {
+    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\ndef identity[T: Comparable](x: T) -> T\n  requires true\n  return x\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("contracts on a generic function must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("not supported on generic functions yet")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_literal_zero_divisor_is_rejected_at_compile_time() {
+    let src = format!("{DIVIDE_SRC}\nputs divide(10, 0)\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program).expect_err("divide(10, 0) must be rejected at compile time");
+    assert!(
+      errs.iter().any(|d| {
+        d.message
+          .contains("contract violation provable at compile time")
+          && d.message.contains("b != 0")
+          && d.message.contains("b = 0")
+      }),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn let_bound_locals_at_a_call_site_are_not_statically_checked() {
+    let src = format!("{DIVIDE_SRC}\ny: Int64 = 10\nz: Int64 = 0\nputs divide(y, z)\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "a Let-bound local must never be statically substituted, even if it happens to be zero"
+    );
+  }
+
+  #[test]
+  fn a_computed_non_literal_argument_is_not_statically_checked() {
+    let src = format!("{DIVIDE_SRC}\nx: Int64 = 3\nw: Int64 = x - 3\nputs divide(20, w)\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "a computed expression argument must never be statically substituted"
+    );
+  }
+
+  #[test]
+  fn a_clause_with_one_literal_and_one_non_literal_argument_is_skipped_entirely() {
+    let src = "def f(a: Int64, b: Int64) -> Int64\n  requires a + b > 0\n  return a + b\nend\n\ny: Int64 = 10\nputs f(5, y)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "a clause referencing any non-literal-bound identifier must be skipped, not partially folded"
     );
   }
 }

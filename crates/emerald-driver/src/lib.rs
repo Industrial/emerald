@@ -76,6 +76,14 @@ fn check_stage(mut program: Program) -> Effect<Program, DriverError, ()> {
         span: (0, 0),
       }]));
     }
+    // Plan 62's Decision log (a real, disclosed bug fix, not part of
+    // the plan's own original design): `RemoteActorError`/
+    // `ContractViolation` must exist before `check_program` runs, or a
+    // user's own `rescue RemoteActorError => e`/`rescue
+    // ContractViolation => e` fails sema with "unknown type" — see
+    // `emerald_codegen::ensure_pre_sema_exception_classes`'s own doc
+    // comment for the full story.
+    emerald_codegen::ensure_pre_sema_exception_classes(&mut program.items);
     emerald_sema::check_program(&program)
       .map(|()| program)
       .map_err(DriverError::Sema)

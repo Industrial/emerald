@@ -20,8 +20,8 @@
 //! change for well-typed Emerald programs.
 
 use emerald_parser::{
-  CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, Expr, Function as AstFunction, Item,
-  ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
+  CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, Expr, Function as AstFunction,
+  Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
 };
 use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
@@ -608,6 +608,8 @@ fn instantiate_generic_class_defs(
       }),
       type_params: Vec::new(),
       is_comptime: false,
+      requires: Vec::new(),
+      ensures: Vec::new(),
     })
     .collect();
 
@@ -1992,6 +1994,13 @@ fn substitute_generic_function(
     splat_param: f.splat_param.clone(),
     type_params: Vec::new(),
     is_comptime: f.is_comptime,
+    // Plan 62's Decision log: `emerald-sema` already rejects a
+    // `type_params`-bearing function with a non-empty `requires`/
+    // `ensures` before this ever runs — `f.requires`/`f.ensures` are
+    // carried through unchanged (not hardcoded empty) purely so this
+    // stays correct-by-construction rather than correct-by-coincidence.
+    requires: f.requires.clone(),
+    ensures: f.ensures.clone(),
   }
 }
 
@@ -3925,6 +3934,15 @@ struct Ctx<'a, 'ctx> {
   /// engineering compromise (Rice's theorem: general termination is
   /// undecidable), not a termination proof.
   comptime_step_limit: u64,
+  /// Plan 62's Decision log: `Some((name, ensures))` only while
+  /// `define_user_function` is compiling a top-level function's own
+  /// body — `Stmt::Return`'s codegen arm and the implicit-return-
+  /// fallthrough codegen path both read this to know whether (and under
+  /// what name/clause list) to inject an `ensures` check before the
+  /// real `ret`. `None` everywhere else (a method/lambda/`main` body
+  /// never declares `ensures` at all — `leaf-ast-parser-contracts`'
+  /// own grammar-level fence already guarantees that).
+  current_function_contracts: Option<(&'a str, &'a [Contract])>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -9718,6 +9736,26 @@ fn build_stmt<'a, 'ctx>(
         )?;
         v
       };
+      // Plan 62's Decision log: runs BEFORE `emit_active_ensures` —
+      // deliberately. A failed `ensures` clause raises a real exception
+      // (`build_raise`, `longjmp`-based), which must be caught by
+      // whatever ENCLOSING `begin`/`rescue` handler actually catches it
+      // (that block's own `build_begin`-emitted exit points already
+      // duplicate its `ensure` body correctly); `emit_active_ensures`
+      // is a completely different mechanism — the compile-time-
+      // duplicated `begin`/`ensure` cleanup a plain, non-exceptional
+      // `return` needs to fall through on its way out. A no-op (no
+      // branch emitted at all) for every function with no `ensures`.
+      build_ensures_checks(
+        context,
+        builder,
+        func,
+        Some((v, ret_kind.clone())),
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       emit_active_ensures(
         context,
         builder,
@@ -9736,6 +9774,22 @@ fn build_stmt<'a, 'ctx>(
       Ok(true)
     }
     Stmt::Return(None) => {
+      // Plan 62's Decision log: see the `Some(e)` arm's own comment for
+      // why this runs before `emit_active_ensures`. `result_value: None`
+      // — a bare `return` has no value to bind under `result`; a clause
+      // referencing it here would already have been rejected by
+      // `emerald-sema` (a `Void` declared return has no comparable
+      // operations).
+      build_ensures_checks(
+        context,
+        builder,
+        func,
+        None,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       emit_active_ensures(
         context,
         builder,
@@ -11172,6 +11226,21 @@ fn build_function_body<'a, 'ctx>(
         local_array_elem_types,
         ctx,
       )?;
+      // Plan 62's Decision log: the implicit-return-fallthrough half of
+      // the two fixed `ensures` injection points — see `Stmt::Return`'s
+      // own identical comment for why this runs unconditionally here
+      // (there is no enclosing `emit_active_ensures` call on this path
+      // at all, unlike an explicit `return`).
+      build_ensures_checks(
+        context,
+        builder,
+        func,
+        Some((v, ret_kind.clone())),
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       builder.build_return(Some(&v)).map_err(|e| e.to_string())?;
     }
     _ => {
@@ -11195,6 +11264,21 @@ fn build_function_body<'a, 'ctx>(
       // `@y = y`) needs an explicit empty `return` — nothing else
       // would ever terminate the block.
       if !terminated && ret_kind == ValKind::Void {
+        // Plan 62's Decision log: only reached when NOTHING else in the
+        // body already terminated it (a real implicit fallthrough) — an
+        // explicit `Stmt::Return`/`Stmt::Raise` reaching `terminated:
+        // true` already ran its own `ensures` check via `build_stmt`'s
+        // own arm; this is the one remaining case that never does.
+        build_ensures_checks(
+          context,
+          builder,
+          func,
+          None,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
         builder.build_return(None).map_err(|e| e.to_string())?;
       }
     }
@@ -11303,6 +11387,149 @@ fn bind_params<'ctx>(
   Ok(())
 }
 
+/// Plan 62's `leaf-codegen-contracts`: raised via `build_raise` reuse —
+/// the exact "synthesize a `Spanned<Expr>::New` and call the EXISTING
+/// `build_raise` function unchanged" technique plan 60's own `Remote
+/// ActorError` raise site already established, simpler here since the
+/// message is entirely compile-time-known (`Contract.text`/`Contract.
+/// line`, both already real strings/numbers by the time codegen runs —
+/// no runtime-computed value to stash in a scratch `vars` entry first,
+/// unlike `RemoteActorError`'s own socket-layer error string). Named
+/// the function and the clause's own declaration LINE — not the file
+/// (a real, disclosed narrowing: `compile_to_object`'s ordinary,
+/// non-debug-info path carries no source file name for codegen to name
+/// here, unlike `compile_to_object_with_debug_info`'s own `di_file`).
+#[allow(clippy::too_many_arguments)]
+fn build_requires_checks<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  fname: &str,
+  requires: &[Contract],
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  for c in requires {
+    let cond = build_bool(
+      context,
+      builder,
+      &c.expr,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let ok_blk = context.append_basic_block(func, "requires.ok");
+    let fail_blk = context.append_basic_block(func, "requires.fail");
+    builder
+      .build_conditional_branch(cond, ok_blk, fail_blk)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(fail_blk);
+    let message = format!(
+      "contract violation: `{fname}`'s requires `{}` failed (declared at line {})",
+      c.text, c.line
+    );
+    let raise_expr = Spanned::synthetic(Expr::New(
+      "ContractViolation".to_string(),
+      vec![Spanned::synthetic(Expr::StringLit(message))],
+    ));
+    build_raise(
+      context,
+      builder,
+      &raise_expr,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+
+    builder.position_at_end(ok_blk);
+  }
+  Ok(())
+}
+
+/// Plan 62's `leaf-codegen-contracts`: the `ensures` mirror of `build_
+/// requires_checks` immediately above — reached from exactly two fixed
+/// codegen sites (`Stmt::Return`'s own arm, both `Some`/`None`; and
+/// `build_function_body`'s own implicit-return-fallthrough path), each
+/// already knowing the function's declared return kind (needed anyway
+/// to emit a correctly-typed `ret`). `result_value` is `Some((v, kind))`
+/// for an explicit `return <expr>` (bound to a fresh scratch `vars`
+/// entry named `result`, so an `ensures` clause's own `build_expr` call
+/// reads it via the ordinary `Expr::Ident("result")` path — no grammar/
+/// AST support needed for the pseudo-identifier at all) or `None` for a
+/// bare `return`/an implicit `Void` fallthrough, where no clause can
+/// legally reference `result` (`emerald-sema` already rejected that).
+/// Reads `ctx.current_function_contracts` directly rather than taking
+/// `ensures`/`fname` as explicit parameters — `None` (every method/
+/// lambda/`main` body) is a real, cheap no-op.
+#[allow(clippy::too_many_arguments)]
+fn build_ensures_checks<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  result_value: Option<(BasicValueEnum<'ctx>, ValKind)>,
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  let Some((fname, ensures)) = ctx.current_function_contracts else {
+    return Ok(());
+  };
+  if ensures.is_empty() {
+    return Ok(());
+  }
+  if let Some((v, kind)) = result_value {
+    let alloca = builder
+      .build_alloca(local_llvm_type(context, &kind), "result")
+      .map_err(|e| e.to_string())?;
+    builder.build_store(alloca, v).map_err(|e| e.to_string())?;
+    vars.insert("result".to_string(), (alloca, kind));
+  }
+  for c in ensures {
+    let cond = build_bool(
+      context,
+      builder,
+      &c.expr,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let ok_blk = context.append_basic_block(func, "ensures.ok");
+    let fail_blk = context.append_basic_block(func, "ensures.fail");
+    builder
+      .build_conditional_branch(cond, ok_blk, fail_blk)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(fail_blk);
+    let message = format!(
+      "contract violation: `{fname}`'s ensures `{}` failed (declared at line {})",
+      c.text, c.line
+    );
+    let raise_expr = Spanned::synthetic(Expr::New(
+      "ContractViolation".to_string(),
+      vec![Spanned::synthetic(Expr::StringLit(message))],
+    ));
+    build_raise(
+      context,
+      builder,
+      &raise_expr,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+
+    builder.position_at_end(ok_blk);
+  }
+  Ok(())
+}
+
 /// Byte offset → 1-based source line, via a binary search over
 /// `newline_offsets` (every `\n`'s byte offset, ascending) — the
 /// conversion plan 35 reuses at every debug-location site instead of
@@ -11405,6 +11632,11 @@ fn define_user_function<'ctx>(
   let fn_ctx = Ctx {
     current_di_scope: di_scope,
     object_allocas: Some(&object_allocas),
+    // Plan 62's Decision log: only a top-level function (never a
+    // method/lambda/`main`) ever has a non-empty `ensures` list — this
+    // is the one real injection point that `Stmt::Return`'s codegen arm
+    // and the implicit-return fallthrough both read from.
+    current_function_contracts: Some((&f.name, &f.ensures)),
     ..*gen_ctx
   };
 
@@ -11422,6 +11654,25 @@ fn define_user_function<'ctx>(
     &mut local_classes,
     &mut local_array_elem_types,
   )?;
+
+  // Plan 62's Decision log: exactly one fixed injection point — right
+  // after `bind_params`, before the user body's first statement
+  // compiles. `f.requires` is empty for every function that doesn't
+  // declare one, so this is a real no-op (not even a branch emitted)
+  // for every pre-plan-62 function/method/lambda/`main`.
+  if !f.requires.is_empty() {
+    build_requires_checks(
+      context,
+      builder,
+      fv,
+      &f.name,
+      &f.requires,
+      &mut vars,
+      &local_classes,
+      &local_array_elem_types,
+      &fn_ctx,
+    )?;
+  }
 
   let mut decls = Vec::new();
   collect_lets(&f.body, &mut decls);
@@ -12893,6 +13144,9 @@ fn compile_to_object_impl(
   if items.iter().any(|i| matches!(i, Item::Actor(_))) {
     ensure_remote_actor_error_class(&mut items);
   }
+  if program_uses_contracts(&items) {
+    ensure_contract_violation_class(&mut items);
+  }
   let owned_program = Program { items };
   let program = &owned_program;
 
@@ -13287,6 +13541,8 @@ fn compile_to_object_impl(
           splat_param: None,
           type_params: Vec::new(),
           is_comptime: false,
+          requires: Vec::new(),
+          ensures: Vec::new(),
         })
         .collect::<Vec<_>>(),
       _ => Vec::new(),
@@ -13505,6 +13761,7 @@ fn compile_to_object_impl(
     actor_method_tables: &actor_method_tables,
     actor_method_counts: &actor_method_counts,
     comptime_step_limit: comptime_step_limit.unwrap_or(1_000_000),
+    current_function_contracts: None,
   };
 
   for item in &program.items {
@@ -13982,6 +14239,8 @@ fn assertion_error_class_item() -> Item {
         splat_param: None,
         type_params: Vec::new(),
         is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
       },
       AstFunction {
         name: "message".to_string(),
@@ -13994,6 +14253,8 @@ fn assertion_error_class_item() -> Item {
         splat_param: None,
         type_params: Vec::new(),
         is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
       },
     ],
     type_params: Vec::new(),
@@ -14044,6 +14305,8 @@ fn remote_actor_error_class_item() -> Item {
         splat_param: None,
         type_params: Vec::new(),
         is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
       },
       AstFunction {
         name: "message".to_string(),
@@ -14056,6 +14319,8 @@ fn remote_actor_error_class_item() -> Item {
         splat_param: None,
         type_params: Vec::new(),
         is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
       },
     ],
     type_params: Vec::new(),
@@ -14073,6 +14338,115 @@ fn ensure_remote_actor_error_class(items: &mut Vec<Item>) {
     .any(|i| matches!(i, Item::Class(c) if c.name == "RemoteActorError"));
   if !already_present {
     items.insert(0, remote_actor_error_class_item());
+  }
+}
+
+/// Plan 62's Decision log: `ContractViolation` — the exact `message:
+/// String`, one-`initialize` shape `AssertionError`/`RemoteActorError`
+/// above already establish, deliberately a DISTINCT class from
+/// `AssertionError` (not a reuse of it): a contract violation is a
+/// language-level correctness failure, not a test-framework assertion
+/// failure, so a program can `rescue` the two apart. Raised at a
+/// function's own `requires`-check (entry) and `ensures`-check (every
+/// `return` site, including the implicit-fallthrough one) injection
+/// points.
+fn contract_violation_class_item() -> Item {
+  Item::Class(ClassDef {
+    name: "ContractViolation".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![Param {
+      name: "message".to_string(),
+      ty: "String".to_string(),
+      default: None,
+    }],
+    methods: vec![
+      AstFunction {
+        name: "initialize".to_string(),
+        params: vec![Param {
+          name: "message".to_string(),
+          ty: "String".to_string(),
+          default: None,
+        }],
+        return_type: "Void".to_string(),
+        body: vec![syn(Stmt::SetField {
+          name: "message".to_string(),
+          value: syn(Expr::Ident("message".to_string())),
+        })],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+        is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
+      },
+      AstFunction {
+        name: "message".to_string(),
+        params: Vec::new(),
+        return_type: "String".to_string(),
+        body: vec![syn(Stmt::Expr(syn(Expr::InstanceVar(
+          "message".to_string(),
+        ))))],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+        is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
+      },
+    ],
+    type_params: Vec::new(),
+  })
+}
+
+/// Gated on the program actually declaring a non-empty `requires`/
+/// `ensures` anywhere (the only source of a raise site this class could
+/// ever be needed for) — mirrors `ensure_assertion_error_class`'s own
+/// `uses_assertions` gate exactly, so a program with no contracts at all
+/// pays zero cost for this synthesized class.
+fn ensure_contract_violation_class(items: &mut Vec<Item>) {
+  let already_present = items
+    .iter()
+    .any(|i| matches!(i, Item::Class(c) if c.name == "ContractViolation"));
+  if !already_present {
+    items.insert(0, contract_violation_class_item());
+  }
+}
+
+fn program_uses_contracts(items: &[Item]) -> bool {
+  items.iter().any(|i| match i {
+    Item::Function(f) => !f.requires.is_empty() || !f.ensures.is_empty(),
+    _ => false,
+  })
+}
+
+/// A real, disclosed bug this leaf's own CLI-level test caught (not
+/// something the plan's own Decision log anticipated): `ensure_remote_
+/// actor_error_class`/`ensure_contract_violation_class` previously only
+/// ever ran inside `compile_to_object_impl`, AFTER `emerald_sema::
+/// check_program` had already run on the un-mutated `Program` — so a
+/// user writing `rescue RemoteActorError => e`/`rescue ContractViolation
+/// => e` in their own real source (exactly what this plan's own worked
+/// example does) failed sema with "unknown type", even though codegen
+/// itself worked fine. `emerald-driver::check_stage` calls this `pub`
+/// entry point BEFORE `check_program`, so sema sees the same synthetic
+/// classes codegen will later (re-)inject — `compile_to_object_impl`'s
+/// own identical gate-and-inject calls become harmless no-ops (`already_
+/// present` is true) once this has already run, and stay exactly as
+/// necessary as before for callers that reach `compile_to_object`
+/// directly, bypassing `emerald-driver` (and this function) entirely —
+/// `emerald-codegen`'s own test suite (`compile_link_run` and friends).
+/// `AssertionError` deliberately isn't included here: verified this
+/// session that its own `rescue` clause is ONLY ever synthesized inside
+/// `compile_test_harness`, entirely in codegen, on a `Program` sema
+/// never re-checks after that synthesis — it has no equivalent gap.
+pub fn ensure_pre_sema_exception_classes(items: &mut Vec<Item>) {
+  if items.iter().any(|i| matches!(i, Item::Actor(_))) {
+    ensure_remote_actor_error_class(items);
+  }
+  if program_uses_contracts(items) {
+    ensure_contract_violation_class(items);
   }
 }
 
@@ -14133,6 +14507,8 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
       splat_param: None,
       type_params: Vec::new(),
       is_comptime: false,
+      requires: Vec::new(),
+      ensures: Vec::new(),
     }));
 
     harness_stmts.push(syn(Stmt::Begin {
@@ -14944,6 +15320,8 @@ mod tests {
           splat_param: None,
           type_params: Vec::new(),
           is_comptime: false,
+          requires: Vec::new(),
+          ensures: Vec::new(),
         }),
         Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
           "repeat".into(),
@@ -16689,5 +17067,72 @@ int main(void) {
       err.contains("exceeded 100 steps"),
       "expected the step-ceiling diagnostic, got: {err}"
     );
+  }
+
+  // Plan 62 (design-by-contract).
+
+  const DIVIDE_SRC: &str = "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b\nend\n";
+
+  #[test]
+  fn contracts_worked_example_prints_5_then_catches_a_real_requires_violation() {
+    // AC1: proof points (a) and (c) together — a runtime-only-
+    // determinable divisor succeeding normally, and a runtime-only-
+    // determinable zero divisor raising a real `ContractViolation`
+    // caught by an ordinary `rescue`. `w`'s own zero-ness is only
+    // knowable at run time (`x - 3`, `x` itself a runtime local), so
+    // this never hits `leaf-sema-static-provability`'s compile-time
+    // rejection at all — it's a genuine runtime-enforcement proof.
+    let src = format!(
+      "{DIVIDE_SRC}\ny: Int64 = 10\nz: Int64 = 2\nputs divide(y, z)\n\nx: Int64 = 3\nw: Int64 = x - 3\nbegin\n  puts divide(20, w)\nrescue ContractViolation => e\n  puts e.message\nend\n"
+    );
+    let out = compile_link_run(&src);
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("5"));
+    let violation_line = lines.next().expect("expected a second line");
+    assert!(
+      violation_line.contains("divide") && violation_line.contains("b != 0"),
+      "expected the requires-violation message, got: {violation_line}"
+    );
+  }
+
+  #[test]
+  fn an_ensures_violation_raises_at_the_ensures_site_not_the_requires_site() {
+    // AC2: `divide2` has the SAME `requires b != 0` as `divide` (so a
+    // non-zero-divisor call passes that check cleanly) but a
+    // deliberately wrong body (`a / b + 1`) that violates `ensures
+    // result * b <= a` — proving the two checks are wired to their own,
+    // independent injection points.
+    let src = "def divide2(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b + 1\nend\n\nbegin\n  puts divide2(10, 2)\nrescue ContractViolation => e\n  puts e.message\nend\n";
+    let out = compile_link_run(src);
+    assert!(
+      out.contains("divide2") && out.contains("ensures") && out.contains("result * b <= a"),
+      "expected the ensures-violation message, got: {out}"
+    );
+  }
+
+  #[test]
+  fn contract_violation_is_never_emitted_for_a_program_with_no_contracts() {
+    // AC3: zero-cost, zero-regression for a program with no `requires`/
+    // `ensures` usage anywhere — verified via white-box IR inspection
+    // (the same "prove it, don't just assert it" standard this leaf's
+    // own `AC3` calls for), not just by inferring it from output.
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  return a + b\nend\n\nputs add(20, 22)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+    let obj_path = dir.join(format!("emerald_codegen_no_contracts_ir_{unique}.o"));
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile to object file");
+    std::fs::remove_file(&obj_path).ok();
+    assert!(
+      !ir.contains("ContractViolation"),
+      "expected no ContractViolation class emitted for a contract-free program, got:\n{ir}"
+    );
+  }
+
+  #[test]
+  fn requires_and_ensures_both_pass_when_the_contract_genuinely_holds() {
+    let src = format!("{DIVIDE_SRC}\nputs divide(10, 2)\n");
+    assert_eq!(compile_link_run(&src), "5\n");
   }
 }
