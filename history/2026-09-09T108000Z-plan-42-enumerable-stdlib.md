@@ -35,17 +35,31 @@ any other plan file — that table is updated separately, once, after all
 twelve siblings in this batch are authored. This plan is the
 highest-leverage plan in the batch for the "collections/stdlib" gap: it
 depends on [plan 41](interfaces-and-generics, assumed contract below)
-for the interface/monomorphization mechanism, [plan 37](ranges-and-
-iteration, assumed contract below) for `Range`, and plan 09
+for the interface/monomorphization mechanism, and plan 09
 (`2026-09-08T190129Z-plan-09-collections.md`, already written and
 partially superseded by plan 25) for `Array[T]`/`Hash[K,V]`'s existing
 representations. Neither plan 41 nor plan 37 exist as files in
 `history/` as of this session (verified: `history/` runs from
 `2026-09-08T173600Z-inception.md` through
 `2026-09-09T101000Z-plan-35-debug-info.md`, nothing numbered 36+) — this
-plan cites their contracts exactly as summarized by the batch's shared
-brief, the normal way parallel sibling plans in this project cite each
-other.
+plan cites plan 41's contract exactly as summarized by the batch's
+shared brief, the normal way parallel sibling plans in this project
+cite each other.
+
+**Post-authoring correction:** this plan was drafted assuming plan 37
+would deliver a first-class `Range` value satisfying `Iterable[Int64]`
+alongside `Array[T]`/`Hash[K,V]`. Plan 37, once actually authored,
+deliberately declined that — its own Decision log restricts `..`/`...`
+to appear only directly after a `for <var> in` scrutinee, with no
+`Expr::Range`/`Type::Range` and no standalone value ever reaching
+`PrimaryExpr` at all (a stricter reduction of surface than this plan
+assumed). Every `Range`-as-`Iterable` reference below is therefore
+stale against plan 37's real, shipped scope; this plan's actual
+contract is `Array[T]` and `Hash[K,V]` only, with `Range`'s `Iterable`
+conformance real, disclosed future work gated on some future plan
+first giving `Range` a first-class value. `leaf-iterable-interface`'s
+AC3 (a `Range.each` proof) is void and must be dropped when this leaf
+is executed; its other four acceptance criteria are unaffected.
 
 Concrete proof this plan targets (no method-chaining — see Decision
 log):
