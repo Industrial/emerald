@@ -72,6 +72,14 @@ pub enum Type {
   /// declines to pay for arbitrary-precision `Integer` (`spec/
   /// TYPE_SYSTEM.md` §3).
   Nullable(Box<Type>),
+  /// A fixed-arity anonymous tuple (plan 39's Decision log) — valid
+  /// ONLY as a function's declared return type, never a parameter
+  /// type, a field type, a `Let`'s local type, an array element type,
+  /// or nested inside another tuple. Never constructed by the shared
+  /// `resolve_type` (used for every param/field/`Let` annotation) —
+  /// only `resolve_return_type` (`function_signature`'s own return-type
+  /// resolution) ever produces this.
+  Tuple(Vec<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +269,56 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
   }
 }
 
+/// Splits `s` on top-level `,` only — a nested `Array[...]`/`Hash[...]`/
+/// `(...)` element's own internal comma(s) don't count as a split
+/// point. Needed because a tuple's own compound-string element list
+/// (`"(Int64, Int64)"`, or in principle `"(Hash[Int64, Int64], Int64)"`)
+/// can itself contain a compound type whose *own* convention already
+/// uses `", "` — `Hash[K, V]`'s existing single `split_once(", ")` only
+/// ever needs to handle exactly two parts with no nesting risk, but a
+/// tuple's arbitrary-length element list does.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+  let mut parts = Vec::new();
+  let mut depth = 0i32;
+  let mut start = 0usize;
+  for (i, b) in s.bytes().enumerate() {
+    match b {
+      b'[' | b'(' => depth += 1,
+      b']' | b')' => depth -= 1,
+      b',' if depth == 0 => {
+        parts.push(s[start..i].trim());
+        start = i + 1;
+      }
+      _ => {}
+    }
+  }
+  parts.push(s[start..].trim());
+  parts
+}
+
+/// Resolves a `def`'s declared return-type annotation only — the one
+/// place a `"(" T1 "," T2 ")"`-shaped tuple annotation gains real
+/// meaning (plan 39's Decision log). Every other annotation site
+/// (params, fields, `Let`) keeps calling the shared `resolve_type`
+/// directly, which has no tuple branch at all and falls through to its
+/// `unknown type` catch-all for this exact shape — the same "grammar
+/// permits it everywhere, only one specific resolution path gives it
+/// real meaning" precedent `resolve_type`'s own bare `"Proc"` case
+/// already established.
+fn resolve_return_type(
+  name: &str,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Type, Diagnostic> {
+  if let Some(inner) = name.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+    let elem_types = split_top_level_commas(inner)
+      .into_iter()
+      .map(|part| resolve_type(part, classes))
+      .collect::<Result<Vec<_>, _>>()?;
+    return Ok(Type::Tuple(elem_types));
+  }
+  resolve_type(name, classes)
+}
+
 /// Plan 43's Decision log: replaces the raw `actual != declared`
 /// equality check at every assignability check-site in this file —
 /// exact-equality for every non-nullable `declared` (so every
@@ -301,7 +359,7 @@ fn function_signature(
     .iter()
     .map(|p| resolve_type(&p.ty, classes))
     .collect::<Result<Vec<_>, _>>()?;
-  let return_type = resolve_type(&f.return_type, classes)?;
+  let return_type = resolve_return_type(&f.return_type, classes)?;
   let param_names = f.params.iter().map(|p| p.name.clone()).collect();
   let defaults = f.params.iter().map(|p| p.default.clone()).collect();
   let splat_elem = f
@@ -1521,6 +1579,21 @@ fn infer_expr_type(
         expr.span,
       ))
     }
+    // Plan 39's Decision log: the grammar only ever constructs this
+    // node from `return a, b`'s comma-list `Stmt::Return` rule, so
+    // there's no separate "TupleLit used somewhere illegal" case to
+    // reject here — whatever `Type::Tuple` this produces either
+    // matches the enclosing function's declared tuple return type (via
+    // `Stmt::Return`'s existing `is_assignable` check, unmodified) or
+    // fails as an ordinary type mismatch, the same as any other
+    // wrong-shaped return value.
+    Expr::TupleLit(elems) => {
+      let types = elems
+        .iter()
+        .map(|e| infer_expr_type(e, env, sigs, classes, self_fields, gctx))
+        .collect::<Result<Vec<_>, _>>()?;
+      Ok(Type::Tuple(types))
+    }
   }
 }
 
@@ -1843,6 +1916,43 @@ fn check_set_index(
   Ok(())
 }
 
+/// Plan 39's Decision log: `x, y = f()`'s own arity/type check against
+/// the tuple `f` actually returned — separated out of `check_multi_
+/// assign` to keep each path's own complexity down.
+fn check_tuple_multi_assign(
+  names: &[String],
+  value: &Spanned<Expr>,
+  ts: &[Type],
+  env: &HashMap<String, Type>,
+) -> Result<(), Diagnostic> {
+  if ts.len() != names.len() {
+    return Err(Diagnostic::new(
+      format!(
+        "multiple assignment arity mismatch: {} target(s), {}-element tuple returned",
+        names.len(),
+        ts.len()
+      ),
+      value.span,
+    ));
+  }
+  for (i, (name, t)) in names.iter().zip(ts.iter()).enumerate() {
+    let declared = env
+      .get(name)
+      .cloned()
+      .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), value.span))?;
+    if !is_assignable(t, &declared) {
+      return Err(Diagnostic::new(
+        format!(
+          "type mismatch in multiple assignment at position {}: `{name}` has type {declared:?}, tuple element has type {t:?}",
+          i + 1
+        ),
+        value.span,
+      ));
+    }
+  }
+  Ok(())
+}
+
 /// `n1, n2, ... = v1, v2, ...` (plan 31's Decision log): fixed-arity
 /// only — an arity mismatch is a real diagnostic, not a panic or silent
 /// truncation/padding. Every `values` expression is type-checked before
@@ -1859,6 +1969,22 @@ fn check_multi_assign(
   self_fields: Option<&HashMap<String, Type>>,
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
+  // Plan 39's Decision log: `x, y = f()` — a single call-shaped value
+  // whose declared return type is a `Type::Tuple` of matching arity —
+  // unpacks positionally, entirely ahead of the ordinary per-value path
+  // below, which never anticipated a single value expression producing
+  // more than one result. Every pre-existing shape (`values.len() ==
+  // names.len()`, no call involved, or a call whose return type isn't
+  // a tuple) falls straight through to that unmodified path — this is
+  // a genuinely additive special case, not a rewrite.
+  if let [value] = values {
+    if let Expr::Call(..) = &value.node {
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
+      if let Type::Tuple(ts) = &actual {
+        return check_tuple_multi_assign(names, value, ts, env);
+      }
+    }
+  }
   if names.len() != values.len() {
     let span = values.first().map(|v| v.span).unwrap_or((0, 0));
     return Err(Diagnostic::new(
@@ -2565,7 +2691,7 @@ fn check_function_body(
     let elem_ty = resolve_type(&p.ty, classes)?;
     env.insert(p.name.clone(), Type::Array(Box::new(elem_ty)));
   }
-  let declared_return = resolve_type(&f.return_type, classes)?;
+  let declared_return = resolve_return_type(&f.return_type, classes)?;
   check_block(
     &f.body,
     &mut env,
@@ -2615,6 +2741,20 @@ fn check_method_body(
     return Err(Diagnostic::new(
       format!(
         "splat parameters are not supported on methods yet (`{class_name}#{}`)",
+        m.name
+      ),
+      (0, 0),
+    ));
+  }
+  // Plan 39's Decision log: a tuple return type is scoped to plain
+  // top-level `def` functions too — checked here, before the ordinary
+  // (non-tuple-aware) `resolve_type` call below, which would otherwise
+  // reject this shape with a generic "unknown type" diagnostic instead
+  // of this explicit, named one.
+  if m.return_type.starts_with('(') {
+    return Err(Diagnostic::new(
+      format!(
+        "tuple return types are not supported on methods yet (`{class_name}#{}`)",
         m.name
       ),
       (0, 0),
@@ -4430,6 +4570,35 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("splat parameters are not supported on methods yet");
+    assert!(errs[0].message.contains("not supported on methods"));
+  }
+
+  const DIVMOD_EXAMPLE: &str = "def divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
+
+  #[test]
+  fn accepts_the_divmod_worked_example_tuple_return() {
+    let program = emerald_parser::parse(DIVMOD_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_tuple_typed_let_annotation_as_an_unknown_type() {
+    // `resolve_type` (used for every Let/param/field annotation) gets
+    // no `"(...)"` branch — only `resolve_return_type` does. A tuple
+    // is valid only as a function's declared return type.
+    let src = "x: (Int64, Int64) = 1\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("a tuple type is not valid on a Let binding");
+    assert!(errs[0].message.to_lowercase().contains("unknown type"));
+  }
+
+  #[test]
+  fn rejects_tuple_return_type_on_a_method() {
+    let src =
+      "class Foo\n  def m(a: Int64, b: Int64) -> (Int64, Int64)\n    return a, b\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("tuple return types are not supported on methods yet");
     assert!(errs[0].message.contains("not supported on methods"));
   }
 

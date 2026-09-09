@@ -57,7 +57,7 @@ use std::path::Path;
 /// an actual value, only a function's declared return kind; `Bool`
 /// labels a `Expr::Compare`/`&&`/`||`/`!` result, or a real declared
 /// `Boolean`-typed value (plan 18) — both share the same `i1` storage.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum ValKind {
   Int64,
   Float64,
@@ -74,6 +74,14 @@ enum ValKind {
   /// a pointer — symbol equality is a plain `icmp` on this kind, never
   /// a runtime string comparison.
   Symbol,
+  /// A fixed-arity anonymous tuple (plan 39's Decision log) — an LLVM
+  /// struct return, never plan 09's boxed `Array[T]`. Valid ONLY as a
+  /// function's declared return kind, exactly like `Type::Tuple` on the
+  /// sema side — never a param/local/field/array-element kind. Carrying
+  /// a `Vec` here is what forces dropping `Copy` from this whole enum;
+  /// every pre-existing call site that relied on an implicit copy of a
+  /// `ValKind` value now needs an explicit `.clone()`.
+  Tuple(Vec<ValKind>),
 }
 
 fn value_kind_for_type(ty: &str) -> ValKind {
@@ -101,28 +109,98 @@ fn value_kind_for_type(ty: &str) -> ValKind {
   }
 }
 
+/// Splits `s` on top-level `,` only — mirrors `emerald-sema`'s own
+/// identically-named helper (a real, disclosed duplication of
+/// bookkeeping between the two passes, matching this codebase's own
+/// established pattern of independent, unsynchronized sema/codegen
+/// registries built from the same AST — see `ClassInfo` vs.
+/// `ClassLayout`). Needed so a tuple return type's own element list
+/// (`"(Int64, Int64)"`, or in principle `"(Hash[Int64, Int64], Int64)"`)
+/// splits correctly even when an element is itself a compound type
+/// whose own convention already uses `", "`.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+  let mut parts = Vec::new();
+  let mut depth = 0i32;
+  let mut start = 0usize;
+  for (i, b) in s.bytes().enumerate() {
+    match b {
+      b'[' | b'(' => depth += 1,
+      b']' | b')' => depth -= 1,
+      b',' if depth == 0 => {
+        parts.push(s[start..i].trim());
+        start = i + 1;
+      }
+      _ => {}
+    }
+  }
+  parts.push(s[start..].trim());
+  parts
+}
+
+/// The one place a `"(" T1 "," T2 ")"`-shaped tuple return-type
+/// annotation gains real meaning in codegen (plan 39's Decision log) —
+/// mirrors `emerald-sema`'s `resolve_return_type` vs. `resolve_type`
+/// split. Used only at a function's own `ret_kind` computation sites
+/// (top-level functions and module methods, which sema's `check_
+/// function_body` path already treats identically — see that
+/// function's own comment); every param/local/field/array-element/
+/// hash-element resolution keeps calling `value_kind_for_type` directly,
+/// which has no tuple branch and falls through to its `_ => ValKind::
+/// Ptr` catch-all for this shape (unreachable in practice: sema already
+/// rejects a tuple annotation everywhere but a top-level-function-like
+/// return type before codegen ever runs).
+fn ret_kind_for_type(ty: &str) -> ValKind {
+  if let Some(inner) = ty.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+    let elem_kinds = split_top_level_commas(inner)
+      .into_iter()
+      .map(value_kind_for_type)
+      .collect();
+    return ValKind::Tuple(elem_kinds);
+  }
+  value_kind_for_type(ty)
+}
+
 /// The LLVM storage type for a `Let`/param/field/array-element/return
 /// kind. `Void` never reaches here — an internal invariant (it only
 /// ever labels a function's return kind, handled separately in
 /// `make_fn_type`), not a user-input-dependent case.
-fn local_llvm_type<'ctx>(context: &'ctx Context, kind: ValKind) -> BasicTypeEnum<'ctx> {
+fn local_llvm_type<'ctx>(context: &'ctx Context, kind: &ValKind) -> BasicTypeEnum<'ctx> {
   match kind {
     ValKind::Int64 | ValKind::Nil | ValKind::Symbol => context.i64_type().into(),
     ValKind::Float64 => context.f64_type().into(),
     ValKind::Ptr | ValKind::Str => context.ptr_type(AddressSpace::default()).into(),
     ValKind::Bool => context.bool_type().into(),
     ValKind::Void => unreachable!("internal: Void never used as a storage type"),
+    ValKind::Tuple(_) => {
+      unreachable!("internal: Tuple is only ever a function's declared return kind")
+    }
   }
+}
+
+/// The LLVM struct type backing a tuple return (plan 39's Decision
+/// log) — one field per element kind, in declared order. Never
+/// recurses into another `Tuple` (nesting is rejected entirely at the
+/// sema/grammar level, so `elem_kinds` here never itself contains a
+/// `ValKind::Tuple`).
+fn tuple_struct_type<'ctx>(
+  context: &'ctx Context,
+  elem_kinds: &[ValKind],
+) -> inkwell::types::StructType<'ctx> {
+  let field_types: Vec<BasicTypeEnum> = elem_kinds
+    .iter()
+    .map(|k| local_llvm_type(context, k))
+    .collect();
+  context.struct_type(&field_types, false)
 }
 
 fn make_fn_type<'ctx>(
   context: &'ctx Context,
   param_kinds: &[ValKind],
-  ret_kind: ValKind,
+  ret_kind: &ValKind,
 ) -> FunctionType<'ctx> {
   let param_types: Vec<BasicMetadataTypeEnum> = param_kinds
     .iter()
-    .map(|k| local_llvm_type(context, *k).into())
+    .map(|k| local_llvm_type(context, k).into())
     .collect();
   match ret_kind {
     ValKind::Void => context.void_type().fn_type(&param_types, false),
@@ -134,13 +212,16 @@ fn make_fn_type<'ctx>(
       .ptr_type(AddressSpace::default())
       .fn_type(&param_types, false),
     ValKind::Bool => context.bool_type().fn_type(&param_types, false),
+    ValKind::Tuple(elem_kinds) => {
+      tuple_struct_type(context, elem_kinds).fn_type(&param_types, false)
+    }
   }
 }
 
 /// A field's byte offset and storage kind within its class's instance
 /// layout — every field is naively 8 bytes (matches the old Cranelift
 /// backend's `FieldInfo`; see `spec/TYPE_SYSTEM.md` §8).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FieldInfo {
   offset: u64,
   kind: ValKind,
@@ -328,6 +409,12 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
         if let StringPart::Expr(e) = part {
           collect_idents_in_expr(e, out);
         }
+      }
+    }
+    // Plan 39: `return a, b` — each element is a real free-variable site.
+    Expr::TupleLit(elems) => {
+      for e in elems {
+        collect_idents_in_expr(e, out);
       }
     }
   }
@@ -568,6 +655,11 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
         if let StringPart::Expr(e) = part {
           collect_symbols_in_expr(e, table);
         }
+      }
+    }
+    Expr::TupleLit(elems) => {
+      for e in elems {
+        collect_symbols_in_expr(e, table);
       }
     }
   }
@@ -948,6 +1040,11 @@ fn collect_specializations_in_expr(
         }
       }
     }
+    Expr::TupleLit(elems) => {
+      for e in elems {
+        collect_specializations_in_expr(e, generic_fns, local_classes, out);
+      }
+    }
   }
 }
 
@@ -1289,9 +1386,9 @@ fn prealloc_lets<'ctx>(
       continue;
     }
     let alloca = builder
-      .build_alloca(local_llvm_type(context, *kind), name)
+      .build_alloca(local_llvm_type(context, kind), name)
       .map_err(|e| e.to_string())?;
-    vars.insert(name.clone(), (alloca, *kind));
+    vars.insert(name.clone(), (alloca, kind.clone()));
   }
   Ok(())
 }
@@ -1941,13 +2038,13 @@ fn build_expr<'ctx>(
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
   match &expr.node {
     Expr::Ident(name) => {
-      let (ptr, kind) = *vars
+      let (ptr, kind) = vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
       let loaded = builder
-        .build_load(local_llvm_type(context, kind), ptr, name)
+        .build_load(local_llvm_type(context, kind), *ptr, name)
         .map_err(|e| e.to_string())?;
-      Ok((loaded, kind))
+      Ok((loaded, kind.clone()))
     }
     Expr::Int(n) => Ok((
       context.i64_type().const_int(*n as u64, true).into(),
@@ -2326,7 +2423,7 @@ fn build_expr<'ctx>(
         local_array_elem_types,
         ctx,
       )?;
-      let cmp = match (lk, rk) {
+      let cmp = match (&lk, &rk) {
         (ValKind::Int64, ValKind::Int64) => {
           let pred = match op {
             CompareOp::Lt => IntPredicate::SLT,
@@ -2579,11 +2676,11 @@ fn build_expr<'ctx>(
       let (self_ptr, fields) = ctx
         .self_ctx
         .ok_or_else(|| format!("codegen: `@{name}` used outside of a method body"))?;
-      let field = *fields
+      let field = fields
         .get(name)
         .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?;
-      let loaded = load_field(context, builder, self_ptr, field)?;
-      Ok((loaded, field.kind))
+      let loaded = load_field(context, builder, self_ptr, field.clone())?;
+      Ok((loaded, field.kind.clone()))
     }
     Expr::ArrayLit(elements) => {
       let ptr = build_array_lit(
@@ -2640,6 +2737,37 @@ fn build_expr<'ctx>(
     // from; reached from anywhere else, it's an unsupported shape.
     Expr::ArrayNew(_) => {
       Err("codegen: `Array.new(...)` may only appear as a top-level `Let`'s value".to_string())
+    }
+    // Plan 39's Decision log: the grammar only ever constructs this
+    // from `return a, b`'s comma-list `Stmt::Return` rule — an LLVM
+    // struct value, built up one field at a time via `build_insert_
+    // value` starting from an `undef` of the right struct type. Every
+    // element's own value/kind comes from an ordinary recursive
+    // `build_expr` call, no different from any other sub-expression.
+    Expr::TupleLit(elems) => {
+      let mut kinds = Vec::with_capacity(elems.len());
+      let mut vals = Vec::with_capacity(elems.len());
+      for e in elems {
+        let (v, k) = build_expr(
+          context,
+          builder,
+          e,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        kinds.push(k);
+        vals.push(v);
+      }
+      let mut agg = tuple_struct_type(context, &kinds).get_undef();
+      for (i, v) in vals.into_iter().enumerate() {
+        agg = builder
+          .build_insert_value(agg, v, i as u32, "tuplelit")
+          .map_err(|e| e.to_string())?
+          .into_struct_value();
+      }
+      Ok((agg.into(), ValKind::Tuple(kinds)))
     }
   }
 }
@@ -2722,8 +2850,31 @@ fn load_field<'ctx>(
 ) -> Result<BasicValueEnum<'ctx>, String> {
   let field_ptr = field_ptr(context, builder, base_ptr, field.offset)?;
   builder
-    .build_load(local_llvm_type(context, field.kind), field_ptr, "fieldval")
+    .build_load(local_llvm_type(context, &field.kind), field_ptr, "fieldval")
     .map_err(|e| e.to_string())
+}
+
+/// Plan 39's Decision log: `x, y = f()`'s own codegen — `struct_val` is
+/// the LLVM struct `f`'s call actually returned; extracts each field in
+/// order and stores it into its target's already-allocated slot (sema
+/// guarantees `names.len()` matches the struct's own field count).
+fn build_tuple_multi_assign<'ctx>(
+  builder: &Builder<'ctx>,
+  names: &[String],
+  struct_val: inkwell::values::StructValue<'ctx>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+) -> Result<(), String> {
+  for (i, name) in names.iter().enumerate() {
+    let elem = builder
+      .build_extract_value(struct_val, i as u32, "tupleelem")
+      .map_err(|e| e.to_string())?;
+    let ptr = vars
+      .get(name)
+      .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?
+      .0;
+    builder.build_store(ptr, elem).map_err(|e| e.to_string())?;
+  }
+  Ok(())
 }
 
 fn field_ptr<'ctx>(
@@ -2850,9 +3001,10 @@ fn build_method_call<'ctx>(
 
   if ctx.module_names.contains(recv_name) {
     let key = format!("{recv_name}_{method}");
-    let (fv, ret_kind) = *ctx
+    let (fv, ret_kind) = ctx
       .user_func_ids
       .get(&key)
+      .map(|(fv, k)| (*fv, k.clone()))
       .ok_or_else(|| format!("codegen: unsupported module method call `{recv_name}.{method}`"))?;
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
       Vec::with_capacity(args.len());
@@ -2878,9 +3030,15 @@ fn build_method_call<'ctx>(
   }
 
   let (fv, ret_kind) = if method == "call" {
-    *ctx.lambda_func_ids.get(recv_name).ok_or_else(|| {
-      format!("codegen: `.call` on `{recv_name}` — not a lambda literal bound to a top-level `Let`")
-    })?
+    ctx
+      .lambda_func_ids
+      .get(recv_name)
+      .map(|(fv, k)| (*fv, k.clone()))
+      .ok_or_else(|| {
+        format!(
+          "codegen: `.call` on `{recv_name}` — not a lambda literal bound to a top-level `Let`"
+        )
+      })?
   } else {
     let class_name = local_classes.get(recv_name).ok_or_else(|| {
       format!("codegen: cannot determine the class of `{recv_name}` for `.{method}`")
@@ -2895,9 +3053,10 @@ fn build_method_call<'ctx>(
       .and_then(|owners| owners.get(method))
       .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
     let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
-    *ctx
+    ctx
       .user_func_ids
       .get(&key)
+      .map(|(fv, k)| (*fv, k.clone()))
       .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?
   };
 
@@ -3163,9 +3322,13 @@ fn build_call_expr<'ctx>(
     .filter(|f| !f.type_params.is_empty())
   {
     let mangled = mangled_generic_call_symbol(name, g, args, local_classes)?;
-    let (fv, ret_kind) = *ctx.user_func_ids.get(&mangled).ok_or_else(|| {
-      format!("codegen: no compiled specialization `{mangled}` for generic function `{name}`")
-    })?;
+    let (fv, ret_kind) = ctx
+      .user_func_ids
+      .get(&mangled)
+      .map(|(fv, k)| (*fv, k.clone()))
+      .ok_or_else(|| {
+        format!("codegen: no compiled specialization `{mangled}` for generic function `{name}`")
+      })?;
     let arg_vals = build_call_arg_vals(
       context,
       builder,
@@ -3184,9 +3347,13 @@ fn build_call_expr<'ctx>(
     }
     return Ok((call_result(call)?, ret_kind));
   }
-  let (fv, ret_kind) = *ctx.user_func_ids.get(name).ok_or_else(|| {
-    format!("codegen: unsupported call to `{name}` (not a compiled user function)")
-  })?;
+  let (fv, ret_kind) = ctx
+    .user_func_ids
+    .get(name)
+    .map(|(fv, k)| (*fv, k.clone()))
+    .ok_or_else(|| {
+      format!("codegen: unsupported call to `{name}` (not a compiled user function)")
+    })?;
   let arg_vals = build_call_arg_vals(
     context,
     builder,
@@ -3222,9 +3389,13 @@ fn build_call_kw_expr<'ctx>(
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
-  let (fv, ret_kind) = *ctx.user_func_ids.get(name).ok_or_else(|| {
-    format!("codegen: unsupported call to `{name}` (not a compiled user function)")
-  })?;
+  let (fv, ret_kind) = ctx
+    .user_func_ids
+    .get(name)
+    .map(|(fv, k)| (*fv, k.clone()))
+    .ok_or_else(|| {
+      format!("codegen: unsupported call to `{name}` (not a compiled user function)")
+    })?;
   let f = ctx
     .func_defs
     .get(name)
@@ -3452,7 +3623,7 @@ fn build_index<'ctx>(
     local_array_elem_types,
     ctx,
   )?;
-  if let Some(&elem_kind) = local_array_elem_types.get(arr_name) {
+  if let Some(elem_kind) = local_array_elem_types.get(arr_name) {
     if idx_kind != ValKind::Int64 {
       return Err("codegen: array index must be Int64".to_string());
     }
@@ -3470,7 +3641,7 @@ fn build_index<'ctx>(
     let loaded = builder
       .build_load(elem_llvm_ty, elem_ptr, "elemval")
       .map_err(|e| e.to_string())?;
-    return Ok((loaded, elem_kind));
+    return Ok((loaded, elem_kind.clone()));
   }
   if let Some((key_kind, value_kind)) = local_classes.get(arr_name).and_then(|s| parse_hash_type(s))
   {
@@ -3484,7 +3655,7 @@ fn build_index<'ctx>(
       idx.into_int_value(),
       ctx,
     )?;
-    let value_llvm_ty = local_llvm_type(context, value_kind);
+    let value_llvm_ty = local_llvm_type(context, &value_kind);
     let loaded = builder
       .build_load(value_llvm_ty, value_ptr, "hashval")
       .map_err(|e| e.to_string())?;
@@ -3570,7 +3741,7 @@ fn build_set_index<'ctx>(
     local_array_elem_types,
     ctx,
   )?;
-  if let Some(&elem_kind) = local_array_elem_types.get(arr_name) {
+  if let Some(elem_kind) = local_array_elem_types.get(arr_name) {
     if idx_kind != ValKind::Int64 {
       return Err("codegen: array index must be Int64".to_string());
     }
@@ -3689,11 +3860,11 @@ fn build_lambda_let<'ctx>(
     .map_err(|e| e.to_string())?;
   let env_ptr = call_result(call)?.into_pointer_value();
   for cap_name in &info.captures {
-    let (cap_ptr, cap_kind) = *vars.get(cap_name).ok_or_else(|| {
+    let (cap_ptr, cap_kind) = vars.get(cap_name).ok_or_else(|| {
       format!("codegen: captured variable `{cap_name}` is not in scope at `{name}`'s creation site")
     })?;
     let val = builder
-      .build_load(local_llvm_type(context, cap_kind), cap_ptr, cap_name)
+      .build_load(local_llvm_type(context, cap_kind), *cap_ptr, cap_name)
       .map_err(|e| e.to_string())?;
     let offset = info.capture_offsets[cap_name];
     let slot_ptr = field_ptr(context, builder, env_ptr, offset)?;
@@ -3774,9 +3945,9 @@ fn build_for<'a, 'ctx>(
     .build_store(idx_alloca, context.i64_type().const_int(0, false))
     .map_err(|e| e.to_string())?;
   let var_alloca = builder
-    .build_alloca(local_llvm_type(context, elem_kind), var)
+    .build_alloca(local_llvm_type(context, &elem_kind), var)
     .map_err(|e| e.to_string())?;
-  vars.insert(var.to_string(), (var_alloca, elem_kind));
+  vars.insert(var.to_string(), (var_alloca, elem_kind.clone()));
 
   let cond_blk = context.append_basic_block(func, "for.cond");
   let body_blk = context.append_basic_block(func, "for.body");
@@ -3801,7 +3972,7 @@ fn build_for<'a, 'ctx>(
     .map_err(|e| e.to_string())?;
 
   builder.position_at_end(body_blk);
-  let elem_llvm_ty = local_llvm_type(context, elem_kind);
+  let elem_llvm_ty = local_llvm_type(context, &elem_kind);
   let elem_ptr = unsafe {
     builder
       .build_in_bounds_gep(elem_llvm_ty, arr_ptr, &[idx_val], "for.elemptr")
@@ -4104,7 +4275,7 @@ fn build_inline_block_call<'a, 'ctx>(
   }
   for (p, (v, k)) in callee.params.iter().zip(evaluated) {
     let alloca = builder
-      .build_alloca(local_llvm_type(context, k), &p.name)
+      .build_alloca(local_llvm_type(context, &k), &p.name)
       .map_err(|e| e.to_string())?;
     builder.build_store(alloca, v).map_err(|e| e.to_string())?;
     vars.insert(p.name.clone(), (alloca, k));
@@ -4117,7 +4288,7 @@ fn build_inline_block_call<'a, 'ctx>(
   for p in blk_params {
     let kind = value_kind_for_type(&p.ty);
     let alloca = builder
-      .build_alloca(local_llvm_type(context, kind), &p.name)
+      .build_alloca(local_llvm_type(context, &kind), &p.name)
       .map_err(|e| e.to_string())?;
     vars.insert(p.name.clone(), (alloca, kind));
   }
@@ -4216,7 +4387,7 @@ fn emit_active_ensures<'a, 'ctx>(
       loop_stack,
       ensure_stack,
       retry_stack,
-      ret_kind,
+      ret_kind.clone(),
       ctx,
     )?;
   }
@@ -4385,9 +4556,10 @@ fn build_stmt<'a, 'ctx>(
     // it in the normal pipeline, but codegen alone shouldn't assume
     // that).
     Stmt::Assign { name, value } => {
-      let (ptr, target_kind) = *vars
+      let (ptr, target_kind) = vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      let (ptr, target_kind) = (*ptr, target_kind.clone());
       // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot special
       // case as `Stmt::Let` above, driven by the target's already-
       // recorded `ValKind` in `vars` instead of a declared-type string.
@@ -4417,11 +4589,12 @@ fn build_stmt<'a, 'ctx>(
     // `build_safe_call`) this statement produces no value at all.
     // Assigns `default` only when `name`'s CURRENT value is nil.
     Stmt::OrAssign { name, default } => {
-      let (ptr, kind) = *vars
+      let (ptr, kind) = vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      let (ptr, kind) = (*ptr, kind.clone());
       let current = builder
-        .build_load(local_llvm_type(context, kind), ptr, name)
+        .build_load(local_llvm_type(context, &kind), ptr, name)
         .map_err(|e| e.to_string())?;
       let is_null = builder
         .build_is_null(current.into_pointer_value(), "orassign.isnil")
@@ -4461,11 +4634,12 @@ fn build_stmt<'a, 'ctx>(
     // Plan 43's Decision log: the asymmetric twin of `OrAssign` above —
     // assigns `value` only when `name`'s CURRENT value is non-nil.
     Stmt::AndAssign { name, value } => {
-      let (ptr, kind) = *vars
+      let (ptr, kind) = vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      let (ptr, kind) = (*ptr, kind.clone());
       let current = builder
-        .build_load(local_llvm_type(context, kind), ptr, name)
+        .build_load(local_llvm_type(context, &kind), ptr, name)
         .map_err(|e| e.to_string())?;
       let is_null = builder
         .build_is_null(current.into_pointer_value(), "andassign.isnil")
@@ -4508,6 +4682,30 @@ fn build_stmt<'a, 'ctx>(
     // values before either alloca is overwritten, or the swap silently
     // corrupts (`a = b` then `b = a` would print the new `a` twice).
     Stmt::MultiAssign { names, values } => {
+      // Plan 39's Decision log: `x, y = f()` — a single call-shaped
+      // value whose declared return type is a tuple — unpacks
+      // positionally, entirely ahead of the ordinary per-value path
+      // below, which never anticipated a single value expression
+      // producing more than one result. Sema (`check_tuple_multi_
+      // assign`) already guarantees arity/type agreement for any
+      // program that reaches here.
+      if let [value] = values.as_slice() {
+        if let Expr::Call(..) = &value.node {
+          let (v, kind) = build_expr(
+            context,
+            builder,
+            value,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          if matches!(kind, ValKind::Tuple(_)) {
+            build_tuple_multi_assign(builder, names, v.into_struct_value(), vars)?;
+            return Ok(false);
+          }
+        }
+      }
       let mut evaluated = Vec::with_capacity(values.len());
       for (name, v) in names.iter().zip(values) {
         // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot
@@ -4516,9 +4714,10 @@ fn build_stmt<'a, 'ctx>(
         // doesn't disturb this statement's own "evaluate every value
         // before writing any target" ordering (the Decision log's own
         // reason `a, b = b, a` is a real swap).
-        let (_, target_kind) = *vars
+        let target_kind = &vars
           .get(name)
-          .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+          .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?
+          .1;
         let val =
           if matches!(v.node, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
             context
@@ -4551,9 +4750,10 @@ fn build_stmt<'a, 'ctx>(
       let (self_ptr, fields) = ctx
         .self_ctx
         .ok_or_else(|| format!("codegen: `@{name} = ...` used outside of a method body"))?;
-      let field = *fields
+      let field_offset = fields
         .get(name)
-        .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?;
+        .ok_or_else(|| format!("codegen: undefined field `@{name}`"))?
+        .offset;
       let (v, _) = build_expr(
         context,
         builder,
@@ -4563,7 +4763,7 @@ fn build_stmt<'a, 'ctx>(
         local_array_elem_types,
         ctx,
       )?;
-      let fp = field_ptr(context, builder, self_ptr, field.offset)?;
+      let fp = field_ptr(context, builder, self_ptr, field_offset)?;
       builder.build_store(fp, v).map_err(|e| e.to_string())?;
       Ok(false)
     }
@@ -4831,7 +5031,7 @@ fn build_stmt<'a, 'ctx>(
         loop_stack,
         ensure_stack,
         retry_stack,
-        ret_kind,
+        ret_kind.clone(),
         ctx,
       )?;
       if !then_terminated {
@@ -5224,7 +5424,7 @@ fn build_case<'a, 'ctx>(
       loop_stack,
       ensure_stack,
       retry_stack,
-      ret_kind,
+      ret_kind.clone(),
       ctx,
     )?;
     if !terminated {
@@ -5432,7 +5632,7 @@ fn build_begin<'a, 'ctx>(
     loop_stack,
     ensure_stack,
     retry_stack,
-    ret_kind,
+    ret_kind.clone(),
     ctx,
   )?;
   ensure_stack.pop();
@@ -5452,7 +5652,7 @@ fn build_begin<'a, 'ctx>(
       loop_stack,
       ensure_stack,
       retry_stack,
-      ret_kind,
+      ret_kind.clone(),
       ctx,
     )?;
     builder
@@ -5554,7 +5754,7 @@ fn build_begin<'a, 'ctx>(
       loop_stack,
       ensure_stack,
       retry_stack,
-      ret_kind,
+      ret_kind.clone(),
       ctx,
     )?;
     ensure_stack.pop();
@@ -5571,7 +5771,7 @@ fn build_begin<'a, 'ctx>(
         loop_stack,
         ensure_stack,
         retry_stack,
-        ret_kind,
+        ret_kind.clone(),
         ctx,
       )?;
       builder
@@ -5663,7 +5863,7 @@ fn build_block<'a, 'ctx>(
       loop_stack,
       ensure_stack,
       retry_stack,
-      ret_kind,
+      ret_kind.clone(),
       ctx,
     )?;
     if terminated {
@@ -5709,7 +5909,7 @@ fn build_function_body<'a, 'ctx>(
     &mut loop_stack,
     &mut ensure_stack,
     &mut retry_stack,
-    ret_kind,
+    ret_kind.clone(),
     ctx,
   )?;
   if terminated {
@@ -5742,7 +5942,7 @@ fn build_function_body<'a, 'ctx>(
         &mut loop_stack,
         &mut ensure_stack,
         &mut retry_stack,
-        ret_kind,
+        ret_kind.clone(),
         ctx,
       )?;
       // A Void-returning body whose last statement isn't a
@@ -5829,7 +6029,7 @@ fn bind_params<'ctx>(
       .get_nth_param(param_offset + i as u32)
       .expect("declared signature has this many params");
     let alloca = builder
-      .build_alloca(local_llvm_type(context, kind), &p.name)
+      .build_alloca(local_llvm_type(context, &kind), &p.name)
       .map_err(|e| e.to_string())?;
     builder
       .build_store(alloca, param_val)
@@ -5955,7 +6155,7 @@ fn define_user_function<'ctx>(
   collect_lets(&f.body, &mut decls);
   prealloc_lets(context, builder, &decls, &mut vars)?;
 
-  let ret_kind = value_kind_for_type(&f.return_type);
+  let ret_kind = ret_kind_for_type(&f.return_type);
   build_function_body(
     context,
     builder,
@@ -6081,14 +6281,14 @@ fn define_lambda<'ctx>(
   let mut local_array_elem_types = HashMap::new();
 
   for cap_name in &info.captures {
-    let kind = info.capture_kinds[cap_name];
+    let kind = info.capture_kinds[cap_name].clone();
     let offset = info.capture_offsets[cap_name];
     let slot_ptr = field_ptr(context, builder, env_ptr, offset)?;
     let val = builder
-      .build_load(local_llvm_type(context, kind), slot_ptr, cap_name)
+      .build_load(local_llvm_type(context, &kind), slot_ptr, cap_name)
       .map_err(|e| e.to_string())?;
     let alloca = builder
-      .build_alloca(local_llvm_type(context, kind), cap_name)
+      .build_alloca(local_llvm_type(context, &kind), cap_name)
       .map_err(|e| e.to_string())?;
     builder
       .build_store(alloca, val)
@@ -6188,7 +6388,7 @@ fn define_main<'ctx>(
     .map_err(|e| e.to_string())?;
   let argv_val = call_result(argv_call)?;
   let argv_alloca = builder
-    .build_alloca(local_llvm_type(context, ValKind::Ptr), "ARGV")
+    .build_alloca(local_llvm_type(context, &ValKind::Ptr), "ARGV")
     .map_err(|e| e.to_string())?;
   builder
     .build_store(argv_alloca, argv_val)
@@ -6204,7 +6404,7 @@ fn define_main<'ctx>(
     .build_int_z_extend(argc_minus_one, context.i64_type(), "argc64")
     .map_err(|e| e.to_string())?;
   let argc_alloca = builder
-    .build_alloca(local_llvm_type(context, ValKind::Int64), "ARGC")
+    .build_alloca(local_llvm_type(context, &ValKind::Int64), "ARGC")
     .map_err(|e| e.to_string())?;
   builder
     .build_store(argc_alloca, argc_i64)
@@ -6270,8 +6470,8 @@ fn declare_user_functions<'ctx>(
       // actually called anywhere in the whole program instead.
       Item::Function(f) if !f.type_params.is_empty() => {}
       Item::Function(f) => {
-        let ret_kind = value_kind_for_type(&f.return_type);
-        let fn_ty = make_fn_type(context, &param_kinds(&effective_params(f)), ret_kind);
+        let ret_kind = ret_kind_for_type(&f.return_type);
+        let fn_ty = make_fn_type(context, &param_kinds(&effective_params(f)), &ret_kind);
         let fv = module.add_function(&f.name, fn_ty, Some(Linkage::External));
         user_func_ids.insert(f.name.clone(), (fv, ret_kind));
       }
@@ -6280,7 +6480,7 @@ fn declare_user_functions<'ctx>(
           let ret_kind = value_kind_for_type(&m.return_type);
           let mut kinds = vec![ValKind::Ptr]; // self
           kinds.extend(param_kinds(&m.params));
-          let fn_ty = make_fn_type(context, &kinds, ret_kind);
+          let fn_ty = make_fn_type(context, &kinds, &ret_kind);
           let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
           let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
           user_func_ids.insert(mangled, (fv, ret_kind));
@@ -6288,8 +6488,8 @@ fn declare_user_functions<'ctx>(
       }
       Item::Module(m) => {
         for f in &m.methods {
-          let ret_kind = value_kind_for_type(&f.return_type);
-          let fn_ty = make_fn_type(context, &param_kinds(&f.params), ret_kind);
+          let ret_kind = ret_kind_for_type(&f.return_type);
+          let fn_ty = make_fn_type(context, &param_kinds(&f.params), &ret_kind);
           let mangled = format!("{}_{}", m.name, f.name);
           let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
           user_func_ids.insert(mangled, (fv, ret_kind));
@@ -6355,7 +6555,7 @@ fn declare_lambda_functions<'ctx>(
     let ret_kind = value_kind_for_type(return_type);
     let mut kinds = vec![ValKind::Ptr]; // env
     kinds.extend(param_kinds(params));
-    let fn_ty = make_fn_type(context, &kinds, ret_kind);
+    let fn_ty = make_fn_type(context, &kinds, &ret_kind);
     let fv = module.add_function(&format!("__lambda_{name}"), fn_ty, Some(Linkage::External));
     lambda_func_ids.insert(name.clone(), (fv, ret_kind));
   }
@@ -6709,7 +6909,7 @@ fn compile_to_object_impl(
       let fn_ty = make_fn_type(
         &context,
         &param_kinds(&effective_params(&substituted)),
-        ret_kind,
+        &ret_kind,
       );
       let mangled = mangled_generic_symbol(fn_name, concrete_class);
       let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
@@ -8224,6 +8424,37 @@ mod tests {
   fn splat_param_with_zero_trailing_arguments_is_a_zero_length_capture() {
     let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all()\n";
     assert_eq!(compile_link_run(src), "0\n");
+  }
+
+  const DIVMOD_EXAMPLE: &str = "def divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
+
+  #[test]
+  fn divmod_worked_example_tuple_return_linked_and_run() {
+    // Plan 39's own combined worked example's second half: a real
+    // fixed-arity anonymous tuple return (LLVM struct return, not
+    // plan 09's boxed `Array[T]`), unpacked positionally on the
+    // receiving `Stmt::MultiAssign` side via `build_extract_value`.
+    assert_eq!(compile_link_run(DIVMOD_EXAMPLE), "3\n2\n");
+  }
+
+  #[test]
+  fn plan_39_full_worked_example_keyword_defaults_and_tuple_return_together() {
+    // The plan's own single combined program exercising all four
+    // leaves at once: keyword args + defaults (`greet`), then a tuple
+    // return unpacked via multi-assign (`divmod`).
+    let src = "def greet(name: String, times: Int64 = 1) -> Void\n  i: Int64 = 0\n  while i < times\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n\ndef divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
+    assert_eq!(compile_link_run(src), "yo\nhi\nhi\n3\n2\n");
+  }
+
+  #[test]
+  fn preexisting_multi_assign_swap_is_still_byte_identical() {
+    // Plan 31's own swap example — regression proof that the new
+    // values.len() == 1-and-tuple-typed-call special case in
+    // check_multi_assign/its codegen mirror left every pre-existing
+    // multi-assign shape (values.len() == names.len(), no call
+    // involved) untouched.
+    let src = "a: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+    assert_eq!(compile_link_run(src), "2\n1\n");
   }
 
   // Plan 40 (operator overloading).

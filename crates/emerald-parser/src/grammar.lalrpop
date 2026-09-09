@@ -358,7 +358,19 @@ Stmt: Spanned<Stmt> = {
   // new Expr-statement) from "return <expr>" (one statement) when the
   // next token can start an Expr either way. Bare Void-returning `return`
   // is deferred until source-line significance is added.
+  // Plan 39's Decision log: generalizes the single-`Expr` `return` into
+  // an optional comma list the same mechanical way `YieldArgs` already
+  // does — `Stmt::Return(Some(e))` unchanged for a single element,
+  // `Stmt::Return(Some(Expr::TupleLit(es)))` for more than one. Reuses
+  // `YieldArgs` for the tail list rather than a second near-identical
+  // nonterminal — it's already exactly "one or more comma-separated
+  // `Expr`s," with no `yield`-specific meaning baked in.
   <l:@L> "return" <e:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Return(Some(e)) },
+  <l:@L> "return" <first:Expr> "," <rest:YieldArgs> <r:@R> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    Spanned { span: (l, r), node: Stmt::Return(Some(Spanned { span: (l, r), node: Expr::TupleLit(v) })) }
+  },
   <l:@L> "break" <r:@R> => Spanned { span: (l, r), node: Stmt::Break },
   <l:@L> "next" <r:@R> => Spanned { span: (l, r), node: Stmt::Next },
   <l:@L> "puts" <arg:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Expr(Spanned { span: (l, r), node: Expr::Call("puts".to_string(), vec![arg]) }) },
@@ -482,6 +494,19 @@ Stmt: Spanned<Stmt> = {
   // there's no existing FOLLOW-set overlap this collides with (same
   // reasoning as plan 20's `CaseValues` right-recursion).
   <l:@L> <names:MultiAssignNames> "=" <values:MultiAssignValues> <r:@R> => Spanned { span: (l, r), node: Stmt::MultiAssign { names, values } },
+  // Plan 39's Decision log: `x, y = f()` — a single call-shaped RHS
+  // whose declared return type is a tuple — needs the multi-assign
+  // Stmt to admit exactly one value too, not just `MultiAssignValues`'
+  // existing two-or-more shape. A dedicated sibling alternative here
+  // (rather than adding a single-`Expr` case to `MultiAssignValues`
+  // itself) avoids a genuine LALR(1) shift/reduce conflict on `,`
+  // between "reduce as the one-and-only value" and "shift `,`, this is
+  // the first of two-or-more" that a shared nonterminal would create.
+  // Sema's `check_multi_assign` is what actually validates this single
+  // value (tuple-returning call vs. a real arity-mismatch diagnostic
+  // for anything else) — the grammar just needs to stop rejecting the
+  // shape outright.
+  <l:@L> <names:MultiAssignNames> "=" <value:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::MultiAssign { names, values: vec![value] } },
   <l:@L> <e:StmtExpr> <r:@R> => Spanned { span: (l, r), node: Stmt::Expr(e) },
 };
 
@@ -1013,6 +1038,28 @@ TypeName: String = {
   "Hash" "[" <k:Ident> "," <v:Ident> "]" => format!("Hash[{k}, {v}]"),
   "Proc" => "Proc".to_string(),
   <base:TypeName> "?" => format!("{base}?"),
+  // Plan 39's Decision log: `"(" T1 "," T2 [, ...] ")"`, mirroring
+  // `Array[Elem]`/`Hash[K, V]`'s own compound-string convention
+  // (formatted as e.g. `"(Int64, Int64)"`). Added as a grammar-wide
+  // `TypeName` alternative, not gated to only the return-type
+  // position — the actual restriction (only a function's declared
+  // return type may ever be a tuple) lives entirely in sema's
+  // `resolve_return_type` vs. the shared `resolve_type` (used for
+  // every param/field/`Let` annotation, which never resolves this
+  // shape and falls through to its `unknown type` catch-all).
+  "(" <parts:TupleTypeNames> ")" => format!("({})", parts.join(", ")),
+};
+
+// At least two element types (a 1-tuple isn't a meaningful multi-return
+// shape) — same mandatory-first-element, right-recursive idiom as
+// `MultiAssignNames`/`YieldArgs` elsewhere in this grammar.
+TupleTypeNames: Vec<String> = {
+  <first:TypeName> "," <last:TypeName> => vec![first, last],
+  <first:TypeName> "," <rest:TupleTypeNames> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+  },
 };
 
 Num: i64 = <s:r"[0-9]+"> => s.parse().unwrap();

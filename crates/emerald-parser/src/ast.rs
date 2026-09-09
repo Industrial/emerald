@@ -234,6 +234,13 @@ pub enum Expr {
   Shl(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
   /// `a >> b` — `Int64`-only arithmetic (signed) right shift.
   Shr(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
+  /// `return a, b` (plan 39's Decision log) — legal ONLY as `Stmt::
+  /// Return`'s direct argument, never a first-class value that can be
+  /// stored in a variable, passed as an argument, or nested inside
+  /// another tuple. Sema accepts this only when the enclosing
+  /// function's declared return type is `Type::Tuple` of matching
+  /// arity and per-position types.
+  TupleLit(Vec<Spanned<Expr>>),
 }
 
 /// One statement in a block (a function body or the program's top level).

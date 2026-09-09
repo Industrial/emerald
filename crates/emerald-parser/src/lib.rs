@@ -308,6 +308,11 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
       }
     }
     Expr::Lambda { body, .. } => rewrite_stmts(body, name, source),
+    Expr::TupleLit(elems) => {
+      for e in elems {
+        rewrite_expr(e, name, source);
+      }
+    }
   }
 }
 
@@ -999,6 +1004,42 @@ mod tests {
         vec![s(Expr::StringLit("yo".to_string()))]
       )))))
     );
+  }
+
+  #[test]
+  fn return_tuple_parses_into_a_tuple_lit() {
+    let src = "def divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert_eq!(f.return_type, "(Int64, Int64)");
+    let Stmt::Return(Some(Spanned {
+      node: Expr::TupleLit(elems),
+      ..
+    })) = &f.body[0].node
+    else {
+      panic!("expected a tuple-literal return, got {:?}", f.body[0]);
+    };
+    assert_eq!(elems.len(), 2);
+  }
+
+  #[test]
+  fn multi_assign_from_a_single_call_value_parses() {
+    let src = "q: Int64 = 0\nr: Int64 = 0\nq, r = f(1, 2)\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::MultiAssign { names, values },
+      ..
+    }) = &program.items[2]
+    else {
+      panic!(
+        "expected a MultiAssign statement, got {:?}",
+        program.items[2]
+      );
+    };
+    assert_eq!(names, &vec!["q".to_string(), "r".to_string()]);
+    assert_eq!(values.len(), 1);
   }
 
   // Plan 40 (operator overloading).
