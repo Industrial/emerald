@@ -11636,6 +11636,27 @@ mod tests {
     assert_eq!(lines, vec!["spinner 1 done", "spinner 2 done"]);
   }
 
+  // Plan 56 (compile-time message safety) — the plan's own positive
+  // worked example, real compiled/linked/run proof that sema's new
+  // message-safety rule doesn't reject the legal case. `def main` (the
+  // plan's own literal text) is renamed `run` — a free function named
+  // `main` would collide with `define_main`'s own generated `main`
+  // symbol at the LLVM level, a real link-time collision the plan's
+  // own text didn't anticipate. `msg.text` also needed a real, explicit
+  // accessor method (`def text -> String \n @text \n end`) — this
+  // compiler has no auto-generated field-accessor convention (verified
+  // this session: `infer_expr_type`'s `Expr::MethodCall` arm looks up
+  // `info.methods` only, never falls back to `info.fields`).
+  const MESSAGE_SAFETY_EXAMPLE: &str = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\n\n  def text -> String\n    @text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n    puts msg.text\n  end\nend\n\ndef run -> Void\n  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  logger.log(msg)\nend\n\nrun()\n";
+
+  #[test]
+  fn message_safety_worked_example_compiled_linked_and_run_prints_hello_from_main() {
+    assert_eq!(
+      compile_link_run(MESSAGE_SAFETY_EXAMPLE),
+      "hello from main\n"
+    );
+  }
+
   // Plan 55 (scheduler and message passing), `leaf-actor-header-and-
   // trampolines`.
 

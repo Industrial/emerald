@@ -3304,6 +3304,417 @@ fn check_implicit_return(
   Ok(())
 }
 
+/// Plan 56 (compile-time message safety) — Pony-lite, not Pony (see
+/// this plan's own Decision log): a cross-actor message argument is
+/// legal iff it's a value type, a freshly constructed reference, or a
+/// named local provably not read again by the sender after the send.
+///
+/// A real, disclosed architectural adaptation of the plan's own
+/// suggested integration point: rather than threading a new `moved`
+/// parameter through `check_stmt`/`check_block`/`infer_expr_type`'s
+/// entire pervasive call graph (`infer_expr_type` alone is this file's
+/// single most-called function), this runs as its own separate,
+/// read-only pass, called once from `check_function_body`/`check_
+/// method_body` right after their own ordinary `check_block` call
+/// already succeeded — reusing that same, by-then fully-populated
+/// `env` unchanged (this compiler's own flat, function-wide scoping —
+/// no shadowing exists anywhere, confirmed by `Stmt::Let`'s own
+/// already-declared-name rejection — means every `Let`-bound name's
+/// type is already known and stable for the rest of the function on
+/// every path, by the time the ordinary pass finishes, regardless of
+/// which branch textually declared it). Mirrors `check_stmt`'s own
+/// control-flow structure (`If`/`Case`/`Begin`/`While`/`For`/
+/// `ForRange`/`MatchResult`) for the moved-set fork/union/loop-
+/// conservatism rules the Decision log specifies, but never mutates
+/// `env` itself and touches no other function's signature in this
+/// file. Scoped to function/method bodies only, matching the plan's
+/// own literal target state — a bare top-level `Item::Stmt` send is a
+/// real, disclosed gap this plan doesn't close (every one of this
+/// plan's own worked examples wraps its send inside `def main()`).
+fn check_message_safety(
+  body: &[Spanned<Stmt>],
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  moved: &mut HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
+  for stmt in body {
+    check_message_safety_stmt(stmt, env, classes, moved)?;
+  }
+  Ok(())
+}
+
+/// A loop body is checked once, then checked AGAIN against the
+/// moved-set the first pass produced (Decision log: a second iteration
+/// could reach a first-iteration's send before a later-in-text use
+/// from that same iteration actually runs) — "treat the body as
+/// concatenated with itself once," implemented directly. The whole
+/// loop then poisons every local it sent for all code after the loop
+/// exits, the same conservative-merge posture branches get.
+fn check_loop_body(
+  body: &[Spanned<Stmt>],
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  moved: &mut HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
+  let mut first_pass = moved.clone();
+  check_message_safety(body, env, classes, &mut first_pass)?;
+  let mut second_pass = first_pass.clone();
+  check_message_safety(body, env, classes, &mut second_pass)?;
+  moved.extend(second_pass);
+  Ok(())
+}
+
+fn check_message_safety_stmt(
+  stmt: &Spanned<Stmt>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  moved: &mut HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
+  match &stmt.node {
+    Stmt::Let { value, .. }
+    | Stmt::SetField { value, .. }
+    | Stmt::Assign { value, .. }
+    | Stmt::OrAssign { default: value, .. }
+    | Stmt::AndAssign { value, .. } => expr_moved_read(value, moved),
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      expr_moved_read(array, moved)?;
+      expr_moved_read(index, moved)?;
+      expr_moved_read(value, moved)
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        expr_moved_read(v, moved)?;
+      }
+      Ok(())
+    }
+    Stmt::Return(Some(e)) | Stmt::Raise(e) => expr_moved_read(e, moved),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => Ok(()),
+    Stmt::Yield(args) => {
+      for a in args {
+        expr_moved_read(a, moved)?;
+      }
+      Ok(())
+    }
+    Stmt::Expr(e) => check_message_safety_expr_stmt(e, env, classes, moved),
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      expr_moved_read(cond, moved)?;
+      let mut then_moved = moved.clone();
+      check_message_safety(then_branch, env, classes, &mut then_moved)?;
+      let mut else_moved = moved.clone();
+      if let Some(else_b) = else_branch {
+        check_message_safety(else_b, env, classes, &mut else_moved)?;
+      }
+      moved.extend(then_moved);
+      moved.extend(else_moved);
+      Ok(())
+    }
+    Stmt::While { cond, body } => {
+      expr_moved_read(cond, moved)?;
+      check_loop_body(body, env, classes, moved)
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        expr_moved_read(e, moved)?;
+      }
+      check_loop_body(body, env, classes, moved)
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      expr_moved_read(start, moved)?;
+      expr_moved_read(end, moved)?;
+      check_loop_body(body, env, classes, moved)
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      expr_moved_read(scrutinee, moved)?;
+      let mut union = HashMap::new();
+      for (_, arm_body) in arms {
+        let mut arm_moved = moved.clone();
+        check_message_safety(arm_body, env, classes, &mut arm_moved)?;
+        union.extend(arm_moved);
+      }
+      if let Some(else_b) = else_body {
+        let mut else_moved = moved.clone();
+        check_message_safety(else_b, env, classes, &mut else_moved)?;
+        union.extend(else_moved);
+      }
+      moved.extend(union);
+      Ok(())
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      let mut body_moved = moved.clone();
+      check_message_safety(body, env, classes, &mut body_moved)?;
+      let mut union = body_moved;
+      for r in rescues {
+        let mut r_moved = moved.clone();
+        check_message_safety(&r.body, env, classes, &mut r_moved)?;
+        union.extend(r_moved);
+      }
+      moved.extend(union);
+      // `ensure` always runs, on every exit path — checked against
+      // `moved` as it now stands post-union, the same conservative
+      // posture branches get.
+      if let Some(ensure_b) = ensure {
+        check_message_safety(ensure_b, env, classes, moved)?;
+      }
+      Ok(())
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      expr_moved_read(scrutinee, moved)?;
+      let mut ok_moved = moved.clone();
+      check_message_safety(ok_body, env, classes, &mut ok_moved)?;
+      let mut err_moved = moved.clone();
+      check_message_safety(err_body, env, classes, &mut err_moved)?;
+      moved.extend(ok_moved);
+      moved.extend(err_moved);
+      Ok(())
+    }
+  }
+}
+
+/// `Stmt::Expr(e)` is where a cross-actor send (`receiver.method(args)`
+/// with an actor-typed receiver — plan 55's assumed contract, `.spawn`
+/// forces `Void` on every non-`initialize` actor method, so a send can
+/// only ever appear as a bare statement) is recognized; every other
+/// bare-expression statement just gets the ordinary moved-read check.
+fn check_message_safety_expr_stmt(
+  e: &Spanned<Expr>,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+  moved: &mut HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
+  if let Expr::MethodCall(recv, method, args) = &e.node {
+    if let Expr::Ident(recv_name) = &recv.node {
+      if let Some(Type::Class(class_name)) = env.get(recv_name) {
+        if classes.get(class_name).is_some_and(|c| c.is_actor) {
+          for (i, arg) in args.iter().enumerate() {
+            check_message_arg(arg, i, method, env, moved)?;
+          }
+          return Ok(());
+        }
+      }
+    }
+  }
+  expr_moved_read(e, moved)
+}
+
+/// `leaf-payload-classification`'s four buckets, in the order the
+/// Decision log states them. Bucket 3 (a named-local reference) is the
+/// only one that both consults AND updates `moved`.
+fn check_message_arg(
+  arg: &Spanned<Expr>,
+  index: usize,
+  method: &str,
+  env: &HashMap<String, Type>,
+  moved: &mut HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
+  match &arg.node {
+    // Bucket 2: trivially fresh — always legal, no prior binding for
+    // anything else to read afterward. Each constructor's own inner
+    // arguments are still real reads in their own right (e.g.
+    // `LogMessage.new(some_moved_local)`), checked recursively.
+    Expr::New(_, inner) | Expr::Spawn(_, inner) => {
+      for a in inner {
+        expr_moved_read(a, moved)?;
+      }
+      Ok(())
+    }
+    Expr::ArrayLit(elems) => {
+      for e in elems {
+        expr_moved_read(e, moved)?;
+      }
+      Ok(())
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        expr_moved_read(k, moved)?;
+        expr_moved_read(v, moved)?;
+      }
+      Ok(())
+    }
+    Expr::ArrayNew(size) => expr_moved_read(size, moved),
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          expr_moved_read(e, moved)?;
+        }
+      }
+      Ok(())
+    }
+    Expr::Lambda { .. } | Expr::StringLit(_) | Expr::Nil => Ok(()),
+    // Bucket 1: value types, always legal by literal shape.
+    Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::SymbolLit(_) => Ok(()),
+    // Bucket 3: a named local — value-typed locals are exempt (still
+    // bucket 1, just via a variable instead of a literal); every other
+    // type is subject to the liveness check, then recorded as a new
+    // move.
+    Expr::Ident(name) => {
+      if let Some(&send_span) = moved.get(name) {
+        return Err(Diagnostic::new(
+          format!(
+            "message-safety: local `{name}` cannot be used again — it was already sent to an \
+             actor (byte offset {}) and message payloads are a one-way transfer",
+            send_span.0
+          ),
+          arg.span,
+        ));
+      }
+      let is_value_type = matches!(
+        env.get(name),
+        Some(Type::Int64) | Some(Type::Float64) | Some(Type::Boolean) | Some(Type::Symbol)
+      );
+      if !is_value_type {
+        moved.insert(name.clone(), arg.span);
+      }
+      Ok(())
+    }
+    // Bucket 4: aliasing-shape — rejected outright, not analyzed (see
+    // this plan's own Decision log for why `@field`/`arr[i]`/a nested
+    // call result can't be proven unaliased by this compiler).
+    Expr::InstanceVar(_) | Expr::Index(_, _) | Expr::Call(_, _) | Expr::MethodCall(_, _, _) => {
+      Err(Diagnostic::new(
+        format!(
+          "message-safety: argument {} to `{method}` must be a value, a freshly constructed \
+           value, or a local variable used for the last time — `@field`/`array[i]`/a nested call \
+           result cannot be proven unaliased by this compiler",
+          index + 1
+        ),
+        arg.span,
+      ))
+    }
+    // Every other shape (arithmetic/comparison/bitwise, `Ok`/`Err`/
+    // `Try`, `TupleLit`, `SafeCall`) reduces to a value in every case
+    // this type system allows here — the same conservative-safe
+    // recursive-read default every OTHER (non-message-argument)
+    // expression position in this whole pass already gets.
+    _ => expr_moved_read(arg, moved),
+  }
+}
+
+/// Any AST position that reads `Expr::Ident(name)` where `name` is a
+/// key in `moved` is the rejection (Decision log: "any use" means
+/// literally any position, not just a bare-statement one).
+fn expr_moved_read(
+  expr: &Spanned<Expr>,
+  moved: &HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
+  match &expr.node {
+    Expr::Ident(name) => {
+      if let Some(&send_span) = moved.get(name) {
+        return Err(Diagnostic::new(
+          format!(
+            "message-safety: local `{name}` cannot be used again — it was already sent to an \
+             actor (byte offset {}) and message payloads are a one-way transfer",
+            send_span.0
+          ),
+          expr.span,
+        ));
+      }
+      Ok(())
+    }
+    Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::Bool(_)
+    | Expr::Nil
+    | Expr::InstanceVar(_) => Ok(()),
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b) => {
+      expr_moved_read(a, moved)?;
+      expr_moved_read(b, moved)
+    }
+    Expr::Compare(a, _, b) => {
+      expr_moved_read(a, moved)?;
+      expr_moved_read(b, moved)
+    }
+    Expr::Neg(a)
+    | Expr::Not(a)
+    | Expr::BitNot(a)
+    | Expr::ArrayNew(a)
+    | Expr::Ok(a)
+    | Expr::Err(a)
+    | Expr::Try(a) => expr_moved_read(a, moved),
+    Expr::Call(_, args) | Expr::New(_, args) | Expr::Spawn(_, args) => {
+      for a in args {
+        expr_moved_read(a, moved)?;
+      }
+      Ok(())
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        expr_moved_read(v, moved)?;
+      }
+      Ok(())
+    }
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
+      expr_moved_read(recv, moved)?;
+      for a in args {
+        expr_moved_read(a, moved)?;
+      }
+      Ok(())
+    }
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for e in elems {
+        expr_moved_read(e, moved)?;
+      }
+      Ok(())
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        expr_moved_read(k, moved)?;
+        expr_moved_read(v, moved)?;
+      }
+      Ok(())
+    }
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          expr_moved_read(e, moved)?;
+        }
+      }
+      Ok(())
+    }
+    // A lambda's own body is a real, disclosed gap this plan doesn't
+    // close — walking a nested Stmt list from an Expr-position
+    // function needs its own dedicated traversal this plan's own
+    // worked examples never exercise (neither uses a lambda at all).
+    Expr::Lambda { .. } => Ok(()),
+  }
+}
+
 fn check_function_body(
   f: &Function,
   sigs: &HashMap<String, FunctionSig>,
@@ -3344,7 +3755,12 @@ fn check_function_body(
     &declared_return,
     &f.name,
     gctx,
-  )
+  )?;
+  // Plan 56 (compile-time message safety) — run once the body's own
+  // ordinary type-check has already succeeded, reusing its final `env`
+  // read-only.
+  let mut moved = HashMap::new();
+  check_message_safety(&f.body, &env, classes, &mut moved)
 }
 
 fn check_method_body(
@@ -3417,7 +3833,13 @@ fn check_method_body(
     &declared_return,
     &format!("{class_name}#{}", m.name),
     gctx,
-  )
+  )?;
+  // Plan 56 (compile-time message safety) — see `check_function_body`'s
+  // identical call for the full rationale; a method body (including an
+  // actor's own method sending to ANOTHER actor) gets the exact same
+  // check.
+  let mut moved = HashMap::new();
+  check_message_safety(&m.body, &env, classes, &mut moved)
 }
 
 /// Plan 34: for every bare top-level statement call to a `block_param`-
@@ -6298,6 +6720,156 @@ mod tests {
   fn accepts_every_non_initialize_method_declaring_no_return_type() {
     let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def bump -> Void\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.spawn(0)\n";
     let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 56 (compile-time message safety).
+
+  /// Shared class/actor preamble for every scenario below — `run_body`
+  /// supplies just the varying statements. `Logger#ping` (a value-type
+  /// param) backs the value-type-argument tests; `Logger#log` (a
+  /// `LogMessage`-typed param) backs the reference-type ones.
+  fn message_safety_program(run_body: &str) -> String {
+    format!(
+      "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\n\n  def text -> String\n    @text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n    puts msg.text\n  end\n\n  def ping(n: Int64) -> Void\n  end\nend\n\ndef run -> Void\n{run_body}end\n\nrun()\n"
+    )
+  }
+
+  #[test]
+  fn accepts_the_message_safety_worked_example() {
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  logger.log(msg)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_read_of_a_local_immediately_after_sending_it() {
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  logger.log(msg)\n  puts msg.text\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`msg` was already sent to Logger — reading it again must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains("msg")),
+      "diagnostic must be distinguishable from an ordinary undefined-variable/type-mismatch \
+       error: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn accepts_a_send_in_one_branch_and_a_read_only_in_the_other() {
+    // The two branches are mutually exclusive — nothing races.
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  flag: Boolean = true\n  if flag\n    logger.log(msg)\n  else\n    puts msg.text\n  end\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_read_after_an_if_whose_only_one_branch_sent() {
+    // Decision log's conservative merge: the moved-set carried past the
+    // whole `if` is the UNION of what every branch did, even though
+    // only one branch could actually have executed on any given run.
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  flag: Boolean = true\n  if flag\n    logger.log(msg)\n  end\n  puts msg.text\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("the conservative branch-merge rule must reject this, not full path sensitivity");
+    assert!(errs.iter().any(|d| d.message.contains("message-safety")));
+  }
+
+  #[test]
+  fn rejects_a_read_on_a_loops_own_last_statement_when_its_first_statement_sent() {
+    // Loop conservatism: "textually after" has no fixed meaning inside
+    // a loop body — a send anywhere in the body is checked against
+    // every other use anywhere else in that SAME body.
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3\n    logger.log(msg)\n    puts msg.text\n    i = i + 1\n  end\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a send and a use in the same loop body must be rejected regardless of order");
+    assert!(errs.iter().any(|d| d.message.contains("message-safety")));
+  }
+
+  #[test]
+  fn rejects_a_read_after_a_loop_whose_body_sent() {
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3\n    logger.log(msg)\n    i = i + 1\n  end\n  puts msg.text\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "a send anywhere in a loop body must poison the local for all code after the loop",
+    );
+    assert!(errs.iter().any(|d| d.message.contains("message-safety")));
+  }
+
+  #[test]
+  fn accepts_a_value_type_argument_reused_after_the_send() {
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  n: Int64 = 42\n  logger.ping(n)\n  puts n\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "an Int64 argument is a value type — copied at the send, reusable afterward"
+    );
+  }
+
+  #[test]
+  fn accepts_a_freshly_constructed_reference_argument() {
+    let src = message_safety_program(
+      "  logger: Logger = Logger.spawn()\n  logger.log(LogMessage.new(\"fresh\"))\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_field_read_passed_directly_as_a_message_argument() {
+    let src = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\n\n  def text -> String\n    @text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n    puts msg.text\n  end\nend\n\nclass Holder\n  msg: LogMessage\n\n  def initialize(msg: LogMessage) -> Void\n    @msg = msg\n  end\n\n  def send_it(logger: Logger) -> Void\n    logger.log(@msg)\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`@msg` can alias a binding that outlives the send — rejected outright");
+    assert!(errs.iter().any(|d| d.message.contains("message-safety")));
+  }
+
+  #[test]
+  fn rejects_an_index_read_passed_directly_as_a_message_argument() {
+    let src = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n  end\nend\n\ndef run -> Void\n  logger: Logger = Logger.spawn()\n  msgs: Array[LogMessage] = Array.new(1)\n  msgs[0] = LogMessage.new(\"x\")\n  logger.log(msgs[0])\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`arr[i]` can alias a binding that outlives the send — rejected outright");
+    assert!(errs.iter().any(|d| d.message.contains("message-safety")));
+  }
+
+  #[test]
+  fn rejects_a_nested_call_result_passed_directly_as_a_message_argument() {
+    let src = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\nend\n\ndef build -> LogMessage\n  LogMessage.new(\"built\")\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n  end\nend\n\ndef run -> Void\n  logger: Logger = Logger.spawn()\n  logger.log(build())\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "a nested call's return value can't be proven unaliased by this compiler — rejected outright",
+    );
+    assert!(errs.iter().any(|d| d.message.contains("message-safety")));
+  }
+
+  #[test]
+  fn plan_56_regression_every_prior_actor_example_still_type_checks() {
+    // No pre-plan-54 example uses actors at all (they can't — the
+    // construct didn't exist); this is the narrowest real regression
+    // check available: plan 54/55's own worked examples, unaffected by
+    // this plan's new rule (neither sends a reference-typed local more
+    // than once).
+    let counter = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
+    let program = emerald_parser::parse(counter).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 }
