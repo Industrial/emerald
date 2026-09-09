@@ -62,6 +62,27 @@ extern long long emerald_supervisor_register_child(void *sup, const char *name,
                                                      long long argc);
 extern void *emerald_supervisor_child(void *sup, const char *name);
 
+/* Plan 60 (distributed, location-transparent actors) — Design decision
+ * 1: an actor-typed VALUE is now a tagged `EmeraldActorRef*`, not a
+ * bare arena pointer. `emerald_supervisor_register_child`/`emerald_
+ * supervisor_notify_terminated` (the `respawn` callback's own return
+ * value) both now unwrap `->local_arena` internally — this harness,
+ * hand-mirroring what real codegen generates, must supply/consume that
+ * same shape at the supervisor boundary. `emerald_actor_enqueue`
+ * itself is UNCHANGED (still takes the raw arena pointer, always has)
+ * — `crashy`/`survivor`/`a0`/`a1` above stay exactly as they were; only
+ * a value that crosses the SUPERVISOR api needs this wrapping. Mirrors
+ * only the leading fields actually read here — real, disclosed
+ * duplication of the runtime's own struct layout (the same "this
+ * harness hand-mirrors what codegen generates" precedent every other
+ * function in this file already establishes), not the full struct
+ * (its trailing `pthread_mutex_t` is never touched from here). */
+struct EmeraldActorRefMirror {
+  unsigned char is_remote;
+  void *local_arena;
+};
+extern void *emerald_actor_ref_local(void *self);
+
 /* --- shared helpers --- */
 
 static void *new_actor(long long extra_bytes) {
@@ -181,7 +202,7 @@ static void run_concurrent_crash_mode(void) {
 static void *worker_respawn(long long *args) {
   void *self = new_actor(8);
   *(long long *) self = args[0];
-  return self;
+  return emerald_actor_ref_local(self);
 }
 
 static void worker_handle_body(void *self, long long *argv) {
@@ -208,7 +229,7 @@ static void worker_handle_trampoline(void *self, long long *argv) {
 /* `Logger`: no fields, always prints "log". Never crashes. */
 static void *logger_respawn(long long *args) {
   (void) args;
-  return new_actor(0);
+  return emerald_actor_ref_local(new_actor(0));
 }
 
 static void logger_handle_body(void *self, long long *argv) {
@@ -244,25 +265,33 @@ static void run_supervisor_mode(void) {
   emerald_supervisor_register_child(sup, "logger", "Logger", logger_respawn, logger,
                                      logger_args, 1);
 
+  /* `emerald_supervisor_child` returns exactly what was registered —
+   * now a ref (plan 60) — but `emerald_actor_enqueue` itself still
+   * takes the raw arena pointer (unchanged): unwrap `->local_arena` at
+   * each call site below, the identical unwrap real codegen's own
+   * `emerald_actor_dispatch` now does internally on the local path. */
   void *w = emerald_supervisor_child(sup, "worker");
   void *l = emerald_supervisor_child(sup, "logger");
+  void *w_arena = ((struct EmeraldActorRefMirror *) w)->local_arena;
+  void *l_arena = ((struct EmeraldActorRefMirror *) l)->local_arena;
 
   long long one[1] = {1};
-  emerald_actor_enqueue(w, worker_handle_trampoline, one, 1); /* 1 */
-  emerald_actor_enqueue(w, worker_handle_trampoline, one, 1); /* 2 */
-  emerald_actor_enqueue(l, logger_handle_trampoline, one, 1); /* log */
-  emerald_actor_enqueue(w, worker_handle_trampoline, one, 1); /* crashes; restarts */
+  emerald_actor_enqueue(w_arena, worker_handle_trampoline, one, 1); /* 1 */
+  emerald_actor_enqueue(w_arena, worker_handle_trampoline, one, 1); /* 2 */
+  emerald_actor_enqueue(l_arena, logger_handle_trampoline, one, 1); /* log */
+  emerald_actor_enqueue(w_arena, worker_handle_trampoline, one, 1); /* crashes; restarts */
 
   void *w2 = emerald_supervisor_child(sup, "worker"); /* blocks until restart done */
-  emerald_actor_enqueue(l, logger_handle_trampoline, one, 1); /* log */
-  emerald_actor_enqueue(w2, worker_handle_trampoline, one, 1); /* 1, not 4 */
+  void *w2_arena = ((struct EmeraldActorRefMirror *) w2)->local_arena;
+  emerald_actor_enqueue(l_arena, logger_handle_trampoline, one, 1); /* log */
+  emerald_actor_enqueue(w2_arena, worker_handle_trampoline, one, 1); /* 1, not 4 */
 
   emerald_worker_pool_drain_and_join();
 
   /* AC4: `w` (the pre-crash, now-dead reference) used again — must be
    * silently dropped, not crash the process and not reach `w2`. */
   emerald_worker_pool_start();
-  emerald_actor_enqueue(w, worker_handle_trampoline, one, 1);
+  emerald_actor_enqueue(w_arena, worker_handle_trampoline, one, 1);
   emerald_worker_pool_drain_and_join();
   printf("dead send did not crash\n");
 }

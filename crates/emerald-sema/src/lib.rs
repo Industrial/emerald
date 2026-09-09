@@ -2393,6 +2393,41 @@ fn infer_expr_type(
       }
       Ok(Type::Class(class_name.clone()))
     }
+    // Plan 60's Decision log: `.spawn`'s distributed counterpart — the
+    // identical `is_actor` gate, and the identical inferred type
+    // (`Type::Class(class)`, Design decision 1: both a local and a
+    // remote actor reference are the same tagged-handle shape at every
+    // call site). `addr`/`name` must be `String`; no `initialize`
+    // arity check here — `.remote` never constructs a new instance, it
+    // resolves an already-`.register`ed one running in another process.
+    Expr::Remote { class, addr, name } => {
+      let info = classes
+        .get(class)
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class}`"), expr.span))?;
+      if !info.is_actor {
+        return Err(Diagnostic::new(
+          format!(
+            "cannot `.remote` `{class}` — `.remote` only resolves actors, and `{class}` is not one"
+          ),
+          expr.span,
+        ));
+      }
+      let addr_ty = infer_expr_type(addr, env, sigs, classes, self_fields, gctx)?;
+      if addr_ty != Type::String {
+        return Err(Diagnostic::new(
+          format!("`{class}.remote`'s address argument must be a String, found {addr_ty:?}"),
+          addr.span,
+        ));
+      }
+      let name_ty = infer_expr_type(name, env, sigs, classes, self_fields, gctx)?;
+      if name_ty != Type::String {
+        return Err(Diagnostic::new(
+          format!("`{class}.remote`'s name argument must be a String, found {name_ty:?}"),
+          name.span,
+        ));
+      }
+      Ok(Type::Class(class.clone()))
+    }
     // Plan 57 (supervision trees), `leaf-supervise-declaration`:
     // `supervise do ... end`'s body is restricted to a flat list of
     // bound-or-bare `<Class>.spawn(<args>)` statements (Decision log —
@@ -2808,6 +2843,27 @@ fn infer_expr_type(
           expr.span,
         )
       })?;
+      // Plan 60's Decision log: `recv.register(name, port)` — scoped by
+      // the receiver's own ACTUAL type being an actor (mirroring the
+      // `Array`/`Hash`/`String`/`Pair` intrinsic dispatches above, this
+      // codebase's own established lesson: guard by receiver type, not
+      // method name alone). A real, disclosed narrowing: an actor class
+      // declaring its OWN method literally named `register` would be
+      // shadowed here — the same accepted tradeoff `File`/`String`'s
+      // own reserved-namespace dispatches already make for their names.
+      if info.is_actor && method == "register" {
+        check_args(
+          "register",
+          args,
+          &[Type::String, Type::Int64],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(Type::Void);
+      }
       let sig = info.methods.get(method).ok_or_else(|| {
         Diagnostic::new(
           format!("class `{class_name}` has no method `{method}`"),
@@ -4747,7 +4803,12 @@ fn check_message_safety_expr_stmt(
       if let Some(Type::Class(class_name)) = env.get(recv_name) {
         if classes.get(class_name).is_some_and(|c| c.is_actor) {
           for (i, arg) in args.iter().enumerate() {
+            // Plan 56's own existing liveness check runs first,
+            // completely unchanged — plan 60's own wire-safety
+            // predicate (Design decision 2) is a second, independent
+            // check layered on AFTER it, never in place of it.
             check_message_arg(arg, i, method, env, moved)?;
+            check_wire_safety(arg, i, method, env, classes)?;
           }
           return Ok(());
         }
@@ -4847,6 +4908,99 @@ fn check_message_arg(
     // recursive-read default every OTHER (non-message-argument)
     // expression position in this whole pass already gets.
     _ => expr_moved_read(arg, moved),
+  }
+}
+
+/// Plan 60's Decision log — Design decision 2: a second, independent,
+/// purely-type-driven predicate, layered on top of (never instead of)
+/// `check_message_arg`'s own liveness check above — applied to every
+/// cross-actor send argument whose receiver's STATIC type is an actor
+/// (sema can't know local-vs-remote statically, so this is
+/// conservative: it runs for every actor-typed receiver, not only ones
+/// proven remote). Determines the argument's type from its own AST
+/// shape + `env` directly (the same finite set of shapes `check_
+/// message_arg`'s own bucket match already discriminates) rather than
+/// the general `infer_expr_type` — sound here specifically because
+/// `check_message_arg`'s bucket-4 rejection above already rules out
+/// every shape (`@field`/`arr[i]`/a nested call result) whose type
+/// isn't recoverable this cheaply.
+fn check_wire_safety(
+  arg: &Spanned<Expr>,
+  index: usize,
+  method: &str,
+  env: &HashMap<String, Type>,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<(), Diagnostic> {
+  let ty = match &arg.node {
+    Expr::Int(_) => Some(Type::Int64),
+    Expr::Float(_) => Some(Type::Float64),
+    Expr::Bool(_) => Some(Type::Boolean),
+    Expr::SymbolLit(_) => Some(Type::Symbol),
+    Expr::StringLit(_) | Expr::Interpolate(_) => Some(Type::String),
+    // Carries no data at all — nothing here for a wire-safety check to
+    // reject.
+    Expr::Nil => None,
+    Expr::New(class_name, _) => Some(Type::Class(class_name.clone())),
+    // An actor reference — `is_wire_safe_type`'s own `is_actor` check
+    // below rejects this uniformly with `Expr::Ident` naming an
+    // already-`.spawn`ed/`.remote`d actor local.
+    Expr::Spawn(class_name, _) => Some(Type::Class(class_name.clone())),
+    Expr::ArrayLit(_) | Expr::ArrayNew(_) => Some(Type::Array(Box::new(Type::Void))),
+    Expr::HashLit(_) => Some(Type::Hash(Box::new(Type::Void), Box::new(Type::Void))),
+    Expr::Lambda { .. } => Some(Type::Proc(Vec::new(), Box::new(Type::Void))),
+    Expr::Ident(name) => env.get(name).cloned(),
+    _ => None,
+  };
+  let Some(ty) = ty else {
+    return Ok(());
+  };
+  let mut seen = HashSet::new();
+  if !is_wire_safe_type(&ty, classes, &mut seen) {
+    return Err(Diagnostic::new(
+      format!(
+        "message-safety: argument {} to `{method}` has type {ty:?}, which is not wire-safe — only \
+         Int64/Float64/Boolean/Symbol/String, or a class whose fields are all recursively \
+         wire-safe, can cross a (possibly remote) actor boundary; Array[_]/Hash[_,_]/Proc/an actor \
+         reference are not",
+        index + 1
+      ),
+      arg.span,
+    ));
+  }
+  Ok(())
+}
+
+/// `Int64`/`Float64`/`Boolean`/`Symbol` (plan 56's own value types) and
+/// `String` are wire-safe directly; a `Class(name)` is wire-safe iff
+/// every one of its OWN flattened fields (`ClassLayout`'s existing
+/// field list — plan 08/32's metadata, reused verbatim, not
+/// recomputed) is, walked recursively. `seen` guards a self-referential
+/// class (`Node { next: Node }`) from infinite recursion — a real,
+/// disclosed limitation: a cyclic class is simply never wire-safe in
+/// v1, rather than this plan attempting real cycle-aware encoding.
+fn is_wire_safe_type(
+  ty: &Type,
+  classes: &HashMap<String, ClassInfo>,
+  seen: &mut HashSet<String>,
+) -> bool {
+  match ty {
+    Type::Int64 | Type::Float64 | Type::Boolean | Type::Symbol | Type::String => true,
+    Type::Class(name) => {
+      let Some(info) = classes.get(name) else {
+        return false;
+      };
+      if info.is_actor {
+        return false;
+      }
+      if !seen.insert(name.clone()) {
+        return false;
+      }
+      info
+        .fields
+        .values()
+        .all(|ft| is_wire_safe_type(ft, classes, seen))
+    }
+    _ => false,
   }
 }
 
@@ -4955,6 +5109,10 @@ fn expr_moved_read(
     // nested `Stmt` list, and this plan's own worked examples never
     // send a moved-out local as a supervised `.spawn` argument.
     Expr::Supervise(_) => Ok(()),
+    Expr::Remote { addr, name, .. } => {
+      expr_moved_read(addr, moved)?;
+      expr_moved_read(name, moved)
+    }
   }
 }
 
@@ -8595,5 +8753,88 @@ end
     let errs =
       check_program(&program).expect_err("String.from_cstring on a bare Int64 must be rejected");
     assert!(!errs.is_empty(), "{errs:?}");
+  }
+
+  // Plan 60 (distributed, location-transparent actors).
+
+  #[test]
+  fn register_on_an_actor_receiver_type_checks() {
+    let src = "actor Counter\n  count: Int64\nend\n\nc: Counter = Counter.spawn()\nc.register(\"counter1\", 9000)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn register_on_a_non_actor_receiver_is_rejected() {
+    let src = "class Widget\nend\n\nw: Widget = Widget.new()\nw.register(\"widget1\", 9001)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("`.register` on a non-actor class must be rejected");
+    assert!(!errs.is_empty(), "{errs:?}");
+  }
+
+  #[test]
+  fn remote_on_a_non_actor_class_is_rejected() {
+    let src = "class Widget\nend\n\nw: Widget = Widget.remote(\"127.0.0.1:9000\", \"widget1\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`.remote` only resolves actors");
+    assert!(
+      errs.iter().any(|d| d.message.contains("cannot `.remote`")),
+      "{errs:?}"
+    );
+  }
+
+  // Plan 56's own message-safety pass only ever runs over a function/
+  // method body (`check_function_body`/`check_method_body`'s own call
+  // sites) — a bare top-level send is a real, pre-existing, disclosed
+  // gap (see plan 56's own Decision log), not something plan 60
+  // changes. Every wire-safety test below wraps its send inside a
+  // `def main()` for exactly this reason, matching plan 56's own
+  // worked examples' established convention.
+
+  #[test]
+  fn an_array_message_argument_is_rejected_as_not_wire_safe() {
+    let src = "actor Logger\n  def log(items: Array[Int64]) -> Void\n  end\nend\n\ndef main() -> Void\n  l: Logger = Logger.spawn()\n  arr: Array[Int64] = [1, 2, 3]\n  l.log(arr)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Array[_] is not wire-safe");
+    assert!(
+      errs.iter().any(|d| d.message.contains("not wire-safe")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_proc_message_argument_is_rejected_as_not_wire_safe() {
+    let src = "actor Logger\n  def run(f: Proc) -> Void\n  end\nend\n\ndef main() -> Void\n  l: Logger = Logger.spawn()\n  cb: Proc = ->() -> Void { }\n  l.run(cb)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Proc is not wire-safe");
+    assert!(
+      errs.iter().any(|d| d.message.contains("not wire-safe")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_second_actor_reference_message_argument_is_rejected_as_not_wire_safe() {
+    let src = "actor Pinger\n  def notify(other: Pinger) -> Void\n  end\nend\n\ndef main() -> Void\n  a: Pinger = Pinger.spawn()\n  b: Pinger = Pinger.spawn()\n  a.notify(b)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("sending an actor reference is not wire-safe");
+    assert!(
+      errs.iter().any(|d| d.message.contains("not wire-safe")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn plan_56_liveness_still_fires_unchanged_on_an_actor_send() {
+    let src = "actor Receiver\n  def take(p: Payload) -> Void\n  end\nend\n\nclass Payload\n  data: String\nend\n\ndef main() -> Void\n  r: Receiver = Receiver.spawn()\n  p: Payload = Payload.new()\n  r.take(p)\n  r.take(p)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("reusing `p` after it was sent must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("cannot be used again")),
+      "{errs:?}"
+    );
   }
 }

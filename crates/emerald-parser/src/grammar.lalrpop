@@ -784,6 +784,10 @@ StmtPrimaryExpr: Spanned<Expr> = {
   // symmetric, textually-disjoint call forms (sema decides which
   // receivers are actually valid for each, not the grammar).
   <l:@L> <recv:Ident> "." "spawn" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Spawn(recv, args) },
+  // Plan 60's Decision log: `.spawn`'s distributed counterpart — the
+  // identical reserved-keyword-headed shape, `remote` reserved the same
+  // LALR(1) way `spawn` already is.
+  <l:@L> <class:Ident> "." "remote" "(" <addr:Expr> "," <name:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Remote { class, addr: Box::new(addr), name: Box::new(name) } },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
   // Plan 53's Decision log: `Ok`/`Err` are literal-keyword-headed
   // constructor productions, the same convention `Array`/`Hash`/`Proc`
@@ -1113,6 +1117,9 @@ PrimaryExpr: Spanned<Expr> = {
   // lookahead token.
   <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
   <l:@L> <recv:Ident> "." "spawn" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Spawn(recv, args) },
+  // Plan 60's Decision log: see `PrimaryExpr`'s own identical `.remote`
+  // alternative for the full rationale.
+  <l:@L> <class:Ident> "." "remote" "(" <addr:Expr> "," <name:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Remote { class, addr: Box::new(addr), name: Box::new(name) } },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
   <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
   <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },

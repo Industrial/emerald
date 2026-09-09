@@ -338,6 +338,10 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
       }
     }
     Expr::Supervise(body) => rewrite_stmts(body, name, source),
+    Expr::Remote { addr, name: n, .. } => {
+      rewrite_expr(addr, name, source);
+      rewrite_expr(n, name, source);
+    }
   }
 }
 
@@ -3172,5 +3176,39 @@ mod tests {
       parse(src).is_err(),
       "`unsafe` is a mandatory, grammar-level marker, not a sema-optional one"
     );
+  }
+
+  // Plan 60 (distributed, location-transparent actors).
+
+  #[test]
+  fn dot_remote_parses_into_an_expr_remote_node() {
+    let src =
+      "actor Counter\nend\n\nc: Counter = Counter.remote(\"127.0.0.1:9000\", \"counter1\")\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[1]
+    else {
+      panic!("expected a top-level Let, got {:?}", program.items[1]);
+    };
+    assert!(matches!(value.node, Expr::Remote { .. }));
+  }
+
+  #[test]
+  fn dot_register_parses_via_the_existing_ordinary_method_call_grammar() {
+    let src =
+      "actor Counter\nend\n\nc: Counter = Counter.spawn()\nc.register(\"counter1\", 9000)\n";
+    let program = parse(src).expect("should parse");
+    assert!(matches!(
+      &program.items[2],
+      Item::Stmt(Spanned {
+        node: Stmt::Expr(Spanned {
+          node: Expr::MethodCall(_, method, _),
+          ..
+        }),
+        ..
+      }) if method == "register"
+    ));
   }
 }

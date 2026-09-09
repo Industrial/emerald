@@ -968,6 +968,10 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
     // spawns) is `mark_expr`'s job (via `collect_referenced_idents`),
     // not this function's.
     Expr::Supervise(_) => {}
+    Expr::Remote { addr, name, .. } => {
+      collect_idents_in_expr(addr, out);
+      collect_idents_in_expr(name, out);
+    }
   }
 }
 
@@ -1368,6 +1372,10 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
       for s in body {
         collect_symbols_in_stmt(s, table);
       }
+    }
+    Expr::Remote { addr, name, .. } => {
+      collect_symbols_in_expr(addr, table);
+      collect_symbols_in_expr(name, table);
     }
   }
 }
@@ -1788,6 +1796,11 @@ fn collect_specializations_in_expr(
     // `classes` context available to call `collect_specializations_
     // in_stmt` with anyway (unlike its statement-level namesake).
     Expr::Supervise(_) => {}
+    // Plan 60: `.remote`'s `addr`/`name` are always plain `String`
+    // expressions — never a generic function call — so there's nothing
+    // here for this pass to find, the same real gap `Expr::Supervise`
+    // immediately above already discloses for the identical reason.
+    Expr::Remote { .. } => {}
   }
 }
 
@@ -2419,6 +2432,10 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
     | Expr::Nil => {}
     Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => mark_expr(&e.node, out),
     Expr::Supervise(body) => collect_referenced_idents(body, out),
+    Expr::Remote { addr, name, .. } => {
+      mark_expr(&addr.node, out);
+      mark_expr(&name.node, out);
+    }
   }
 }
 
@@ -2650,6 +2667,14 @@ fn declare_exception_runtime_funcs<'ctx>(
 #[derive(Clone, Copy)]
 struct ActorRuntimeFuncs<'ctx> {
   init_header: FunctionValue<'ctx>,
+  /// Plan 60's Decision log: no longer called directly from codegen —
+  /// `build_actor_enqueue_call` now always calls `dispatch` below,
+  /// which itself calls `emerald_actor_enqueue` internally on the
+  /// local path (byte-for-byte the same runtime call, just made from
+  /// inside C instead of from generated IR). Kept declared (not
+  /// removed) purely for documentation/future-caller symmetry with
+  /// every other runtime function this struct names.
+  #[allow(dead_code)]
   enqueue: FunctionValue<'ctx>,
   pool_start: FunctionValue<'ctx>,
   pool_drain_and_join: FunctionValue<'ctx>,
@@ -2661,6 +2686,18 @@ struct ActorRuntimeFuncs<'ctx> {
   supervisor_create: FunctionValue<'ctx>,
   supervisor_register_child: FunctionValue<'ctx>,
   supervisor_child: FunctionValue<'ctx>,
+  /// Plan 60 (distributed, location-transparent actors) — see each
+  /// declaration's own comment in `declare_actor_runtime_funcs` for its
+  /// real C signature/purpose.
+  ref_local: FunctionValue<'ctx>,
+  register: FunctionValue<'ctx>,
+  ref_remote: FunctionValue<'ctx>,
+  dispatch: FunctionValue<'ctx>,
+  remote_last_error: FunctionValue<'ctx>,
+  wirebuf_push_i64: FunctionValue<'ctx>,
+  wirebuf_push_string: FunctionValue<'ctx>,
+  wirebuf_read_i64: FunctionValue<'ctx>,
+  wirebuf_read_string: FunctionValue<'ctx>,
 }
 
 fn declare_actor_runtime_funcs<'ctx>(
@@ -2738,6 +2775,74 @@ fn declare_actor_runtime_funcs<'ctx>(
     Some(Linkage::External),
   );
 
+  // Plan 60 (distributed, location-transparent actors).
+  let i32_ty = context.i32_type();
+  let ref_local = module.add_function(
+    "emerald_actor_ref_local",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let register = module.add_function(
+    "emerald_actor_register",
+    void_ty.fn_type(
+      &[
+        ptr_ty.into(),
+        ptr_ty.into(),
+        i64_ty.into(),
+        i32_ty.into(),
+        ptr_ty.into(),
+        i64_ty.into(),
+      ],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let ref_remote = module.add_function(
+    "emerald_actor_ref_remote",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let dispatch = module.add_function(
+    "emerald_actor_dispatch",
+    i32_ty.fn_type(
+      &[
+        ptr_ty.into(),
+        i32_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        i64_ty.into(),
+      ],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let remote_last_error = module.add_function(
+    "emerald_remote_last_error_message",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let wirebuf_push_i64 = module.add_function(
+    "emerald_wirebuf_push_i64",
+    void_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let wirebuf_push_string = module.add_function(
+    "emerald_wirebuf_push_string",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let wirebuf_read_i64 = module.add_function(
+    "emerald_wirebuf_read_i64",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let wirebuf_read_string = module.add_function(
+    "emerald_wirebuf_read_string",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+
   ActorRuntimeFuncs {
     init_header,
     enqueue,
@@ -2749,6 +2854,15 @@ fn declare_actor_runtime_funcs<'ctx>(
     supervisor_create,
     supervisor_register_child,
     supervisor_child,
+    ref_local,
+    register,
+    ref_remote,
+    dispatch,
+    remote_last_error,
+    wirebuf_push_i64,
+    wirebuf_push_string,
+    wirebuf_read_i64,
+    wirebuf_read_string,
   }
 }
 
@@ -3063,13 +3177,519 @@ fn declare_supervisor_respawn_thunks<'ctx>(
       }
     }
 
+    // Plan 60's Decision log (Design decision 1): a respawned actor's
+    // value flows out through `emerald_supervisor_child` exactly the
+    // same way `.spawn`'s own value does — needs the identical
+    // `EmeraldActorRef` wrapping `build_spawn_alloc` now applies, or a
+    // supervised actor's post-respawn value would be the wrong shape.
+    let ref_call = builder
+      .build_call(actor_funcs.ref_local, &[self_ptr.into()], "respawnreflocal")
+      .map_err(|e| e.to_string())?;
+    let ref_ptr = call_result(ref_call)?.into_pointer_value();
     builder
-      .build_return(Some(&self_ptr))
+      .build_return(Some(&ref_ptr))
       .map_err(|e| e.to_string())?;
 
     thunks.insert(a.name.clone(), thunk_fv);
   }
   Ok(thunks)
+}
+
+/// Plan 60's Decision log — Design decision 2, re-derived independently
+/// on the codegen side (this codebase's own "no shared sema→codegen
+/// structure" architecture — sema's own identically-shaped `is_wire_
+/// safe_type` already rejected an unsafe program before codegen ever
+/// runs; this purely decides which classes actually need a generated
+/// `_encode`/`_decode` pair). `seen` guards a self-referential class
+/// from infinite recursion the same way sema's own version does.
+fn is_wire_safe_class_field(
+  ty: &str,
+  classes: &HashMap<String, ClassLayout>,
+  actor_names: &HashSet<String>,
+  seen: &mut HashSet<String>,
+) -> bool {
+  match value_kind_for_type(ty) {
+    ValKind::Int64 | ValKind::Float64 | ValKind::Bool | ValKind::Symbol | ValKind::Nil => true,
+    ValKind::Str => true,
+    ValKind::Ptr => {
+      if actor_names.contains(ty) {
+        return false;
+      }
+      let Some(layout) = classes.get(ty) else {
+        return false;
+      };
+      if !seen.insert(ty.to_string()) {
+        return false;
+      }
+      layout
+        .field_classes
+        .values()
+        .all(|ft| is_wire_safe_class_field(ft, classes, actor_names, seen))
+    }
+    ValKind::Void | ValKind::Tuple(_) => false,
+  }
+}
+
+/// One `{Class}_encode(i8* self, EmeraldWireBuf* out)`/`{Class}_decode
+/// (EmeraldWireBuf* in) -> i8*` pair per wire-safe class (`leaf-wire-
+/// codec`), walking `ClassLayout`'s existing field list (plan 08's
+/// fixed 8-byte-per-field, plan 32's chain-resolved offsets) in
+/// offset order, dispatching per field on its already-known `ValKind` —
+/// `String` -> length-prefixed wire copy; a nested wire-safe `Class` ->
+/// recurse into its own `_encode`/`_decode`; every scalar kind -> a raw
+/// 8-byte wire copy (`Float64`/`Bool` bit-cast/extended the same way
+/// `build_actor_enqueue_call`'s own `argv` packing already does).
+/// Declared for every wire-safe class up front, in one pass, before any
+/// body is built, so a self-referential or mutually-referential pair
+/// can call each other regardless of declaration order.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn declare_wire_class_codecs<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  classes: &HashMap<String, ClassLayout>,
+  actor_names: &HashSet<String>,
+  actor_funcs: &ActorRuntimeFuncs<'ctx>,
+  alloc_fn: FunctionValue<'ctx>,
+) -> Result<
+  (
+    HashMap<String, FunctionValue<'ctx>>,
+    HashMap<String, FunctionValue<'ctx>>,
+  ),
+  String,
+> {
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let i64_ty = context.i64_type();
+  let void_ty = context.void_type();
+  let builder = context.create_builder();
+
+  let mut wire_safe: Vec<String> = Vec::new();
+  for name in classes.keys() {
+    if actor_names.contains(name) {
+      continue;
+    }
+    let mut seen = HashSet::new();
+    if is_wire_safe_class_field(name, classes, actor_names, &mut seen) {
+      wire_safe.push(name.clone());
+    }
+  }
+
+  let encode_ty = void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+  let decode_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
+  let mut encode_fns = HashMap::new();
+  let mut decode_fns = HashMap::new();
+  for name in &wire_safe {
+    encode_fns.insert(
+      name.clone(),
+      module.add_function(
+        &format!("{name}_encode"),
+        encode_ty,
+        Some(Linkage::External),
+      ),
+    );
+    decode_fns.insert(
+      name.clone(),
+      module.add_function(
+        &format!("{name}_decode"),
+        decode_ty,
+        Some(Linkage::External),
+      ),
+    );
+  }
+
+  for name in &wire_safe {
+    let layout = &classes[name];
+    let mut fields: Vec<(&String, &FieldInfo)> = layout.fields.iter().collect();
+    fields.sort_by_key(|(_, info)| info.offset);
+
+    let encode_fv = encode_fns[name];
+    builder.position_at_end(context.append_basic_block(encode_fv, "entry"));
+    let self_param = encode_fv
+      .get_nth_param(0)
+      .expect("encode always has a self param")
+      .into_pointer_value();
+    let out_param = encode_fv
+      .get_nth_param(1)
+      .expect("encode always has an out param")
+      .into_pointer_value();
+    for (fname, finfo) in &fields {
+      let field_val = load_field(context, &builder, self_param, (*finfo).clone())?;
+      let raw_ty = &layout.field_classes[*fname];
+      match finfo.kind {
+        ValKind::Str => {
+          builder
+            .build_call(
+              actor_funcs.wirebuf_push_string,
+              &[out_param.into(), field_val.into()],
+              "wireencstr",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        ValKind::Ptr => {
+          let sub_encode = encode_fns.get(raw_ty).ok_or_else(|| {
+            format!("codegen: internal — `{raw_ty}` has no generated `_encode` (not wire-safe)")
+          })?;
+          builder
+            .build_call(
+              *sub_encode,
+              &[field_val.into(), out_param.into()],
+              "wireencrec",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        ValKind::Float64 => {
+          let raw = builder
+            .build_bit_cast(field_val, i64_ty, "wireencf64raw")
+            .map_err(|e| e.to_string())?;
+          builder
+            .build_call(
+              actor_funcs.wirebuf_push_i64,
+              &[out_param.into(), raw.into()],
+              "wirencf64",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        ValKind::Bool => {
+          let ext = builder
+            .build_int_z_extend(field_val.into_int_value(), i64_ty, "wireencbool")
+            .map_err(|e| e.to_string())?;
+          builder
+            .build_call(
+              actor_funcs.wirebuf_push_i64,
+              &[out_param.into(), ext.into()],
+              "wireencboolraw",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        ValKind::Int64 | ValKind::Nil | ValKind::Symbol => {
+          builder
+            .build_call(
+              actor_funcs.wirebuf_push_i64,
+              &[out_param.into(), field_val.into()],
+              "wireenci64",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        ValKind::Void | ValKind::Tuple(_) => {
+          return Err(format!(
+            "codegen: internal — `{name}.{fname}` is not a valid wire-safe field kind"
+          ));
+        }
+      }
+    }
+    builder.build_return(None).map_err(|e| e.to_string())?;
+
+    let decode_fv = decode_fns[name];
+    builder.position_at_end(context.append_basic_block(decode_fv, "entry"));
+    let in_param = decode_fv
+      .get_nth_param(0)
+      .expect("decode always has an in param")
+      .into_pointer_value();
+    let size_val = i64_ty.const_int(layout.size, false);
+    let alloc_call = builder
+      .build_call(alloc_fn, &[size_val.into()], "wiredecalloc")
+      .map_err(|e| e.to_string())?;
+    let out_ptr = call_result(alloc_call)?.into_pointer_value();
+    for (fname, finfo) in &fields {
+      let raw_ty = &layout.field_classes[*fname];
+      let value: BasicValueEnum = match finfo.kind {
+        ValKind::Str => {
+          let call = builder
+            .build_call(
+              actor_funcs.wirebuf_read_string,
+              &[in_param.into()],
+              "wiredecstr",
+            )
+            .map_err(|e| e.to_string())?;
+          call_result(call)?
+        }
+        ValKind::Ptr => {
+          let sub_decode = decode_fns.get(raw_ty).ok_or_else(|| {
+            format!("codegen: internal — `{raw_ty}` has no generated `_decode` (not wire-safe)")
+          })?;
+          let call = builder
+            .build_call(*sub_decode, &[in_param.into()], "wiredecrec")
+            .map_err(|e| e.to_string())?;
+          call_result(call)?
+        }
+        ValKind::Float64 => {
+          let call = builder
+            .build_call(
+              actor_funcs.wirebuf_read_i64,
+              &[in_param.into()],
+              "wiredecraw",
+            )
+            .map_err(|e| e.to_string())?;
+          let raw = call_result(call)?;
+          builder
+            .build_bit_cast(raw, context.f64_type(), "wiredecf64")
+            .map_err(|e| e.to_string())?
+        }
+        ValKind::Bool => {
+          let call = builder
+            .build_call(
+              actor_funcs.wirebuf_read_i64,
+              &[in_param.into()],
+              "wiredecraw",
+            )
+            .map_err(|e| e.to_string())?;
+          let raw = call_result(call)?.into_int_value();
+          builder
+            .build_int_truncate(raw, context.bool_type(), "wiredecbool")
+            .map_err(|e| e.to_string())?
+            .into()
+        }
+        ValKind::Int64 | ValKind::Nil | ValKind::Symbol => {
+          let call = builder
+            .build_call(
+              actor_funcs.wirebuf_read_i64,
+              &[in_param.into()],
+              "wiredecraw",
+            )
+            .map_err(|e| e.to_string())?;
+          call_result(call)?
+        }
+        ValKind::Void | ValKind::Tuple(_) => {
+          return Err(format!(
+            "codegen: internal — `{name}.{fname}` is not a valid wire-safe field kind"
+          ));
+        }
+      };
+      let dst = field_ptr(context, &builder, out_ptr, finfo.offset)?;
+      builder.build_store(dst, value).map_err(|e| e.to_string())?;
+    }
+    builder
+      .build_return(Some(&out_ptr))
+      .map_err(|e| e.to_string())?;
+  }
+
+  Ok((encode_fns, decode_fns))
+}
+
+/// One `{key}_encode_args(long long *argv, EmeraldWireBuf *out)`/`{key}_
+/// decode_args(EmeraldWireBuf *in, long long *argv_out)` pair per actor
+/// method (`leaf-wire-codec`), mirroring `declare_actor_trampolines`'s
+/// own "one per actor method, whether or not cross-actor-called"
+/// precedent — `argv`'s own raw-word packing is EXACTLY `build_actor_
+/// enqueue_call`'s (a `Float64`/`Bool` argument is already a raw
+/// bitcast/zero-extended `i64` by the time it's in `argv`, so only
+/// `String`/wire-safe-`Class` params need a real pointer-conversion
+/// step here). A `Class`-typed param with no generated `_encode`/
+/// `_decode` (not wire-safe — `Array`/`Hash`/`Proc`/an actor reference)
+/// falls back to a raw-word wire copy instead of a codegen-time error:
+/// sema already guarantees no cross-actor SEND site ever supplies such
+/// an argument (`check_wire_safety`), so this exact branch is real,
+/// disclosed dead code for a method that's declared but only ever
+/// called same-actor/locally, never actually remotely dispatched.
+/// Also returns each method's `method_tag` — declaration order within
+/// its actor, the same dense-index convention `class_tags` uses —
+/// consulted both by a remote SEND's own encoded frame header and by
+/// `.register`'s own per-class method table.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn declare_actor_wire_arg_codecs<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  program: &Program,
+  actor_funcs: &ActorRuntimeFuncs<'ctx>,
+  wire_encode_fns: &HashMap<String, FunctionValue<'ctx>>,
+  wire_decode_fns: &HashMap<String, FunctionValue<'ctx>>,
+) -> Result<
+  (
+    HashMap<String, FunctionValue<'ctx>>,
+    HashMap<String, FunctionValue<'ctx>>,
+    HashMap<String, i32>,
+  ),
+  String,
+> {
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let i64_ty = context.i64_type();
+  let void_ty = context.void_type();
+  let builder = context.create_builder();
+
+  let encode_ty = void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+  let decode_ty = void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+
+  let mut encode_fns = HashMap::new();
+  let mut decode_fns = HashMap::new();
+  let mut method_tags = HashMap::new();
+
+  for item in &program.items {
+    let Item::Actor(a) = item else { continue };
+    for (tag, m) in a.methods.iter().enumerate() {
+      let key = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
+      method_tags.insert(key.clone(), tag as i32);
+      let encode_fv = module.add_function(
+        &format!("{key}_encode_args"),
+        encode_ty,
+        Some(Linkage::External),
+      );
+      let decode_fv = module.add_function(
+        &format!("{key}_decode_args"),
+        decode_ty,
+        Some(Linkage::External),
+      );
+
+      builder.position_at_end(context.append_basic_block(encode_fv, "entry"));
+      let argv_param = encode_fv
+        .get_nth_param(0)
+        .expect("encode_args always has an argv param")
+        .into_pointer_value();
+      let out_param = encode_fv
+        .get_nth_param(1)
+        .expect("encode_args always has an out param")
+        .into_pointer_value();
+      for (i, p) in m.params.iter().enumerate() {
+        let idx = i64_ty.const_int(i as u64, false);
+        let slot_ptr = unsafe {
+          builder
+            .build_in_bounds_gep(i64_ty, argv_param, &[idx], "encargvslot")
+            .map_err(|e| e.to_string())?
+        };
+        let raw = builder
+          .build_load(i64_ty, slot_ptr, "encargraw")
+          .map_err(|e| e.to_string())?
+          .into_int_value();
+        match value_kind_for_type(&p.ty) {
+          ValKind::Str => {
+            let str_ptr = builder
+              .build_int_to_ptr(raw, ptr_ty, "encargstrptr")
+              .map_err(|e| e.to_string())?;
+            builder
+              .build_call(
+                actor_funcs.wirebuf_push_string,
+                &[out_param.into(), str_ptr.into()],
+                "encargstr",
+              )
+              .map_err(|e| e.to_string())?;
+          }
+          ValKind::Ptr if wire_encode_fns.contains_key(&p.ty) => {
+            let obj_ptr = builder
+              .build_int_to_ptr(raw, ptr_ty, "encargobjptr")
+              .map_err(|e| e.to_string())?;
+            builder
+              .build_call(
+                wire_encode_fns[&p.ty],
+                &[obj_ptr.into(), out_param.into()],
+                "encargrec",
+              )
+              .map_err(|e| e.to_string())?;
+          }
+          _ => {
+            builder
+              .build_call(
+                actor_funcs.wirebuf_push_i64,
+                &[out_param.into(), raw.into()],
+                "encargi64",
+              )
+              .map_err(|e| e.to_string())?;
+          }
+        }
+      }
+      builder.build_return(None).map_err(|e| e.to_string())?;
+
+      builder.position_at_end(context.append_basic_block(decode_fv, "entry"));
+      let in_param = decode_fv
+        .get_nth_param(0)
+        .expect("decode_args always has an in param")
+        .into_pointer_value();
+      let argv_out_param = decode_fv
+        .get_nth_param(1)
+        .expect("decode_args always has an argv_out param")
+        .into_pointer_value();
+      for (i, p) in m.params.iter().enumerate() {
+        let raw = match value_kind_for_type(&p.ty) {
+          ValKind::Str => {
+            let call = builder
+              .build_call(
+                actor_funcs.wirebuf_read_string,
+                &[in_param.into()],
+                "decargstr",
+              )
+              .map_err(|e| e.to_string())?;
+            let str_ptr = call_result(call)?.into_pointer_value();
+            builder
+              .build_ptr_to_int(str_ptr, i64_ty, "decargstrraw")
+              .map_err(|e| e.to_string())?
+          }
+          ValKind::Ptr if wire_decode_fns.contains_key(&p.ty) => {
+            let call = builder
+              .build_call(wire_decode_fns[&p.ty], &[in_param.into()], "decargrec")
+              .map_err(|e| e.to_string())?;
+            let obj_ptr = call_result(call)?.into_pointer_value();
+            builder
+              .build_ptr_to_int(obj_ptr, i64_ty, "decargobjraw")
+              .map_err(|e| e.to_string())?
+          }
+          _ => {
+            let call = builder
+              .build_call(
+                actor_funcs.wirebuf_read_i64,
+                &[in_param.into()],
+                "decargi64",
+              )
+              .map_err(|e| e.to_string())?;
+            call_result(call)?.into_int_value()
+          }
+        };
+        let idx = i64_ty.const_int(i as u64, false);
+        let slot_ptr = unsafe {
+          builder
+            .build_in_bounds_gep(i64_ty, argv_out_param, &[idx], "decargvslot")
+            .map_err(|e| e.to_string())?
+        };
+        builder
+          .build_store(slot_ptr, raw)
+          .map_err(|e| e.to_string())?;
+      }
+      builder.build_return(None).map_err(|e| e.to_string())?;
+
+      encode_fns.insert(key.clone(), encode_fv);
+      decode_fns.insert(key, decode_fv);
+    }
+  }
+
+  Ok((encode_fns, decode_fns, method_tags))
+}
+
+/// One `static const EmeraldMethodEntry[]` global per actor class
+/// (`leaf-remote-dispatch-and-worked-proof`), indexed by `method_tag`
+/// (declaration order — matching `emerald_actor_register`'s own C
+/// signature, `runtime/emerald_runtime.c`'s `EmeraldMethodEntry
+/// {trampoline, decode_args}`), passed to `emerald_actor_register` at
+/// every `.register` call site for that class. Built once, alongside
+/// `actor_trampolines`/the wire-arg-codec pass, so a `.register` call
+/// site just references an already-built pointer.
+fn build_actor_method_tables<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  program: &Program,
+  actor_trampolines: &HashMap<String, FunctionValue<'ctx>>,
+  arg_decode_fns: &HashMap<String, FunctionValue<'ctx>>,
+) -> (HashMap<String, PointerValue<'ctx>>, HashMap<String, i64>) {
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let entry_ty = context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+
+  let mut tables = HashMap::new();
+  let mut counts = HashMap::new();
+  for item in &program.items {
+    let Item::Actor(a) = item else { continue };
+    let entries: Vec<_> = a
+      .methods
+      .iter()
+      .map(|m| {
+        let key = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
+        let trampoline_ptr = actor_trampolines[&key].as_global_value().as_pointer_value();
+        let decode_ptr = arg_decode_fns[&key].as_global_value().as_pointer_value();
+        entry_ty.const_named_struct(&[trampoline_ptr.into(), decode_ptr.into()])
+      })
+      .collect();
+    counts.insert(a.name.clone(), entries.len() as i64);
+    let array_ty = entry_ty.array_type(entries.len() as u32);
+    let global = module.add_global(array_ty, None, &format!("{}__methods", a.name));
+    global.set_initializer(&entry_ty.const_array(&entries));
+    global.set_constant(true);
+    tables.insert(a.name.clone(), global.as_pointer_value());
+  }
+  (tables, counts)
 }
 
 /// The header/exit blocks of the innermost enclosing loop, for `break`
@@ -3280,6 +3900,14 @@ struct Ctx<'a, 'ctx> {
   /// "one per actor method, whether or not it's ever cross-actor-
   /// called" precedent).
   supervisor_respawn_thunks: &'a HashMap<String, FunctionValue<'ctx>>,
+  /// Plan 60 (distributed, location-transparent actors) —
+  /// `leaf-wire-codec`/`leaf-remote-dispatch-and-worked-proof`: see
+  /// `declare_actor_wire_arg_codecs`/`build_actor_method_tables`'s own
+  /// doc comments.
+  actor_arg_encoders: &'a HashMap<String, FunctionValue<'ctx>>,
+  actor_method_tags: &'a HashMap<String, i32>,
+  actor_method_tables: &'a HashMap<String, PointerValue<'ctx>>,
+  actor_method_counts: &'a HashMap<String, i64>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -3747,7 +4375,22 @@ fn build_spawn_alloc<'ctx>(
     local_array_elem_types,
     ctx,
   )?;
-  Ok(self_ptr)
+  // Plan 60's Decision log (Design decision 1): from this plan on, an
+  // actor-typed Emerald VALUE is a tagged `EmeraldActorRef*`, not the
+  // bare arena pointer — `self_ptr` above is still exactly what every
+  // OTHER actor mechanism (field access inside a method body,
+  // `emerald_actor_enqueue`'s own header lookup, `emerald_actor_
+  // terminate`) expects and keeps using unmodified; only the value
+  // that flows OUT of `.spawn` into a local/field/`argv` slot changes
+  // shape, wrapped here in one extra fixed-size allocation.
+  let ref_call = builder
+    .build_call(
+      ctx.actor_funcs.ref_local,
+      &[self_ptr.into()],
+      "spawnreflocal",
+    )
+    .map_err(|e| e.to_string())?;
+  Ok(call_result(ref_call)?.into_pointer_value())
 }
 
 fn build_expr<'ctx>(
@@ -4653,6 +5296,62 @@ fn build_expr<'ctx>(
       }
       Ok((sup_ptr.into(), ValKind::Ptr))
     }
+    // Plan 60's Decision log (Design decision 1): `.spawn`'s
+    // distributed counterpart — a synchronous connect + RESOLVE
+    // handshake, raising a real, catchable `RemoteActorError` on any
+    // failure (host unreachable, connect timeout, or "not found")
+    // rather than returning a `NULL` the caller could dereference.
+    Expr::Remote {
+      class: _,
+      addr,
+      name,
+    } => {
+      let (addr_val, _) = build_expr(
+        context,
+        builder,
+        addr,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (name_val, _) = build_expr(
+        context,
+        builder,
+        name,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let name_len_call = builder
+        .build_call(ctx.string_length, &[name_val.into()], "remotenamelen")
+        .map_err(|e| e.to_string())?;
+      let name_len = call_result(name_len_call)?;
+      let ref_call = builder
+        .build_call(
+          ctx.actor_funcs.ref_remote,
+          &[addr_val.into(), name_val.into(), name_len.into()],
+          "remoteref",
+        )
+        .map_err(|e| e.to_string())?;
+      let ref_ptr = call_result(ref_call)?.into_pointer_value();
+      let is_null = builder
+        .build_is_null(ref_ptr, "remoterefisnull")
+        .map_err(|e| e.to_string())?;
+      build_raise_on_remote_send_failure(
+        context,
+        builder,
+        builder
+          .build_int_z_extend(is_null, context.i32_type(), "remoterefnullstatus")
+          .map_err(|e| e.to_string())?,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      Ok((ref_ptr.into(), ValKind::Ptr))
+    }
     Expr::MethodCall(recv, method, args) => build_method_call(
       context,
       builder,
@@ -5251,6 +5950,24 @@ fn build_method_call<'ctx>(
     let class_name = local_classes.get(recv_name).ok_or_else(|| {
       format!("codegen: cannot determine the class of `{recv_name}` for `.{method}`")
     })?;
+    // Plan 60's Decision log: `recv.register(name, port)` — scoped by
+    // the receiver's own actual class being a declared actor, mirroring
+    // sema's own identical `info.is_actor && method == "register"` gate
+    // (`infer_expr_type`). Checked before the ordinary `method_owners`
+    // lookup below, since "register" is never a real declared method.
+    if method == "register" && ctx.actor_names.contains(class_name.as_str()) {
+      return build_actor_register_call(
+        context,
+        builder,
+        recv,
+        args,
+        class_name,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      );
+    }
     // Plan 32: resolve which ancestor actually *declares* `method` —
     // only the defining class has a compiled `{Class}_{method}` symbol
     // (`d.age` on a `Dog` that never declares `age` must call
@@ -6408,20 +7125,207 @@ fn build_actor_enqueue_call<'ctx>(
   }
 
   let argc = i64_ty.const_int(args.len() as u64, false);
-  builder
+
+  // Plan 60's Decision log (Design decision 1b): every cross-actor send
+  // now compiles to this ONE uniform call, regardless of whether `key`
+  // is ever actually dispatched remotely — `emerald_actor_dispatch`
+  // itself branches on `self_val->is_remote` at runtime, reusing
+  // `emerald_actor_enqueue` byte-for-byte on the local path (AC2's own
+  // "zero added overhead beyond plan 55's own existing call shape").
+  let method_tag = *ctx
+    .actor_method_tags
+    .get(key)
+    .ok_or_else(|| format!("codegen: no method_tag assigned for cross-actor call `{key}`"))?;
+  let arg_encoder_fv = *ctx
+    .actor_arg_encoders
+    .get(key)
+    .ok_or_else(|| format!("codegen: no arg encoder compiled for cross-actor call `{key}`"))?;
+  let arg_encoder_ptr = arg_encoder_fv.as_global_value().as_pointer_value();
+  let i32_ty = context.i32_type();
+  let method_tag_val = i32_ty.const_int(method_tag as u64, true);
+  let dispatch_call = builder
     .build_call(
-      ctx.actor_funcs.enqueue,
+      ctx.actor_funcs.dispatch,
       &[
         self_val.into(),
+        method_tag_val.into(),
         trampoline_ptr.into(),
+        arg_encoder_ptr.into(),
         argv_alloca.into(),
         argc.into(),
       ],
-      "enqueuetmp",
+      "dispatchtmp",
     )
     .map_err(|e| e.to_string())?;
+  let status = call_result(dispatch_call)?.into_int_value();
+  build_raise_on_remote_send_failure(
+    context,
+    builder,
+    status,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
 
   Ok((i64_ty.const_int(0, false).into(), ValKind::Void))
+}
+
+/// `leaf-remote-dispatch-and-worked-proof`'s own failure path: `status
+/// != 0` means `emerald_actor_dispatch`'s remote branch hit a real
+/// socket error — raises a real, catchable `RemoteActorError` (via
+/// `build_raise`, the exact same codegen an ordinary `raise ClassName.
+/// new(args)` statement already uses) naming the concrete reason
+/// (`emerald_remote_last_error_message`), rather than silently
+/// continuing or aborting the process. `status == 0` (the local path,
+/// always, and a successful remote send) falls straight through with
+/// no branch overhead beyond the one `icmp`/`br` pair.
+#[allow(clippy::too_many_arguments)]
+fn build_raise_on_remote_send_failure<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  status: inkwell::values::IntValue<'ctx>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  let func = builder
+    .get_insert_block()
+    .and_then(|b| b.get_parent())
+    .ok_or_else(|| {
+      "codegen: internal — no enclosing function for a remote-send check".to_string()
+    })?;
+  let zero = context.i32_type().const_int(0, false);
+  let is_err = builder
+    .build_int_compare(IntPredicate::NE, status, zero, "remotesendfailed")
+    .map_err(|e| e.to_string())?;
+  let err_blk = context.append_basic_block(func, "remotesend.err");
+  let ok_blk = context.append_basic_block(func, "remotesend.ok");
+  builder
+    .build_conditional_branch(is_err, err_blk, ok_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(err_blk);
+  let msg_call = builder
+    .build_call(ctx.actor_funcs.remote_last_error, &[], "remotesenderrmsg")
+    .map_err(|e| e.to_string())?;
+  let msg_ptr = call_result(msg_call)?.into_pointer_value();
+  let msg_slot = builder
+    .build_alloca(
+      context.ptr_type(AddressSpace::default()),
+      "remotesenderrmsgslot",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(msg_slot, msg_ptr)
+    .map_err(|e| e.to_string())?;
+  let mut raise_vars = vars.clone();
+  raise_vars.insert(
+    "__remote_send_err_msg".to_string(),
+    (msg_slot, ValKind::Str),
+  );
+  let raise_expr = Spanned::synthetic(Expr::New(
+    "RemoteActorError".to_string(),
+    vec![Spanned::synthetic(Expr::Ident(
+      "__remote_send_err_msg".to_string(),
+    ))],
+  ));
+  build_raise(
+    context,
+    builder,
+    &raise_expr,
+    &raise_vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+
+  builder.position_at_end(ok_blk);
+  Ok(())
+}
+
+/// `recv.register(name, port)` (`leaf-actor-ref-and-addressing`) —
+/// evaluates `name`/`port`, computes `name`'s length via the same
+/// `ctx.string_length` runtime helper `.remote`'s own codegen already
+/// uses, and calls `emerald_actor_register` with `class_name`'s own
+/// already-built method-dispatch table (`build_actor_method_tables`).
+/// Always `Void` — `.register`'s only effect is the side effect of
+/// starting this process's listener (idempotent) and adding a name
+/// entry, nothing meaningful to return.
+#[allow(clippy::too_many_arguments)]
+fn build_actor_register_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  recv: &Spanned<Expr>,
+  args: &[Spanned<Expr>],
+  class_name: &str,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (ref_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let (name_val, _) = build_expr(
+    context,
+    builder,
+    &args[0],
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let (port_val, _) = build_expr(
+    context,
+    builder,
+    &args[1],
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let name_len_call = builder
+    .build_call(ctx.string_length, &[name_val.into()], "registernamelen")
+    .map_err(|e| e.to_string())?;
+  let name_len = call_result(name_len_call)?;
+  let port32 = builder
+    .build_int_truncate(
+      port_val.into_int_value(),
+      context.i32_type(),
+      "registerport32",
+    )
+    .map_err(|e| e.to_string())?;
+  let methods_ptr = *ctx
+    .actor_method_tables
+    .get(class_name)
+    .ok_or_else(|| format!("codegen: internal — no method table built for actor `{class_name}`"))?;
+  let method_count = *ctx.actor_method_counts.get(class_name).ok_or_else(|| {
+    format!("codegen: internal — no method count recorded for actor `{class_name}`")
+  })?;
+  let method_count_val = context.i64_type().const_int(method_count as u64, false);
+  builder
+    .build_call(
+      ctx.actor_funcs.register,
+      &[
+        ref_val.into(),
+        name_val.into(),
+        name_len.into(),
+        port32.into(),
+        methods_ptr.into(),
+        method_count_val.into(),
+      ],
+      "registercall",
+    )
+    .map_err(|e| e.to_string())?;
+  Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
 }
 
 /// `obj&.method(args)` (plan 43's Decision log) — reuses `build_short_
@@ -11146,6 +12050,9 @@ fn compile_to_object_impl(
   if uses_assertions {
     ensure_assertion_error_class(&mut items);
   }
+  if items.iter().any(|i| matches!(i, Item::Actor(_))) {
+    ensure_remote_actor_error_class(&mut items);
+  }
   let owned_program = Program { items };
   let program = &owned_program;
 
@@ -11661,6 +12568,34 @@ fn compile_to_object_impl(
     })
     .collect();
 
+  // Plan 60 (distributed, location-transparent actors) — `leaf-wire-
+  // codec`/`leaf-remote-dispatch-and-worked-proof`: built once, after
+  // `classes`/`actor_names`/`actor_funcs`/`actor_trampolines` are all
+  // ready, before `gen_ctx` borrows any of them.
+  let (wire_encode_fns, wire_decode_fns) = declare_wire_class_codecs(
+    &context,
+    &module,
+    &classes,
+    &actor_names,
+    &actor_funcs,
+    alloc,
+  )?;
+  let (actor_arg_encoders, actor_arg_decoders, actor_method_tags) = declare_actor_wire_arg_codecs(
+    &context,
+    &module,
+    program,
+    &actor_funcs,
+    &wire_encode_fns,
+    &wire_decode_fns,
+  )?;
+  let (actor_method_tables, actor_method_counts) = build_actor_method_tables(
+    &context,
+    &module,
+    program,
+    &actor_trampolines,
+    &actor_arg_decoders,
+  );
+
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
     classes: &classes,
@@ -11716,6 +12651,10 @@ fn compile_to_object_impl(
     actor_trampolines: &actor_trampolines,
     actor_names: &actor_names,
     supervisor_respawn_thunks: &supervisor_respawn_thunks,
+    actor_arg_encoders: &actor_arg_encoders,
+    actor_method_tags: &actor_method_tags,
+    actor_method_tables: &actor_method_tables,
+    actor_method_counts: &actor_method_counts,
   };
 
   for item in &program.items {
@@ -12211,6 +13150,70 @@ fn ensure_assertion_error_class(items: &mut Vec<Item>) {
     .any(|i| matches!(i, Item::Class(c) if c.name == "AssertionError"));
   if !already_present {
     items.insert(0, assertion_error_class_item());
+  }
+}
+
+/// Plan 60's Decision log (Design decision 5): a plain class with a
+/// `message: String` field — the identical shape/mechanism `Assertion
+/// Error` above already established, reusing plan 11/38's real
+/// exception machinery exactly, not a new mechanism. Raised (via
+/// `build_raise_remote_actor_error`) at every `.remote(...)` connect
+/// failure and every failed cross-actor SEND, naming the concrete
+/// socket-layer reason (`emerald_remote_last_error_message`).
+fn remote_actor_error_class_item() -> Item {
+  Item::Class(ClassDef {
+    name: "RemoteActorError".to_string(),
+    superclass: None,
+    implements: None,
+    fields: vec![Param {
+      name: "message".to_string(),
+      ty: "String".to_string(),
+      default: None,
+    }],
+    methods: vec![
+      AstFunction {
+        name: "initialize".to_string(),
+        params: vec![Param {
+          name: "message".to_string(),
+          ty: "String".to_string(),
+          default: None,
+        }],
+        return_type: "Void".to_string(),
+        body: vec![syn(Stmt::SetField {
+          name: "message".to_string(),
+          value: syn(Expr::Ident("message".to_string())),
+        })],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+      },
+      AstFunction {
+        name: "message".to_string(),
+        params: Vec::new(),
+        return_type: "String".to_string(),
+        body: vec![syn(Stmt::Expr(syn(Expr::InstanceVar(
+          "message".to_string(),
+        ))))],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+      },
+    ],
+    type_params: Vec::new(),
+  })
+}
+
+/// Gated on the program actually declaring at least one `actor` (the
+/// only source of a `.remote(...)`/cross-actor-send site this class
+/// could ever be raised from) — mirrors `ensure_assertion_error_class`'s
+/// own `uses_assertions` gate exactly, so a program with no actors at
+/// all pays zero cost for this synthesized class.
+fn ensure_remote_actor_error_class(items: &mut Vec<Item>) {
+  let already_present = items
+    .iter()
+    .any(|i| matches!(i, Item::Class(c) if c.name == "RemoteActorError"));
+  if !already_present {
+    items.insert(0, remote_actor_error_class_item());
   }
 }
 
@@ -14260,6 +15263,14 @@ mod tests {
     // AC3: `@peer.hit` inspected via the emitted LLVM IR, not merely
     // the program's eventual output (the test above already covers
     // that black-box angle).
+    //
+    // Plan 60's Decision log (Design decision 1b): every cross-actor
+    // call site now compiles to `emerald_actor_dispatch`, not `emerald_
+    // actor_enqueue` directly — `dispatch` itself calls `enqueue`
+    // internally, byte-for-byte, on the local path (from inside C, not
+    // generated IR). Updated to match this real, intentional behavior
+    // change; the underlying local-mailbox mechanism this AC actually
+    // cares about is unchanged.
     let program = emerald_parser::parse(PINGPONG_EXAMPLE).expect("should parse");
     let dir = fresh_temp_dir("pingpong_enqueue_ir");
     let obj_path = dir.join("out.o");
@@ -14267,8 +15278,8 @@ mod tests {
       compile_to_object_ir_text_for_test(&program, &obj_path).expect("should compile to IR text");
     std::fs::remove_dir_all(&dir).ok();
     assert!(
-      ir.contains("call void @emerald_actor_enqueue("),
-      "`@peer.hit` must compile to a real emerald_actor_enqueue call:\n{ir}"
+      ir.contains("call i32 @emerald_actor_dispatch("),
+      "`@peer.hit` must compile to a real emerald_actor_dispatch call:\n{ir}"
     );
   }
 
@@ -14707,5 +15718,29 @@ int main(void) {
       "a chained `.select(...).map(...)` call must be rejected, not silently miscompiled",
     );
     assert!(!errs.is_empty());
+  }
+
+  // Plan 60 (distributed, location-transparent actors).
+  //
+  // The genuine two-process, real-socket worked proof (`Counter`/
+  // `host.em`/`client.em`) lives in `crates/emerald-cli/tests/
+  // distributed_actors.rs` — it needs two real, separately launched OS
+  // processes, which this crate's own single-process `compile_link_run`
+  // test harness can't provide. The tests below cover what a single
+  // process genuinely can: `.remote(...)` against an unreachable
+  // address raising a real, catchable `RemoteActorError` (AC4,
+  // `leaf-actor-ref-and-addressing`), and regression proof that every
+  // pre-existing plan 54/55/56/57 worked example above still compiles/
+  // links/runs identically now that an actor's own value is a tagged
+  // `EmeraldActorRef*` (Design decision 1), not a bare arena pointer.
+
+  #[test]
+  fn remote_against_a_closed_port_raises_a_real_catchable_remote_actor_error() {
+    // The plan's own literal AC4 address — a real, unassigned/reserved
+    // low port essentially never listening on any real machine, so
+    // `connect()` fails fast with a real `ECONNREFUSED` (no long
+    // `EMERALD_REMOTE_TIMEOUT_MS` wait needed for this specific gate).
+    let src = "actor Counter\n  count: Int64\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nbegin\n  handle: Counter = Counter.remote(\"127.0.0.1:1\", \"counter1\")\n  puts \"should not reach here\"\nrescue RemoteActorError => e\n  puts \"caught\"\nend\n";
+    assert_eq!(compile_link_run(src), "caught\n");
   }
 }

@@ -20,6 +20,13 @@
 /* Plan 55 (scheduler and message passing). */
 #include <pthread.h>
 #include <unistd.h>
+/* Plan 60 (distributed, location-transparent actors) — verified this
+ * session: plan 45's real file has no socket primitive of any kind. */
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 void emerald_print_i64(long long n) {
   printf("%lld\n", n);
@@ -648,6 +655,30 @@ typedef struct EmeraldActorHeader {
   struct EmeraldActorHeader *next_runnable;
 } EmeraldActorHeader;
 
+/* Plan 60 (distributed, location-transparent actors) — Design decision
+ * 1: from that plan on, an actor-typed Emerald value (`.spawn`'s own
+ * return, `.remote(...)`'s, and a respawned supervised actor's) is a
+ * pointer to one of these, not a bare arena pointer. `local_arena` is
+ * exactly the SAME `self` pointer (arena_base + sizeof(void*)) every
+ * function above already dereferences via `self - sizeof(void*)` — so
+ * `emerald_actor_enqueue`/`emerald_actor_terminate`/`emerald_actor_
+ * set_region`/every already-compiled trampoline stay completely
+ * unmodified; only the value codegen carries between a `.spawn`/
+ * `.remote` call and the next dispatch site changes shape. Declared
+ * here (not down in plan 60's own section further below) because
+ * `emerald_supervisor_notify_terminated`, defined before that section,
+ * also needs to unwrap one. `send_mutex` serializes concurrent sends
+ * from multiple Emerald threads sharing one remote ref over its single
+ * socket (Decision log: one socket per ref, no multiplexing). */
+typedef struct EmeraldActorRef {
+  uint8_t is_remote;
+  void *local_arena;
+  uint32_t node_ipv4;
+  uint16_t node_port;
+  int32_t sockfd;
+  pthread_mutex_t send_mutex;
+} EmeraldActorRef;
+
 /* Called once per `.spawn`, on the raw allocation, before `initialize`
  * runs — mallocs the real header, stores this instance's field-region
  * pointer on it, and writes the header pointer into the arena's own
@@ -880,11 +911,33 @@ void emerald_worker_pool_start(void) {
  * send `main` will ever issue) has already run — see this file's own
  * `EmeraldActorHeader` doc comment for why a send racing this call is
  * not a scenario generated code can produce. */
+/* Plan 60 — forward declarations only; both are actually defined much
+ * further down, alongside the rest of this plan's own new section, but
+ * `emerald_worker_pool_drain_and_join`'s own extension (right below)
+ * needs them declared before that point in the file. */
+static int emerald_network_active;
+static pthread_t emerald_accept_thread;
+
 void emerald_worker_pool_drain_and_join(void) {
   pthread_mutex_lock(&emerald_runnable_mutex);
   while (emerald_outstanding_messages > 0) {
     pthread_cond_wait(&emerald_runnable_cond, &emerald_runnable_mutex);
   }
+  pthread_mutex_unlock(&emerald_runnable_mutex);
+
+  /* Plan 60's own extension: a process that has ever `.register`ed is
+   * now a server whose remaining work arrives over the network, not
+   * its own local mailboxes — it blocks here instead of shutting the
+   * worker pool down and returning, exactly as its own doc comment
+   * above (`emerald_network_active`) states. `emerald_accept_main`
+   * itself never returns (an infinite `accept()` loop), so joining it
+   * is a real, indefinite block, not a busy-wait. */
+  if (emerald_network_active) {
+    pthread_join(emerald_accept_thread, NULL);
+    return;
+  }
+
+  pthread_mutex_lock(&emerald_runnable_mutex);
   emerald_pool_shutdown = 1;
   pthread_cond_broadcast(&emerald_runnable_cond);
   pthread_mutex_unlock(&emerald_runnable_mutex);
@@ -994,8 +1047,14 @@ long long emerald_supervisor_register_child(void *sup_ptr, const char *name,
   child->argc = argc;
   child->current_self = child_self;
 
+  // Plan 60's Decision log: `child_self` is `.spawn`'s own NEW
+  // `EmeraldActorRef*` value (Design decision 1) — `current_self`
+  // stores that ref unchanged (it flows back out via `emerald_
+  // supervisor_child`), but the header lookup below still needs the
+  // real arena pointer underneath it.
+  void *child_arena = ((EmeraldActorRef *) child_self)->local_arena;
   EmeraldActorHeader *header =
-      *(EmeraldActorHeader **) ((char *) child_self - sizeof(void *));
+      *(EmeraldActorHeader **) ((char *) child_arena - sizeof(void *));
   pthread_mutex_lock(&header->mailbox_mutex);
   header->supervisor = sup_ptr;
   header->child_slot = slot;
@@ -1016,13 +1075,21 @@ void emerald_supervisor_notify_terminated(void *sup_ptr, long long slot) {
   EmeraldSupervisor *sup = (EmeraldSupervisor *) sup_ptr;
   pthread_mutex_lock(&sup->mutex);
   EmeraldSupervisedChild *child = &sup->children[slot];
+  /* Plan 60's Decision log: `respawn` (codegen's own per-actor thunk)
+   * now returns a real `EmeraldActorRef*` (Design decision 1), not a
+   * bare arena pointer — `current_self` stores that ref (it flows back
+   * out to Emerald source via `emerald_supervisor_child` unchanged),
+   * but every lookup HERE still needs the real arena pointer
+   * underneath it, exactly like `emerald_actor_dispatch`'s own
+   * `ref->local_arena` unwrap. */
   void *new_self = child->respawn(child->args);
   child->current_self = new_self;
+  void *new_arena = ((EmeraldActorRef *) new_self)->local_arena;
   printf("restarting %s\n", child->class_name);
   pthread_mutex_unlock(&sup->mutex);
 
   EmeraldActorHeader *header =
-      *(EmeraldActorHeader **) ((char *) new_self - sizeof(void *));
+      *(EmeraldActorHeader **) ((char *) new_arena - sizeof(void *));
   pthread_mutex_lock(&header->mailbox_mutex);
   header->supervisor = sup_ptr;
   header->child_slot = slot;
@@ -1106,4 +1173,565 @@ void emerald_actor_terminate(void *self) {
   if (supervisor != NULL) {
     emerald_supervisor_notify_terminated(supervisor, slot);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Plan 60 — distributed, location-transparent actors.                */
+/* ------------------------------------------------------------------ */
+
+void *emerald_actor_ref_local(void *self) {
+  EmeraldActorRef *ref = malloc(sizeof(EmeraldActorRef));
+  ref->is_remote = 0;
+  ref->local_arena = self;
+  ref->node_ipv4 = 0;
+  ref->node_port = 0;
+  ref->sockfd = -1;
+  return ref;
+}
+
+/* A plain grow-on-demand byte buffer — the wire codec's own encode
+ * target/decode source (`leaf-wire-codec`), and the payload of every
+ * `SEND`/`RESOLVE` frame this section builds. */
+typedef struct EmeraldWireBuf {
+  unsigned char *data;
+  size_t len;
+  size_t cap;
+  /* Decode-side read cursor — `data`/`len`/`cap` describe the whole
+   * buffer; `pos` is how far a `_read_*` call has consumed so far. */
+  size_t pos;
+} EmeraldWireBuf;
+
+static void emerald_wirebuf_init(EmeraldWireBuf *buf) {
+  buf->data = NULL;
+  buf->len = 0;
+  buf->cap = 0;
+  buf->pos = 0;
+}
+
+static void emerald_wirebuf_free(EmeraldWireBuf *buf) {
+  free(buf->data);
+  buf->data = NULL;
+  buf->len = 0;
+  buf->cap = 0;
+  buf->pos = 0;
+}
+
+static void emerald_wirebuf_reserve(EmeraldWireBuf *buf, size_t extra) {
+  if (buf->len + extra <= buf->cap) {
+    return;
+  }
+  size_t new_cap = buf->cap == 0 ? 64 : buf->cap * 2;
+  while (new_cap < buf->len + extra) {
+    new_cap *= 2;
+  }
+  buf->data = realloc(buf->data, new_cap);
+  buf->cap = new_cap;
+}
+
+static void emerald_wirebuf_push_bytes(EmeraldWireBuf *buf, const void *src, size_t n) {
+  emerald_wirebuf_reserve(buf, n);
+  memcpy(buf->data + buf->len, src, n);
+  buf->len += n;
+}
+
+/* Plan 08/32's own fixed 8-byte-per-field convention — every scalar
+ * kind (`Int64`/`Float64`/`Boolean`/`Symbol`) is already carried in one
+ * raw 8-byte `argv`/field word on this side, so the wire copy is a bare
+ * `memcpy` of that word, no per-kind branching needed at this layer. */
+void emerald_wirebuf_push_i64(EmeraldWireBuf *buf, long long v) {
+  emerald_wirebuf_push_bytes(buf, &v, sizeof(v));
+}
+
+/* Length-prefixed (a `u32` byte count, then the raw bytes, no NUL) —
+ * `String`'s own `ValKind::Str` representation is a NUL-terminated
+ * `char*`, but the wire format carries an explicit length so a decode
+ * never has to trust the sender's NUL placement. */
+void emerald_wirebuf_push_string(EmeraldWireBuf *buf, const char *s) {
+  uint32_t n = (uint32_t) strlen(s);
+  emerald_wirebuf_push_bytes(buf, &n, sizeof(n));
+  emerald_wirebuf_push_bytes(buf, s, n);
+}
+
+static int emerald_wirebuf_read_bytes(EmeraldWireBuf *buf, void *dst, size_t n) {
+  if (buf->pos + n > buf->len) {
+    return 0;
+  }
+  memcpy(dst, buf->data + buf->pos, n);
+  buf->pos += n;
+  return 1;
+}
+
+long long emerald_wirebuf_read_i64(EmeraldWireBuf *buf) {
+  long long v = 0;
+  emerald_wirebuf_read_bytes(buf, &v, sizeof(v));
+  return v;
+}
+
+/* Allocates the decoded string via the same plain `emerald_alloc`
+ * every other `String` value already uses (Design decision 2b — a
+ * decoded remote payload has no sender-side scope to be bound to, so
+ * it leaks exactly as every other `emerald_alloc`'d value already does
+ * today, not a new gap this plan introduces). */
+char *emerald_wirebuf_read_string(EmeraldWireBuf *buf) {
+  uint32_t n = 0;
+  if (!emerald_wirebuf_read_bytes(buf, &n, sizeof(n))) {
+    return emerald_alloc(1);
+  }
+  char *out = emerald_alloc((long long) n + 1);
+  if (n > 0) {
+    emerald_wirebuf_read_bytes(buf, out, n);
+  }
+  out[n] = '\0';
+  return out;
+}
+
+/* ---- leaf-tcp-transport ---- */
+
+/* One `int` per call, real, disclosed default: 5000ms. Overridable via
+ * `EMERALD_REMOTE_TIMEOUT_MS` (mirrors plan 55's own `EMERALD_WORKERS`
+ * environment-variable convention), read once per connect/register
+ * call — cheap enough (`getenv` + `atol`) not to need caching. */
+static int emerald_remote_timeout_ms(void) {
+  const char *env = getenv("EMERALD_REMOTE_TIMEOUT_MS");
+  if (env != NULL) {
+    long v = atol(env);
+    if (v > 0) {
+      return (int) v;
+    }
+  }
+  return 5000;
+}
+
+static void emerald_set_socket_timeouts(int fd, int timeout_ms) {
+  struct timeval tv;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+/* Thread-local, mirroring `errno`'s own convention — set by any
+ * transport call that can fail, read by codegen's own generated
+ * `RemoteActorError` raise site (`leaf-remote-dispatch-and-worked-
+ * proof`) immediately after the failing call returns. */
+static _Thread_local char emerald_remote_last_error[256];
+
+static void emerald_set_remote_error(const char *msg) {
+  strncpy(emerald_remote_last_error, msg, sizeof(emerald_remote_last_error) - 1);
+  emerald_remote_last_error[sizeof(emerald_remote_last_error) - 1] = '\0';
+}
+
+const char *emerald_remote_last_error_message(void) {
+  return emerald_remote_last_error;
+}
+
+/* `bind`/`listen` with `SO_REUSEADDR` — a plain blocking listener, one
+ * per process (Design decision: v1 supports exactly one `.register`ed
+ * port per process, matching this plan's own single-server worked
+ * example; a second `.register` call with a different port is a real,
+ * disclosed no-op, stated explicitly at its own call site below). */
+int emerald_tcp_listen(uint16_t port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    emerald_set_remote_error("emerald_tcp_listen: socket() failed");
+    return -1;
+  }
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port = htons(port);
+  if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+    emerald_set_remote_error("emerald_tcp_listen: bind() failed");
+    close(fd);
+    return -1;
+  }
+  if (listen(fd, 16) != 0) {
+    emerald_set_remote_error("emerald_tcp_listen: listen() failed");
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+/* `connect()` with `SO_SNDTIMEO`/`SO_RCVTIMEO` set BEFORE connecting —
+ * on most platforms `connect()` itself doesn't honor `SO_SNDTIMEO` for
+ * the initial handshake against a black-holed address, a real,
+ * disclosed gap (a `poll`-based non-blocking connect would close it,
+ * genuinely larger scope this plan declines); a refused (as opposed to
+ * black-holed) port still fails immediately via `ECONNREFUSED`,
+ * exactly what this plan's own worked example's failure proof (AC4,
+ * `leaf-actor-ref-and-addressing`) exercises. */
+int emerald_tcp_connect(uint32_t ip_network_order, uint16_t port, int timeout_ms) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    emerald_set_remote_error("emerald_tcp_connect: socket() failed");
+    return -1;
+  }
+  emerald_set_socket_timeouts(fd, timeout_ms);
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = ip_network_order;
+  addr.sin_port = htons(port);
+  if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+    emerald_set_remote_error("emerald_tcp_connect: connect() failed");
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+/* Parses `"127.0.0.1:9000"` into network-byte-order IPv4 + host-order
+ * port. Returns 0 on success. No DNS resolution (Design decision 4 —
+ * a literal dotted-quad only, matching this plan's own worked example
+ * and its explicit "no cluster membership" scope). */
+int emerald_parse_host_port(const char *addr, uint32_t *ip_out, uint16_t *port_out) {
+  const char *colon = strchr(addr, ':');
+  if (colon == NULL) {
+    return -1;
+  }
+  char host[64];
+  size_t host_len = (size_t) (colon - addr);
+  if (host_len >= sizeof(host)) {
+    return -1;
+  }
+  memcpy(host, addr, host_len);
+  host[host_len] = '\0';
+  struct in_addr in;
+  if (inet_pton(AF_INET, host, &in) != 1) {
+    return -1;
+  }
+  *ip_out = in.s_addr;
+  *port_out = (uint16_t) atoi(colon + 1);
+  return 0;
+}
+
+/* Length-prefixed frame I/O — TCP is a byte stream, not a message
+ * stream, so every send/receive here explicitly frames with a leading
+ * `u32` byte count (network byte order) rather than assuming one
+ * `write()`/`read()` call lines up with one logical message. Loops
+ * until the full length is written/read or a real error/EOF occurs. */
+int emerald_tcp_send_frame(int fd, const void *data, uint32_t len) {
+  uint32_t len_be = htonl(len);
+  const unsigned char *hdr = (const unsigned char *) &len_be;
+  size_t hdr_sent = 0;
+  while (hdr_sent < sizeof(len_be)) {
+    ssize_t n = send(fd, hdr + hdr_sent, sizeof(len_be) - hdr_sent, 0);
+    if (n <= 0) {
+      emerald_set_remote_error("emerald_tcp_send_frame: failed writing length header");
+      return -1;
+    }
+    hdr_sent += (size_t) n;
+  }
+  const unsigned char *bytes = (const unsigned char *) data;
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(fd, bytes + sent, len - sent, 0);
+    if (n <= 0) {
+      emerald_set_remote_error("emerald_tcp_send_frame: failed writing payload");
+      return -1;
+    }
+    sent += (size_t) n;
+  }
+  return 0;
+}
+
+/* Reads one full frame into a freshly `emerald_wirebuf_init`'d `out`
+ * (caller owns freeing it via `emerald_wirebuf_free`). Returns 0 on
+ * success, -1 on any read error/EOF/timeout. */
+int emerald_tcp_recv_frame(int fd, EmeraldWireBuf *out) {
+  uint32_t len_be = 0;
+  unsigned char *hdr = (unsigned char *) &len_be;
+  size_t hdr_got = 0;
+  while (hdr_got < sizeof(len_be)) {
+    ssize_t n = recv(fd, hdr + hdr_got, sizeof(len_be) - hdr_got, 0);
+    if (n <= 0) {
+      emerald_set_remote_error("emerald_tcp_recv_frame: failed reading length header");
+      return -1;
+    }
+    hdr_got += (size_t) n;
+  }
+  uint32_t len = ntohl(len_be);
+  emerald_wirebuf_init(out);
+  emerald_wirebuf_reserve(out, len);
+  size_t got = 0;
+  while (got < len) {
+    ssize_t n = recv(fd, out->data + got, len - got, 0);
+    if (n <= 0) {
+      emerald_set_remote_error("emerald_tcp_recv_frame: failed reading payload");
+      emerald_wirebuf_free(out);
+      return -1;
+    }
+    got += (size_t) n;
+  }
+  out->len = len;
+  return 0;
+}
+
+/* One trampoline + decoder per remotely-reachable actor method,
+ * indexed by `method_tag` (declaration order — the same dense-index
+ * convention `class_tags`/`EnumLayout::variant_tags` already use).
+ * Built and passed to `emerald_actor_register` by codegen, once per
+ * actor class, mirroring the per-method trampoline table plan 55
+ * already generates. */
+typedef struct EmeraldMethodEntry {
+  void (*trampoline)(void *self, long long *argv);
+  void (*decode_args)(EmeraldWireBuf *in, long long *argv_out);
+} EmeraldMethodEntry;
+
+/* One process-local `name -> registered actor` record — a plain,
+ * mutex-guarded array (v1 scope: a handful of `.register`ed actors per
+ * process, linear scan is fine). */
+typedef struct EmeraldRegisteredActor {
+  char *name;
+  void *self;
+  EmeraldMethodEntry *methods;
+  long long method_count;
+} EmeraldRegisteredActor;
+
+#define EMERALD_MAX_REGISTERED_ACTORS 64
+
+static pthread_mutex_t emerald_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static EmeraldRegisteredActor emerald_registry[EMERALD_MAX_REGISTERED_ACTORS];
+static int emerald_registry_count = 0;
+
+static int emerald_listener_fd = -1;
+static int emerald_listener_started = 0;
+/* `emerald_network_active`/`emerald_accept_thread` themselves are
+ * forward-declared above, next to `emerald_worker_pool_drain_and_
+ * join`'s own extension — real, tentative-definition file-scope
+ * declarations; no separate definition needed here. */
+
+/* One SEND frame's own payload shape: `[method_tag:i32][argc:i32]
+ * [encoded argv...]` — `RESOLVE`'s own shape (name-length-prefixed
+ * only) is simple enough it's inlined directly at its two call sites
+ * (`emerald_actor_register`'s reader thread, `emerald_actor_ref_
+ * remote`) rather than named constants here. */
+typedef struct EmeraldReaderArgs {
+  int fd;
+} EmeraldReaderArgs;
+
+static void *emerald_reader_main(void *arg) {
+  int fd = ((EmeraldReaderArgs *) arg)->fd;
+  free(arg);
+
+  EmeraldWireBuf resolve_buf;
+  if (emerald_tcp_recv_frame(fd, &resolve_buf) != 0) {
+    close(fd);
+    return NULL;
+  }
+  char *name = emerald_wirebuf_read_string(&resolve_buf);
+  emerald_wirebuf_free(&resolve_buf);
+
+  pthread_mutex_lock(&emerald_registry_mutex);
+  EmeraldRegisteredActor *found = NULL;
+  for (int i = 0; i < emerald_registry_count; i++) {
+    if (strcmp(emerald_registry[i].name, name) == 0) {
+      found = &emerald_registry[i];
+      break;
+    }
+  }
+  pthread_mutex_unlock(&emerald_registry_mutex);
+
+  unsigned char ok = found != NULL ? 1 : 0;
+  emerald_tcp_send_frame(fd, &ok, 1);
+  if (found == NULL) {
+    close(fd);
+    return NULL;
+  }
+
+  /* This connection is now bound to `found` for its whole lifetime —
+   * one socket, one remote ref, one target actor (Design decision:
+   * "one socket per `EmeraldActorRef`" — no per-frame actor-id
+   * multiplexing needed as a result). */
+  for (;;) {
+    EmeraldWireBuf frame;
+    if (emerald_tcp_recv_frame(fd, &frame) != 0) {
+      break;
+    }
+    long long method_tag = 0;
+    long long argc = 0;
+    int32_t method_tag32 = 0;
+    int32_t argc32 = 0;
+    if (frame.len < sizeof(method_tag32) + sizeof(argc32)) {
+      emerald_wirebuf_free(&frame);
+      break;
+    }
+    memcpy(&method_tag32, frame.data, sizeof(method_tag32));
+    memcpy(&argc32, frame.data + sizeof(method_tag32), sizeof(argc32));
+    frame.pos = sizeof(method_tag32) + sizeof(argc32);
+    method_tag = method_tag32;
+    argc = argc32;
+    if (method_tag < 0 || method_tag >= found->method_count) {
+      emerald_wirebuf_free(&frame);
+      continue;
+    }
+    long long argv[EMERALD_MESSAGE_ARGV_MAX];
+    memset(argv, 0, sizeof(argv));
+    EmeraldMethodEntry *entry = &found->methods[method_tag];
+    entry->decode_args(&frame, argv);
+    emerald_wirebuf_free(&frame);
+    /* Design decision 3's own required concrete reuse — the receiving
+     * process's real local mailbox mechanism, unchanged. */
+    emerald_actor_enqueue(found->self, entry->trampoline, argv, argc);
+  }
+  close(fd);
+  return NULL;
+}
+
+static void *emerald_accept_main(void *arg) {
+  (void) arg;
+  for (;;) {
+    int client_fd = accept(emerald_listener_fd, NULL, NULL);
+    if (client_fd < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    emerald_set_socket_timeouts(client_fd, emerald_remote_timeout_ms());
+    EmeraldReaderArgs *reader_args = malloc(sizeof(EmeraldReaderArgs));
+    reader_args->fd = client_fd;
+    pthread_t reader;
+    pthread_create(&reader, NULL, emerald_reader_main, reader_args);
+    pthread_detach(reader);
+  }
+  return NULL;
+}
+
+/* `.register("name", port)`'s own codegen call site (`leaf-actor-ref-
+ * and-addressing`). Idempotent: the first call in a process starts the
+ * one listener/accept-thread this v1 scope supports (Design decision,
+ * stated at `emerald_tcp_listen`'s own doc comment); every call
+ * (first or not) inserts its own `(name, self, methods)` into the
+ * process-local registry, so a process CAN register more than one
+ * actor by name, just not on more than one port. */
+void emerald_actor_register(void *ref, const char *name, long long name_len, int port,
+                             void *methods, long long method_count) {
+  EmeraldActorRef *r = (EmeraldActorRef *) ref;
+
+  /* A `.register`ed process is now a server the OWNING test/orchestrator
+   * kills externally while still running (Design decision 5 — no
+   * remote-shutdown protocol exists) — its stdout is very likely a pipe,
+   * not a TTY, which glibc fully block-buffers by default. Unbuffered
+   * here (once, the first time this process ever registers) so a
+   * `puts` a message handler emits is actually visible in that pipe
+   * before an external kill, instead of sitting lost in a libc buffer
+   * that only flushes on a normal, un-signaled exit. Scoped to exactly
+   * the processes that need it — an ordinary, non-`.register`ing
+   * Emerald program's stdout buffering is completely unchanged. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+
+  pthread_mutex_lock(&emerald_registry_mutex);
+  if (emerald_registry_count < EMERALD_MAX_REGISTERED_ACTORS) {
+    char *name_copy = malloc((size_t) name_len + 1);
+    memcpy(name_copy, name, (size_t) name_len);
+    name_copy[name_len] = '\0';
+    emerald_registry[emerald_registry_count].name = name_copy;
+    emerald_registry[emerald_registry_count].self = r->local_arena;
+    emerald_registry[emerald_registry_count].methods = (EmeraldMethodEntry *) methods;
+    emerald_registry[emerald_registry_count].method_count = method_count;
+    emerald_registry_count++;
+  }
+  emerald_network_active = 1;
+  pthread_mutex_unlock(&emerald_registry_mutex);
+
+  if (!emerald_listener_started) {
+    emerald_listener_fd = emerald_tcp_listen((uint16_t) port);
+    if (emerald_listener_fd >= 0) {
+      pthread_create(&emerald_accept_thread, NULL, emerald_accept_main, NULL);
+      emerald_listener_started = 1;
+    }
+  }
+}
+
+/* `ClassName.remote(addr, name)`'s own codegen call site — a
+ * synchronous connect + RESOLVE handshake. Returns a real
+ * `EmeraldActorRef*` on success; `NULL` on any failure (unreachable
+ * host, connect timeout, or a RESOLVE that comes back "not found") —
+ * codegen checks for `NULL` and raises `RemoteActorError` itself (see
+ * `leaf-remote-dispatch-and-worked-proof`), reading the concrete
+ * reason via `emerald_remote_last_error_message`. */
+void *emerald_actor_ref_remote(const char *addr, const char *name, long long name_len) {
+  uint32_t ip = 0;
+  uint16_t port = 0;
+  if (emerald_parse_host_port(addr, &ip, &port) != 0) {
+    emerald_set_remote_error("emerald_actor_ref_remote: malformed \"host:port\" address");
+    return NULL;
+  }
+  int timeout_ms = emerald_remote_timeout_ms();
+  int fd = emerald_tcp_connect(ip, port, timeout_ms);
+  if (fd < 0) {
+    return NULL; /* emerald_tcp_connect already set the error message. */
+  }
+
+  EmeraldWireBuf out;
+  emerald_wirebuf_init(&out);
+  uint32_t name_len32 = (uint32_t) name_len;
+  emerald_wirebuf_push_bytes(&out, &name_len32, sizeof(name_len32));
+  emerald_wirebuf_push_bytes(&out, name, (size_t) name_len);
+  int send_rc = emerald_tcp_send_frame(fd, out.data, (uint32_t) out.len);
+  emerald_wirebuf_free(&out);
+  if (send_rc != 0) {
+    close(fd);
+    return NULL;
+  }
+
+  EmeraldWireBuf resp;
+  if (emerald_tcp_recv_frame(fd, &resp) != 0) {
+    close(fd);
+    return NULL;
+  }
+  int ok = resp.len >= 1 && resp.data[0] == 1;
+  emerald_wirebuf_free(&resp);
+  if (!ok) {
+    emerald_set_remote_error("emerald_actor_ref_remote: no actor registered under that name");
+    close(fd);
+    return NULL;
+  }
+
+  EmeraldActorRef *ref = malloc(sizeof(EmeraldActorRef));
+  ref->is_remote = 1;
+  ref->local_arena = NULL;
+  ref->node_ipv4 = ip;
+  ref->node_port = port;
+  ref->sockfd = fd;
+  pthread_mutex_init(&ref->send_mutex, NULL);
+  return ref;
+}
+
+/* `leaf-remote-dispatch-and-worked-proof`'s own single, uniform call
+ * site every cross-actor send now compiles to — the concrete mechanism
+ * satisfying "ordinary call-site code doesn't need to know which kind
+ * it has" (Design decision 1b). `false` on `ref->is_remote` reuses
+ * `emerald_actor_enqueue` byte-for-byte, plan 55's own exact local
+ * mailbox call, zero new work. `true` builds a wire frame via
+ * `arg_encoder` and sends it; returns 0 on success, -1 on any socket
+ * error (codegen checks this and raises `RemoteActorError` itself). */
+int emerald_actor_dispatch(void *ref_ptr, int32_t method_tag,
+                            void (*trampoline)(void *, long long *),
+                            void (*arg_encoder)(long long *, EmeraldWireBuf *),
+                            long long *argv, long long argc) {
+  EmeraldActorRef *ref = (EmeraldActorRef *) ref_ptr;
+  if (!ref->is_remote) {
+    emerald_actor_enqueue(ref->local_arena, trampoline, argv, argc);
+    return 0;
+  }
+
+  EmeraldWireBuf payload;
+  emerald_wirebuf_init(&payload);
+  int32_t method_tag_le = method_tag;
+  int32_t argc32 = (int32_t) argc;
+  emerald_wirebuf_push_bytes(&payload, &method_tag_le, sizeof(method_tag_le));
+  emerald_wirebuf_push_bytes(&payload, &argc32, sizeof(argc32));
+  arg_encoder(argv, &payload);
+
+  pthread_mutex_lock(&ref->send_mutex);
+  int rc = emerald_tcp_send_frame(ref->sockfd, payload.data, (uint32_t) payload.len);
+  pthread_mutex_unlock(&ref->send_mutex);
+  emerald_wirebuf_free(&payload);
+  return rc;
 }

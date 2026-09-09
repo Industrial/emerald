@@ -277,6 +277,18 @@ pub enum Expr {
   /// the same "grammar stays general, sema narrows" discipline plan
   /// 31 already established for its own restricted-shape leaves.
   Supervise(Vec<Spanned<Stmt>>),
+  /// `ActorName.remote(addr, name)` (plan 60's Decision log) —
+  /// `.spawn`'s distributed counterpart: connects to `addr` (a
+  /// `"host:port"` `String`) and resolves `name`, raising a real,
+  /// catchable `RemoteActorError` on any failure rather than returning
+  /// a null the caller could dereference. The returned value is usable
+  /// at every call site `.spawn`'s own already is (Design decision 1 —
+  /// both are the identical tagged `EmeraldActorRef*` shape).
+  Remote {
+    class: String,
+    addr: Box<Spanned<Expr>>,
+    name: Box<Spanned<Expr>>,
+  },
 }
 
 /// One statement in a block (a function body or the program's top level).
