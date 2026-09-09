@@ -25,10 +25,27 @@ void emerald_print_f64(double n) {
   printf("%g\n", n);
 }
 
+/* Plan 51 (scope-based arena allocation) — a process-wide, single-
+ * threaded (matches every other piece of shared state in this file —
+ * no ownership/concurrency until plan 54's actor model) byte-
+ * outstanding counter. Incremented by every `malloc`/`calloc` this
+ * runtime performs (`emerald_alloc`/`emerald_alloc_zeroed` below, and
+ * a region's own chunk growth further down); decremented only by
+ * `emerald_region_destroy`'s frees — `emerald_alloc`'s own bytes never
+ * come back down, since it has no corresponding free. Exists purely so
+ * a test harness can measure "did memory actually stay bounded" as a
+ * real number instead of trusting the design argument alone. */
+static long long emerald_bytes_outstanding_counter = 0;
+
+long long emerald_bytes_outstanding(void) {
+  return emerald_bytes_outstanding_counter;
+}
+
 /* Thin malloc wrapper backing `ClassName.new` (plan 08). No corresponding
  * free — no GC, no lifetime tracking yet; matches inception §12 (no
  * ownership system, no GC pressure, for now). */
 void *emerald_alloc(long long size) {
+  emerald_bytes_outstanding_counter += size;
   return malloc((size_t) size);
 }
 
@@ -37,7 +54,98 @@ void *emerald_alloc(long long size) {
  * `malloc`. No length tracking, matching `emerald_alloc`'s own
  * no-bounds-info contract. */
 void *emerald_alloc_zeroed(long long size) {
+  emerald_bytes_outstanding_counter += size;
   return calloc((size_t) size, 1);
+}
+
+/* Plan 51 (scope-based arena allocation) — a bump-allocated region
+ * scoped to (in the future codegen consumer this leaf's own runtime
+ * primitive is built for) a function's call frame, freed in one bulk
+ * operation rather than per-object. `EmeraldRegion` owns a linked list
+ * of growing chunks — never one `realloc`'d buffer, since `realloc`
+ * may move memory and would invalidate every pointer this region has
+ * already handed out. Single-threaded, matches every other helper in
+ * this file (see the byte-counter comment above); no per-object free
+ * inside a region (`emerald_region_free_one`-style) — that would
+ * defeat the entire point of a bulk-free arena. */
+#define EMERALD_REGION_DEFAULT_CHUNK_SIZE ((size_t) 4096)
+
+typedef struct EmeraldRegionChunk {
+  struct EmeraldRegionChunk *next;
+  size_t capacity;
+  size_t used;
+  unsigned char data[];
+} EmeraldRegionChunk;
+
+typedef struct EmeraldRegion {
+  /* The chunk allocations are currently bump-allocated from — the
+   * most recently grown one. Older, now-full chunks stay reachable
+   * via `next` purely so `emerald_region_destroy` can free them all;
+   * `emerald_region_alloc` never looks at anything but `head`. */
+  EmeraldRegionChunk *head;
+} EmeraldRegion;
+
+static EmeraldRegionChunk *emerald_region_new_chunk(size_t min_capacity) {
+  size_t capacity = min_capacity > EMERALD_REGION_DEFAULT_CHUNK_SIZE
+                       ? min_capacity
+                       : EMERALD_REGION_DEFAULT_CHUNK_SIZE;
+  EmeraldRegionChunk *chunk = malloc(sizeof(EmeraldRegionChunk) + capacity);
+  chunk->next = NULL;
+  chunk->capacity = capacity;
+  chunk->used = 0;
+  emerald_bytes_outstanding_counter +=
+      (long long) (sizeof(EmeraldRegionChunk) + capacity);
+  return chunk;
+}
+
+void *emerald_region_create(void) {
+  EmeraldRegion *region = malloc(sizeof(EmeraldRegion));
+  emerald_bytes_outstanding_counter += (long long) sizeof(EmeraldRegion);
+  region->head = emerald_region_new_chunk(EMERALD_REGION_DEFAULT_CHUNK_SIZE);
+  return region;
+}
+
+/* Bump-allocates `size` bytes from `region`'s current chunk, appending
+ * a new chunk (doubling growth, or exactly `size` if that's larger —
+ * mirroring Zig's `std.heap.ArenaAllocator`'s own growth policy) if
+ * the current chunk lacks room. Every request is 8-byte-aligned within
+ * its chunk, matching the alignment `malloc` itself already
+ * guarantees on every platform this runtime targets — never returns
+ * `NULL` for a satisfiable request, the same no-OOM-check contract
+ * `emerald_alloc` already has. */
+void *emerald_region_alloc(void *region_ptr, long long size) {
+  EmeraldRegion *region = (EmeraldRegion *) region_ptr;
+  size_t aligned = ((size_t) size + 7) & ~((size_t) 7);
+  EmeraldRegionChunk *chunk = region->head;
+  if (chunk->used + aligned > chunk->capacity) {
+    size_t new_capacity = chunk->capacity * 2;
+    if (new_capacity < aligned) {
+      new_capacity = aligned;
+    }
+    EmeraldRegionChunk *new_chunk = emerald_region_new_chunk(new_capacity);
+    new_chunk->next = chunk;
+    region->head = new_chunk;
+    chunk = new_chunk;
+  }
+  void *ptr = chunk->data + chunk->used;
+  chunk->used += aligned;
+  return ptr;
+}
+
+/* The region's one bulk-free operation: every chunk it ever grew into,
+ * then the region's own control structure. */
+void emerald_region_destroy(void *region_ptr) {
+  EmeraldRegion *region = (EmeraldRegion *) region_ptr;
+  EmeraldRegionChunk *chunk = region->head;
+  while (chunk != NULL) {
+    EmeraldRegionChunk *next = chunk->next;
+    emerald_bytes_outstanding_counter -=
+        (long long) (sizeof(EmeraldRegionChunk) + chunk->capacity);
+    free(chunk);
+    chunk = next;
+  }
+  emerald_bytes_outstanding_counter -= (long long) sizeof(EmeraldRegion);
+  free(region);
 }
 
 /* `Hash[K, V]` indexed read/write with no matching key (plan 25's
