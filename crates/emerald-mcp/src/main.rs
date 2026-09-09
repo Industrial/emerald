@@ -249,6 +249,9 @@ impl EmeraldServer {
       // unreachable here, but the match must stay exhaustive.
       Err(DriverError::Codegen(e)) => vec![internal_diagnostic(e)],
       Err(DriverError::Link(e)) => vec![internal_diagnostic(e)],
+      // Plan 49: only ever produced by `emerald_driver::parallel::
+      // compile_parallel`, which `check()` never calls.
+      Err(DriverError::Require(e)) => vec![internal_diagnostic(e)],
     };
     Json(CheckSourceResponse { diagnostics })
   }
@@ -330,6 +333,15 @@ impl EmeraldServer {
         stdout: None,
         stderr: None,
         diagnostics: vec![internal_diagnostic(format!("link error: {e}"))],
+      },
+      // Plan 49: only ever produced by `emerald_driver::parallel::
+      // compile_parallel`, which `compile()` never calls.
+      Err(DriverError::Require(e)) => CompileAndRunResponse {
+        compiled: false,
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        diagnostics: vec![internal_diagnostic(format!("require error: {e}"))],
       },
     };
 

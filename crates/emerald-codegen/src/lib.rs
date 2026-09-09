@@ -6569,7 +6569,36 @@ fn declare_lambda_functions<'ctx>(
 /// `__lambda_{name}` per top-level `Proc` `Let`, plus a `main`
 /// (`extern "C" fn() -> i32`) that evaluates the top-level statements.
 pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, None)
+  compile_to_object_impl(program, out_path, None, None)
+}
+
+/// Plan 49's `leaf-parallel-codegen-and-jobs-flag`: compiles `program`
+/// (a per-file node's full transitive-dependency closure — see
+/// `emerald-driver`'s `require_graph::closure_items`) into an object
+/// file that only *defines* the functions named in `own_names` —
+/// every other function in `program` is still declared (so calls
+/// resolve, an `External`-linkage symbol the linker fills in from
+/// whichever file's own object file actually defines it, the same
+/// cross-translation-unit pattern multi-file C compilation already
+/// uses) but never given a body here. `is_entry` gates whether this
+/// call also assembles `main` from `program`'s own top-level
+/// statements — exactly one node in a require graph may ever be
+/// `is_entry: true`, since only one `main` symbol can exist across the
+/// whole linked binary.
+///
+/// Real, disclosed scope: only bare, non-generic, non-block-param
+/// `Item::Function`s are actually split this way — `emerald-driver`'s
+/// `require_graph::unsupported_construct` refuses the whole multi-file
+/// parallel compile before this is ever called if any node in the
+/// graph declares a class, a module, a generic/block-param function,
+/// or a top-level lambda `Let`, so `program` here never contains one.
+pub fn compile_to_object_scoped(
+  program: &Program,
+  own_names: &std::collections::HashSet<String>,
+  is_entry: bool,
+  out_path: &Path,
+) -> Result<(), String> {
+  compile_to_object_impl(program, out_path, None, Some((own_names, is_entry)))
 }
 
 /// Plan 35's `leaf-line-table-generation`: identical to
@@ -6585,13 +6614,21 @@ pub fn compile_to_object_with_debug_info(
   source: &str,
   file_name: &str,
 ) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, Some((source, file_name)))
+  compile_to_object_impl(program, out_path, Some((source, file_name)), None)
 }
 
 fn compile_to_object_impl(
   program: &Program,
   out_path: &Path,
   source_info: Option<(&str, &str)>,
+  // Plan 49's `leaf-parallel-codegen-and-jobs-flag`: `Some((own_names,
+  // is_entry))` restricts which `Item::Function`s in `program` actually
+  // get a body defined here (everything else stays declare-only, see
+  // `compile_to_object_scoped`'s own doc comment) and whether `main` is
+  // assembled at all. `None` (both pre-existing entry points) means
+  // "define everything, always add main" — this function's behavior is
+  // completely unchanged for every caller that doesn't pass `Some`.
+  scope: Option<(&std::collections::HashSet<String>, bool)>,
 ) -> Result<(), String> {
   // Plan 47's Decision log: a `test "..." do ... end` block only ever
   // compiles through `compile_test_harness` (`emerald test`) — reaching
@@ -6973,8 +7010,15 @@ fn compile_to_object_impl(
       // specializations is defined separately, below.
       Item::Function(f) if !f.type_params.is_empty() => {}
       Item::Function(f) => {
-        let (fv, _) = user_func_ids[&f.name];
-        define_user_function(&context, &builder, f, fv, &gen_ctx)?;
+        // Plan 49: when `scope` restricts this compile to a subset of
+        // `program`'s own functions (a per-file node's transitive
+        // closure), a function outside `own_names` belongs to another
+        // file and stays declare-only here — its body is defined in
+        // that file's own separately-emitted object file instead.
+        if scope.is_none_or(|(own_names, _)| own_names.contains(&f.name)) {
+          let (fv, _) = user_func_ids[&f.name];
+          define_user_function(&context, &builder, f, fv, &gen_ctx)?;
+        }
       }
       Item::Class(c) => {
         let layout = &classes[&c.name];
@@ -7067,11 +7111,18 @@ fn compile_to_object_impl(
   // `main(argc, argv)` ABI `cc`'s own linked `_start` already expects,
   // so no change to `emerald-cli`'s link step is needed. A program that
   // never references `ARGV`/`ARGC`/`gets()` is unaffected.
-  let main_ty = context
-    .i32_type()
-    .fn_type(&[context.i32_type().into(), ptr_ty.into()], false);
-  let main_fn = module.add_function("main", main_ty, Some(Linkage::External));
-  define_main(&context, &builder, main_fn, program, &gen_ctx)?;
+  // Plan 49: exactly one node in a require graph is ever `is_entry:
+  // true` — a dependency file's own separately-emitted object file
+  // must not also define `main`, or linking every file's `.o` together
+  // would hit a duplicate-symbol error. `scope.is_none()` (both
+  // pre-existing entry points) always assembles `main`, unchanged.
+  if scope.is_none_or(|(_, is_entry)| is_entry) {
+    let main_ty = context
+      .i32_type()
+      .fn_type(&[context.i32_type().into(), ptr_ty.into()], false);
+    let main_fn = module.add_function("main", main_ty, Some(Linkage::External));
+    define_main(&context, &builder, main_fn, program, &gen_ctx)?;
+  }
 
   // Plan 35: must run before verification/object emission, per
   // `DebugInfoBuilder::finalize`'s own doc — its `Drop` impl also calls

@@ -466,9 +466,15 @@ pub fn check_diagnostics(text: &str) -> Vec<Diagnostic> {
         ..Default::default()
       })
       .collect(),
-    // `check()` only ever parses + type-checks — codegen/link are
-    // unreachable here, but the match must stay exhaustive.
-    Err(emerald_driver::DriverError::Codegen(_) | emerald_driver::DriverError::Link(_)) => {
+    // `check()` only ever parses + type-checks — codegen/link/require
+    // (plan 49's graph-building errors, only ever produced by
+    // `emerald_driver::parallel::compile_parallel`) are unreachable
+    // here, but the match must stay exhaustive.
+    Err(
+      emerald_driver::DriverError::Codegen(_)
+      | emerald_driver::DriverError::Link(_)
+      | emerald_driver::DriverError::Require(_),
+    ) => {
       vec![]
     }
   }

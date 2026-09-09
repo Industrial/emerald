@@ -105,6 +105,10 @@ pub(crate) fn report_driver_error(e: DriverError, source: Option<(&str, &str)>) 
     }
     DriverError::Codegen(e) => eprintln!("codegen error: {e}"),
     DriverError::Link(e) => eprintln!("error: {e}"),
+    // Plan 49: a require cycle, a missing/unreadable required file, or
+    // a construct `--jobs`-parallel multi-file codegen doesn't support
+    // yet — see `emerald_driver::require_graph::unsupported_construct`.
+    DriverError::Require(e) => eprintln!("error: {e}"),
   }
 }
 
@@ -151,10 +155,42 @@ fn verbose_cache_requested(args: &[String]) -> bool {
   args.iter().any(|a| a == "--verbose-cache")
 }
 
+/// Plan 49's `leaf-parallel-codegen-and-jobs-flag`: `--jobs N` — a new,
+/// strictly additive/opt-in flag exactly like `--verbose-cache` above.
+/// `None` (no flag) means every pre-plan-49 code path here is
+/// completely unchanged; `Some(n)` (n.max(1)) routes through
+/// `emerald_driver::parallel::compile_parallel` instead.
+fn jobs_requested(args: &[String]) -> Option<usize> {
+  args
+    .iter()
+    .position(|a| a == "--jobs")
+    .and_then(|i| args.get(i + 1))
+    .and_then(|v| v.parse::<usize>().ok())
+    .map(|n| n.max(1))
+}
+
+/// Plan 49: the source path is the first positional (non-flag) argument
+/// — `emerald --jobs 2 main.em -o main` (the plan's own worked-example
+/// invocation) puts a flag *before* the source path, so this can no
+/// longer just be `args[1]` unconditionally, the way it was before
+/// `--jobs` existed. Skips `-o`/`--jobs`'s own consumed value too, not
+/// just the flag token itself.
+fn find_source_path(args: &[String]) -> Option<&String> {
+  let mut i = 1;
+  while i < args.len() {
+    match args[i].as_str() {
+      "-o" | "--jobs" => i += 2,
+      "--verbose-cache" => i += 1,
+      _ => return Some(&args[i]),
+    }
+  }
+  None
+}
+
 fn run_legacy(args: &[String]) {
-  let Some(source_path) = args.get(1) else {
+  let Some(source_path) = find_source_path(args) else {
     eprintln!(
-      "usage: emerald <source.em> [-o <output>] [--verbose-cache]  |  emerald new/build/run <name>"
+      "usage: emerald <source.em> [-o <output>] [--verbose-cache] [--jobs N]  |  emerald new/build/run <name>"
     );
     process::exit(2);
   };
@@ -165,6 +201,40 @@ fn run_legacy(args: &[String]) {
     .and_then(|i| args.get(i + 1))
     .map(PathBuf::from)
     .unwrap_or_else(|| PathBuf::from("a.out"));
+
+  // Plan 49: `--jobs N` builds and levels `source_path`'s own require
+  // graph directly (never `require::resolve_program`'s single-flattened
+  // `Program` — see `emerald_driver::parallel`'s own doc comment on
+  // why that step is exactly what per-file parallel work needs to
+  // avoid) — real end-to-end proof for the plan's own worked example:
+  // `emerald-cli --jobs 2 examples/parallel/main.em -o main`.
+  if let Some(jobs) = jobs_requested(args) {
+    let cache = emerald_driver::cache::QueryCache::new(cache_root());
+    let result = if verbose_cache_requested(args) {
+      emerald_driver::parallel::compile_parallel(
+        Path::new(source_path),
+        &output_path,
+        jobs,
+        &cache,
+        &emerald_driver::cache::VerboseReporter,
+      )
+    } else {
+      emerald_driver::parallel::compile_parallel(
+        Path::new(source_path),
+        &output_path,
+        jobs,
+        &cache,
+        &emerald_driver::cache::SilentReporter,
+      )
+    };
+    if let Err(e) = result {
+      // A require-graph program has no single coherent source string
+      // (same reasoning `cmd_build`'s own `None` already uses below).
+      report_driver_error(e, None);
+      process::exit(1);
+    }
+    return;
+  }
 
   let source = std::fs::read_to_string(source_path).unwrap_or_else(|e| {
     eprintln!("error: cannot read `{source_path}`: {e}");

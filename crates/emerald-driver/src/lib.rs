@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 pub mod cache;
+pub mod parallel;
+pub mod require_graph;
 use cache::{CacheKey, CacheReporter, QueryCache, raw_hash};
 
 // Plan 21's Decision log: `emerald-lsp` keeps depending only on this
@@ -39,6 +41,11 @@ pub enum DriverError {
   Sema(Vec<emerald_sema::Diagnostic>),
   Codegen(String),
   Link(String),
+  /// Plan 49's `leaf-require-graph-leveling`: a require cycle, a
+  /// missing/unreadable required file, or (leaf 3) a construct this
+  /// plan's parallel multi-file codegen doesn't support yet (see
+  /// `require_graph::unsupported_construct`).
+  Require(String),
 }
 
 fn parse_stage(source: String, name: String) -> Effect<Program, DriverError, ()> {
