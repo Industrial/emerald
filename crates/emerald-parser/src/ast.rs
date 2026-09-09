@@ -507,13 +507,20 @@ pub struct Function {
   pub type_params: Vec<TypeParam>,
 }
 
-/// `T: Comparable` inside a generic function's `[...]` clause — the bound
-/// is mandatory (plan 41's Decision log: no `def identity[T](x: T)`
-/// unbounded form).
+/// `T: Comparable` inside a generic function's or generic class's `[...]`
+/// clause. Plan 58's Decision log: `bound` widens from a mandatory
+/// `String` (plan 41's original, function-only design — no `def
+/// identity[T](x: T)` unbounded form) to `Option<String>`, since a
+/// generic *class*'s own headline case (`class Box[T] ... end`,
+/// `class Stack[T] ... end`) has no bound at all. A real, disclosed,
+/// source-compatible widening of the one `TypeParam` shape plan 41
+/// already shipped, not a second, class-only type-parameter struct —
+/// every FUNCTION-side reader keeps requiring a bound (now enforced by
+/// sema's own diagnostic instead of structurally by the grammar).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
   pub name: String,
-  pub bound: String,
+  pub bound: Option<String>,
 }
 
 /// `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
@@ -549,6 +556,15 @@ pub struct ClassDef {
   pub implements: Option<String>,
   pub fields: Vec<Param>,
   pub methods: Vec<Function>,
+  /// `class Stack[T]`/`class Box[T: Comparable]` (plan 58's Decision
+  /// log) — empty `Vec` for every class that doesn't declare one,
+  /// additive and source-compatible, mirroring `Function.type_params`'s
+  /// own precedent above. A non-empty `type_params` marks this `ClassDef`
+  /// as a raw, unresolved TEMPLATE — `emerald-sema` registers it into a
+  /// separate `generic_classes` registry instead of the ordinary
+  /// `classes` table, and it is never monomorphized without a real
+  /// concrete instantiation actually written somewhere in the program.
+  pub type_params: Vec<TypeParam>,
 }
 
 /// A namespace-only module (plan `12`'s Decision log — `SEMANTICS.md`

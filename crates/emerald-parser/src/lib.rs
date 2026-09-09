@@ -2364,9 +2364,108 @@ mod tests {
       max_fn.type_params,
       vec![TypeParam {
         name: "T".to_string(),
-        bound: "Comparable".to_string(),
+        bound: Some("Comparable".to_string()),
       }]
     );
+  }
+
+  // Plan 58 (generic types).
+
+  #[test]
+  fn generic_class_with_no_bound_parses_with_a_bound_less_type_param() {
+    let src = "class Box[T]\n  value: T\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    assert_eq!(
+      c.type_params,
+      vec![TypeParam {
+        name: "T".to_string(),
+        bound: None,
+      }]
+    );
+  }
+
+  #[test]
+  fn generic_class_with_a_bound_parses_with_a_some_bound_type_param() {
+    let src = "class Box[T: Comparable]\n  value: T\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    assert_eq!(
+      c.type_params,
+      vec![TypeParam {
+        name: "T".to_string(),
+        bound: Some("Comparable".to_string()),
+      }]
+    );
+  }
+
+  const STACK_GENERIC_EXAMPLE: &str = "class Stack[T]\n  items: Array[T]\n  count: Int64\n\n  def initialize -> Void\n    @items = Array.new(8)\n    @count = 0\n  end\n\n  def push(x: T) -> Void\n    @items[@count] = x\n    @count = @count + 1\n  end\n\n  def pop -> T\n    @count = @count - 1\n    @items[@count]\n  end\n\n  def peek -> T\n    @items[@count - 1]\n  end\nend\n\ns1: Stack[Int64] = Stack.new()\ns1.push(10)\ns1.push(20)\ns1.push(30)\nputs s1.pop\nputs s1.peek\n\ns2: Stack[String] = Stack.new()\ns2.push(\"first\")\ns2.push(\"second\")\nputs s2.pop\nputs s2.peek\n";
+
+  #[test]
+  fn stack_generic_worked_example_parses_end_to_end() {
+    let program = parse(STACK_GENERIC_EXAMPLE).expect("should parse");
+    let Item::Class(stack) = &program.items[0] else {
+      panic!("expected the Stack class");
+    };
+    assert_eq!(
+      stack.type_params,
+      vec![TypeParam {
+        name: "T".to_string(),
+        bound: None,
+      }]
+    );
+    let items_field = stack
+      .fields
+      .iter()
+      .find(|p| p.name == "items")
+      .expect("items field");
+    assert_eq!(items_field.ty, "Array[T]");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, .. },
+      ..
+    }) = &program.items[1]
+    else {
+      panic!("expected `s1`'s Let statement");
+    };
+    assert_eq!(ty, "Stack[Int64]");
+  }
+
+  #[test]
+  fn nested_generic_type_arguments_parse_as_one_compound_typename_string() {
+    let src = "class Box[T]\n  value: T\nend\n\nb: Box[Box[Int64]] = Box.new()\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, .. },
+      ..
+    }) = &program.items[1]
+    else {
+      panic!("expected `b`'s Let statement");
+    };
+    assert_eq!(ty, "Box[Box[Int64]]");
+  }
+
+  #[test]
+  fn a_non_generic_class_still_parses_with_empty_type_params() {
+    let src = "class Point\n  x: Int64\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    assert_eq!(c.type_params, vec![]);
+  }
+
+  #[test]
+  fn malformed_generic_class_header_is_a_parse_error_not_a_panic() {
+    // A paren-parameter-list immediately after `class NoBound[T]`, with
+    // no intervening field/method shape — a real, disclosed AST-level
+    // impossibility (no grammar production accepts this), not a panic.
+    let src = "class NoBound[T](x: T)\nend\n";
+    let errs = parse(src).expect_err("must be a real parse error");
+    assert!(!errs.is_empty());
   }
 
   #[test]

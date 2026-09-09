@@ -138,6 +138,90 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
   parts
 }
 
+/// Plan 58: mirrors `emerald-sema`'s identically-named helper (the same
+/// real, disclosed duplication `split_top_level_commas` above already
+/// documents) — parses `"Stack[Int64]"` into `("Stack", ["Int64"])`,
+/// excluding the 4 hardcoded compound forms by base name. By the time
+/// codegen ever sees a generic-instantiation type-name string, sema has
+/// already accepted the whole program, so this never needs to produce
+/// its own diagnostics — a bad shape here just falls through to
+/// `None`, same as an ordinary unresolvable annotation would.
+fn parse_generic_instantiation(ty: &str) -> Option<(&str, Vec<&str>)> {
+  let open = ty.find('[')?;
+  if !ty.ends_with(']') {
+    return None;
+  }
+  let base = &ty[..open];
+  if matches!(base, "Array" | "Hash" | "Pair" | "Result") {
+    return None;
+  }
+  let inner = &ty[open + 1..ty.len() - 1];
+  let args = split_top_level_commas(inner);
+  if args.is_empty() || args.iter().any(|a| a.is_empty()) {
+    return None;
+  }
+  Some((base, args))
+}
+
+/// Plan 58: `"Stack[Int64]"` -> `"Stack$Int64"` — mirrors `emerald-
+/// sema`'s identically-named helper exactly (this string doubles as
+/// both sema's synthesized `Type::Class` name and codegen's own
+/// `{ClassName}_{method}` mangling prefix, by design).
+fn mangle_type_name(ty: &str) -> String {
+  match parse_generic_instantiation(ty) {
+    Some((base, args)) => {
+      let mangled_args: Vec<String> = args.iter().map(|a| mangle_type_name(a)).collect();
+      format!("{base}${}", mangled_args.join("$"))
+    }
+    None => ty.to_string(),
+  }
+}
+
+/// Plan 58: mirrors `emerald-sema`'s identically-named helper — whole-
+/// token identifier-run substitution, so substituting `T` never touches
+/// `Total`.
+fn substitute_type_params(raw: &str, subst: &HashMap<&str, &str>) -> String {
+  let mut out = String::with_capacity(raw.len());
+  let bytes = raw.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes[i];
+    if b.is_ascii_alphabetic() || b == b'_' {
+      let start = i;
+      while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+      }
+      let word = &raw[start..i];
+      out.push_str(subst.get(word).copied().unwrap_or(word));
+    } else {
+      out.push(bytes[i] as char);
+      i += 1;
+    }
+  }
+  out
+}
+
+/// Plan 58: resolves a possibly-generic-instantiation type-name string
+/// (`"Stack[Int64]"`) to whichever key actually names it in `classes` —
+/// its mangled form (`"Stack$Int64"`) if that's what's registered,
+/// otherwise the bare string unchanged (an ordinary class name, or an
+/// unresolvable one — `None` either way, matching every pre-existing
+/// `ctx.classes.contains_key(bare_ty)` call site's own behavior for a
+/// name that just isn't a class).
+fn resolve_local_class_name(
+  bare_ty: &str,
+  classes: &HashMap<String, ClassLayout>,
+) -> Option<String> {
+  if classes.contains_key(bare_ty) {
+    return Some(bare_ty.to_string());
+  }
+  let mangled = mangle_type_name(bare_ty);
+  if mangled != bare_ty && classes.contains_key(&mangled) {
+    return Some(mangled);
+  }
+  None
+}
+
 /// The one place a `"(" T1 "," T2 ")"`-shaped tuple return-type
 /// annotation gains real meaning in codegen (plan 39's Decision log) —
 /// mirrors `emerald-sema`'s `resolve_return_type` vs. `resolve_type`
@@ -385,6 +469,362 @@ fn build_class_layout(
     size: offset,
     field_classes,
   })
+}
+
+const GENERIC_INSTANTIATION_DEPTH_LIMIT: usize = 32;
+
+/// Plan 58: builds ONE monomorphized `ClassDef` for `base_name<
+/// type_args>` by substituting every type-parameter-named field/method
+/// param/return type in the TEMPLATE — mirrors `emerald-sema`'s
+/// `instantiate_generic_class`/`build_generic_class_info`, minus the
+/// bound/depth-diagnostic machinery (sema already accepted this whole
+/// program; a malformed instantiation never reaches codegen at all).
+/// Still needs the identical self-reference short-circuit for
+/// correctness, not just parity with sema: a linked-list-shaped `Node
+/// [T]`'s own `succ: Node[T]` field would otherwise recurse forever
+/// building its own synthesized `ClassDef`, regardless of how sema
+/// already proved the *program* terminates.
+///
+/// Real, disclosed gap: a method BODY's own internal `Stmt::Let`
+/// annotation referencing the bare type-parameter name directly (e.g.
+/// `local: T = ...`) is NOT rewritten — `body` carries over unchanged.
+/// `value_kind_for_type` falls through an unrecognized string to
+/// `ValKind::Ptr`, which is only correct when `T` is instantiated with
+/// a reference type; a primitive instantiation (`Stack[Int64]`) whose
+/// method body declares such a local would compile a wrong storage
+/// kind. Not exercised by this plan's own worked example, whose methods
+/// only ever read/write `T`-typed FIELDS (substituted correctly below),
+/// never an intermediate `T`-typed local.
+fn instantiate_generic_class_defs(
+  base_name: &str,
+  type_args: &[&str],
+  generic_class_defs: &HashMap<String, &ClassDef>,
+  synthesized: &mut HashMap<String, ClassDef>,
+  in_progress: &mut Vec<String>,
+) -> String {
+  let mangled_args: Vec<String> = type_args.iter().map(|a| mangle_type_name(a)).collect();
+  let mangled = format!("{base_name}${}", mangled_args.join("$"));
+
+  if synthesized.contains_key(&mangled) {
+    return mangled;
+  }
+  if in_progress.last().map(String::as_str) == Some(mangled.as_str()) {
+    synthesized.insert(
+      mangled.clone(),
+      ClassDef {
+        name: mangled.clone(),
+        superclass: None,
+        implements: None,
+        fields: Vec::new(),
+        methods: Vec::new(),
+        type_params: Vec::new(),
+      },
+    );
+    return mangled;
+  }
+  if in_progress.len() >= GENERIC_INSTANTIATION_DEPTH_LIMIT {
+    // Defensive only — sema already rejects any program that would
+    // reach this; codegen just needs to terminate rather than hang.
+    return mangled;
+  }
+  let Some(c) = generic_class_defs.get(base_name).copied() else {
+    return mangled;
+  };
+
+  let subst: HashMap<&str, &str> = c
+    .type_params
+    .iter()
+    .map(|tp| tp.name.as_str())
+    .zip(type_args.iter().copied())
+    .collect();
+
+  in_progress.push(mangled.clone());
+
+  let fields: Vec<Param> = c
+    .fields
+    .iter()
+    .map(|f| Param {
+      name: f.name.clone(),
+      ty: resolve_substituted_type_cg(&f.ty, &subst, generic_class_defs, synthesized, in_progress),
+      default: None,
+    })
+    .collect();
+
+  let methods: Vec<AstFunction> = c
+    .methods
+    .iter()
+    .map(|m| AstFunction {
+      name: m.name.clone(),
+      params: m
+        .params
+        .iter()
+        .map(|p| Param {
+          name: p.name.clone(),
+          ty: resolve_substituted_type_cg(
+            &p.ty,
+            &subst,
+            generic_class_defs,
+            synthesized,
+            in_progress,
+          ),
+          default: p.default.clone(),
+        })
+        .collect(),
+      return_type: resolve_substituted_type_cg(
+        &m.return_type,
+        &subst,
+        generic_class_defs,
+        synthesized,
+        in_progress,
+      ),
+      body: m.body.clone(),
+      block_param: m.block_param.clone(),
+      splat_param: m.splat_param.as_ref().map(|p| Param {
+        name: p.name.clone(),
+        ty: resolve_substituted_type_cg(
+          &p.ty,
+          &subst,
+          generic_class_defs,
+          synthesized,
+          in_progress,
+        ),
+        default: None,
+      }),
+      type_params: Vec::new(),
+    })
+    .collect();
+
+  in_progress.pop();
+
+  synthesized.insert(
+    mangled.clone(),
+    ClassDef {
+      name: mangled.clone(),
+      superclass: c.superclass.clone(),
+      implements: c.implements.clone(),
+      fields,
+      methods,
+      type_params: Vec::new(),
+    },
+  );
+  mangled
+}
+
+fn resolve_substituted_type_cg(
+  raw: &str,
+  subst: &HashMap<&str, &str>,
+  generic_class_defs: &HashMap<String, &ClassDef>,
+  synthesized: &mut HashMap<String, ClassDef>,
+  in_progress: &mut Vec<String>,
+) -> String {
+  let substituted = substitute_type_params(raw, subst);
+  if let Some((base, args)) = parse_generic_instantiation(&substituted) {
+    if generic_class_defs.contains_key(base) {
+      return instantiate_generic_class_defs(
+        base,
+        &args,
+        generic_class_defs,
+        synthesized,
+        in_progress,
+      );
+    }
+  }
+  substituted
+}
+
+/// Plan 58: whole-program walk collecting every generic-class-
+/// instantiation type-name string actually written anywhere — mirrors
+/// `emerald-sema`'s identically-shaped `collect_generic_instantiation_
+/// typenames`/`collect_typenames_in_stmt`. A generic class TEMPLATE's
+/// own raw field/method types are deliberately skipped (handled via
+/// substitution inside `instantiate_generic_class_defs` instead).
+fn collect_generic_instantiation_typenames(program: &Program) -> Vec<String> {
+  let mut out = Vec::new();
+  for item in &program.items {
+    match item {
+      Item::Function(f) => {
+        if f.type_params.is_empty() {
+          for p in &f.params {
+            push_generic_typename(&p.ty, &mut out);
+          }
+          push_generic_typename(&f.return_type, &mut out);
+          if let Some(p) = &f.splat_param {
+            push_generic_typename(&p.ty, &mut out);
+          }
+        }
+        for s in &f.body {
+          collect_typenames_in_stmt(s, &mut out);
+        }
+      }
+      Item::Class(c) => {
+        if c.type_params.is_empty() {
+          for field in &c.fields {
+            push_generic_typename(&field.ty, &mut out);
+          }
+          for m in &c.methods {
+            for p in &m.params {
+              push_generic_typename(&p.ty, &mut out);
+            }
+            push_generic_typename(&m.return_type, &mut out);
+            for s in &m.body {
+              collect_typenames_in_stmt(s, &mut out);
+            }
+          }
+        }
+      }
+      Item::Module(md) => {
+        for m in &md.methods {
+          for p in &m.params {
+            push_generic_typename(&p.ty, &mut out);
+          }
+          push_generic_typename(&m.return_type, &mut out);
+          for s in &m.body {
+            collect_typenames_in_stmt(s, &mut out);
+          }
+        }
+      }
+      Item::Actor(a) => {
+        for field in &a.fields {
+          push_generic_typename(&field.ty, &mut out);
+        }
+        for m in &a.methods {
+          for p in &m.params {
+            push_generic_typename(&p.ty, &mut out);
+          }
+          push_generic_typename(&m.return_type, &mut out);
+          for s in &m.body {
+            collect_typenames_in_stmt(s, &mut out);
+          }
+        }
+      }
+      Item::Stmt(s) => collect_typenames_in_stmt(s, &mut out),
+      Item::Test { body, .. } => {
+        for s in body {
+          collect_typenames_in_stmt(s, &mut out);
+        }
+      }
+      Item::Enum(_) | Item::Interface(_) | Item::Require(_) | Item::Error => {}
+    }
+  }
+  out
+}
+
+fn push_generic_typename(ty: &str, out: &mut Vec<String>) {
+  if parse_generic_instantiation(ty).is_some() {
+    out.push(ty.to_string());
+  }
+}
+
+fn collect_typenames_in_stmt(stmt: &Spanned<Stmt>, out: &mut Vec<String>) {
+  match &stmt.node {
+    Stmt::Let { ty, .. } => push_generic_typename(ty, out),
+    Stmt::If {
+      then_branch,
+      else_branch,
+      ..
+    } => {
+      for s in then_branch {
+        collect_typenames_in_stmt(s, out);
+      }
+      if let Some(eb) = else_branch {
+        for s in eb {
+          collect_typenames_in_stmt(s, out);
+        }
+      }
+    }
+    Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ForRange { body, .. } => {
+      for s in body {
+        collect_typenames_in_stmt(s, out);
+      }
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        collect_typenames_in_stmt(s, out);
+      }
+      for r in rescues {
+        for s in &r.body {
+          collect_typenames_in_stmt(s, out);
+        }
+      }
+      if let Some(e) = ensure {
+        for s in e {
+          collect_typenames_in_stmt(s, out);
+        }
+      }
+    }
+    Stmt::Case {
+      arms, else_body, ..
+    } => {
+      for (_, body) in arms {
+        for s in body {
+          collect_typenames_in_stmt(s, out);
+        }
+      }
+      if let Some(eb) = else_body {
+        for s in eb {
+          collect_typenames_in_stmt(s, out);
+        }
+      }
+    }
+    Stmt::MatchResult {
+      ok_body, err_body, ..
+    } => {
+      for s in ok_body {
+        collect_typenames_in_stmt(s, out);
+      }
+      for s in err_body {
+        collect_typenames_in_stmt(s, out);
+      }
+    }
+    Stmt::SetField { .. }
+    | Stmt::SetIndex { .. }
+    | Stmt::Assign { .. }
+    | Stmt::MultiAssign { .. }
+    | Stmt::Return(_)
+    | Stmt::Break
+    | Stmt::Next
+    | Stmt::Expr(_)
+    | Stmt::Raise(_)
+    | Stmt::Yield(_)
+    | Stmt::Retry
+    | Stmt::OrAssign { .. }
+    | Stmt::AndAssign { .. } => {}
+  }
+}
+
+/// Plan 58: the top-level driver — collects every generic-instantiation
+/// type-name string written anywhere in `program`, then monomorphizes
+/// each (and, transitively, every nested/self-referential instantiation
+/// a template's own fields/methods pull in) into a real `ClassDef`,
+/// returned keyed by mangled name. Callers merge this into `class_defs`
+/// exactly like `actor_class_defs`'s own synthesis already does.
+fn collect_generic_class_specializations(
+  program: &Program,
+  generic_class_defs: &HashMap<String, &ClassDef>,
+) -> HashMap<String, ClassDef> {
+  let mut synthesized = HashMap::new();
+  if generic_class_defs.is_empty() {
+    return synthesized;
+  }
+  for ty in collect_generic_instantiation_typenames(program) {
+    if let Some((base, args)) = parse_generic_instantiation(&ty) {
+      if generic_class_defs.contains_key(base) {
+        let mut in_progress = Vec::new();
+        instantiate_generic_class_defs(
+          base,
+          &args,
+          generic_class_defs,
+          &mut synthesized,
+          &mut in_progress,
+        );
+      }
+    }
+  }
+  synthesized
 }
 
 /// `{class name} -> {method name} -> defining class name}` for every
@@ -7553,10 +7993,20 @@ fn build_stmt<'a, 'ctx>(
       .is_some_and(|allocas| allocas.contains_key(name)) =>
     {
       let ptr = *ctx.object_allocas.unwrap().get(name).unwrap();
+      // Plan 58: `Stack.new()`'s own `class_name` is the bare template
+      // name — sema only ever accepts this shape when `ty` is a
+      // matching generic instantiation (`Stack[Int64]`), so mangling
+      // `ty` here always finds the real, monomorphized class.
+      let effective_class_name = mangle_type_name(ty.strip_suffix('?').unwrap_or(ty.as_str()));
+      let effective_class_name = if ctx.classes.contains_key(&effective_class_name) {
+        effective_class_name.as_str()
+      } else {
+        class_name.as_str()
+      };
       build_initialize_call(
         context,
         builder,
-        class_name,
+        effective_class_name,
         args,
         ptr,
         vars,
@@ -7567,10 +8017,13 @@ fn build_stmt<'a, 'ctx>(
       // Same `local_classes` bookkeeping the generic `Stmt::Let` arm
       // below performs — a later method call on `name` still needs to
       // resolve its class via this side table regardless of which
-      // allocation strategy backs it.
+      // allocation strategy backs it. Plan 58: `resolve_local_class_
+      // name` also tries the MANGLED form (`"Stack[Int64]"` ->
+      // `"Stack$Int64"`) — a generic-instantiation-typed local resolves
+      // to its real, monomorphized class exactly like an ordinary one.
       let bare_ty = ty.strip_suffix('?').unwrap_or(ty.as_str());
-      if ctx.classes.contains_key(bare_ty) {
-        local_classes.insert(name.clone(), bare_ty.to_string());
+      if let Some(resolved) = resolve_local_class_name(bare_ty, ctx.classes) {
+        local_classes.insert(name.clone(), resolved);
       }
       let (dst, _) = *vars
         .get(name)
@@ -7579,6 +8032,63 @@ fn build_stmt<'a, 'ctx>(
       if let Some(stats) = ctx.escape_stats {
         stats.borrow_mut().stack_allocated += 1;
       }
+      Ok(false)
+    }
+    // Plan 58: `s: Stack[Int64] = Stack.new()`, the ordinary (not
+    // stack-allocated — see the `object_allocas` arm just above for
+    // that path) heap-allocating case. `build_expr`'s own generic
+    // `Expr::New` arm can't handle this: it only ever sees the bare
+    // `class_name` AST node (`"Stack"`), with no access to the
+    // enclosing `Let`'s own declared type — the only place the concrete
+    // type argument actually lives. Mirrors that arm's own alloc-then-
+    // initialize logic exactly, just keyed by the MANGLED name instead.
+    // Sema's own `Stmt::Let` special case (mirrored here) guarantees
+    // this shape only ever appears when `ty` really is a generic
+    // instantiation of `class_name` — this never fires for an ordinary,
+    // non-generic `Foo.new()` (`mangle_type_name` is a no-op for a
+    // plain class name, so `ctx.classes.contains_key` would just find
+    // the very same, already-generic-instantiation-free entry the
+    // ordinary fallthrough arm below would anyway; the guard below only
+    // actually matches a real generic instantiation).
+    Stmt::Let {
+      name,
+      ty,
+      value: Spanned {
+        node: Expr::New(class_name, args),
+        ..
+      },
+    } if parse_generic_instantiation(ty.strip_suffix('?').unwrap_or(ty.as_str()))
+      .is_some_and(|(base, _)| base == class_name.as_str()) =>
+    {
+      let mangled = mangle_type_name(ty.strip_suffix('?').unwrap_or(ty.as_str()));
+      let layout = ctx
+        .classes
+        .get(&mangled)
+        .ok_or_else(|| format!("codegen: unknown class `{mangled}`"))?;
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let alloc_call = builder
+        .build_call(ctx.alloc, &[size_val.into()], "newtmp")
+        .map_err(|e| e.to_string())?;
+      let ptr = call_result(alloc_call)?.into_pointer_value();
+      build_initialize_call(
+        context,
+        builder,
+        &mangled,
+        args,
+        ptr,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if let Some(stats) = ctx.escape_stats {
+        stats.borrow_mut().heap_allocated += 1;
+      }
+      local_classes.insert(name.clone(), mangled);
+      let (dst, _) = *vars
+        .get(name)
+        .expect("pre-allocated by prealloc_lets for every reachable Let");
+      builder.build_store(dst, ptr).map_err(|e| e.to_string())?;
       Ok(false)
     }
     // Plan 53's Decision log: `n: T = parse_int(s)?` — `Expr::Try`'s
@@ -7798,10 +8308,13 @@ fn build_stmt<'a, 'ctx>(
       // `supervise do ... end` local too — never a real `ctx.classes`
       // entry (see `build_method_call`'s own `sup.child(...)` dispatch
       // check, which is what actually consults this).
-      if ctx.classes.contains_key(bare_ty)
-        || ctx.enums.contains_key(bare_ty)
-        || bare_ty == "Supervisor"
-      {
+      // Plan 58: `resolve_local_class_name` also tries the MANGLED form
+      // (`"Stack[Int64]"` -> `"Stack$Int64"`) — a generic-instantiation-
+      // typed local resolves to its real, monomorphized class exactly
+      // like an ordinary one.
+      if let Some(resolved) = resolve_local_class_name(bare_ty, ctx.classes) {
+        local_classes.insert(name.clone(), resolved);
+      } else if ctx.enums.contains_key(bare_ty) || bare_ty == "Supervisor" {
         local_classes.insert(name.clone(), bare_ty.to_string());
       }
       if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
@@ -10285,6 +10798,7 @@ fn declare_user_functions<'ctx>(
   module: &Module<'ctx>,
   program: &Program,
   classes: &HashMap<String, ClassLayout>,
+  generic_instances: &HashMap<String, ClassDef>,
 ) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
   let mut user_func_ids = HashMap::new();
   for item in &program.items {
@@ -10310,6 +10824,13 @@ fn declare_user_functions<'ctx>(
         let fv = module.add_function(&f.name, fn_ty, Some(Linkage::External));
         user_func_ids.insert(f.name.clone(), (fv, ret_kind));
       }
+      // Plan 58: a generic class TEMPLATE's own raw methods (bare `T`-
+      // typed params/returns) are never declared under its own
+      // unmangled name — `generic_instances`' own methods, declared in
+      // the dedicated pass just below this loop, are the only real
+      // LLVM symbols any monomorphized instantiation's calls ever
+      // target.
+      Item::Class(c) if !c.type_params.is_empty() => {}
       Item::Class(c) => {
         for m in &c.methods {
           let ret_kind = value_kind_for_type(&m.return_type);
@@ -10366,6 +10887,22 @@ fn declare_user_functions<'ctx>(
       // returns `Ok(program)` with zero recovered errors, meaning no
       // `Item::Error` in `program.items` — codegen never receives one.
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
+    }
+  }
+  // Plan 58: each monomorphized generic-class instantiation's methods,
+  // declared exactly like an ordinary `Item::Class`'s own methods above
+  // (same leading `self` ptr, same `{ClassName}_{method}` mangling —
+  // `c.name` here is already the MANGLED name, e.g. `Stack$Int64`, so
+  // this produces `Stack$Int64_push` with zero further special-casing).
+  for c in generic_instances.values() {
+    for m in &c.methods {
+      let ret_kind = value_kind_for_type(&m.return_type);
+      let mut kinds = vec![ValKind::Ptr]; // self
+      kinds.extend(param_kinds(&m.params));
+      let fn_ty = make_fn_type(context, &kinds, &ret_kind);
+      let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
+      let fv = module.add_function(&mangled, fn_ty, Some(Linkage::External));
+      user_func_ids.insert(mangled, (fv, ret_kind));
     }
   }
   let _ = classes; // kept in the signature for symmetry with the define pass
@@ -10809,18 +11346,40 @@ fn compile_to_object_impl(
         implements: None,
         fields: a.fields.clone(),
         methods: a.methods.clone(),
+        type_params: Vec::new(),
       }),
       _ => None,
     })
     .collect();
 
+  // Plan 58: a class with a non-empty `type_params` is a generic
+  // TEMPLATE — never inserted into `class_defs` under its own bare
+  // name (it has no `ClassLayout` of its own at all); routed here
+  // instead, consulted only by `collect_generic_class_specializations`
+  // below.
+  let mut generic_class_defs: HashMap<String, &ClassDef> = HashMap::new();
   let mut class_defs: HashMap<String, &ClassDef> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
-      class_defs.insert(c.name.clone(), c);
+      if c.type_params.is_empty() {
+        class_defs.insert(c.name.clone(), c);
+      } else {
+        generic_class_defs.insert(c.name.clone(), c);
+      }
     }
   }
   for c in &actor_class_defs {
+    class_defs.insert(c.name.clone(), c);
+  }
+
+  // Plan 58: every generic-class instantiation actually written
+  // anywhere in the program, monomorphized into a real `ClassDef` —
+  // mirrors `actor_class_defs`'s own synthesis-then-merge shape above.
+  // Kept alive for the rest of this function so `class_defs`' borrows
+  // into it stay valid, exactly like `actor_class_defs`.
+  let generic_instances: HashMap<String, ClassDef> =
+    collect_generic_class_specializations(program, &generic_class_defs);
+  for c in generic_instances.values() {
     class_defs.insert(c.name.clone(), c);
   }
 
@@ -10831,13 +11390,19 @@ fn compile_to_object_impl(
   let mut class_tags: HashMap<String, i64> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
-      classes.insert(c.name.clone(), build_class_layout(&c.name, &class_defs)?);
-      class_tags.insert(c.name.clone(), class_tags.len() as i64);
+      if c.type_params.is_empty() {
+        classes.insert(c.name.clone(), build_class_layout(&c.name, &class_defs)?);
+        class_tags.insert(c.name.clone(), class_tags.len() as i64);
+      }
     }
     if let Item::Actor(a) = item {
       classes.insert(a.name.clone(), build_class_layout(&a.name, &class_defs)?);
       class_tags.insert(a.name.clone(), class_tags.len() as i64);
     }
+  }
+  for name in generic_instances.keys() {
+    classes.insert(name.clone(), build_class_layout(name, &class_defs)?);
+    class_tags.insert(name.clone(), class_tags.len() as i64);
   }
   let method_owners = build_method_owners(&class_defs)?;
 
@@ -10904,7 +11469,8 @@ fn compile_to_object_impl(
     .collect();
 
   let lambda_infos = collect_lambda_infos(program)?;
-  let mut user_func_ids = declare_user_functions(&context, &module, program, &classes);
+  let mut user_func_ids =
+    declare_user_functions(&context, &module, program, &classes, &generic_instances);
   let lambda_func_ids = declare_lambda_functions(&context, &module, program, &lambda_infos);
 
   // Plan 41's Decision log: one specialization cache entry per distinct
@@ -11059,6 +11625,12 @@ fn compile_to_object_impl(
           define_user_function(&context, &builder, f, fv, &gen_ctx)?;
         }
       }
+      // Plan 58: a generic class TEMPLATE's own raw method bodies never
+      // compile under its own unmangled name — `generic_instances`' own
+      // methods, defined in the dedicated pass just below this loop,
+      // are the only real bodies any monomorphized instantiation's
+      // calls ever reach.
+      Item::Class(c) if !c.type_params.is_empty() => {}
       Item::Class(c) => {
         let layout = &classes[&c.name];
         for m in &c.methods {
@@ -11157,6 +11729,29 @@ fn compile_to_object_impl(
       // Plan 52: pure data — no function body to compile.
       Item::Enum(_) => {}
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
+    }
+  }
+
+  // Plan 58: each monomorphized generic-class instantiation's method
+  // bodies, compiled via the *existing*, unmodified `define_method`
+  // path — 100% reuse of the non-generic machinery, just fed a
+  // synthesized `ClassDef`'s own methods instead of one straight from
+  // the parser (mirrors plan 41's own generic-FUNCTION specialization
+  // pass immediately below).
+  for c in generic_instances.values() {
+    let layout = &classes[&c.name];
+    for m in &c.methods {
+      let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
+      let (fv, _) = user_func_ids[&mangled];
+      define_method(
+        &context,
+        &builder,
+        m,
+        fv,
+        &layout.fields,
+        &layout.field_classes,
+        &gen_ctx,
+      )?;
     }
   }
 
@@ -11490,6 +12085,7 @@ fn assertion_error_class_item() -> Item {
         type_params: Vec::new(),
       },
     ],
+    type_params: Vec::new(),
   })
 }
 
@@ -13867,6 +14463,25 @@ int main(void) {
   #[test]
   fn enumerable_worked_example_compiled_linked_and_run_prints_24() {
     assert_eq!(compile_link_run(ENUMERABLE_EXAMPLE), "24\n");
+  }
+
+  // Plan 58 (generic types).
+
+  // A fixed-3-slot `Stack[T]` — deliberately avoids `Array[T]`/a self-
+  // referential linked-node field (both real, disclosed gaps in this
+  // plan's own template-checking/codegen — see `check_generic_class_
+  // body`'s and `instantiate_generic_class_defs`'s own doc comments),
+  // proving the core mechanism (field/param/return substitution, two
+  // simultaneous distinct instantiations, `{MangledName}_{method}`
+  // dispatch) with plain `T`-typed fields only.
+  const GENERIC_CLASSES_EXAMPLE: &str = "class Stack[T]\n  slot0: T\n  slot1: T\n  slot2: T\n  count: Int64\n  def initialize() -> Void\n    @count = 0\n  end\n  def push(value: T) -> Void\n    if @count == 0\n      @slot0 = value\n    end\n    if @count == 1\n      @slot1 = value\n    end\n    if @count == 2\n      @slot2 = value\n    end\n    @count = @count + 1\n  end\n  def pop() -> T\n    @count = @count - 1\n    if @count == 0\n      return @slot0\n    end\n    if @count == 1\n      return @slot1\n    end\n    return @slot2\n  end\nend\n\nints: Stack[Int64] = Stack.new()\nints.push(10)\nints.push(20)\nints.push(30)\nputs ints.pop()\nputs ints.pop()\n\nstrs: Stack[String] = Stack.new()\nstrs.push(\"first\")\nstrs.push(\"second\")\nputs strs.pop()\nputs strs.pop()\n";
+
+  #[test]
+  fn generic_stack_worked_example_compiled_linked_and_run_prints_the_expected_four_lines() {
+    assert_eq!(
+      compile_link_run(GENERIC_CLASSES_EXAMPLE),
+      "30\n20\nsecond\nfirst\n"
+    );
   }
 
   #[test]

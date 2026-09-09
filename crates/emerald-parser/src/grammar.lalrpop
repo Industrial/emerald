@@ -81,7 +81,11 @@ RequirePath: String = {
 // parameter) — fields and methods have disjoint FIRST sets (`Ident` vs
 // `"def"`), so `Param*` followed by `FuncDef*` is unambiguous.
 ClassDef: ClassDef = {
-  "class" <name:Ident> <superclass:SuperclassClause?> <implements:ImplementsClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
+  // Plan 58's Decision log: `<type_params:TypeParamClause?>` slots in
+  // immediately after the class name, before `SuperclassClause?` —
+  // reuses `TypeParamClause`/`TypeParamList` (plan 41's own generic-
+  // function `[T: Bound]` clause) verbatim, no new grammar production.
+  "class" <name:Ident> <type_params:TypeParamClause?> <superclass:SuperclassClause?> <implements:ImplementsClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
     let mut fields = Vec::new();
     let mut all_methods = Vec::new();
     for (p, synthesized) in class_fields {
@@ -89,7 +93,7 @@ ClassDef: ClassDef = {
       all_methods.extend(synthesized);
     }
     all_methods.extend(methods);
-    ClassDef { name, superclass, implements, fields, methods: all_methods }
+    ClassDef { name, superclass, implements, fields, methods: all_methods, type_params: type_params.unwrap_or_default() }
   }
 };
 
@@ -241,7 +245,13 @@ TypeParamList: Vec<TypeParam> = {
 };
 
 TypeParam: TypeParam = {
-  <name:Ident> ":" <bound:Ident> => TypeParam { name, bound },
+  <name:Ident> ":" <bound:Ident> => TypeParam { name, bound: Some(bound) },
+  // Plan 58's Decision log: the bound-less alternative — `class Box[T]`'s
+  // own headline case. `TypeParam.bound` widened to `Option<String>`
+  // precisely to admit this; sema (not the grammar) still rejects a
+  // bound-less type parameter on a top-level generic FUNCTION with its
+  // own "generic functions require a bound" diagnostic, unchanged.
+  <name:Ident> => TypeParam { name, bound: None },
 };
 
 // Plan 40's Decision log: operator-named methods are legal only inside
@@ -1204,6 +1214,32 @@ TypeName: String = {
   // every param/field/`Let` annotation, which never resolves this
   // shape and falls through to its `unknown type` catch-all).
   "(" <parts:TupleTypeNames> ")" => format!("({})", parts.join(", ")),
+  // Plan 58's Decision log: a general `<Ident> "[" ... "]"` compound
+  // form for a user-declared generic class (`Stack[Int64]`,
+  // `Box[Box[Int64]]`) — distinct from the four hardcoded-keyword
+  // forms above (`Array`/`Hash`/`Pair`/`Result` are reserved terminals,
+  // never matched by the plain `Ident` regex, so there is no FIRST-set
+  // overlap to disambiguate: LALR(1) picks this alternative purely by
+  // whether a `[` follows the identifier). Deliberately accepts a full
+  // recursive `TypeName` per type argument (`GenericTypeArgs`), NOT the
+  // narrower bare-`Ident`-only convention the four hardcoded forms use
+  // above — `Box[Box[Int64]]` must parse as a single compound string
+  // for this plan's own recursive-instantiation hazard to ever reach
+  // sema at all (see the plan's own Decision log).
+  <name:Ident> "[" <args:GenericTypeArgs> "]" => format!("{name}[{}]", args.join(", ")),
+};
+
+// Plan 58: one-or-more comma-separated `TypeName`s (unlike
+// `TupleTypeNames`'s "at least two" — a single-type-parameter generic
+// class, `Stack[Int64]`, is the common case). Right-recursive, mirroring
+// every other separator-delimited list in this grammar.
+GenericTypeArgs: Vec<String> = {
+  <t:TypeName> => vec![t],
+  <t:TypeName> "," <rest:GenericTypeArgs> => {
+    let mut v = vec![t];
+    v.extend(rest);
+    v
+  },
 };
 
 // At least two element types (a 1-tuple isn't a meaningful multi-return
