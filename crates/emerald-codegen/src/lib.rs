@@ -28,7 +28,13 @@ use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::{Linkage, Module};
+// Plan 35: DWARF line-table debug info (v1 scope — see the plan's own
+// Decision log: line tables only, no variable/type DIEs).
+use inkwell::debug_info::{
+  AsDIScope, DIFile, DIFlags, DIFlagsConstants, DIScope, DWARFEmissionKind, DWARFSourceLanguage,
+  DebugInfoBuilder,
+};
+use inkwell::module::{FlagBehavior, Linkage, Module};
 use inkwell::targets::{
   CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -1562,6 +1568,20 @@ struct Ctx<'a, 'ctx> {
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
   build_argv: FunctionValue<'ctx>,
+  /// Plan 35: `Some` only when `compile_to_object_with_debug_info` was
+  /// the entry point — `None` (the `compile_to_object` path) attaches
+  /// no debug info at all, unchanged behavior.
+  dibuilder: Option<&'a DebugInfoBuilder<'ctx>>,
+  di_file: Option<DIFile<'ctx>>,
+  /// Sorted byte offsets of every `\n` in the compiled source — a
+  /// `Spanned<T>`'s byte-offset span converts to a 1-based source line
+  /// via `line_for_offset`'s binary search over this table.
+  newline_offsets: Option<&'a [usize]>,
+  /// The enclosing function/method/lambda's own `DISubprogram` scope,
+  /// set once per `define_user_function`/`define_method`/
+  /// `define_lambda`/`define_main` call — `build_stmt` reads this to
+  /// build each statement's debug location.
+  current_di_scope: Option<DIScope<'ctx>>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -4232,6 +4252,17 @@ fn build_stmt<'a, 'ctx>(
   ret_kind: ValKind,
   ctx: &Ctx<'a, 'ctx>,
 ) -> Result<bool, String> {
+  // Plan 35: every statement anywhere (top-level body, nested if/while/
+  // case/begin/rescue/ensure — all funnel through this one function)
+  // gets a real debug location from its own `Spanned<Stmt>` span before
+  // any of its instructions are built.
+  if let (Some(dibuilder), Some(scope), Some(offsets)) =
+    (ctx.dibuilder, ctx.current_di_scope, ctx.newline_offsets)
+  {
+    let line = line_for_offset(offsets, stmt.span.0);
+    let loc = dibuilder.create_debug_location(context, line, 0, scope, None);
+    builder.set_current_debug_location(loc);
+  }
   match &stmt.node {
     Stmt::Let {
       name,
@@ -5818,6 +5849,70 @@ fn bind_params<'ctx>(
   Ok(())
 }
 
+/// Byte offset → 1-based source line, via a binary search over
+/// `newline_offsets` (every `\n`'s byte offset, ascending) — the
+/// conversion plan 35 reuses at every debug-location site instead of
+/// re-deriving spans (plan 22's `Spanned<T>.span.0` is already a real
+/// byte offset into the same source text this table was built from).
+fn line_for_offset(newline_offsets: &[usize], byte_offset: usize) -> u32 {
+  1 + newline_offsets.partition_point(|&nl| nl < byte_offset) as u32
+}
+
+/// Creates one `DISubprogram` for a function/method/lambda about to be
+/// compiled, attaches it to `fv`, and returns its scope — `None` when
+/// `gen_ctx` carries no debug info (the ordinary `compile_to_object`
+/// path). `first_stmt_span` anchors the subprogram's own declared line
+/// (its body's first real statement — a reasonable, if approximate,
+/// stand-in for the `def`/lambda-literal's own line, since neither
+/// `AstFunction` nor a lambda literal carries its own span; v1 scope
+/// only needs per-STATEMENT line accuracy, which `build_stmt` derives
+/// independently from each statement's own span).
+///
+/// Also sets `builder`'s current debug location to this new scope
+/// immediately — LLVM's builder keeps whatever debug location was last
+/// set across `position_at_end` calls into a *different* function's
+/// entry block, so without this, the first instructions built in a new
+/// function (`bind_params`'s allocas, `define_main`'s `ARGV`/`ARGC`
+/// setup) would carry the *previous* function's leftover `!dbg`
+/// location — caught by `module.verify()` for real this session
+/// ("!dbg attachment points at wrong subprogram for function") before
+/// this fix. Must be called before any instruction is built in the new
+/// function, not just before `build_stmt` starts walking its body.
+fn di_scope_for_function<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  gen_ctx: &Ctx<'_, 'ctx>,
+  fv: FunctionValue<'ctx>,
+  name: &str,
+  first_stmt_span: Option<(usize, usize)>,
+) -> Option<DIScope<'ctx>> {
+  let dibuilder = gen_ctx.dibuilder?;
+  let file = gen_ctx.di_file?;
+  let line = match (first_stmt_span, gen_ctx.newline_offsets) {
+    (Some((start, _)), Some(offsets)) => line_for_offset(offsets, start),
+    _ => 1,
+  };
+  let subroutine_ty = dibuilder.create_subroutine_type(file, None, &[], DIFlags::PUBLIC);
+  let subprogram = dibuilder.create_function(
+    file.as_debug_info_scope(),
+    name,
+    None,
+    file,
+    line,
+    subroutine_ty,
+    true,
+    true,
+    line,
+    DIFlags::PUBLIC,
+    false,
+  );
+  fv.set_subprogram(subprogram);
+  let scope = subprogram.as_debug_info_scope();
+  let loc = dibuilder.create_debug_location(context, line, 0, scope, None);
+  builder.set_current_debug_location(loc);
+  Some(scope)
+}
+
 fn define_user_function<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
@@ -5827,6 +5922,19 @@ fn define_user_function<'ctx>(
 ) -> Result<(), String> {
   let entry = context.append_basic_block(fv, "entry");
   builder.position_at_end(entry);
+
+  let di_scope = di_scope_for_function(
+    context,
+    builder,
+    gen_ctx,
+    fv,
+    &f.name,
+    f.body.first().map(|s| s.span),
+  );
+  let fn_ctx = Ctx {
+    current_di_scope: di_scope,
+    ..*gen_ctx
+  };
 
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
@@ -5857,7 +5965,7 @@ fn define_user_function<'ctx>(
     &mut local_classes,
     &mut local_array_elem_types,
     ret_kind,
-    gen_ctx,
+    &fn_ctx,
   )
 }
 
@@ -5882,6 +5990,20 @@ fn define_method<'ctx>(
     .expect("methods always declare a leading self param")
     .into_pointer_value();
 
+  let di_scope = di_scope_for_function(
+    context,
+    builder,
+    gen_ctx,
+    fv,
+    &m.name,
+    m.body.first().map(|s| s.span),
+  );
+  let method_ctx = Ctx {
+    self_ctx: Some((self_ptr, self_fields)),
+    current_di_scope: di_scope,
+    ..*gen_ctx
+  };
+
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
   let mut local_array_elem_types = HashMap::new();
@@ -5901,10 +6023,6 @@ fn define_method<'ctx>(
   collect_lets(&m.body, &mut decls);
   prealloc_lets(context, builder, &decls, &mut vars)?;
 
-  let method_ctx = Ctx {
-    self_ctx: Some((self_ptr, self_fields)),
-    ..*gen_ctx
-  };
   let ret_kind = value_kind_for_type(&m.return_type);
   build_function_body(
     context,
@@ -5929,6 +6047,7 @@ fn define_method<'ctx>(
 fn define_lambda<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
+  name: &str,
   params: &[Param],
   return_type: &str,
   body: &[Spanned<Stmt>],
@@ -5943,6 +6062,19 @@ fn define_lambda<'ctx>(
     .get_nth_param(0)
     .expect("lambdas always declare a leading env param")
     .into_pointer_value();
+
+  let di_scope = di_scope_for_function(
+    context,
+    builder,
+    gen_ctx,
+    fv,
+    name,
+    body.first().map(|s| s.span),
+  );
+  let fn_ctx = Ctx {
+    current_di_scope: di_scope,
+    ..*gen_ctx
+  };
 
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
@@ -5990,7 +6122,7 @@ fn define_lambda<'ctx>(
     &mut local_classes,
     &mut local_array_elem_types,
     ret_kind,
-    gen_ctx,
+    &fn_ctx,
   )
 }
 
@@ -6017,6 +6149,19 @@ fn define_main<'ctx>(
       _ => None,
     })
     .collect();
+
+  let di_scope = di_scope_for_function(
+    context,
+    builder,
+    gen_ctx,
+    main_fn,
+    "main",
+    top_stmts.first().map(|s| s.span),
+  );
+  let fn_ctx = Ctx {
+    current_di_scope: di_scope,
+    ..*gen_ctx
+  };
 
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
@@ -6084,7 +6229,7 @@ fn define_main<'ctx>(
     &mut ensure_stack,
     &mut retry_stack,
     ValKind::Int64, // main's own AST-level "return kind" is never consulted -- top-level has no `return`
-    gen_ctx,
+    &fn_ctx,
   )?;
   if !terminated {
     let zero = context.i32_type().const_int(0, false);
@@ -6224,6 +6369,30 @@ fn declare_lambda_functions<'ctx>(
 /// `__lambda_{name}` per top-level `Proc` `Let`, plus a `main`
 /// (`extern "C" fn() -> i32`) that evaluates the top-level statements.
 pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
+  compile_to_object_impl(program, out_path, None)
+}
+
+/// Plan 35's `leaf-line-table-generation`: identical to
+/// `compile_to_object`, except the emitted object file also carries
+/// real DWARF line-table debug info (v1 scope — line tables only, no
+/// variable/type DIEs; see the plan's own Decision log) derived from
+/// `source`'s real text and `file_name`'s path via plan 22's
+/// `Spanned<T>` byte-offset spans, already threaded through every AST
+/// node this backend consumes.
+pub fn compile_to_object_with_debug_info(
+  program: &Program,
+  out_path: &Path,
+  source: &str,
+  file_name: &str,
+) -> Result<(), String> {
+  compile_to_object_impl(program, out_path, Some((source, file_name)))
+}
+
+fn compile_to_object_impl(
+  program: &Program,
+  out_path: &Path,
+  source_info: Option<(&str, &str)>,
+) -> Result<(), String> {
   // Plan 47's Decision log: a `test "..." do ... end` block only ever
   // compiles through `compile_test_harness` (`emerald test`) — reaching
   // this, the ordinary `emerald <file>`/`emerald build` path, is a
@@ -6260,6 +6429,54 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   module.set_triple(&triple);
   module.set_data_layout(&target_machine.get_target_data().get_data_layout());
   let builder = context.create_builder();
+
+  // Plan 35: DWARF line-table debug info, only when the caller supplied
+  // real source text (see `compile_to_object_with_debug_info`) — the
+  // ordinary `compile_to_object` entry point attaches none, unchanged
+  // behavior.
+  let debug_metadata_version = context.i32_type().const_int(3, false);
+  let newline_offsets_owner: Option<Vec<usize>> = source_info.map(|(source, _)| {
+    source
+      .bytes()
+      .enumerate()
+      .filter(|(_, b)| *b == b'\n')
+      .map(|(i, _)| i)
+      .collect()
+  });
+  let debug_info: Option<(DebugInfoBuilder, DIFile)> = source_info.map(|(_, file_name)| {
+    module.add_basic_value_flag(
+      "Debug Info Version",
+      FlagBehavior::Warning,
+      debug_metadata_version,
+    );
+    let path = Path::new(file_name);
+    let directory = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+    let filename = path
+      .file_name()
+      .and_then(|f| f.to_str())
+      .unwrap_or(file_name);
+    let (dibuilder, compile_unit) = module.create_debug_info_builder(
+      true,
+      DWARFSourceLanguage::C,
+      filename,
+      directory,
+      "emerald",
+      false,
+      "",
+      0,
+      "",
+      DWARFEmissionKind::Full,
+      0,
+      false,
+      false,
+      "",
+      "",
+    );
+    let file = compile_unit.get_file();
+    (dibuilder, file)
+  });
+  let dibuilder_owner = debug_info.as_ref().map(|(dib, _)| dib);
+  let di_file = debug_info.as_ref().map(|(_, file)| *file);
 
   let ptr_ty = context.ptr_type(AddressSpace::default());
   let i64_ty = context.i64_type();
@@ -6540,6 +6757,10 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     file_write,
     gets,
     build_argv,
+    dibuilder: dibuilder_owner,
+    di_file,
+    newline_offsets: newline_offsets_owner.as_deref(),
+    current_di_scope: None,
   };
 
   for item in &program.items {
@@ -6595,6 +6816,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
           define_lambda(
             &context,
             &builder,
+            name,
             params,
             return_type,
             body,
@@ -6651,6 +6873,15 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   let main_fn = module.add_function("main", main_ty, Some(Linkage::External));
   define_main(&context, &builder, main_fn, program, &gen_ctx)?;
 
+  // Plan 35: must run before verification/object emission, per
+  // `DebugInfoBuilder::finalize`'s own doc — its `Drop` impl also calls
+  // this, but only when `debug_info` drops at the end of this function,
+  // which is after emission; an explicit call here is required, and
+  // safe to repeat (`finalize` is documented idempotent).
+  if let Some((dibuilder, _)) = &debug_info {
+    dibuilder.finalize();
+  }
+
   module.verify().map_err(|e| e.to_string())?;
 
   // Plan 38: `setjmp`'s `returns_twice` attribute (see
@@ -6671,7 +6902,20 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   // its own (mem2reg is a pure optimization, not required for
   // correctness), just slower — an acceptable, real tradeoff for a
   // rare, non-hot-path exception-recovery construct.
-  if program_uses_retry(program) {
+  // Plan 35: verified for real this session — `default<O3>` freely
+  // inlines and constant-folds a small function like the worked
+  // example's `add(a, b) -> a + b` (called with two literal args)
+  // straight into `main`, so the real compiled binary never actually
+  // calls `add` at runtime at all — a real `gdb` session confirmed the
+  // breakpoint resolved to a valid address in `add`'s still-emitted
+  // body, but `run` sailed straight through to the program's normal
+  // exit without ever stopping there. This is the exact same
+  // observation-changes-the-program problem `program_uses_retry` above
+  // already works around, just via inlining instead of `mem2reg`/SROA
+  // — skipping optimization whenever debug info is attached is the
+  // same "-O0 -g" tradeoff virtually every real compiler makes for
+  // debug builds: correct, steppable control flow over speed.
+  if program_uses_retry(program) || debug_info.is_some() {
     return target_machine
       .write_to_file(&module, FileType::Object, out_path)
       .map_err(|e| e.to_string());

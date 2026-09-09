@@ -52,11 +52,24 @@ fn check_stage(program: Program) -> Effect<Program, DriverError, ()> {
   })
 }
 
-fn codegen_stage(program: Program, obj_path: PathBuf) -> Effect<PathBuf, DriverError, ()> {
+/// Plan 35's `leaf-line-table-generation`: `source_info` is `Some((source,
+/// name))` only from `compile`'s own source-text entry point — `compile_
+/// program`'s already-parsed-`Program` entry point has no source text to
+/// derive DWARF line numbers from, so it passes `None` and gets the same
+/// debug-info-free object file this crate always produced.
+fn codegen_stage(
+  program: Program,
+  obj_path: PathBuf,
+  source_info: Option<(String, String)>,
+) -> Effect<PathBuf, DriverError, ()> {
   Effect::new(move |_env: &mut ()| {
-    emerald_codegen::compile_to_object(&program, &obj_path)
-      .map(|()| obj_path)
-      .map_err(DriverError::Codegen)
+    let result = match &source_info {
+      Some((source, name)) => {
+        emerald_codegen::compile_to_object_with_debug_info(&program, &obj_path, source, name)
+      }
+      None => emerald_codegen::compile_to_object(&program, &obj_path),
+    };
+    result.map(|()| obj_path).map_err(DriverError::Codegen)
   })
 }
 
@@ -112,9 +125,10 @@ pub fn check(source: &str, name: &str) -> Result<(), DriverError> {
 pub fn compile(source: &str, name: &str, output_path: &Path) -> Result<(), DriverError> {
   let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
   let output_path = output_path.to_path_buf();
+  let source_info = Some((source.to_string(), name.to_string()));
   let pipeline = parse_stage(source.to_string(), name.to_string())
     .flat_map(check_stage)
-    .flat_map(move |program| codegen_stage(program, obj_path))
+    .flat_map(move |program| codegen_stage(program, obj_path, source_info))
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
   run_blocking(pipeline, ())
 }
@@ -172,7 +186,7 @@ pub fn compile_program(program: Program, output_path: &Path) -> Result<(), Drive
   let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
   let output_path = output_path.to_path_buf();
   let pipeline = check_stage(program)
-    .flat_map(move |program| codegen_stage(program, obj_path))
+    .flat_map(move |program| codegen_stage(program, obj_path, None))
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
   run_blocking(pipeline, ())
 }
