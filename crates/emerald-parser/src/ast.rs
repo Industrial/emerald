@@ -463,6 +463,21 @@ pub enum Expr {
     addr: Box<Spanned<Expr>>,
     name: Box<Spanned<Expr>>,
   },
+  /// `ActorName.locate(key, args...)` (plan 65's Decision log,
+  /// `leaf-virtual-actor-placement`) — Orleans-style on-demand virtual
+  /// actor placement: `key` (a `String`) consistent-hashes over the
+  /// discovered `EMERALD_PEERS` set to decide the owning node; `args`
+  /// are the class's real `initialize` arguments, used only the first
+  /// time this key is ever activated (a lazily-spawned instance is
+  /// cached thereafter, on whichever node owns it). Deliberately a
+  /// THIRD, textually-disjoint reserved call form alongside `.spawn`/
+  /// `.remote` (never a reuse of either) — sema decides which
+  /// receivers are valid, same as both siblings.
+  Locate {
+    class: String,
+    key: Box<Spanned<Expr>>,
+    args: Vec<Spanned<Expr>>,
+  },
   /// `comptime <expr>` (plan 61's Decision log) — the operand binds at
   /// `UnaryExpr`'s tight precedence tier, the exact same real, build-
   /// verified-necessary placement `-`/`!`/`~` already use (an

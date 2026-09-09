@@ -102,6 +102,21 @@ fn ac3_two_messages_on_the_same_actor_fire_in_enqueue_order() {
   );
 }
 
+/// Plan 65's `leaf-unified-fallible-send` AC3, proven directly at the
+/// runtime layer — `emerald_actor_enqueue` against an already-
+/// terminated actor must report failure (a nonzero return), not the
+/// old hardcoded success.
+#[test]
+fn plan65_enqueue_against_a_terminated_actor_reports_failure() {
+  let binary = build_harness("terminated");
+  let samples = run_harness(&binary, "terminated", 1);
+  assert_eq!(
+    samples,
+    vec![1],
+    "enqueuing a message against an already-terminated actor must report failure, not silently succeed"
+  );
+}
+
 #[test]
 fn ac4_two_concurrently_running_workers_report_distinct_thread_ids() {
   let binary = build_harness("threadid");

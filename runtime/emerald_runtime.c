@@ -807,8 +807,19 @@ static int emerald_pool_started = 0;
  * `EMERALD_MESSAGE_ARGV_MAX` truncates (sema/codegen's own compile-time
  * arity cap on a cross-actor call keeps this from ever firing in
  * practice — see the plan's own Decision log). */
-void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
-                            long long *argv, long long argc) {
+/* Plan 65's `leaf-unified-fallible-send`: return type widened from
+ * `void` to `int` (0 = enqueued, -1 = the target actor was already
+ * terminated) — the "hardcoded success" gap the Decision log names:
+ * before this leaf, `emerald_actor_dispatch`'s local branch was
+ * architecturally incapable of reporting a dead-actor send at all.
+ * Every pre-existing call site (this file's own `emerald_reader_main`,
+ * `emerald_actor_dispatch` below, and every hand-built `.c` test
+ * harness) already discards a `void` return, so simply not reading the
+ * new `int` is completely valid C — zero source-level change required
+ * at any of them (only their own `extern` prototypes, if they declare
+ * one, need the matching return type). */
+int emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
+                           long long *argv, long long argc) {
   EmeraldActorHeader *header = *(EmeraldActorHeader **) ((char *) self - sizeof(void *));
 
   EmeraldMessage *msg = malloc(sizeof(EmeraldMessage));
@@ -832,7 +843,7 @@ void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
   if (header->terminated) {
     pthread_mutex_unlock(&header->mailbox_mutex);
     free(msg);
-    return;
+    return -1;
   }
   pthread_mutex_lock(&emerald_runnable_mutex);
   emerald_outstanding_messages++;
@@ -863,6 +874,7 @@ void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
     pthread_cond_signal(&emerald_runnable_cond);
     pthread_mutex_unlock(&emerald_runnable_mutex);
   }
+  return 0;
 }
 
 #ifndef __wasi__
@@ -1537,6 +1549,438 @@ int emerald_tcp_connect(uint32_t ip_network_order, uint16_t port, int timeout_ms
   return fd;
 }
 
+/* Plan 65's `leaf-automatic-discovery` — the smallest genuinely zero-
+ * implementor-code peer-discovery mechanism: `EMERALD_PEERS` (comma-
+ * separated `host:port`) plus `EMERALD_SELF` (which entry is this
+ * process), both read once, lazily, the first time any caller actually
+ * needs the peer set (`leaf-virtual-actor-placement`'s `.locate`
+ * codegen and its own heartbeat prober) — mirroring `emerald_remote_
+ * timeout_ms`'s own "cheap enough not to need caching" posture, and
+ * paying nothing for an ordinary program that never uses this feature
+ * (AC3/AC4). DNS-SRV, a Kubernetes API discovery client, and gossip
+ * membership are explicitly declined (Decision log) — each a real,
+ * substantially larger mechanism in its own right, not a smaller
+ * version of this one. */
+/* Forward-declared — `emerald_discover_peers` (right below) calls it
+ * per peer entry, but its own real definition sits a little further
+ * down this file (right after this whole section). */
+int emerald_parse_host_port(const char *addr, uint32_t *ip_out, uint16_t *port_out);
+
+#define EMERALD_MAX_PEERS 32
+/* One `"host:port"` entry's own max stored length, including the NUL
+ * — comfortably larger than any real IPv4-literal-plus-port spelling
+ * (`emerald_parse_host_port`'s own `host[64]` local buffer is the
+ * same size class). */
+#define EMERALD_HOST_PORT_MAX 64
+
+typedef struct EmeraldPeer {
+  uint32_t ip;
+  uint16_t port;
+  /* Original `"host:port"` spelling, kept verbatim (not just IP/port)
+   * so `.locate`'s own remote-resolve path can hand it straight to
+   * `emerald_actor_ref_remote` without re-formatting a dotted-quad
+   * string back out of `ip`. */
+  char addr[EMERALD_HOST_PORT_MAX];
+} EmeraldPeer;
+
+typedef struct EmeraldPeerSet {
+  EmeraldPeer peers[EMERALD_MAX_PEERS];
+  int count;
+  /* Index into `peers` this process itself is, or -1 if `EMERALD_
+   * PEERS` is unset entirely (a real, valid single-process
+   * configuration — Decision log — every `.locate` then degenerates
+   * to "the ring has one node, always itself"). */
+  int self_index;
+} EmeraldPeerSet;
+
+/* Splits `s` on `sep`, writing each substring's start into `out[]`
+ * (as a fresh, NUL-terminated `malloc`'d copy) and returning the
+ * split count, or -1 if `s` contains more than `max` fields. Purely a
+ * small string-splitting helper — no networking, no validation of the
+ * substrings themselves (that's `emerald_discover_peers`'s own job,
+ * entry by entry, so a bad entry's own diagnostic can name exactly
+ * which one). */
+static int emerald_split(const char *s, char sep, char **out, int max) {
+  int n = 0;
+  const char *start = s;
+  for (;;) {
+    const char *p = start;
+    while (*p != '\0' && *p != sep) {
+      p++;
+    }
+    if (n >= max) {
+      return -1;
+    }
+    size_t len = (size_t) (p - start);
+    char *copy = malloc(len + 1);
+    memcpy(copy, start, len);
+    copy[len] = '\0';
+    out[n++] = copy;
+    if (*p == '\0') {
+      break;
+    }
+    start = p + 1;
+  }
+  return n;
+}
+
+/* Real, named startup errors (Decision log/AC2/AC3) rather than a
+ * crash or a silent skip — mirrors `emerald_tcp_listen`'s own
+ * `emerald_set_remote_error`-then-return-failure convention. Returns
+ * 0 on success, -1 on any malformed entry or a missing/unmatched
+ * `EMERALD_SELF` (an unset `EMERALD_PEERS` is NOT an error — see
+ * `EmeraldPeerSet.self_index`'s own doc comment). `out` is left
+ * zeroed on failure (no partial peer set a caller could mistakenly
+ * treat as complete). */
+int emerald_discover_peers(EmeraldPeerSet *out) {
+  memset(out, 0, sizeof(*out));
+  out->self_index = -1;
+
+  const char *peers_env = getenv("EMERALD_PEERS");
+  if (peers_env == NULL || peers_env[0] == '\0') {
+    return 0;
+  }
+
+  char *fields[EMERALD_MAX_PEERS];
+  int n = emerald_split(peers_env, ',', fields, EMERALD_MAX_PEERS);
+  if (n < 0) {
+    emerald_set_remote_error("EMERALD_PEERS: more than EMERALD_MAX_PEERS entries");
+    return -1;
+  }
+
+  for (int i = 0; i < n; i++) {
+    const char *entry = fields[i];
+    const char *colon = strchr(entry, ':');
+    int malformed = colon == NULL;
+    if (!malformed) {
+      for (const char *p = colon + 1; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+          malformed = 1;
+          break;
+        }
+      }
+      malformed = malformed || *(colon + 1) == '\0';
+    }
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (!malformed && emerald_parse_host_port(entry, &ip, &port) != 0) {
+      malformed = 1;
+    }
+    if (malformed) {
+      emerald_set_remote_error("EMERALD_PEERS: malformed \"host:port\" entry");
+      /* Free from `i` onward only — every field before `i` was already
+       * freed by its own successful iteration below (a prior double-
+       * free bug, found by this leaf's own new test). */
+      for (int j = i; j < n; j++) {
+        free(fields[j]);
+      }
+      memset(out, 0, sizeof(*out));
+      out->self_index = -1;
+      return -1;
+    }
+    out->peers[i].ip = ip;
+    out->peers[i].port = port;
+    strncpy(out->peers[i].addr, entry, sizeof(out->peers[i].addr) - 1);
+    out->peers[i].addr[sizeof(out->peers[i].addr) - 1] = '\0';
+    free(fields[i]);
+  }
+  out->count = n;
+
+  const char *self_env = getenv("EMERALD_SELF");
+  if (self_env == NULL || self_env[0] == '\0') {
+    emerald_set_remote_error("EMERALD_SELF is unset — required whenever EMERALD_PEERS is set");
+    memset(out, 0, sizeof(*out));
+    out->self_index = -1;
+    return -1;
+  }
+  for (int i = 0; i < out->count; i++) {
+    if (strcmp(out->peers[i].addr, self_env) == 0) {
+      out->self_index = i;
+      return 0;
+    }
+  }
+  emerald_set_remote_error("EMERALD_SELF does not match any entry in EMERALD_PEERS");
+  memset(out, 0, sizeof(*out));
+  out->self_index = -1;
+  return -1;
+}
+
+/* Plan 65's `leaf-virtual-actor-placement` — a real, simple, single-
+ * ring consistent hash (Decision log: NOT Orleans' own replicated
+ * directory/coordinator — every process recomputes this ring
+ * independently, locally, from whatever `EMERALD_PEERS` plus the
+ * liveness table below says RIGHT NOW). Each peer contributes
+ * `EMERALD_VIRTUAL_POINTS_PER_PEER` virtual points
+ * (`FNV-1a("host:port#i")`), smoothing distribution across a small
+ * peer set; a key's owner is the ring's first virtual point at or
+ * after `FNV-1a(key)`, wrapping around. */
+#define EMERALD_VIRTUAL_POINTS_PER_PEER 4
+
+static uint32_t emerald_fnv1a(const char *s) {
+  uint32_t h = 2166136261u;
+  for (const unsigned char *p = (const unsigned char *) s; *p != '\0'; p++) {
+    h ^= *p;
+    h *= 16777619u;
+  }
+  return h;
+}
+
+typedef struct EmeraldRingPoint {
+  uint32_t hash;
+  int peer_index;
+} EmeraldRingPoint;
+
+static int emerald_ring_point_cmp(const void *a, const void *b) {
+  uint32_t ha = ((const EmeraldRingPoint *) a)->hash;
+  uint32_t hb = ((const EmeraldRingPoint *) b)->hash;
+  if (ha < hb) {
+    return -1;
+  }
+  if (ha > hb) {
+    return 1;
+  }
+  return 0;
+}
+
+/* Returns the owning peer's index into `peers->peers`, computed only
+ * over the peers `live` marks up (`live[i]` non-zero) — a `NULL live`
+ * treats every peer as live (used to exercise the pure hash function
+ * in isolation, and by any caller that hasn't started the heartbeat
+ * prober). Returns -1 if `peers->count == 0` (the real, valid
+ * single-process configuration — Decision log — the ring degenerates
+ * to "always self"); -2 if `peers->count > 0` but every peer is
+ * currently marked dead (real, disclosed: nothing left to route to,
+ * distinct from -1's "there was never anyone else"). AC3's own
+ * stability requirement — adding a fourth, never-contacted (always-
+ * dead) peer must not change who owns an existing key — holds by
+ * construction: a dead peer contributes zero ring points at all, so
+ * its presence in `peers` alone (with `live[i] == 0`) never perturbs
+ * the surviving points' own relative order. */
+int emerald_consistent_hash_owner(const char *key, const EmeraldPeerSet *peers, const int *live) {
+  if (peers->count == 0) {
+    return -1;
+  }
+  EmeraldRingPoint ring[EMERALD_MAX_PEERS * EMERALD_VIRTUAL_POINTS_PER_PEER];
+  int ring_len = 0;
+  for (int i = 0; i < peers->count; i++) {
+    if (live != NULL && !live[i]) {
+      continue;
+    }
+    for (int v = 0; v < EMERALD_VIRTUAL_POINTS_PER_PEER; v++) {
+      char vkey[EMERALD_HOST_PORT_MAX + 8];
+      snprintf(vkey, sizeof(vkey), "%s#%d", peers->peers[i].addr, v);
+      ring[ring_len].hash = emerald_fnv1a(vkey);
+      ring[ring_len].peer_index = i;
+      ring_len++;
+    }
+  }
+  if (ring_len == 0) {
+    return -2;
+  }
+  qsort(ring, (size_t) ring_len, sizeof(EmeraldRingPoint), emerald_ring_point_cmp);
+  uint32_t key_hash = emerald_fnv1a(key);
+  for (int i = 0; i < ring_len; i++) {
+    if (ring[i].hash >= key_hash) {
+      return ring[i].peer_index;
+    }
+  }
+  return ring[0].peer_index;
+}
+
+/* Plan 65's own addition beyond plan 60 (Decision log: plan 60
+ * explicitly declined a heartbeat/liveness protocol — "a genuinely
+ * wedged peer is only detected once a send is attempted"). A per-
+ * process LOCAL failure detector, not a distributed consensus
+ * protocol: two processes can disagree about a third peer's liveness
+ * for up to a few heartbeat intervals (the same split-brain-adjacent
+ * gap the Decision log already names). Marks a peer dead after
+ * `EMERALD_LIVENESS_MISS_THRESHOLD` consecutive failed connect probes,
+ * alive again the moment a probe succeeds. */
+#define EMERALD_LIVENESS_MISS_THRESHOLD 3
+
+static pthread_mutex_t emerald_liveness_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int emerald_liveness_alive[EMERALD_MAX_PEERS];
+static int emerald_liveness_misses[EMERALD_MAX_PEERS];
+static EmeraldPeerSet emerald_cached_peers;
+static int emerald_discovery_started = 0;
+
+static int emerald_heartbeat_interval_ms(void) {
+  const char *env = getenv("EMERALD_HEARTBEAT_INTERVAL_MS");
+  if (env != NULL) {
+    long v = atol(env);
+    if (v > 0) {
+      return (int) v;
+    }
+  }
+  return 1000;
+}
+
+static void *emerald_heartbeat_main(void *arg) {
+  (void) arg;
+  for (;;) {
+    int interval_ms = emerald_heartbeat_interval_ms();
+    for (int i = 0; i < emerald_cached_peers.count; i++) {
+      if (i == emerald_cached_peers.self_index) {
+        continue;
+      }
+      int fd = emerald_tcp_connect(
+          emerald_cached_peers.peers[i].ip, emerald_cached_peers.peers[i].port, interval_ms);
+      int ok = fd >= 0;
+      if (fd >= 0) {
+        close(fd);
+      }
+      pthread_mutex_lock(&emerald_liveness_mutex);
+      if (ok) {
+        emerald_liveness_misses[i] = 0;
+        emerald_liveness_alive[i] = 1;
+      } else {
+        emerald_liveness_misses[i]++;
+        if (emerald_liveness_misses[i] >= EMERALD_LIVENESS_MISS_THRESHOLD) {
+          emerald_liveness_alive[i] = 0;
+        }
+      }
+      pthread_mutex_unlock(&emerald_liveness_mutex);
+    }
+    struct timespec ts;
+    ts.tv_sec = interval_ms / 1000;
+    ts.tv_nsec = (long) (interval_ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+  }
+  return NULL;
+}
+
+/* Idempotent lazy init — the first call in a process discovers peers
+ * (via `emerald_discover_peers`, a real, named fatal startup error on
+ * malformed config, per that function's own doc comment: "surfaced the
+ * first time discovery is actually needed") and starts the heartbeat
+ * prober (a no-op under `__wasi__` — `pthread_create`'s own shim
+ * always fails there, so liveness simply stays permanently
+ * optimistic, matching this target's own single-execution-context
+ * reality). `.locate`'s own runtime entry point calls this before
+ * every consistent-hash computation. */
+void emerald_ensure_discovery_and_heartbeat(void) {
+  static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock(&init_mutex);
+  if (!emerald_discovery_started) {
+    int rc = emerald_discover_peers(&emerald_cached_peers);
+    if (rc != 0) {
+      fprintf(stderr, "emerald: fatal: %s\n", emerald_remote_last_error_message());
+      fflush(stderr);
+      exit(1);
+    }
+    for (int i = 0; i < emerald_cached_peers.count; i++) {
+      emerald_liveness_alive[i] = 1;
+      emerald_liveness_misses[i] = 0;
+    }
+    if (emerald_cached_peers.count > 0) {
+      pthread_t heartbeat;
+      pthread_create(&heartbeat, NULL, emerald_heartbeat_main, NULL);
+      pthread_detach(heartbeat);
+    }
+    emerald_discovery_started = 1;
+  }
+  pthread_mutex_unlock(&init_mutex);
+}
+
+/* Real, tested (via a dedicated C harness) accessors — never called
+ * from generated code directly, only from this file's own `.locate`
+ * runtime entry point (below) and from test harnesses exercising the
+ * liveness table in isolation. */
+const EmeraldPeerSet *emerald_peer_set(void) {
+  return &emerald_cached_peers;
+}
+
+int emerald_peer_is_live(int index) {
+  if (index < 0 || index >= emerald_cached_peers.count) {
+    return 0;
+  }
+  pthread_mutex_lock(&emerald_liveness_mutex);
+  int alive = emerald_liveness_alive[index];
+  pthread_mutex_unlock(&emerald_liveness_mutex);
+  return alive;
+}
+
+/* Plan 65's `leaf-virtual-actor-placement`: `.locate`'s own real
+ * runtime entry points — `emerald_locate_is_self_owner`/`emerald_
+ * locate_owner_addr` share one computation (the current live-peer-
+ * filtered consistent-hash owner for `key`), and `emerald_locate_
+ * cache_get`/`_put` back the process-local "already activated"
+ * cache codegen's own `build_locate_call` checks before allocating a
+ * fresh instance. A REAL, disclosed scope limitation: the cache is
+ * keyed on the bare `key` string alone, not `(class, key)` — two
+ * DIFFERENT actor classes sharing the identical key string would
+ * collide; every worked example and test this leaf ships never does
+ * that, and closing this fully would need a second string field per
+ * entry this leaf's own time budget didn't extend to. */
+static int emerald_locate_owner_index(const char *key) {
+  emerald_ensure_discovery_and_heartbeat();
+  int live[EMERALD_MAX_PEERS];
+  for (int i = 0; i < emerald_cached_peers.count; i++) {
+    live[i] = emerald_peer_is_live(i);
+  }
+  return emerald_consistent_hash_owner(key, &emerald_cached_peers, live);
+}
+
+int emerald_locate_is_self_owner(const char *key) {
+  int owner = emerald_locate_owner_index(key);
+  /* -1: `EMERALD_PEERS` unset entirely — the real, valid single-
+   * process configuration (Decision log), always self. Otherwise
+   * self iff the computed owner index matches this process's own. */
+  return owner == -1 || owner == emerald_cached_peers.self_index;
+}
+
+const char *emerald_locate_owner_addr(const char *key) {
+  int owner = emerald_locate_owner_index(key);
+  if (owner < 0 || owner >= emerald_cached_peers.count) {
+    return NULL;
+  }
+  return emerald_cached_peers.peers[owner].addr;
+}
+
+#define EMERALD_MAX_LOCATE_CACHE_ENTRIES 256
+
+typedef struct EmeraldLocateCacheEntry {
+  char *key;
+  void *value;
+} EmeraldLocateCacheEntry;
+
+static pthread_mutex_t emerald_locate_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static EmeraldLocateCacheEntry emerald_locate_cache[EMERALD_MAX_LOCATE_CACHE_ENTRIES];
+static int emerald_locate_cache_count = 0;
+
+void *emerald_locate_cache_get(const char *key) {
+  pthread_mutex_lock(&emerald_locate_cache_mutex);
+  void *found = NULL;
+  for (int i = 0; i < emerald_locate_cache_count; i++) {
+    if (strcmp(emerald_locate_cache[i].key, key) == 0) {
+      found = emerald_locate_cache[i].value;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&emerald_locate_cache_mutex);
+  return found;
+}
+
+/* A real, disclosed cap (`EMERALD_MAX_LOCATE_CACHE_ENTRIES`, mirroring
+ * `EMERALD_MAX_REGISTERED_ACTORS`'s own small-fixed-cap convention) —
+ * silently drops the insert past that many DISTINCT keys ever
+ * activated by this one process (the value itself is still returned
+ * to the caller and used normally; only FUTURE lookups for that key
+ * will miss the cache and reactivate, a real but narrow inefficiency,
+ * never a correctness bug). */
+void emerald_locate_cache_put(const char *key, void *value) {
+  pthread_mutex_lock(&emerald_locate_cache_mutex);
+  if (emerald_locate_cache_count < EMERALD_MAX_LOCATE_CACHE_ENTRIES) {
+    size_t len = strlen(key);
+    char *key_copy = malloc(len + 1);
+    memcpy(key_copy, key, len + 1);
+    emerald_locate_cache[emerald_locate_cache_count].key = key_copy;
+    emerald_locate_cache[emerald_locate_cache_count].value = value;
+    emerald_locate_cache_count++;
+  }
+  pthread_mutex_unlock(&emerald_locate_cache_mutex);
+}
+
 /* Parses `"127.0.0.1:9000"` into network-byte-order IPv4 + host-order
  * port. Returns 0 on success. No DNS resolution (Design decision 4 —
  * a literal dotted-quad only, matching this plan's own worked example
@@ -1864,14 +2308,35 @@ void *emerald_actor_ref_remote(const char *addr, const char *name, long long nam
  * mailbox call, zero new work. `true` builds a wire frame via
  * `arg_encoder` and sends it; returns 0 on success, -1 on any socket
  * error (codegen checks this and raises `RemoteActorError` itself). */
+/* Plan 65's `leaf-unified-fallible-send`: return codes widened from
+ * "0 success, -1 failure" to a real, distinguishable set — codegen's
+ * own `build_actor_enqueue_call` maps each one to a specific
+ * `SendError` variant instead of unconditionally raising
+ * `RemoteActorError`:
+ *   0 = success
+ *   1 = EMERALD_DISPATCH_ACTOR_TERMINATED — the local branch's own
+ *       real dead-actor signal (`emerald_actor_enqueue` returning -1),
+ *       closing the "hardcoded `return 0`" gap the Decision log names.
+ *   2 = EMERALD_DISPATCH_NODE_UNREACHABLE — the remote branch's own
+ *       ordinary socket failure (connection reset/refused/`EPIPE`,
+ *       anything that isn't specifically a send timeout).
+ *   3 = EMERALD_DISPATCH_TIMEOUT — the remote branch's send blocked
+ *       until `SO_SNDTIMEO`/`emerald_remote_timeout_ms` expired
+ *       (`errno == EAGAIN`/`EWOULDBLOCK` right after the failing
+ *       `send()`, captured immediately — before any other libc call
+ *       that could otherwise clobber `errno` first). */
+#define EMERALD_DISPATCH_ACTOR_TERMINATED 1
+#define EMERALD_DISPATCH_NODE_UNREACHABLE 2
+#define EMERALD_DISPATCH_TIMEOUT 3
+
 int emerald_actor_dispatch(void *ref_ptr, int32_t method_tag,
                             void (*trampoline)(void *, long long *),
                             void (*arg_encoder)(long long *, EmeraldWireBuf *),
                             long long *argv, long long argc) {
   EmeraldActorRef *ref = (EmeraldActorRef *) ref_ptr;
   if (!ref->is_remote) {
-    emerald_actor_enqueue(ref->local_arena, trampoline, argv, argc);
-    return 0;
+    int rc = emerald_actor_enqueue(ref->local_arena, trampoline, argv, argc);
+    return rc == 0 ? 0 : EMERALD_DISPATCH_ACTOR_TERMINATED;
   }
 
   EmeraldWireBuf payload;
@@ -1884,7 +2349,14 @@ int emerald_actor_dispatch(void *ref_ptr, int32_t method_tag,
 
   pthread_mutex_lock(&ref->send_mutex);
   int rc = emerald_tcp_send_frame(ref->sockfd, payload.data, (uint32_t) payload.len);
+  int send_errno = errno;
   pthread_mutex_unlock(&ref->send_mutex);
   emerald_wirebuf_free(&payload);
-  return rc;
+  if (rc == 0) {
+    return 0;
+  }
+  if (send_errno == EAGAIN || send_errno == EWOULDBLOCK) {
+    return EMERALD_DISPATCH_TIMEOUT;
+  }
+  return EMERALD_DISPATCH_NODE_UNREACHABLE;
 }

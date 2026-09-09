@@ -2489,6 +2489,60 @@ fn infer_expr_type(
       }
       Ok(Type::Class(class.clone()))
     }
+    // Plan 65's Decision log, `leaf-virtual-actor-placement`: `.locate`'s
+    // own check — the identical `is_actor` gate `.spawn`/`.remote`
+    // already use, `key` must be `String` (mirroring `.remote`'s own
+    // `addr`/`name` checks), and `args` gets the identical `initialize`
+    // arity/type check `.spawn` already performs (a `.locate` that
+    // activates locally reuses `.spawn`'s own allocation path
+    // verbatim — codegen's own `build_locate_call`). Inferred type is
+    // `Type::Class(class)`, the same tagged-handle shape `.spawn`/
+    // `.remote` already share — Design decision 1's own "every actor
+    // reference looks identical at every call site" rule, extended to
+    // a third construction form.
+    Expr::Locate { class, key, args } => {
+      let info = classes
+        .get(class)
+        .ok_or_else(|| Diagnostic::new(format!("undefined class `{class}`"), expr.span))?;
+      if !info.is_actor {
+        return Err(Diagnostic::new(
+          format!(
+            "cannot `.locate` `{class}` — `.locate` only resolves/activates actors, and `{class}` is not one"
+          ),
+          expr.span,
+        ));
+      }
+      let key_ty = infer_expr_type(key, env, sigs, classes, self_fields, gctx)?;
+      if key_ty != Type::String {
+        return Err(Diagnostic::new(
+          format!("`{class}.locate`'s key argument must be a String, found {key_ty:?}"),
+          key.span,
+        ));
+      }
+      match info.methods.get("initialize") {
+        Some(sig) => check_args(
+          "initialize",
+          args,
+          &sig.params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?,
+        None if args.is_empty() => {}
+        None => {
+          return Err(Diagnostic::new(
+            format!(
+              "`{class}.locate` called with {} argument(s), but `{class}` declares no `initialize`",
+              args.len()
+            ),
+            expr.span,
+          ));
+        }
+      }
+      Ok(Type::Class(class.clone()))
+    }
     // Plan 61's Decision log: `comptime`'s own legal *position*
     // restriction (a top-level `Let`'s direct value, `Array.new`'s
     // direct size argument) is enforced by a separate, standalone walk
@@ -2954,6 +3008,22 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
+      // Plan 65's `leaf-unified-fallible-send`: a cross-actor send's
+      // real, compiled type moves from `Void` to `Result[Void,
+      // SendError]` — every OTHER method call (an ordinary class's own
+      // method, or an actor's own `self.method(...)` same-thread direct
+      // call — codegen's own `build_method_call` Decision log states
+      // this exact "literal `self` is always a direct call" rule, the
+      // identical check reused here) keeps its ordinary declared return
+      // type unchanged. `.register` (checked above, `Ok(Type::Void)`)
+      // is a local-only setup call, never a cross-actor send, so it's
+      // already excluded by construction (that branch already returned).
+      if info.is_actor && !matches!(&recv.node, Expr::Ident(n) if n == "self") {
+        return Ok(Type::Result(
+          Box::new(Type::Void),
+          Box::new(Type::Enum("SendError".to_string())),
+        ));
+      }
       Ok(sig.return_type.clone())
     }
     // Plan 43's Decision log: scoped to a class-typed nullable receiver
@@ -4842,6 +4912,43 @@ fn check_block(
   Ok(())
 }
 
+/// Plan 65's Decision log: a cross-actor send is legal as a bare
+/// statement in ANY position, including the trailing one
+/// (`check_message_safety_expr_stmt`'s own doc comment already
+/// establishes this for its own, differently-scoped purpose) — its
+/// real type is `Result[Void, SendError]`, not `Void`, but a fire-
+/// and-forget send discards that value uniformly regardless of
+/// position, the same way it always discarded `Void`. A trailing one
+/// is therefore NOT an implicit return of that `Result` and must be
+/// exempted from `check_implicit_return`'s own declared-return-type
+/// match below, or every pre-existing `-> Void` method/function whose
+/// body happens to END with a bare send (previously trivially
+/// matching `Void == Void`) would newly fail to type-check — a real,
+/// disclosed regression this leaf's own new test caught, corrected
+/// here rather than left as an unstated breaking change the Decision
+/// log's own "additive at the source level" claim would otherwise be
+/// wrong about.
+fn is_cross_actor_send(
+  e: &Spanned<Expr>,
+  env: &HashMap<String, Type>,
+  self_fields: Option<&HashMap<String, Type>>,
+  classes: &HashMap<String, ClassInfo>,
+) -> bool {
+  let Expr::MethodCall(recv, method, _) = &e.node else {
+    return false;
+  };
+  if method == "register" {
+    return false;
+  }
+  let recv_ty = match &recv.node {
+    Expr::Ident(name) if name == "self" => return false,
+    Expr::Ident(name) => env.get(name),
+    Expr::InstanceVar(field) => self_fields.and_then(|f| f.get(field)),
+    _ => None,
+  };
+  matches!(recv_ty, Some(Type::Class(cn)) if classes.get(cn).is_some_and(|c| c.is_actor))
+}
+
 /// Checks the final-statement implicit-return rule shared by free
 /// functions and methods (Ruby-style: a body whose last statement is a
 /// bare expression returns that expression's value).
@@ -4861,6 +4968,9 @@ fn check_implicit_return(
     ..
   }) = body.last()
   {
+    if is_cross_actor_send(e, env, self_fields, classes) {
+      return Ok(());
+    }
     let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
     if t != *declared_return {
       return Err(Diagnostic::new(
@@ -5390,6 +5500,13 @@ fn expr_moved_read(
       expr_moved_read(addr, moved)?;
       expr_moved_read(name, moved)
     }
+    Expr::Locate { key, args, .. } => {
+      expr_moved_read(key, moved)?;
+      for a in args {
+        expr_moved_read(a, moved)?;
+      }
+      Ok(())
+    }
   }
 }
 
@@ -5826,6 +5943,12 @@ fn collect_purity_edges_expr(
     Expr::Remote { addr, name, .. } => {
       collect_purity_edges_expr(addr, node_index, env, classes, out);
       collect_purity_edges_expr(name, node_index, env, classes, out);
+    }
+    Expr::Locate { key, args, .. } => {
+      collect_purity_edges_expr(key, node_index, env, classes, out);
+      for a in args {
+        collect_purity_edges_expr(a, node_index, env, classes, out);
+      }
     }
   }
 }
@@ -6616,6 +6739,15 @@ fn check_purity_expr(
         verified_pure,
       )
     }
+    // Plan 65's Decision log: `.locate` may lazily spawn a fresh actor
+    // instance (running a real `initialize`) exactly like `.spawn`
+    // itself, or perform a remote connect — at least as much of a
+    // side effect as `.spawn`'s own unconditional forbid above, so it
+    // gets the identical treatment.
+    Expr::Locate { .. } => Err(Diagnostic::new(
+      "a `pure` function may not call `.locate` — activating an actor is forbidden inside a `pure` function",
+      expr.span,
+    )),
   }
 }
 
@@ -7052,6 +7184,7 @@ fn check_comptime_legal_expr(
     | Expr::ArrayNew(_)
     | Expr::TupleLit(_)
     | Expr::Remote { .. }
+    | Expr::Locate { .. }
     | Expr::Comptime(_) => Err(Diagnostic::new(
       "this expression form is not part of the comptime-legal subset",
       expr.span,
@@ -7334,6 +7467,12 @@ fn scan_comptime_position_expr(expr: &Spanned<Expr>, diags: &mut Vec<Diagnostic>
     Expr::Remote { addr, name, .. } => {
       scan_comptime_position_expr(addr, diags);
       scan_comptime_position_expr(name, diags);
+    }
+    Expr::Locate { key, args, .. } => {
+      scan_comptime_position_expr(key, diags);
+      for a in args {
+        scan_comptime_position_expr(a, diags);
+      }
     }
   }
 }

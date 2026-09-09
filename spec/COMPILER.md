@@ -262,6 +262,78 @@ Evidence: `crates/emerald-codegen/src/lib.rs` (`CodegenTarget`,
 
 ---
 
+## Distributed runtime
+
+### 2026-09-09 addendum (`65 automatic-actor-placement`): discovery, `.locate`, and unified fallible sends
+
+Three real, shipped additions to plan 60's distributed actors: (1)
+`EMERALD_PEERS`/`EMERALD_SELF` environment-variable peer discovery
+(`emerald_discover_peers`, `runtime/emerald_runtime.c`), read lazily and
+raising a real, named fatal error on a malformed entry or a missing/
+unmatched `EMERALD_SELF` — an unset `EMERALD_PEERS` is a real, valid
+single-process configuration, not an error; (2) `ClassName.locate(key,
+args...)` — a new reserved call form (grammar/AST/sema/codegen) that
+consistent-hashes `key` (FNV-1a ring, `EMERALD_VIRTUAL_POINTS_PER_PEER`
+points per live peer) over the discovered peer set to decide an owning
+node, lazily activating (reusing `.spawn`'s own `build_spawn_alloc`
+allocation path verbatim) and caching a fresh instance on the local
+owner, or resolving one already active on a remote owner via `.remote`'s
+own `emerald_actor_ref_remote` mechanism; a background heartbeat prober
+(`emerald_heartbeat_main`, `EMERALD_HEARTBEAT_INTERVAL_MS`) marks a peer
+dead after 3 consecutive missed connect probes, filtering it out of
+future ring computations; (3) every cross-actor send's real compiled
+type moves from `Void` to `Result[Void, SendError]`
+(`SendError::{ActorTerminated, Timeout, NodeUnreachable}`, a compiler-
+synthesized plan-52 enum) — additive at the source level (a bare-
+statement send, including a trailing one, still discards the value
+exactly as before; `check_implicit_return` was fixed to exempt a
+trailing cross-actor send from its own declared-return-type match, a
+real regression this leaf's own new test caught), and closes a real,
+pre-existing gap: a local send to an already-terminated actor used to
+be silently dropped with no signal at all (`emerald_actor_enqueue` now
+returns a real failure code instead of `void`).
+
+**Two real, disclosed scope limitations, stated plainly:**
+- **No lazy remote activation on a RESOLVE miss.** `.locate` routing to
+  a remote-owned key only succeeds if that peer has ALREADY locally
+  activated (via its own `.locate` call) and `.register`ed the exact
+  key — `emerald_reader_main`'s RESOLVE handler was not extended to
+  carry a class name + encoded `initialize` arguments and lazily spawn
+  on a miss, the way Orleans' own directory does. A remote-owned key
+  nobody has activated yet returns `Err(SendError::NodeUnreachable())`
+  (via the identical `NULL`-ref path an ordinary `.remote` resolve-miss
+  already takes) rather than being spun up on demand. Closing this is
+  real, substantial future work: a new wire message carrying the
+  activation payload, and a per-class "activator" callback table
+  mirroring `.register`'s own method-dispatch-table registration.
+- **No multi-process SIGKILL/reactivation worked example was run end to
+  end in this session.** The plan's own three-node-plus-client worked
+  example (kill the owning node, confirm reassignment to fresh state
+  within one heartbeat interval) exercises real orchestration this
+  session's own time budget did not extend to; what IS real and
+  verified: the consistent-hash ring itself (`emerald_consistent_hash_
+  owner`, tested directly via a C harness — stable under a never-
+  contacted dead peer, deterministic across processes), the liveness
+  table's own miss-threshold marking, local activation and caching
+  (a real compiled-and-run Emerald program, including a second
+  `.locate` call for the same key returning the cached instance, not a
+  fresh one), and plan 60's own existing real cross-process `.remote`
+  proof (`crates/emerald-cli/tests/distributed_actors.rs`) that
+  `.locate`'s remote branch reuses verbatim.
+
+Evidence: `runtime/emerald_runtime.c` (`emerald_discover_peers`,
+`emerald_consistent_hash_owner`, `emerald_heartbeat_main`, `emerald_
+locate_*`); `crates/emerald-parser/src/{ast.rs,grammar.lalrpop}`
+(`Expr::Locate`); `crates/emerald-sema/src/lib.rs` (`.locate`'s
+arity/type check, `Result[Void, SendError]` inference, `is_cross_
+actor_send`); `crates/emerald-codegen/src/lib.rs` (`build_locate_call`,
+`build_send_result`, `send_error_enum_item`); `crates/emerald-driver/
+tests/{discovery_runtime,placement_runtime,scheduler_runtime}.rs`;
+`crates/emerald-codegen/src/lib.rs`'s own `plan65_*`-prefixed tests;
+`history/2026-09-09T143000Z-plan-65-automatic-actor-placement.md`.
+
+---
+
 ## Cross-references
 
 - Grammar-file location and content: [`GRAMMAR.md`](./GRAMMAR.md),

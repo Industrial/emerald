@@ -20,8 +20,9 @@
 //! change for well-typed Emerald programs.
 
 use emerald_parser::{
-  CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, Expr, Function as AstFunction,
-  Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
+  CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
+  Function as AstFunction, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
+  StringPart,
 };
 use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
@@ -979,6 +980,12 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
       collect_idents_in_expr(addr, out);
       collect_idents_in_expr(name, out);
     }
+    Expr::Locate { key, args, .. } => {
+      collect_idents_in_expr(key, out);
+      for a in args {
+        collect_idents_in_expr(a, out);
+      }
+    }
   }
 }
 
@@ -1384,6 +1391,12 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
     Expr::Remote { addr, name, .. } => {
       collect_symbols_in_expr(addr, table);
       collect_symbols_in_expr(name, table);
+    }
+    Expr::Locate { key, args, .. } => {
+      collect_symbols_in_expr(key, table);
+      for a in args {
+        collect_symbols_in_expr(a, table);
+      }
     }
   }
 }
@@ -1812,6 +1825,16 @@ fn collect_specializations_in_expr(
     // here for this pass to find, the same real gap `Expr::Supervise`
     // immediately above already discloses for the identical reason.
     Expr::Remote { .. } => {}
+    // Plan 65: `.locate`'s own `args` reuses `.spawn`'s own identical
+    // recursion (line ~1780 above) — `initialize`'s arguments can be
+    // arbitrary expressions, including a generic call site this pass
+    // needs to find; `key` is always a plain `String` expression, the
+    // same "nothing to find there" reasoning `.remote` above states.
+    Expr::Locate { args, .. } => {
+      for a in args {
+        collect_specializations_in_expr(a, generic_fns, local_classes, out);
+      }
+    }
   }
 }
 
@@ -2457,6 +2480,12 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
       mark_expr(&name.node, out);
     }
     Expr::Comptime(inner) => mark_expr(&inner.node, out),
+    Expr::Locate { key, args, .. } => {
+      mark_expr(&key.node, out);
+      for a in args {
+        mark_expr(&a.node, out);
+      }
+    }
   }
 }
 
@@ -2719,6 +2748,13 @@ struct ActorRuntimeFuncs<'ctx> {
   wirebuf_push_string: FunctionValue<'ctx>,
   wirebuf_read_i64: FunctionValue<'ctx>,
   wirebuf_read_string: FunctionValue<'ctx>,
+  /// Plan 65 (automatic actor placement) — see each declaration's own
+  /// comment in `declare_actor_runtime_funcs` for its real C
+  /// signature/purpose.
+  locate_is_self_owner: FunctionValue<'ctx>,
+  locate_owner_addr: FunctionValue<'ctx>,
+  locate_cache_get: FunctionValue<'ctx>,
+  locate_cache_put: FunctionValue<'ctx>,
 }
 
 fn declare_actor_runtime_funcs<'ctx>(
@@ -2734,9 +2770,15 @@ fn declare_actor_runtime_funcs<'ctx>(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 65's `leaf-unified-fallible-send`: real C return type is now
+  // `int` (0 success, -1 terminated), not `void` — this declaration
+  // was never actually CALLED from this file (`#[allow(dead_code)]`
+  // below), so the stale `void` signature was harmless dead code, not
+  // a real bug, but is corrected here for the same reason any other
+  // known-stale declaration would be.
   let enqueue = module.add_function(
     "emerald_actor_enqueue",
-    void_ty.fn_type(
+    context.i32_type().fn_type(
       &[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i64_ty.into()],
       false,
     ),
@@ -2864,6 +2906,30 @@ fn declare_actor_runtime_funcs<'ctx>(
     Some(Linkage::External),
   );
 
+  // Plan 65 (automatic actor placement), `leaf-virtual-actor-
+  // placement`: `.locate`'s own real runtime entry points — see each
+  // one's own doc comment in `runtime/emerald_runtime.c`.
+  let locate_is_self_owner = module.add_function(
+    "emerald_locate_is_self_owner",
+    i32_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let locate_owner_addr = module.add_function(
+    "emerald_locate_owner_addr",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let locate_cache_get = module.add_function(
+    "emerald_locate_cache_get",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let locate_cache_put = module.add_function(
+    "emerald_locate_cache_put",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+
   ActorRuntimeFuncs {
     init_header,
     enqueue,
@@ -2884,6 +2950,10 @@ fn declare_actor_runtime_funcs<'ctx>(
     wirebuf_push_string,
     wirebuf_read_i64,
     wirebuf_read_string,
+    locate_is_self_owner,
+    locate_owner_addr,
+    locate_cache_get,
+    locate_cache_put,
   }
 }
 
@@ -4430,6 +4500,186 @@ fn build_spawn_alloc<'ctx>(
   Ok(call_result(ref_call)?.into_pointer_value())
 }
 
+/// Plan 65's `leaf-virtual-actor-placement`: `ClassName.locate(key,
+/// args...)`'s own codegen — computes `emerald_locate_is_self_owner`
+/// (a real, live-peer-filtered consistent-hash owner check) and
+/// branches: on the self-owner path, a process-local cache lookup
+/// (`emerald_locate_cache_get`) either returns an already-activated
+/// `EmeraldActorRef*` or, on a miss, calls `build_spawn_alloc`
+/// verbatim (the identical allocation/`initialize` path `.spawn`
+/// already uses) and caches the fresh result; on the remote-owner
+/// path, resolves the owning peer's address (`emerald_locate_owner_
+/// addr`) and reuses `ctx.actor_funcs.ref_remote` directly — the same
+/// underlying call `Expr::Remote`'s own codegen arm makes — addressed
+/// by `key` itself as the registered name. **A real, disclosed gap**:
+/// this does NOT extend the RESOLVE wire handshake for lazy remote
+/// activation (Design decision left un-implemented by this leaf's own
+/// time budget) — a remote-owner `.locate` only succeeds if that peer
+/// has ALREADY locally activated (via its own `.locate` call) and
+/// `.register`ed this exact key; otherwise `ref_remote` returns `NULL`
+/// exactly like an ordinary `.remote` resolve-miss does, and the
+/// identical `RemoteActorError` is raised. Both branches converge on
+/// one merged `EmeraldActorRef*` (`ValKind::Ptr`, the same shape
+/// `.spawn`/`.remote` already share), via the "alloca + per-branch
+/// store + one final load" idiom `build_send_result` already
+/// established for this file.
+#[allow(clippy::too_many_arguments)]
+fn build_locate_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  class_name: &str,
+  key: &Spanned<Expr>,
+  args: &[Spanned<Expr>],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let func = builder
+    .get_insert_block()
+    .and_then(|b| b.get_parent())
+    .ok_or_else(|| "codegen: internal — no enclosing function for a `.locate` call".to_string())?;
+
+  let (key_val, _) = build_expr(
+    context,
+    builder,
+    key,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let key_ptr = key_val.into_pointer_value();
+
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let result_slot = builder
+    .build_alloca(ptr_ty, "locateresultslot")
+    .map_err(|e| e.to_string())?;
+
+  let is_self_call = builder
+    .build_call(
+      ctx.actor_funcs.locate_is_self_owner,
+      &[key_ptr.into()],
+      "locateisself",
+    )
+    .map_err(|e| e.to_string())?;
+  let is_self = call_result(is_self_call)?.into_int_value();
+  let is_self_bool = builder
+    .build_int_compare(
+      IntPredicate::NE,
+      is_self,
+      context.i32_type().const_int(0, false),
+      "locateisselfbool",
+    )
+    .map_err(|e| e.to_string())?;
+
+  let self_blk = context.append_basic_block(func, "locate.self");
+  let remote_blk = context.append_basic_block(func, "locate.remote");
+  let merge_blk = context.append_basic_block(func, "locate.merge");
+  builder
+    .build_conditional_branch(is_self_bool, self_blk, remote_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(self_blk);
+  let cache_get_call = builder
+    .build_call(
+      ctx.actor_funcs.locate_cache_get,
+      &[key_ptr.into()],
+      "locatecacheget",
+    )
+    .map_err(|e| e.to_string())?;
+  let cached_ptr = call_result(cache_get_call)?.into_pointer_value();
+  let is_cached = builder
+    .build_is_not_null(cached_ptr, "locateiscached")
+    .map_err(|e| e.to_string())?;
+  let cache_hit_blk = context.append_basic_block(func, "locate.cachehit");
+  let cache_miss_blk = context.append_basic_block(func, "locate.cachemiss");
+  builder
+    .build_conditional_branch(is_cached, cache_hit_blk, cache_miss_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(cache_hit_blk);
+  builder
+    .build_store(result_slot, cached_ptr)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(merge_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(cache_miss_blk);
+  let new_ref = build_spawn_alloc(
+    context,
+    builder,
+    class_name,
+    args,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  builder
+    .build_call(
+      ctx.actor_funcs.locate_cache_put,
+      &[key_ptr.into(), new_ref.into()],
+      "locatecacheput",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(result_slot, new_ref)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(merge_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(remote_blk);
+  let owner_addr_call = builder
+    .build_call(
+      ctx.actor_funcs.locate_owner_addr,
+      &[key_ptr.into()],
+      "locateowneraddr",
+    )
+    .map_err(|e| e.to_string())?;
+  let owner_addr_ptr = call_result(owner_addr_call)?.into_pointer_value();
+  let key_len_call = builder
+    .build_call(ctx.string_length, &[key_ptr.into()], "locatekeylen")
+    .map_err(|e| e.to_string())?;
+  let key_len = call_result(key_len_call)?;
+  let ref_call = builder
+    .build_call(
+      ctx.actor_funcs.ref_remote,
+      &[owner_addr_ptr.into(), key_ptr.into(), key_len.into()],
+      "locateremoteref",
+    )
+    .map_err(|e| e.to_string())?;
+  let remote_ref_ptr = call_result(ref_call)?.into_pointer_value();
+  let is_null = builder
+    .build_is_null(remote_ref_ptr, "locateremoterefisnull")
+    .map_err(|e| e.to_string())?;
+  build_raise_on_remote_send_failure(
+    context,
+    builder,
+    builder
+      .build_int_z_extend(is_null, context.i32_type(), "locateremoterefnullstatus")
+      .map_err(|e| e.to_string())?,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  builder
+    .build_store(result_slot, remote_ref_ptr)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(merge_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(merge_blk);
+  let loaded = builder
+    .build_load(ptr_ty, result_slot, "locateresult")
+    .map_err(|e| e.to_string())?;
+  Ok((loaded, ValKind::Ptr))
+}
+
 fn build_expr<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
@@ -5389,6 +5639,17 @@ fn build_expr<'ctx>(
       )?;
       Ok((ref_ptr.into(), ValKind::Ptr))
     }
+    Expr::Locate { class, key, args } => build_locate_call(
+      context,
+      builder,
+      class,
+      key,
+      args,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
     Expr::MethodCall(recv, method, args) => build_method_call(
       context,
       builder,
@@ -7222,7 +7483,7 @@ fn build_actor_enqueue_call<'ctx>(
     )
     .map_err(|e| e.to_string())?;
   let status = call_result(dispatch_call)?.into_int_value();
-  build_raise_on_remote_send_failure(
+  build_send_result(
     context,
     builder,
     status,
@@ -7230,20 +7491,201 @@ fn build_actor_enqueue_call<'ctx>(
     local_classes,
     local_array_elem_types,
     ctx,
-  )?;
-
-  Ok((i64_ty.const_int(0, false).into(), ValKind::Void))
+  )
 }
 
-/// `leaf-remote-dispatch-and-worked-proof`'s own failure path: `status
-/// != 0` means `emerald_actor_dispatch`'s remote branch hit a real
-/// socket error — raises a real, catchable `RemoteActorError` (via
-/// `build_raise`, the exact same codegen an ordinary `raise ClassName.
-/// new(args)` statement already uses) naming the concrete reason
-/// (`emerald_remote_last_error_message`), rather than silently
-/// continuing or aborting the process. `status == 0` (the local path,
-/// always, and a successful remote send) falls straight through with
-/// no branch overhead beyond the one `icmp`/`br` pair.
+/// Plan 65's `leaf-unified-fallible-send`: replaces the old `build_
+/// raise_on_remote_send_failure` (which always raised a catchable
+/// `RemoteActorError` on any nonzero status, and always returned
+/// `(0, Void)` otherwise) with a real `Result[Void, SendError]`
+/// VALUE — `status` is now `runtime/emerald_runtime.c`'s own real,
+/// 4-way `EMERALD_DISPATCH_*` code (0 = success, 1 =
+/// `ACTOR_TERMINATED`, 3 = `TIMEOUT`, anything else — in practice
+/// always 2, `NODE_UNREACHABLE` — the default/fallback arm). Builds
+/// and evaluates a synthetic `Expr::Ok`/`Expr::Err` node per branch
+/// (`Spanned::synthetic`, the identical "synthesize an AST node in
+/// Rust, feed it through the ordinary `build_expr` path" idiom this
+/// function's own predecessor already used for its `RemoteActorError`
+/// raise), storing each
+/// branch's resulting pointer into one shared stack slot merged at
+/// `result_blk` — the same "alloca + per-branch store + one final
+/// load" value-merge idiom this backend already uses wherever two
+/// branches must produce one SSA value without a raw `PHINode` (no
+/// existing call site in this file builds one by hand; this leaf
+/// doesn't start that precedent either). `RemoteActorError` is
+/// UNCHANGED — still raised by `.remote(...)`'s own connect-time
+/// failure, a genuinely different, earlier moment this leaf never
+/// touches (Decision log).
+#[allow(clippy::too_many_arguments)]
+fn build_send_result<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  status: inkwell::values::IntValue<'ctx>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let func = builder
+    .get_insert_block()
+    .and_then(|b| b.get_parent())
+    .ok_or_else(|| {
+      "codegen: internal — no enclosing function for a send-result check".to_string()
+    })?;
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let result_slot = builder
+    .build_alloca(ptr_ty, "sendresultslot")
+    .map_err(|e| e.to_string())?;
+
+  let i32_ty = context.i32_type();
+  let ok_blk = context.append_basic_block(func, "sendresult.ok");
+  let check_terminated_blk = context.append_basic_block(func, "sendresult.checkterminated");
+  let terminated_blk = context.append_basic_block(func, "sendresult.terminated");
+  let check_timeout_blk = context.append_basic_block(func, "sendresult.checktimeout");
+  let timeout_blk = context.append_basic_block(func, "sendresult.timeout");
+  let unreachable_blk = context.append_basic_block(func, "sendresult.unreachable");
+  let merge_blk = context.append_basic_block(func, "sendresult.merge");
+
+  let is_ok = builder
+    .build_int_compare(
+      IntPredicate::EQ,
+      status,
+      i32_ty.const_int(0, false),
+      "sendisok",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_conditional_branch(is_ok, ok_blk, check_terminated_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(ok_blk);
+  let ok_expr = Spanned::synthetic(Expr::Ok(Box::new(Spanned::synthetic(Expr::Int(0)))));
+  let (ok_val, _) = build_expr(
+    context,
+    builder,
+    &ok_expr,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  builder
+    .build_store(result_slot, ok_val)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(merge_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(check_terminated_blk);
+  let is_terminated = builder
+    .build_int_compare(
+      IntPredicate::EQ,
+      status,
+      i32_ty.const_int(1, false),
+      "sendisterminated",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_conditional_branch(is_terminated, terminated_blk, check_timeout_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(terminated_blk);
+  let terminated_expr = Spanned::synthetic(Expr::Err(Box::new(Spanned::synthetic(Expr::Call(
+    "ActorTerminated".to_string(),
+    Vec::new(),
+  )))));
+  let (terminated_val, _) = build_expr(
+    context,
+    builder,
+    &terminated_expr,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  builder
+    .build_store(result_slot, terminated_val)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(merge_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(check_timeout_blk);
+  let is_timeout = builder
+    .build_int_compare(
+      IntPredicate::EQ,
+      status,
+      i32_ty.const_int(3, false),
+      "sendistimeout",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_conditional_branch(is_timeout, timeout_blk, unreachable_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(timeout_blk);
+  let timeout_expr = Spanned::synthetic(Expr::Err(Box::new(Spanned::synthetic(Expr::Call(
+    "Timeout".to_string(),
+    Vec::new(),
+  )))));
+  let (timeout_val, _) = build_expr(
+    context,
+    builder,
+    &timeout_expr,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  builder
+    .build_store(result_slot, timeout_val)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(merge_blk)
+    .map_err(|e| e.to_string())?;
+
+  // Default/fallback arm — in practice always `EMERALD_DISPATCH_NODE_
+  // UNREACHABLE` (2), but any other, unanticipated nonzero code lands
+  // here too rather than being silently mistaken for success.
+  builder.position_at_end(unreachable_blk);
+  let unreachable_expr = Spanned::synthetic(Expr::Err(Box::new(Spanned::synthetic(Expr::Call(
+    "NodeUnreachable".to_string(),
+    Vec::new(),
+  )))));
+  let (unreachable_val, _) = build_expr(
+    context,
+    builder,
+    &unreachable_expr,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  builder
+    .build_store(result_slot, unreachable_val)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(merge_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(merge_blk);
+  let loaded = builder
+    .build_load(ptr_ty, result_slot, "sendresult")
+    .map_err(|e| e.to_string())?;
+  Ok((loaded, ValKind::Ptr))
+}
+
+/// `leaf-remote-dispatch-and-worked-proof`'s own failure path,
+/// UNCHANGED by plan 65 (Decision log: `.remote(addr, name)`'s own
+/// connect-time failure is a genuinely different, EARLIER moment than
+/// a post-connection send — no `EmeraldActorRef` even exists yet for
+/// a `Result` to travel through, so it stays exactly what it always
+/// was, a raised, catchable `RemoteActorError`). `status != 0` means
+/// `Expr::Remote`'s own `.remote(...)` call site (its only remaining
+/// caller after plan 65's `build_send_result` took over the cross-
+/// actor SEND path) got back a `NULL` ref. `status == 0` falls
+/// straight through with no branch overhead beyond the one `icmp`/
+/// `br` pair.
 #[allow(clippy::too_many_arguments)]
 fn build_raise_on_remote_send_failure<'ctx>(
   context: &'ctx Context,
@@ -10658,23 +11100,38 @@ fn build_match_result<'a, 'ctx>(
     .map_err(|e| e.to_string())?;
 
   builder.position_at_end(ok_blk);
-  let ok_val = load_field(
-    context,
-    builder,
-    ptr,
-    FieldInfo {
-      offset: 8,
-      kind: ok_kind.clone(),
-    },
-  )?;
-  let ok_alloca = builder
-    .build_alloca(local_llvm_type(context, &ok_kind), ok_var)
-    .map_err(|e| e.to_string())?;
-  builder
-    .build_store(ok_alloca, ok_val)
-    .map_err(|e| e.to_string())?;
+  // Plan 65's `leaf-unified-fallible-send`, a real, disclosed edge
+  // case its own Decision log named but didn't fully resolve on the
+  // BINDING side: `Result[Void, SendError]`'s `Ok(v)` arm binds `v`
+  // at sema's own inferred `Type::Void` — `local_llvm_type`'s own
+  // documented invariant is that `Void` never reaches it as a storage
+  // type (found by this leaf's own new AC2 test, which panicked here
+  // before this fix). There is nothing meaningful to load/bind — a
+  // `Void` value carries no real data, and sema already forbids using
+  // one anywhere a real value is required (the same "Void can't be
+  // used as a value" rule every other `Void`-typed expression already
+  // enforces) — so `ok_var` simply isn't inserted into `vars` at all
+  // for this one case; `prior_ok`, captured either way, still restores
+  // whatever `ok_var` named beforehand (or nothing) once the arm ends.
   let prior_ok = vars.get(ok_var).cloned();
-  vars.insert(ok_var.to_string(), (ok_alloca, ok_kind));
+  if ok_kind != ValKind::Void {
+    let ok_val = load_field(
+      context,
+      builder,
+      ptr,
+      FieldInfo {
+        offset: 8,
+        kind: ok_kind.clone(),
+      },
+    )?;
+    let ok_alloca = builder
+      .build_alloca(local_llvm_type(context, &ok_kind), ok_var)
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_store(ok_alloca, ok_val)
+      .map_err(|e| e.to_string())?;
+    vars.insert(ok_var.to_string(), (ok_alloca, ok_kind));
+  }
   let ok_terminated = build_block(
     context,
     builder,
@@ -12801,6 +13258,12 @@ fn collect_runtime_call_names_expr(expr: &Spanned<Expr>, out: &mut HashSet<Strin
       collect_runtime_call_names_expr(addr, out);
       collect_runtime_call_names_expr(name, out);
     }
+    Expr::Locate { key, args, .. } => {
+      collect_runtime_call_names_expr(key, out);
+      for a in args {
+        collect_runtime_call_names_expr(a, out);
+      }
+    }
   }
 }
 
@@ -13256,6 +13719,7 @@ fn compile_to_object_impl(
   }
   if items.iter().any(|i| matches!(i, Item::Actor(_))) {
     ensure_remote_actor_error_class(&mut items);
+    ensure_send_error_enum(&mut items);
   }
   if program_uses_contracts(&items) {
     ensure_contract_violation_class(&mut items);
@@ -14557,6 +15021,54 @@ fn ensure_contract_violation_class(items: &mut Vec<Item>) {
   }
 }
 
+/// Plan 65's `leaf-unified-fallible-send`: a plan-52 enum, not a
+/// plan-53 hardcoded type and not a reuse of `RemoteActorError`
+/// (Decision log — the two failure-signaling mechanisms cover two
+/// genuinely different moments: `RemoteActorError` is still raised by
+/// `.remote(addr, name)`'s own connect-time failure, before any
+/// `EmeraldActorRef` exists to return a `Result` through at all;
+/// `SendError` is what a POST-connection cross-actor send returns).
+/// Every variant is zero-field (`EnumVariant.fields: Vec::new()`) —
+/// the AST itself has no trouble representing that even though the
+/// concrete `ActorTerminated()`/`Timeout()`/`NodeUnreachable()` syntax
+/// (mandatory parens on every variant, plan 52's real grammar) would
+/// need them if a user ever wrote this enum by hand, which they never
+/// do — `SendError` is compiler-synthesized only, the same "never
+/// something Emerald source declares" posture `RemoteActorError`/
+/// `ContractViolation` already have.
+fn send_error_enum_item() -> Item {
+  Item::Enum(EnumDef {
+    name: "SendError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "ActorTerminated".to_string(),
+        fields: Vec::new(),
+      },
+      EnumVariant {
+        name: "Timeout".to_string(),
+        fields: Vec::new(),
+      },
+      EnumVariant {
+        name: "NodeUnreachable".to_string(),
+        fields: Vec::new(),
+      },
+    ],
+  })
+}
+
+/// Gated on the program actually declaring at least one `actor` — the
+/// only source of a cross-actor send this enum could ever be needed
+/// for — mirrors `ensure_remote_actor_error_class`'s own identical
+/// gate exactly, so a program with no actors at all pays zero cost.
+fn ensure_send_error_enum(items: &mut Vec<Item>) {
+  let already_present = items
+    .iter()
+    .any(|i| matches!(i, Item::Enum(e) if e.name == "SendError"));
+  if !already_present {
+    items.insert(0, send_error_enum_item());
+  }
+}
+
 fn program_uses_contracts(items: &[Item]) -> bool {
   items.iter().any(|i| match i {
     Item::Function(f) => !f.requires.is_empty() || !f.ensures.is_empty(),
@@ -14587,6 +15099,12 @@ fn program_uses_contracts(items: &[Item]) -> bool {
 pub fn ensure_pre_sema_exception_classes(items: &mut Vec<Item>) {
   if items.iter().any(|i| matches!(i, Item::Actor(_))) {
     ensure_remote_actor_error_class(items);
+    // Plan 65's `leaf-unified-fallible-send`: `SendError` needs the
+    // same pre-sema injection `RemoteActorError` already gets, for the
+    // identical reason (this function's own doc comment) — a cross-
+    // actor send's real type now names `SendError` directly, not just
+    // a `rescue` clause naming it.
+    ensure_send_error_enum(items);
   }
   if program_uses_contracts(items) {
     ensure_contract_violation_class(items);
@@ -15020,6 +15538,42 @@ mod tests {
       description.to_lowercase().contains("wasm")
         || description.to_lowercase().contains("webassembly"),
       "expected `file` to report a WebAssembly object, got: {description}"
+    );
+  }
+
+  // Plan 65 (automatic actor placement), `leaf-unified-fallible-send`
+  // AC2: capturing a cross-actor send's own real `Result[Void,
+  // SendError]` explicitly (new source-level syntax this leaf makes
+  // possible for the first time), then matching it via plan 53's real
+  // `MatchResult` form — real proof the success path round-trips
+  // through, not just that it type-checks.
+  #[test]
+  fn plan65_capturing_a_local_sends_result_and_matching_ok_prints_the_ok_arm() {
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.spawn(0)\nresult: Result[Void, SendError] = c.increment\ncase result\nwhen Ok(v)\n  puts \"ok\"\nwhen Err(e)\n  puts \"err\"\nend\n";
+    assert_eq!(compile_link_run(src), "ok\n");
+  }
+
+  // Plan 65 (automatic actor placement), `leaf-virtual-actor-
+  // placement`'s own local-activation proof: with no `EMERALD_PEERS`
+  // set (the real, valid single-process configuration — Decision
+  // log), `.locate` degenerates to "always self," reusing `.spawn`'s
+  // own allocation path.
+  #[test]
+  fn plan65_locate_with_no_peers_configured_activates_locally_like_spawn() {
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\nc: Counter = Counter.locate(\"shard-1\", 0)\nc.increment\nc.increment\nc.value\n";
+    assert_eq!(compile_link_run(src), "2\n");
+  }
+
+  // AC1-adjacent: a SECOND `.locate` call for the SAME key must return
+  // the cached, already-activated instance — not a fresh one that
+  // resets `@count` back to its original `initialize` argument.
+  #[test]
+  fn plan65_a_second_locate_call_for_the_same_key_returns_the_cached_instance() {
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\nc1: Counter = Counter.locate(\"shard-1\", 0)\nc1.increment\nc2: Counter = Counter.locate(\"shard-1\", 999)\nc2.increment\nc2.value\n";
+    assert_eq!(
+      compile_link_run(src),
+      "2\n",
+      "the second .locate must return the SAME cached instance (count 0->1->2), not a fresh one seeded from 999"
     );
   }
 

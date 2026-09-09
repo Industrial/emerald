@@ -37,8 +37,8 @@
 
 extern void *emerald_actor_init_header(void *arena_base);
 extern void emerald_actor_set_region(void *self, void *region);
-extern void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
-                                   long long *argv, long long argc);
+extern int emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
+                                  long long *argv, long long argc);
 extern void emerald_worker_pool_start(void);
 extern void emerald_worker_pool_drain_and_join(void);
 

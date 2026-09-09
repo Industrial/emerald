@@ -364,6 +364,12 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
       rewrite_expr(addr, name, source);
       rewrite_expr(n, name, source);
     }
+    Expr::Locate { key, args, .. } => {
+      rewrite_expr(key, name, source);
+      for a in args {
+        rewrite_expr(a, name, source);
+      }
+    }
   }
 }
 

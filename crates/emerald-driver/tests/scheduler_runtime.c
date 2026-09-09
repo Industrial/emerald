@@ -38,11 +38,12 @@
 #include <string.h>
 
 extern void *emerald_actor_init_header(void *arena_base);
-extern void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
-                                   long long *argv, long long argc);
+extern int emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
+                                  long long *argv, long long argc);
 extern void emerald_worker_pool_start(void);
 extern void emerald_worker_pool_drain_and_join(void);
 extern long long emerald_current_thread_id(void);
+extern void emerald_actor_terminate(void *self);
 
 static void *actor_self(void *arena) {
   return (char *) arena + sizeof(void *);
@@ -149,9 +150,34 @@ static void run_threadid_mode(void) {
   printf("%lld\n", thread_ids[1]);
 }
 
+/* Plan 65 (automatic actor placement), `leaf-unified-fallible-send`'s
+ * own AC3, proven directly at the runtime layer (mirroring this
+ * file's own established "pool"/"fifo"/"threadid" modes): a message
+ * enqueued against an actor already marked terminated (via a real
+ * `emerald_actor_terminate` call, the identical mechanism a crashed
+ * message trampoline itself uses) must return -1, not silently
+ * succeed — the "hardcoded `return 0`" gap `emerald_actor_dispatch`'s
+ * own local branch used to have, closed by `emerald_actor_enqueue`'s
+ * own widened `int` return (`leaf-unified-fallible-send`'s Decision
+ * log). Prints 1 if the post-termination enqueue correctly reported
+ * failure, 0 otherwise. */
+static void noop_trampoline(void *self, long long *argv) {
+  (void) self;
+  (void) argv;
+}
+
+static void run_terminated_mode(void) {
+  void *arena = new_actor_arena(0);
+  void *self = actor_self(arena);
+  long long argv[1] = {0};
+  emerald_actor_terminate(self);
+  int rc = emerald_actor_enqueue(self, noop_trampoline, argv, 0);
+  printf("%d\n", rc != 0 ? 1 : 0);
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: %s [pool|fifo|threadid]\n", argv[0]);
+    fprintf(stderr, "usage: %s [pool|fifo|threadid|terminated]\n", argv[0]);
     return 2;
   }
   if (strcmp(argv[1], "pool") == 0) {
@@ -160,6 +186,8 @@ int main(int argc, char **argv) {
     run_fifo_mode();
   } else if (strcmp(argv[1], "threadid") == 0) {
     run_threadid_mode();
+  } else if (strcmp(argv[1], "terminated") == 0) {
+    run_terminated_mode();
   } else {
     fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;

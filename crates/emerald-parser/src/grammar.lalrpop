@@ -868,6 +868,11 @@ StmtPrimaryExpr: Spanned<Expr> = {
   // identical reserved-keyword-headed shape, `remote` reserved the same
   // LALR(1) way `spawn` already is.
   <l:@L> <class:Ident> "." "remote" "(" <addr:Expr> "," <name:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Remote { class, addr: Box::new(addr), name: Box::new(name) } },
+  // Plan 65's Decision log: `.locate`'s own reserved-keyword-headed
+  // shape, `locate` reserved the same LALR(1) way `spawn`/`remote`
+  // already are — a third, textually-disjoint call form, never a
+  // reuse of either sibling.
+  <l:@L> <class:Ident> "." "locate" "(" <ka:LocateArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Locate { class, key: Box::new(ka.0), args: ka.1 } },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
   // Plan 53's Decision log: `Ok`/`Err` are literal-keyword-headed
   // constructor productions, the same convention `Array`/`Hash`/`Proc`
@@ -1219,6 +1224,9 @@ PrimaryExpr: Spanned<Expr> = {
   // Plan 60's Decision log: see `PrimaryExpr`'s own identical `.remote`
   // alternative for the full rationale.
   <l:@L> <class:Ident> "." "remote" "(" <addr:Expr> "," <name:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Remote { class, addr: Box::new(addr), name: Box::new(name) } },
+  // Plan 65's Decision log: see `PrimaryExpr`'s own identical `.locate`
+  // alternative for the full rationale.
+  <l:@L> <class:Ident> "." "locate" "(" <ka:LocateArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Locate { class, key: Box::new(ka.0), args: ka.1 } },
   <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
   <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
   <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },
@@ -1278,6 +1286,15 @@ Args: Vec<Spanned<Expr>> = {
       Some(e) => { v.push(e); v }
     }
   }
+};
+
+// Plan 65's Decision log: `.locate(key, args...)`'s own argument
+// shape — `key` is mandatory (no bare `.locate()`), the trailing
+// `args...` reuses `Args` verbatim and may be empty (a zero-arg
+// `initialize`, matching `.spawn`'s own `Args` form).
+LocateArgs: (Spanned<Expr>, Vec<Spanned<Expr>>) = {
+  <key:Expr> => (key, Vec::new()),
+  <key:Expr> "," <args:Args> => (key, args),
 };
 
 Params: Vec<Param> = {
