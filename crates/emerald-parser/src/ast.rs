@@ -230,6 +230,20 @@ pub enum Stmt {
   /// `Stmt::Yield` becomes a direct call to that block's synthesized
   /// function — never an indirect/first-class call.
   Yield(Vec<Expr>),
+  /// `for var in start..end body end` (`exclusive: false`) or
+  /// `start...end` (`exclusive: true`) — plan 37's Decision log: no
+  /// first-class `Range` value exists anywhere (this shape only ever
+  /// appears directly as a `for...in` scrutinee, grammar-restricted the
+  /// same way `Stmt::For`'s own literal-array scrutinee is); `start`/
+  /// `end` are arbitrary `Int64`-typed expressions, evaluated once each
+  /// before the loop begins, not just literals.
+  ForRange {
+    var: String,
+    start: Expr,
+    end: Expr,
+    exclusive: bool,
+    body: Vec<Stmt>,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq)]

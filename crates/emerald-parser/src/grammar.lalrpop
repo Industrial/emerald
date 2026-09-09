@@ -175,6 +175,26 @@ Stmt: Stmt = {
     elements,
     body,
   },
+  // Plan 37: no first-class `Range` value — `..`/`...` are grammar-
+  // restricted to appear only directly after a `for <var> in`
+  // scrutinee, mirroring plan 30's own array-literal-only restriction
+  // immediately above. LALRPOP's literal-terminal tokenizer resolves
+  // `"..."` vs `".."` vs the pre-existing single `"."` token by
+  // longest-match, so no `match {}` priority reordering is needed.
+  "for" <var:Ident> "in" <start:Expr> ".." <end:Expr> <body:Stmt*> "end" => Stmt::ForRange {
+    var,
+    start,
+    end,
+    exclusive: false,
+    body,
+  },
+  "for" <var:Ident> "in" <start:Expr> "..." <end:Expr> <body:Stmt*> "end" => Stmt::ForRange {
+    var,
+    start,
+    end,
+    exclusive: true,
+    body,
+  },
   // Requires a value (no bare `return;`) — `<e:Expr?>` here is genuinely
   // LALR(1)-ambiguous: with no significant newlines (plan 04's
   // simplification), the parser can't tell "return" (empty, followed by a

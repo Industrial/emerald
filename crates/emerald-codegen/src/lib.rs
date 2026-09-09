@@ -421,6 +421,24 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
         collect_idents_in_expr(a, referenced);
       }
     }
+    // Plan 37: mirrors `Stmt::For`'s own arm immediately above — `var`
+    // is bound, `start`/`end` are referenced (evaluated in the
+    // enclosing scope, before the loop var exists), `body` recurses
+    // normally.
+    Stmt::ForRange {
+      var,
+      start,
+      end,
+      body,
+      ..
+    } => {
+      bound.insert(var.clone());
+      collect_idents_in_expr(start, referenced);
+      collect_idents_in_expr(end, referenced);
+      for s in body {
+        collect_idents_in_stmt(s, referenced, bound);
+      }
+    }
   }
 }
 
@@ -511,6 +529,16 @@ fn collect_lets(stmts: &[Stmt], out: &mut Vec<(String, ValKind)>) {
       // `Let`s inside `body` still need hoisting, same as every other
       // loop/branch body here.
       Stmt::For { body, .. } => collect_lets(body, out),
+      // Plan 37: unlike `Stmt::For`'s `var` immediately above, `var`'s
+      // `ValKind` *is* knowable statically here — a Range's endpoints
+      // are Int64-only by construction (see the plan's Decision log),
+      // with zero dependence on either operand's shape — so it's
+      // hoisted up front exactly like an ordinary `Let`, a real
+      // simplification `Stmt::For`'s own case structurally can't take.
+      Stmt::ForRange { var, body, .. } => {
+        out.push((var.clone(), ValKind::Int64));
+        collect_lets(body, out);
+      }
       Stmt::If {
         then_branch,
         else_branch,
@@ -2352,6 +2380,160 @@ fn build_for<'ctx>(
   Ok(false)
 }
 
+/// `for var in start..end body end` (`exclusive: false`) or
+/// `start...end` (`exclusive: true`) — plan 37's Decision log: reuses
+/// `build_for`'s exact five-block skeleton (`for.cond`/`for.body`/
+/// `for.incr`/`for.after`, `LoopTargets` push/pop around `build_block`)
+/// verbatim, with no array materialization and no per-iteration
+/// GEP/load — a Range's "elements" *are* the loop index itself.
+/// Unlike `build_for`, `var`'s `alloca` is NOT built here:
+/// `collect_lets`/`prealloc_lets` already hoisted it (its `ValKind` is
+/// statically `Int64` — see the Decision log), so this function looks
+/// it up from `vars` instead of inserting a fresh one. `start`/`end`
+/// are each evaluated exactly once, before the loop begins.
+#[allow(clippy::too_many_arguments)]
+fn build_for_range<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  var: &str,
+  start: &Expr,
+  end: &Expr,
+  exclusive: bool,
+  body: &[Stmt],
+  vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &mut HashMap<String, String>,
+  local_array_elem_types: &mut HashMap<String, ValKind>,
+  loop_stack: &mut Vec<LoopTargets<'ctx>>,
+  ret_kind: ValKind,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<bool, String> {
+  let (start_val, start_kind) = build_expr(
+    context,
+    builder,
+    start,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if start_kind != ValKind::Int64 {
+    return Err(format!(
+      "codegen: internal error — sema should have rejected a non-Int64 range start, found {start_kind:?}"
+    ));
+  }
+  let (end_val, end_kind) = build_expr(
+    context,
+    builder,
+    end,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if end_kind != ValKind::Int64 {
+    return Err(format!(
+      "codegen: internal error — sema should have rejected a non-Int64 range end, found {end_kind:?}"
+    ));
+  }
+
+  let idx_alloca = builder
+    .build_alloca(context.i64_type(), "forrange.idx")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(idx_alloca, start_val.into_int_value())
+    .map_err(|e| e.to_string())?;
+
+  let (var_alloca, _) = *vars
+    .get(var)
+    .expect("pre-allocated by prealloc_lets for every Stmt::ForRange loop var");
+
+  let cond_blk = context.append_basic_block(func, "forrange.cond");
+  let body_blk = context.append_basic_block(func, "forrange.body");
+  let incr_blk = context.append_basic_block(func, "forrange.incr");
+  let exit_blk = context.append_basic_block(func, "forrange.after");
+
+  builder
+    .build_unconditional_branch(cond_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(cond_blk);
+  let idx_val = builder
+    .build_load(context.i64_type(), idx_alloca, "forrange.idx.val")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+  // `..` (inclusive, `exclusive: false`) keeps iterating through
+  // `idx == end` (`SLE`); `...` (`exclusive: true`) stops one short of
+  // it (`SLT`) — the real distinguishing bit this plan's worked example
+  // (15 vs. 10) proves.
+  let predicate = if exclusive {
+    IntPredicate::SLT
+  } else {
+    IntPredicate::SLE
+  };
+  let cond_val = builder
+    .build_int_compare(
+      predicate,
+      idx_val,
+      end_val.into_int_value(),
+      "forrange.cond.cmp",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_conditional_branch(cond_val, body_blk, exit_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(body_blk);
+  builder
+    .build_store(var_alloca, idx_val)
+    .map_err(|e| e.to_string())?;
+
+  loop_stack.push(LoopTargets {
+    header: incr_blk,
+    exit: exit_blk,
+  });
+  let body_terminated = build_block(
+    context,
+    builder,
+    func,
+    body,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    loop_stack,
+    ret_kind,
+    ctx,
+  )?;
+  loop_stack.pop();
+  if !body_terminated {
+    builder
+      .build_unconditional_branch(incr_blk)
+      .map_err(|e| e.to_string())?;
+  }
+
+  builder.position_at_end(incr_blk);
+  let idx_val = builder
+    .build_load(context.i64_type(), idx_alloca, "forrange.idx.val")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+  let next_idx = builder
+    .build_int_add(
+      idx_val,
+      context.i64_type().const_int(1, false),
+      "forrange.idx.next",
+    )
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(idx_alloca, next_idx)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_unconditional_branch(cond_blk)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(exit_blk);
+  Ok(false)
+}
+
 /// `name(args) { |params| body }` where `name` declares `block_param`
 /// (plan 34's Decision log) — call-site specialization, not an ordinary
 /// call: this compiles a fresh copy of `callee`'s body inline, directly
@@ -2886,6 +3068,30 @@ fn build_stmt<'ctx>(
       func,
       var,
       elements,
+      body,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      loop_stack,
+      ret_kind,
+      ctx,
+    ),
+    // Plan 37: no array materialization, no per-iteration GEP/load — a
+    // Range's "elements" are the loop index itself. See `build_for_range`.
+    Stmt::ForRange {
+      var,
+      start,
+      end,
+      exclusive,
+      body,
+    } => build_for_range(
+      context,
+      builder,
+      func,
+      var,
+      start,
+      end,
+      *exclusive,
       body,
       vars,
       local_classes,
@@ -4792,5 +4998,40 @@ mod tests {
   fn string_interpolation_of_bool_and_float_linked_and_run() {
     let src = "puts \"#{true} and #{3.5}\"\n";
     assert_eq!(compile_link_run(src), "true and 3.5\n");
+  }
+
+  // Plan 37 (ranges and range-based iteration).
+
+  const RANGE_WORKED_EXAMPLE: &str = "total: Int64 = 0\nfor i in 1..5\n  total += i\nend\nputs total\n\ntotal2: Int64 = 0\nfor i in 1...5\n  total2 += i\nend\nputs total2\n";
+
+  #[test]
+  fn range_worked_example_linked_and_run() {
+    // The real distinguishing proof `..`/`...` bind their upper
+    // endpoint differently: 1+2+3+4+5 = 15 vs. 1+2+3+4 = 10.
+    assert_eq!(compile_link_run(RANGE_WORKED_EXAMPLE), "15\n10\n");
+  }
+
+  #[test]
+  fn break_inside_a_range_for_in_stops_iteration_early() {
+    let src = "for i in 1..5\n  if i == 3\n    break\n  end\n  puts i\nend\n";
+    assert_eq!(compile_link_run(src), "1\n2\n");
+  }
+
+  #[test]
+  fn next_inside_a_range_for_in_skips_one_element() {
+    let src = "for i in 1..5\n  if i == 3\n    next\n  end\n  puts i\nend\n";
+    assert_eq!(compile_link_run(src), "1\n2\n4\n5\n");
+  }
+
+  #[test]
+  fn range_for_in_over_a_non_literal_endpoint_linked_and_run() {
+    let src = "n: Int64 = 4\nfor i in 0..n\n  puts i\nend\n";
+    assert_eq!(compile_link_run(src), "0\n1\n2\n3\n4\n");
+  }
+
+  #[test]
+  fn reverse_range_for_in_is_a_well_typed_zero_iteration_loop() {
+    let src = "for i in 5..1\n  puts i\nend\n";
+    assert_eq!(compile_link_run(src), "");
   }
 }

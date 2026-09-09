@@ -1157,6 +1157,45 @@ fn check_stmt(
         yields_allowed,
       )
     }
+    // Plan 37: no first-class `Range` value — `start`/`end` are each
+    // independently checked as `Int64` (rejecting any other type by
+    // name, not silently coercing), `var` is bound at `Int64`
+    // unconditionally for `body`, and `in_loop = true` is threaded
+    // exactly as `Stmt::For`'s own arm does. A reverse range
+    // (`start > end`) is deliberately not rejected here — that's a
+    // runtime shape (a well-typed, zero-iteration loop), not a type
+    // error.
+    Stmt::ForRange {
+      var,
+      start,
+      end,
+      exclusive: _,
+      body,
+    } => {
+      let start_ty = infer_expr_type(start, env, sigs, classes, self_fields)?;
+      if start_ty != Type::Int64 {
+        return Err(Diagnostic::new(format!(
+          "range start must be Int64, found {start_ty:?}"
+        )));
+      }
+      let end_ty = infer_expr_type(end, env, sigs, classes, self_fields)?;
+      if end_ty != Type::Int64 {
+        return Err(Diagnostic::new(format!(
+          "range end must be Int64, found {end_ty:?}"
+        )));
+      }
+      env.insert(var.clone(), Type::Int64);
+      check_block(
+        body,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        return_type,
+        true,
+        yields_allowed,
+      )
+    }
   }
 }
 
@@ -2538,5 +2577,43 @@ mod tests {
     let errs = check_program(&program)
       .expect_err("must reject interpolating an Array — not a compiler-known stringifiable type");
     assert!(errs[0].message.contains("cannot be interpolated"));
+  }
+
+  // Plan 37 (ranges and range-based iteration).
+
+  #[test]
+  fn accepts_range_for_in_with_literal_endpoints() {
+    let src = "for i in 1..5\n  x: Int64 = i + 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_range_for_in_with_non_literal_endpoint_expression() {
+    // No parenthesized-expression grouping exists anywhere in this
+    // grammar (verified: no `"(" Expr ")"` production, only call-arg
+    // and param-list parens) — `n - 1` parses fine unparenthesized as
+    // the range's end operand, the real proof endpoints are arbitrary
+    // expressions, not just literals.
+    let src = "n: Int64 = 5\nfor i in 0..n - 1\n  puts i\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_non_int64_range_endpoint() {
+    let src = "for i in \"a\"..\"z\"\n  puts i\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("must reject a String range endpoint, not just Int64");
+    assert!(errs[0].message.contains("String"));
+  }
+
+  #[test]
+  fn accepts_break_and_next_inside_a_range_for_in() {
+    let src =
+      "for i in 1..5\n  if i == 3\n    break\n  end\n  if i == 2\n    next\n  end\n  puts i\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 }

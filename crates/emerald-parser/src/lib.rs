@@ -1283,6 +1283,64 @@ mod tests {
     );
   }
 
+  // Plan 37 (ranges and range-based iteration).
+
+  #[test]
+  fn inclusive_range_for_in_parses_to_stmt_for_range() {
+    let src = "for i in 1..5\n  puts i\nend\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::ForRange {
+        var: "i".to_string(),
+        start: Expr::Int(1),
+        end: Expr::Int(5),
+        exclusive: false,
+        body: vec![Stmt::Expr(Expr::Call(
+          "puts".to_string(),
+          vec![Expr::Ident("i".to_string())]
+        ))],
+      })
+    );
+  }
+
+  #[test]
+  fn exclusive_range_for_in_parses_to_stmt_for_range() {
+    let src = "for i in 1...5\n  puts i\nend\n";
+    let program = parse(src).unwrap();
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::ForRange {
+        var: "i".to_string(),
+        start: Expr::Int(1),
+        end: Expr::Int(5),
+        exclusive: true,
+        body: vec![Stmt::Expr(Expr::Call(
+          "puts".to_string(),
+          vec![Expr::Ident("i".to_string())]
+        ))],
+      })
+    );
+  }
+
+  #[test]
+  fn bare_range_outside_a_for_in_scrutinee_is_a_parse_error() {
+    let src = "r = 1..5\n";
+    assert!(
+      parse(src).is_err(),
+      "a Range has no standalone AST shape — only legal directly after `for <var> in`"
+    );
+  }
+
+  #[test]
+  fn endless_range_for_in_is_a_parse_error() {
+    let src = "for i in 5..\n  puts i\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "an endless range (no end operand) must be rejected at parse time"
+    );
+  }
+
   // Plan 29 (control-flow completeness).
 
   #[test]
