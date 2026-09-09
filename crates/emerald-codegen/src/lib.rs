@@ -704,6 +704,16 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
         }
       }
       Item::Stmt(s) => collect_symbols_in_stmt(s, &mut table),
+      // Plan 47: never actually reached — `compile_to_object`'s own
+      // prologue desugars every `Item::Test` into an `Item::Function`
+      // before this runs — handled anyway, the same way a function
+      // body is, for robustness against any future caller that skips
+      // that prologue.
+      Item::Test { body, .. } => {
+        for s in body {
+          collect_symbols_in_stmt(s, &mut table);
+        }
+      }
       Item::Interface(_) | Item::Require(_) | Item::Error => {}
     }
   }
@@ -6102,11 +6112,15 @@ fn declare_user_functions<'ctx>(
       Item::Interface(_) => {}
       // Plan 23: nothing to declare — `compile_to_object`'s own
       // per-item loop is where a `Program` that still contains an
-      // unresolved `Item::Require` (meaning `emerald-driver`'s
-      // resolution step, plan 17, was skipped or is missing entirely —
-      // not yet extracted in this codebase) produces a real, descriptive
-      // `Err` instead of silently compiling an incomplete program.
+      // unresolved `Item::Require` (meaning `emerald-cli`'s own
+      // `require.rs`, plan 46, was skipped) produces a real,
+      // descriptive `Err` instead of silently compiling an incomplete
+      // program.
       Item::Require(_) => {}
+      // Plan 47: never actually reached — `compile_to_object`'s own
+      // prologue rejects any `Program` still containing an
+      // `Item::Test` before this runs at all.
+      Item::Test { .. } => {}
       // Plan 26: `emerald_parser::parse`/`parse_named` only ever
       // returns `Ok(program)` with zero recovered errors, meaning no
       // `Item::Error` in `program.items` — codegen never receives one.
@@ -6157,6 +6171,23 @@ fn declare_lambda_functions<'ctx>(
 /// `__lambda_{name}` per top-level `Proc` `Let`, plus a `main`
 /// (`extern "C" fn() -> i32`) that evaluates the top-level statements.
 pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
+  // Plan 47's Decision log: a `test "..." do ... end` block only ever
+  // compiles through `compile_test_harness` (`emerald test`) — reaching
+  // this, the ordinary `emerald <file>`/`emerald build` path, is a
+  // real, described rejection, not a silent no-op or panic.
+  if program.items.iter().any(|i| matches!(i, Item::Test { .. })) {
+    return Err(
+      "top-level test block only valid under `emerald test`, not an ordinary compile".to_string(),
+    );
+  }
+  let mut items = program.items.clone();
+  let uses_assertions = desugar_asserts_in_items(&mut items);
+  if uses_assertions {
+    ensure_assertion_error_class(&mut items);
+  }
+  let owned_program = Program { items };
+  let program = &owned_program;
+
   Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
   let triple = TargetMachine::get_default_triple();
   let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
@@ -6516,15 +6547,18 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
       // never a body — nothing here to compile.
       Item::Interface(_) => {}
       // Plan 23's Decision log: reaching codegen with an unresolved
-      // `Item::Require` means `emerald-driver`'s resolution step (plan
-      // 17, not yet extracted in this codebase) was skipped or is
-      // missing — a real, descriptive `Err`, not a silent partial
-      // compile.
+      // `Item::Require` means `emerald-cli`'s own `require.rs` (plan
+      // 46) was skipped or is missing — a real, descriptive `Err`, not
+      // a silent partial compile.
       Item::Require(path) => {
         return Err(format!(
-          "codegen: unresolved `require {path}` — internal driver bug (emerald-driver's resolution step should have stripped this before codegen)"
+          "codegen: unresolved `require {path}` — internal driver bug (require.rs's resolution step should have stripped this before codegen)"
         ));
       }
+      // Plan 47: never actually reached — `compile_to_object`'s own
+      // prologue rejects any `Program` still containing an
+      // `Item::Test` before this runs at all.
+      Item::Test { .. } => {}
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
     }
   }
@@ -6589,6 +6623,342 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   target_machine
     .write_to_file(&module, FileType::Object, out_path)
     .map_err(|e| e.to_string())
+}
+
+/// Plan 47's Decision log: `assert(cond, loc)`/`assert_eq(expected,
+/// actual, loc)` are recognized-call-name intrinsics (like `puts`) —
+/// this rewrites every such `Stmt::Expr(Expr::Call(...))` reachable
+/// from `items` into a real `if !(...) { raise AssertionError.new(loc)
+/// }` shape, entirely at the AST level, before any LLVM emission. They
+/// can only ever appear as a bare statement (grammar.lalrpop only adds
+/// them to `StmtPrimaryExpr`, never nested `PrimaryExpr`), so this only
+/// needs to pattern-match at the `Stmt` level, never walk into
+/// arbitrary sub-expressions. Returns whether it rewrote anything, so
+/// the synthetic `AssertionError` class is only ever injected into a
+/// program that actually needed it (never a plain `hello.em`).
+fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
+  let mut rewrote = false;
+  for item in items {
+    match item {
+      Item::Function(f) => desugar_asserts_in_stmts(&mut f.body, &mut rewrote),
+      Item::Class(c) => {
+        for m in &mut c.methods {
+          desugar_asserts_in_stmts(&mut m.body, &mut rewrote);
+        }
+      }
+      Item::Module(m) => {
+        for f in &mut m.methods {
+          desugar_asserts_in_stmts(&mut f.body, &mut rewrote);
+        }
+      }
+      Item::Stmt(s) => desugar_asserts_in_stmt(s, &mut rewrote),
+      Item::Test { body, .. } => desugar_asserts_in_stmts(body, &mut rewrote),
+      Item::Interface(_) | Item::Require(_) | Item::Error => {}
+    }
+  }
+  rewrote
+}
+
+fn desugar_asserts_in_stmts(stmts: &mut [Stmt], rewrote: &mut bool) {
+  for s in stmts {
+    desugar_asserts_in_stmt(s, rewrote);
+  }
+}
+
+fn desugar_asserts_in_stmt(stmt: &mut Stmt, rewrote: &mut bool) {
+  match stmt {
+    Stmt::If {
+      then_branch,
+      else_branch,
+      ..
+    } => {
+      desugar_asserts_in_stmts(then_branch, rewrote);
+      if let Some(b) = else_branch {
+        desugar_asserts_in_stmts(b, rewrote);
+      }
+    }
+    Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ForRange { body, .. } => {
+      desugar_asserts_in_stmts(body, rewrote)
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      desugar_asserts_in_stmts(body, rewrote);
+      for r in rescues {
+        desugar_asserts_in_stmts(&mut r.body, rewrote);
+      }
+      if let Some(e) = ensure {
+        desugar_asserts_in_stmts(e, rewrote);
+      }
+    }
+    Stmt::Case {
+      arms, else_body, ..
+    } => {
+      for (_, body) in arms {
+        desugar_asserts_in_stmts(body, rewrote);
+      }
+      if let Some(b) = else_body {
+        desugar_asserts_in_stmts(b, rewrote);
+      }
+    }
+    _ => {}
+  }
+  let replacement = match stmt {
+    Stmt::Expr(Expr::Call(name, args)) if name == "assert" && args.len() == 2 => {
+      Some(desugar_assert(&args[0], &args[1]))
+    }
+    Stmt::Expr(Expr::Call(name, args)) if name == "assert_eq" && args.len() == 3 => {
+      Some(desugar_assert_eq(&args[0], &args[1], &args[2]))
+    }
+    _ => None,
+  };
+  if let Some(new_stmt) = replacement {
+    *stmt = new_stmt;
+    *rewrote = true;
+  }
+}
+
+fn desugar_assert(cond: &Expr, loc: &Expr) -> Stmt {
+  Stmt::If {
+    cond: Expr::Not(Box::new(cond.clone())),
+    then_branch: vec![Stmt::Raise(Expr::New(
+      "AssertionError".to_string(),
+      vec![loc.clone()],
+    ))],
+    else_branch: None,
+  }
+}
+
+/// Plan 47's Decision log: the failure report concatenates only
+/// `String + String` (the `"expected:"`/`"but got:"` labels) and
+/// prints `expected`/`actual`'s own values via `puts` on their own
+/// lines, exactly like `emerald test`'s summary counts — real,
+/// disclosed limit: this only actually compiles for the Int64/Float64/
+/// String operand types `puts` itself supports (see `build_puts`); a
+/// `Boolean`/`Symbol` `assert_eq` (sema accepts both, matching `==`'s
+/// own scope) fails at this point with `build_puts`'s own, unchanged
+/// "does not support" codegen error.
+fn desugar_assert_eq(expected: &Expr, actual: &Expr, loc: &Expr) -> Stmt {
+  let compare = Expr::Compare(
+    Box::new(expected.clone()),
+    CompareOp::Eq,
+    Box::new(actual.clone()),
+  );
+  Stmt::If {
+    cond: Expr::Not(Box::new(compare)),
+    then_branch: vec![
+      Stmt::Expr(Expr::Call(
+        "puts".to_string(),
+        vec![Expr::StringLit("expected:".to_string())],
+      )),
+      Stmt::Expr(Expr::Call("puts".to_string(), vec![expected.clone()])),
+      Stmt::Expr(Expr::Call(
+        "puts".to_string(),
+        vec![Expr::StringLit("but got:".to_string())],
+      )),
+      Stmt::Expr(Expr::Call("puts".to_string(), vec![actual.clone()])),
+      Stmt::Raise(Expr::New("AssertionError".to_string(), vec![loc.clone()])),
+    ],
+    else_branch: None,
+  }
+}
+
+/// A synthetic `class AssertionError; message: String; def initialize
+/// (message: String) -> Void; @message = message; end; def message ->
+/// String; @message; end; end` — the smallest real, catchable value
+/// `raise`/`rescue` (plan 11, unchanged) already supports, mirroring
+/// plan 33's own `read <name>: <Type>` field-accessor sugar's exact
+/// codegen shape for the accessor. Inserted at index 0 so it's always
+/// declared before anything that might reference it.
+fn assertion_error_class_item() -> Item {
+  Item::Class(ClassDef {
+    name: "AssertionError".to_string(),
+    superclass: None,
+    implements: None,
+    fields: vec![Param {
+      name: "message".to_string(),
+      ty: "String".to_string(),
+      default: None,
+    }],
+    methods: vec![
+      AstFunction {
+        name: "initialize".to_string(),
+        params: vec![Param {
+          name: "message".to_string(),
+          ty: "String".to_string(),
+          default: None,
+        }],
+        return_type: "Void".to_string(),
+        body: vec![Stmt::SetField {
+          name: "message".to_string(),
+          value: Expr::Ident("message".to_string()),
+        }],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+      },
+      AstFunction {
+        name: "message".to_string(),
+        params: Vec::new(),
+        return_type: "String".to_string(),
+        body: vec![Stmt::Expr(Expr::InstanceVar("message".to_string()))],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+      },
+    ],
+  })
+}
+
+fn ensure_assertion_error_class(items: &mut Vec<Item>) {
+  let already_present = items
+    .iter()
+    .any(|i| matches!(i, Item::Class(c) if c.name == "AssertionError"));
+  if !already_present {
+    items.insert(0, assertion_error_class_item());
+  }
+}
+
+/// Plan 47's `leaf-test-runner`: synthesizes a runnable program from
+/// every `Item::Test` in `program.items` — each test's body becomes
+/// its own top-level `Item::Function` (`__emerald_test_N`), called
+/// from a synthesized top-level sequence that wraps each call in
+/// `begin ... rescue AssertionError => e ... end`, tracks `passed`/
+/// `failed` counts, prints `PASS:`/`FAIL:` lines and the final
+/// `passed:`/`failed:` summary, then — since top-level Emerald code has
+/// no mechanism of its own to set `main`'s exit code (see
+/// `define_main`'s own doc comment) — deliberately `raise`s an
+/// uncaught `AssertionError` when `failed > 0`, reusing
+/// `emerald_raise`'s own already-tested uncaught-exception path
+/// (`runtime/emerald_runtime.c`: a `stderr`-only message, `exit(1)`)
+/// instead of adding any new LLVM-emitting code. The whole synthesized
+/// program is then compiled by the ordinary, unmodified
+/// `compile_to_object` — this function never touches LLVM directly.
+pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize, String> {
+  let tests: Vec<(String, Vec<Stmt>)> = program
+    .items
+    .iter()
+    .filter_map(|it| match it {
+      Item::Test { description, body } => Some((description.clone(), body.clone())),
+      _ => None,
+    })
+    .collect();
+  let num_tests = tests.len();
+
+  let mut items: Vec<Item> = program
+    .items
+    .iter()
+    .filter(|it| !matches!(it, Item::Test { .. }))
+    .cloned()
+    .collect();
+
+  let mut harness_stmts = vec![
+    Stmt::Let {
+      name: "passed".to_string(),
+      ty: "Int64".to_string(),
+      value: Expr::Int(0),
+    },
+    Stmt::Let {
+      name: "failed".to_string(),
+      ty: "Int64".to_string(),
+      value: Expr::Int(0),
+    },
+  ];
+
+  for (i, (description, body)) in tests.into_iter().enumerate() {
+    let fn_name = format!("__emerald_test_{i}");
+    items.push(Item::Function(AstFunction {
+      name: fn_name.clone(),
+      params: Vec::new(),
+      return_type: "Void".to_string(),
+      body,
+      block_param: None,
+      splat_param: None,
+      type_params: Vec::new(),
+    }));
+
+    harness_stmts.push(Stmt::Begin {
+      body: vec![
+        Stmt::Expr(Expr::Call(fn_name, Vec::new())),
+        Stmt::Expr(Expr::Call(
+          "puts".to_string(),
+          vec![Expr::StringLit(format!("PASS: {description}"))],
+        )),
+        Stmt::Assign {
+          name: "passed".to_string(),
+          value: Expr::Add(
+            Box::new(Expr::Ident("passed".to_string())),
+            Box::new(Expr::Int(1)),
+          ),
+        },
+      ],
+      rescues: vec![RescueClause {
+        class_name: Some("AssertionError".to_string()),
+        var: "e".to_string(),
+        body: vec![
+          Stmt::Expr(Expr::Call(
+            "puts".to_string(),
+            vec![Expr::Add(
+              Box::new(Expr::StringLit(format!("FAIL: {description}: "))),
+              Box::new(Expr::MethodCall(
+                Box::new(Expr::Ident("e".to_string())),
+                "message".to_string(),
+                Vec::new(),
+              )),
+            )],
+          )),
+          Stmt::Assign {
+            name: "failed".to_string(),
+            value: Expr::Add(
+              Box::new(Expr::Ident("failed".to_string())),
+              Box::new(Expr::Int(1)),
+            ),
+          },
+        ],
+      }],
+      ensure: None,
+    });
+  }
+
+  harness_stmts.push(Stmt::Expr(Expr::Call(
+    "puts".to_string(),
+    vec![Expr::StringLit("passed:".to_string())],
+  )));
+  harness_stmts.push(Stmt::Expr(Expr::Call(
+    "puts".to_string(),
+    vec![Expr::Ident("passed".to_string())],
+  )));
+  harness_stmts.push(Stmt::Expr(Expr::Call(
+    "puts".to_string(),
+    vec![Expr::StringLit("failed:".to_string())],
+  )));
+  harness_stmts.push(Stmt::Expr(Expr::Call(
+    "puts".to_string(),
+    vec![Expr::Ident("failed".to_string())],
+  )));
+  harness_stmts.push(Stmt::If {
+    cond: Expr::Compare(
+      Box::new(Expr::Ident("failed".to_string())),
+      CompareOp::Gt,
+      Box::new(Expr::Int(0)),
+    ),
+    then_branch: vec![Stmt::Raise(Expr::New(
+      "AssertionError".to_string(),
+      vec![Expr::StringLit(
+        "emerald test: one or more tests failed".to_string(),
+      )],
+    ))],
+    else_branch: None,
+  });
+
+  items.extend(harness_stmts.into_iter().map(Item::Stmt));
+  ensure_assertion_error_class(&mut items);
+
+  let owned_program = Program { items };
+  compile_to_object(&owned_program, out_path)?;
+  Ok(num_tests)
 }
 
 #[cfg(test)]
@@ -7826,5 +8196,172 @@ mod tests {
   fn gets_at_immediate_eof_returns_empty_string_not_a_hang() {
     let src = "line: String = gets()\nputs line.length\n";
     assert_eq!(compile_link_run_with_stdin(src, ""), "0\n");
+  }
+
+  // Plan 47 (REPL and test framework).
+
+  /// Like `compile_link_run`, but parses with a chosen source name —
+  /// needed for `assert`'s own `"{name}:{line}"` location capture,
+  /// which `compile_link_run`'s hardcoded `emerald_parser::parse` (name
+  /// `"<source>"`) can't produce.
+  fn compile_link_run_named(src: &str, name: &str) -> String {
+    let program = emerald_parser::parse_named(src, name).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!(
+      "{}_{:?}_named",
+      std::process::id(),
+      std::thread::current().id()
+    );
+    let obj_path = dir.join(format!("emerald_codegen_aot_{unique}.o"));
+    let bin_path = dir.join(format!("emerald_codegen_aot_bin_{unique}"));
+
+    compile_to_object(&program, &obj_path).expect("should compile to object file");
+
+    let status = Command::new("cc")
+      .arg("-no-pie")
+      .arg(&obj_path)
+      .arg(runtime_path())
+      .arg("-o")
+      .arg(&bin_path)
+      .status()
+      .expect("failed to invoke cc");
+    assert!(status.success(), "linking should succeed");
+
+    let output = Command::new(&bin_path)
+      .output()
+      .expect("failed to run compiled binary");
+    assert!(output.status.success(), "compiled binary should exit 0");
+
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&bin_path).ok();
+
+    String::from_utf8_lossy(&output.stdout).into_owned()
+  }
+
+  #[test]
+  fn assert_true_compiles_links_and_runs_with_no_output() {
+    let src = "def f() -> Void\n  assert(true)\nend\n\nf()\n";
+    assert_eq!(compile_link_run(src), "");
+  }
+
+  #[test]
+  fn assert_false_raises_an_assertion_error_carrying_the_real_file_and_line() {
+    // AC2: `assert(false)` on line 3 (1-based) of a file named `t.em`.
+    let src = "def f() -> Void\n  begin\n    assert(false)\n  rescue AssertionError => e\n    puts e.message\n  end\nend\n\nf()\n";
+    assert_eq!(compile_link_run_named(src, "t.em"), "t.em:3\n");
+  }
+
+  #[test]
+  fn assert_eq_mismatch_prints_expected_then_actual_before_the_rescue() {
+    // AC3.
+    let src = "begin\n  assert_eq(3, 1 + 1)\nrescue AssertionError => e\n  puts 999\nend\n";
+    assert_eq!(compile_link_run(src), "expected:\n3\nbut got:\n2\n999\n");
+  }
+
+  #[test]
+  fn assert_eq_match_raises_nothing() {
+    let src = "begin\n  assert_eq(2, 1 + 1)\n  puts 1\nrescue AssertionError => e\n  puts 0\nend\n";
+    assert_eq!(compile_link_run(src), "1\n");
+  }
+
+  #[test]
+  fn a_plain_hello_em_style_program_never_gets_an_assertionerror_symbol() {
+    // AC5: `AssertionError` injection only fires for a program that
+    // actually uses `test`/`assert`/`assert_eq` — real, checked proof
+    // against the emitted object file's own symbol table, not just "it
+    // still compiles".
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("no_assertion_symbol");
+    let obj_path = dir.join("hello.o");
+    compile_to_object(&program, &obj_path).expect("should compile");
+    let nm = Command::new("nm")
+      .arg(&obj_path)
+      .output()
+      .expect("failed to run nm");
+    let symbols = String::from_utf8_lossy(&nm.stdout);
+    assert!(
+      !symbols.contains("AssertionError"),
+      "a plain hello.em-style program's object file must carry no AssertionError symbol, found:\n{symbols}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  /// Compiles `src` via `compile_test_harness` (not `compile_to_object`
+  /// — the point of this whole leaf) and actually runs the produced
+  /// binary. Returns the reported test count plus the full process
+  /// `Output` (so a non-zero exit code, the disclosed AC1 negative
+  /// case, can be asserted rather than forced to succeed).
+  fn compile_test_harness_link_run(src: &str, name: &str) -> (usize, std::process::Output) {
+    let program = emerald_parser::parse_named(src, name).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!(
+      "{}_{:?}_testharness",
+      std::process::id(),
+      std::thread::current().id()
+    );
+    let obj_path = dir.join(format!("emerald_codegen_th_{unique}.o"));
+    let bin_path = dir.join(format!("emerald_codegen_th_bin_{unique}"));
+
+    let count = compile_test_harness(&program, &obj_path).expect("should compile the test harness");
+
+    let status = Command::new("cc")
+      .arg("-no-pie")
+      .arg(&obj_path)
+      .arg(runtime_path())
+      .arg("-o")
+      .arg(&bin_path)
+      .status()
+      .expect("failed to invoke cc");
+    assert!(status.success(), "linking should succeed");
+
+    let output = Command::new(&bin_path)
+      .output()
+      .expect("failed to run compiled binary");
+
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&bin_path).ok();
+
+    (count, output)
+  }
+
+  const MATH_TEST_EXAMPLE: &str = "test \"addition works\" do\n  assert_eq(2, 1 + 1)\nend\n\ntest \"addition is broken on purpose\" do\n  assert_eq(3, 1 + 1)\nend\n";
+
+  #[test]
+  fn math_test_worked_example_prints_the_exact_worked_transcript_and_exits_1() {
+    let (count, output) = compile_test_harness_link_run(MATH_TEST_EXAMPLE, "math_test.em");
+    assert_eq!(count, 2);
+    assert_eq!(
+      String::from_utf8_lossy(&output.stdout),
+      "PASS: addition works\nexpected:\n3\nbut got:\n2\nFAIL: addition is broken on purpose: math_test.em:6\npassed:\n1\nfailed:\n1\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+  }
+
+  #[test]
+  fn a_file_where_every_test_passes_exits_0() {
+    let src = "test \"one\" do\n  assert_eq(1, 1)\nend\n\ntest \"two\" do\n  assert(true)\nend\n";
+    let (count, output) = compile_test_harness_link_run(src, "all_green_test.em");
+    assert_eq!(count, 2);
+    assert_eq!(
+      String::from_utf8_lossy(&output.stdout),
+      "PASS: one\nPASS: two\npassed:\n2\nfailed:\n0\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+  }
+
+  #[test]
+  fn compiling_a_test_file_via_the_ordinary_path_is_a_described_rejection() {
+    // AC4 (leaf-test-runner) / AC5 (leaf-test-intrinsics): the ordinary
+    // `emerald <file>`-shaped `compile_to_object` path rejects a
+    // `Program` containing a `test` block with a specific, named
+    // message — not a panic, not a silent no-op compile.
+    let program = emerald_parser::parse(MATH_TEST_EXAMPLE).expect("should parse");
+    let dir = fresh_temp_dir("reject_test_block");
+    let obj_path = dir.join("out.o");
+    let err = compile_to_object(&program, &obj_path)
+      .expect_err("a top-level test block must be rejected by the ordinary compile path");
+    assert!(err.contains("only valid under `emerald test`"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
   }
 }

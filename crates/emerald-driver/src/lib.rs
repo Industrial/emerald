@@ -112,6 +112,38 @@ pub fn compile(source: &str, name: &str, output_path: &Path) -> Result<(), Drive
   run_blocking(pipeline, ())
 }
 
+/// Plan 47's `leaf-test-runner`: parses + checks `source` exactly like
+/// `compile` does, then hands the result to
+/// `emerald_codegen::compile_test_harness` (not `compile_to_object`)
+/// and links the result — a thin passthrough, mirroring how `compile`
+/// itself already wraps `compile_to_object`. Returns the number of
+/// `test` blocks found.
+pub fn compile_test(source: &str, name: &str, output_path: &Path) -> Result<usize, DriverError> {
+  let obj_path = std::env::temp_dir().join(format!("emerald_test_{}.o", process::id()));
+  let output_path = output_path.to_path_buf();
+  let pipeline = parse_stage(source.to_string(), name.to_string())
+    .flat_map(check_stage)
+    .flat_map(move |program| codegen_test_stage(program, obj_path))
+    .flat_map(move |(obj_path, count)| {
+      let output_path = output_path.clone();
+      link_stage(obj_path, output_path).flat_map(move |()| {
+        Effect::new(move |_env: &mut ()| -> Result<usize, DriverError> { Ok(count) })
+      })
+    });
+  run_blocking(pipeline, ())
+}
+
+fn codegen_test_stage(
+  program: Program,
+  obj_path: PathBuf,
+) -> Effect<(PathBuf, usize), DriverError, ()> {
+  Effect::new(move |_env: &mut ()| {
+    emerald_codegen::compile_test_harness(&program, &obj_path)
+      .map(|count| (obj_path.clone(), count))
+      .map_err(DriverError::Codegen)
+  })
+}
+
 /// Type-checks an already-parsed `Program` directly.
 pub fn check_program(program: &Program) -> Result<(), DriverError> {
   emerald_sema::check_program(program).map_err(DriverError::Sema)

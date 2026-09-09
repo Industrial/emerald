@@ -87,6 +87,230 @@ const MAX_RECOVERED_ERRORS: usize = 50;
 /// `Err(Vec<ParseError>)` instead, exactly the same all-or-nothing
 /// shape `parse_named` had before this plan, just now potentially
 /// carrying more than one error.
+/// Plan 47's Decision log: `assert(cond)`/`assert_eq(expected, actual)`
+/// capture a raw `@L` byte offset at parse time (as a placeholder
+/// `Expr::Int`, the grammar's own action) — this targeted post-parse
+/// pass is the only place that offset is ever converted into the real
+/// `Expr::StringLit("{name}:{line}")` a test failure's `.message`
+/// reads. Deliberately not plan 22's general `Spanned<T>` overhaul
+/// (out of scope, would touch every `Expr`/`Stmt` variant); this walks
+/// only to find `Expr::Call("assert"|"assert_eq", _)` shapes.
+fn line_at(source: &str, offset: usize) -> usize {
+  1 + source.as_bytes()[..offset.min(source.len())]
+    .iter()
+    .filter(|&&b| b == b'\n')
+    .count()
+}
+
+fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
+  for item in items {
+    match item {
+      Item::Function(f) => rewrite_stmts(&mut f.body, name, source),
+      Item::Class(c) => {
+        for m in &mut c.methods {
+          rewrite_stmts(&mut m.body, name, source);
+        }
+      }
+      Item::Module(m) => {
+        for f in &mut m.methods {
+          rewrite_stmts(&mut f.body, name, source);
+        }
+      }
+      Item::Interface(_) | Item::Require(_) | Item::Error => {}
+      Item::Stmt(s) => rewrite_stmt(s, name, source),
+      Item::Test { body, .. } => rewrite_stmts(body, name, source),
+    }
+  }
+}
+
+fn rewrite_stmts(stmts: &mut [Stmt], name: &str, source: &str) {
+  for s in stmts {
+    rewrite_stmt(s, name, source);
+  }
+}
+
+fn rewrite_stmt(stmt: &mut Stmt, name: &str, source: &str) {
+  match stmt {
+    Stmt::Let { value, .. }
+    | Stmt::SetField { value, .. }
+    | Stmt::Assign { value, .. }
+    | Stmt::Raise(value)
+    | Stmt::OrAssign { default: value, .. }
+    | Stmt::AndAssign { value, .. }
+    | Stmt::Expr(value) => rewrite_expr(value, name, source),
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      rewrite_expr(array, name, source);
+      rewrite_expr(index, name, source);
+      rewrite_expr(value, name, source);
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        rewrite_expr(v, name, source);
+      }
+    }
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      rewrite_expr(cond, name, source);
+      rewrite_stmts(then_branch, name, source);
+      if let Some(b) = else_branch {
+        rewrite_stmts(b, name, source);
+      }
+    }
+    Stmt::While { cond, body } => {
+      rewrite_expr(cond, name, source);
+      rewrite_stmts(body, name, source);
+    }
+    Stmt::Return(Some(e)) => rewrite_expr(e, name, source),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => {}
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      rewrite_stmts(body, name, source);
+      for r in rescues {
+        rewrite_stmts(&mut r.body, name, source);
+      }
+      if let Some(e) = ensure {
+        rewrite_stmts(e, name, source);
+      }
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      rewrite_expr(scrutinee, name, source);
+      for (values, body) in arms {
+        for v in values {
+          rewrite_expr(v, name, source);
+        }
+        rewrite_stmts(body, name, source);
+      }
+      if let Some(b) = else_body {
+        rewrite_stmts(b, name, source);
+      }
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        rewrite_expr(e, name, source);
+      }
+      rewrite_stmts(body, name, source);
+    }
+    Stmt::Yield(args) => {
+      for a in args {
+        rewrite_expr(a, name, source);
+      }
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      rewrite_expr(start, name, source);
+      rewrite_expr(end, name, source);
+      rewrite_stmts(body, name, source);
+    }
+  }
+}
+
+fn rewrite_expr(expr: &mut Expr, name: &str, source: &str) {
+  match expr {
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::Bool(_)
+    | Expr::Nil
+    | Expr::InstanceVar(_) => {}
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          rewrite_expr(e, name, source);
+        }
+      }
+    }
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b) => {
+      rewrite_expr(a, name, source);
+      rewrite_expr(b, name, source);
+    }
+    Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) | Expr::ArrayNew(a) => {
+      rewrite_expr(a, name, source)
+    }
+    Expr::Compare(a, _, b) => {
+      rewrite_expr(a, name, source);
+      rewrite_expr(b, name, source);
+    }
+    Expr::Call(fn_name, args) => {
+      for a in args.iter_mut() {
+        rewrite_expr(a, name, source);
+      }
+      let expected_arity = match fn_name.as_str() {
+        "assert" => Some(2),
+        "assert_eq" => Some(3),
+        _ => None,
+      };
+      if expected_arity == Some(args.len()) {
+        let offset = match args.last() {
+          Some(Expr::Int(offset)) => Some(*offset),
+          _ => None,
+        };
+        if let Some(offset) = offset {
+          let line = line_at(source, offset as usize);
+          *args.last_mut().expect("checked non-empty above") =
+            Expr::StringLit(format!("{name}:{line}"));
+        }
+      }
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, e) in kwargs {
+        rewrite_expr(e, name, source);
+      }
+    }
+    Expr::New(_, args) => {
+      for a in args {
+        rewrite_expr(a, name, source);
+      }
+    }
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
+      rewrite_expr(recv, name, source);
+      for a in args {
+        rewrite_expr(a, name, source);
+      }
+    }
+    Expr::ArrayLit(elems) => {
+      for e in elems {
+        rewrite_expr(e, name, source);
+      }
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        rewrite_expr(k, name, source);
+        rewrite_expr(v, name, source);
+      }
+    }
+    Expr::Lambda { body, .. } => rewrite_stmts(body, name, source),
+  }
+}
+
 pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
   let mut recovered = Vec::new();
   let result = grammar::grammar::ProgramParser::new().parse(&mut recovered, src);
@@ -95,7 +319,10 @@ pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
     .map(|e| to_parse_error(e.error, name, src))
     .collect();
   match result {
-    Ok(program) if errors.is_empty() => Ok(program),
+    Ok(mut program) if errors.is_empty() => {
+      rewrite_assert_locations(&mut program.items, name, src);
+      Ok(program)
+    }
     Ok(_) => {
       errors.truncate(MAX_RECOVERED_ERRORS);
       Err(errors)
@@ -2082,5 +2309,77 @@ mod tests {
     let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 10);
+  }
+
+  // Plan 47 (REPL and test framework).
+
+  #[test]
+  fn test_block_parses_into_item_test() {
+    let src = "test \"addition works\" do\n  assert_eq(2, 1 + 1)\nend\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(program.items.len(), 1);
+    let Item::Test { description, body } = &program.items[0] else {
+      panic!("expected an Item::Test, got {:?}", program.items[0]);
+    };
+    assert_eq!(description, "addition works");
+    assert_eq!(body.len(), 1);
+  }
+
+  #[test]
+  fn assert_call_rewrites_its_trailing_offset_into_a_file_line_string() {
+    // `assert(...)` is on line 2 (1-based) of this named source.
+    let src = "def f() -> Void\n  assert(true)\nend\n";
+    let program = parse_named(src, "t.em").expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item");
+    };
+    assert_eq!(
+      f.body,
+      vec![Stmt::Expr(Expr::Call(
+        "assert".to_string(),
+        vec![Expr::Bool(true), Expr::StringLit("t.em:2".to_string())]
+      ))]
+    );
+  }
+
+  #[test]
+  fn assert_eq_call_rewrites_its_trailing_offset_into_a_file_line_string() {
+    let src = "assert_eq(3, 1 + 1)\n";
+    let program = parse_named(src, "math_test.em").expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::Call(
+        "assert_eq".to_string(),
+        vec![
+          Expr::Int(3),
+          Expr::Add(Box::new(Expr::Int(1)), Box::new(Expr::Int(1))),
+          Expr::StringLit("math_test.em:1".to_string()),
+        ]
+      )))
+    );
+  }
+
+  #[test]
+  fn assert_inside_a_nested_block_still_gets_its_own_correct_line() {
+    // The rewrite pass must recurse into `if`/`while`/etc. bodies, not
+    // just top-level statements — this asserts on line 3.
+    let src = "x: Int64 = 1\nif x == 1\n  assert(x == 1)\nend\n";
+    let program = parse_named(src, "nested.em").expect("should parse");
+    let Item::Stmt(Stmt::If { then_branch, .. }) = &program.items[1] else {
+      panic!("expected an if statement");
+    };
+    let Stmt::Expr(Expr::Call(_, args)) = &then_branch[0] else {
+      panic!("expected an assert call");
+    };
+    assert_eq!(args[1], Expr::StringLit("nested.em:3".to_string()));
+  }
+
+  #[test]
+  fn math_test_worked_example_parses_with_two_test_blocks() {
+    let src = "test \"addition works\" do\n  assert_eq(2, 1 + 1)\nend\n\ntest \"addition is broken on purpose\" do\n  assert_eq(3, 1 + 1)\nend\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(program.items.len(), 2);
+    assert!(matches!(program.items[0], Item::Test { .. }));
+    assert!(matches!(program.items[1], Item::Test { .. }));
   }
 }

@@ -799,6 +799,49 @@ fn infer_expr_type(
       }
       Ok(Type::String)
     }
+    // Plan 47's Decision log: `assert`/`assert_eq` are recognized by
+    // literal call name, exactly the mechanism `puts`/`gets` already
+    // use above — not new `Stmt` variants. The trailing argument is
+    // always a real `Expr::StringLit("file:line")` by the time sema
+    // ever sees it (`emerald_parser::parse_named`'s own post-parse
+    // rewrite already replaced the grammar's raw-offset placeholder),
+    // so it needs no special-casing here beyond the arity check.
+    Expr::Call(name, args) if name == "assert" => {
+      if args.len() != 2 {
+        return Err(Diagnostic::new(format!(
+          "`assert` expects 1 argument, found {}",
+          args.len().saturating_sub(1)
+        )));
+      }
+      let cond_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields, gctx)?;
+      if cond_ty != Type::Boolean {
+        return Err(Diagnostic::new(format!(
+          "`assert` expects a Boolean condition, found {cond_ty:?}"
+        )));
+      }
+      Ok(Type::Void)
+    }
+    // Not new sema logic — the existing `==`-comparison checker,
+    // invoked on a synthetic `Expr::Compare(expected, Eq, actual)`
+    // node, keeping only its `Ok(())`/`Err(Diagnostic)` (the
+    // `Type::Boolean` it returns on success is discarded). This is
+    // also `assert_eq`'s real scope: exactly the operand types `==`
+    // already supports, not classes/arrays/hashes.
+    Expr::Call(name, args) if name == "assert_eq" => {
+      if args.len() != 3 {
+        return Err(Diagnostic::new(format!(
+          "`assert_eq` expects 2 arguments, found {}",
+          args.len().saturating_sub(1)
+        )));
+      }
+      let compare = Expr::Compare(
+        Box::new(args[0].clone()),
+        CompareOp::Eq,
+        Box::new(args[1].clone()),
+      );
+      infer_expr_type(&compare, env, sigs, classes, self_fields, gctx)?;
+      Ok(Type::Void)
+    }
     // Plan 41's Decision log: call-site checking is a separate, later
     // pass from body-checking, and only it ever touches a real concrete
     // type — checked before the ordinary `sigs.get(name)` fallback below
@@ -2358,13 +2401,18 @@ fn check_block_call_sites(
       // Plan 41: an interface declares one required method signature,
       // never a body — nothing here can contain a `yield` site.
       Item::Interface(_) => {}
-      // Plan 23: `emerald-driver`'s `resolve_program` (not yet
-      // extracted in this codebase) is meant to strip every
-      // `Item::Require` before `emerald-sema` ever sees a `Program` —
-      // a no-op here, not an error, since a `require`-bearing `Program`
-      // reaching this far is a real, disclosed gap this plan names
-      // rather than papering over with a fabricated driver crate.
+      // Plan 17/46: `emerald-cli`'s own `require.rs` (not
+      // `emerald-driver`) splices multi-file `require`s before a
+      // `Program` ever reaches `emerald-sema` — a no-op here, not an
+      // error, since a `require`-bearing `Program` reaching this far
+      // is a real, disclosed gap this plan names rather than papering
+      // over.
       Item::Require(_) => {}
+      // Plan 47: a `test` body is checked exactly like a free
+      // function's — it can contain a block-attaching call site too.
+      Item::Test { body, .. } => {
+        scan_block_call_sites(body, sigs, classes, func_defs, gctx, &mut diags)
+      }
       Item::Error => {}
     }
   }
@@ -2846,6 +2894,24 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // Plan 23: see `check_block_call_sites`'s own `Item::Require`
       // arm — a no-op here too, for the same reason.
       Item::Require(_) => {}
+      // Plan 47's Decision log: a `test` body type-checks as a fresh,
+      // `Void`-return, no-`self`-fields scope — the exact same shape
+      // `check_function_body` already gives a free function, so this
+      // just synthesizes one rather than duplicating that logic.
+      Item::Test { body, .. } => {
+        let synthetic = Function {
+          name: "test".to_string(),
+          params: Vec::new(),
+          return_type: "Void".to_string(),
+          body: body.clone(),
+          block_param: None,
+          splat_param: None,
+          type_params: Vec::new(),
+        };
+        if let Err(d) = check_function_body(&synthetic, &sigs, &classes, &gctx) {
+          diags.push(d);
+        }
+      }
       // Plan 26's Decision log: `emerald_parser::parse`/`parse_named`
       // returns `Ok(program)` only when zero errors were recovered —
       // `program.items` then contains no `Item::Error` by construction,
@@ -4352,6 +4418,43 @@ mod tests {
   #[test]
   fn accepts_the_plan_45_worked_example() {
     let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 47 (REPL and test framework).
+
+  #[test]
+  fn accepts_a_test_block_using_assert_and_assert_eq() {
+    let src = "test \"addition works\" do\n  assert(true)\n  assert_eq(2, 1 + 1)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_assert_with_a_non_boolean_condition() {
+    let src = "test \"bad\" do\n  assert(1)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn rejects_assert_eq_with_mismatched_operand_types() {
+    // AC4: rejected with the existing Compare-family type-mismatch
+    // diagnostic (naming String/Int64), not a runtime failure.
+    let src = "test \"bad\" do\n  assert_eq(\"s\", 1)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("String vs Int64 assert_eq should be rejected");
+    assert!(errs[0].message.contains("String"));
+    assert!(errs[0].message.contains("Int64"));
+  }
+
+  #[test]
+  fn accepts_a_top_level_assert_outside_any_test_block() {
+    // `assert`/`assert_eq` are ordinary recognized-call-name intrinsics
+    // (like `puts`) — legal anywhere an `Expr::Call` is, not just
+    // inside `test ... do ... end`.
+    let src = "assert(1 + 1 == 2)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }

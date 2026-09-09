@@ -427,13 +427,27 @@ pub enum Item {
   /// relative to the *containing* file, `.em` implied. Reachable only
   /// from `Program`'s top-level `Item*` rule, never from `Stmt*` — a
   /// `require` inside a function body is a real parse error, not
-  /// silently accepted. `emerald-driver`'s `resolve_program` (plan 17,
-  /// not yet extracted in this codebase) is meant to strip every
-  /// `Item::Require` before handing a `Program` to `emerald-sema`/
-  /// `emerald-codegen` — until that driver exists, one reaching either
-  /// crate is a real, disclosed gap: sema treats it as a no-op, codegen
-  /// returns a descriptive `Err` rather than silently ignoring it.
+  /// silently accepted. Plan 17's `emerald-driver` doesn't splice
+  /// multi-file `require`s itself (that's `emerald-cli`'s own
+  /// `require.rs`, plan 46) — one reaching `emerald-sema`/
+  /// `emerald-codegen` directly is a real, disclosed gap: sema treats
+  /// it as a no-op, codegen returns a descriptive `Err` rather than
+  /// silently ignoring it.
   Require(String),
+  /// `test "description" do ... end` (plan 47's Decision log) — a
+  /// narrow, self-contained grammar addition (its own `"do" Stmt*
+  /// "end"` production, not plan 34's general `{ |params| body }`
+  /// block syntax, which explicitly declined a `do...end` form).
+  /// `body` is compiled as its own synthesized zero-parameter,
+  /// `Void`-returning function, wrapped in `begin ... rescue
+  /// AssertionError => e ... end` by `emerald_codegen::
+  /// compile_test_harness` (`leaf-test-runner`) — never reachable via
+  /// the ordinary `emerald <file>` compile path, which rejects a
+  /// `Program` containing one.
+  Test {
+    description: String,
+    body: Vec<Stmt>,
+  },
   /// A top-level construct LALRPOP's `!` error-recovery mechanism
   /// resynchronized past (plan 26's Decision log) — a real parse error
   /// was recorded for it. Never appears in a `Program` `parse`/

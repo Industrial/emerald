@@ -13,7 +13,9 @@
 mod deps;
 mod lockfile;
 mod manifest;
+mod repl;
 mod require;
+mod test_runner;
 
 use deps::DepsError;
 use emerald_driver::DriverError;
@@ -37,7 +39,7 @@ fn report_error(e: CliError) {
   }
 }
 
-fn report_driver_error(e: DriverError) {
+pub(crate) fn report_driver_error(e: DriverError) {
   match e {
     // `ParseError` implements `miette::Diagnostic` (plan 13) — its
     // `{:?}` rendering, via miette's `fancy`-feature graphical
@@ -68,6 +70,8 @@ fn main() {
       cmd_build();
     }
     Some("run") => cmd_run(),
+    Some("test") => test_runner::run(&args),
+    Some("repl") => repl::run(),
     Some("update") => {
       eprintln!(
         "error: `emerald update` is not supported yet — edit the dependency's \
@@ -76,6 +80,10 @@ fn main() {
       );
       process::exit(1);
     }
+    // Plan 47's Decision log: zero args (a bare `emerald`) enters the
+    // REPL too — `run_legacy` below already requires a real
+    // `args.get(1)` source-file argument, so this arm must come first.
+    None => repl::run(),
     _ => run_legacy(&args),
   }
 }

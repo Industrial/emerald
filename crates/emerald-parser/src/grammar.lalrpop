@@ -56,6 +56,11 @@ Item: Item = {
   // from `Stmt`/`Stmt*`, so `require` inside a function/`if`/`while`
   // body is a real parse error, not silently accepted.
   "require" <path:RequirePath> => Item::Require(path),
+  // Plan 47's Decision log: `test "..." do ... end` gets its own
+  // narrow production (a real, new "do" terminal) — not plan 34's
+  // general `{ |params| body }` block syntax, which explicitly
+  // declined a `do...end` form.
+  "test" <description:StringLitTok> "do" <body:Stmt*> "end" => Item::Test { description, body },
   ! => { errors.push(<>); Item::Error },
 };
 
@@ -632,6 +637,16 @@ StmtPrimaryExpr: Expr = {
     Expr::SafeCall(Box::new(Expr::Ident(recv)), method, args)
   },
   <recv:Ident> "&." <method:CallMethodName> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  // Plan 47's Decision log: `assert`/`assert_eq` need their own
+  // productions (not the generic `<name:Ident> "(" <args:Args> ")"`
+  // call shape) purely to capture `@L` — LALRPOP's own byte-offset
+  // marker, available only in a grammar action, never reconstructable
+  // sema/codegen-side. The extra trailing `Expr::Int(l as i64)` is a
+  // raw-offset placeholder `parse_named`'s own post-parse pass
+  // (`rewrite_assert_locations`) rewrites into a real
+  // `Expr::StringLit("{name}:{line}")` before any caller ever sees it.
+  <l:@L> "assert" "(" <cond:Expr> ")" => Expr::Call("assert".to_string(), vec![cond, Expr::Int(l as i64)]),
+  <l:@L> "assert_eq" "(" <expected:Expr> "," <actual:Expr> ")" => Expr::Call("assert_eq".to_string(), vec![expected, actual, Expr::Int(l as i64)]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
   <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
