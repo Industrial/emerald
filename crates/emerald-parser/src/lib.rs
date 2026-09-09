@@ -2052,4 +2052,35 @@ mod tests {
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 6);
   }
+
+  // Plan 45 (stdlib strings and I/O).
+
+  #[test]
+  fn dot_read_method_call_parses_despite_read_being_reserved_by_class_field_sugar() {
+    // Plan 33's `read <name>: <Type>` class-field sugar already
+    // reserves `read` as a distinct terminal, globally — `.read` (e.g.
+    // `File.read(path)`) needs `CallMethodName` to widen the
+    // method-name slot at every call site, or this fails to parse.
+    let src = "content: String = File.read(\"x.txt\")\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Let {
+        name: "content".to_string(),
+        ty: "String".to_string(),
+        value: Expr::MethodCall(
+          Box::new(Expr::Ident("File".to_string())),
+          "read".to_string(),
+          vec![Expr::StringLit("x.txt".to_string())],
+        ),
+      })
+    );
+  }
+
+  #[test]
+  fn plan_45_worked_example_parses_end_to_end() {
+    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(program.items.len(), 10);
+  }
 }

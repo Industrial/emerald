@@ -1508,6 +1508,34 @@ struct Ctx<'a, 'ctx> {
   /// function body compiles). No runtime interning table exists at all
   /// — the symbol set is closed and fully enumerable at parse time.
   symbol_table: &'a HashMap<String, i64>,
+  /// Plan 45's curated `String` intrinsic surface — declared once in
+  /// `compile_to_object`, alongside `print_str`/`string_concat`/
+  /// `string_eq`, dispatched from `build_method_call`/`build_index`
+  /// once the receiver's `ValKind` is `Str`.
+  string_length: FunctionValue<'ctx>,
+  string_upcase: FunctionValue<'ctx>,
+  string_downcase: FunctionValue<'ctx>,
+  string_strip: FunctionValue<'ctx>,
+  string_to_i: FunctionValue<'ctx>,
+  string_to_f: FunctionValue<'ctx>,
+  string_char_at: FunctionValue<'ctx>,
+  string_slice: FunctionValue<'ctx>,
+  string_split_count: FunctionValue<'ctx>,
+  string_split: FunctionValue<'ctx>,
+  /// Plan 45's Decision log: `File` reuses plan 12's `Name.method(args)`
+  /// dispatch shape but is a separate, hard-coded arm in `build_method_
+  /// call` — `File` is never a `ModuleDef`, so it never populates
+  /// `user_func_ids` the way a real module's methods do.
+  file_read: FunctionValue<'ctx>,
+  file_write: FunctionValue<'ctx>,
+  /// `gets()` — dispatched directly in `build_expr`'s `Expr::Call`
+  /// handling, the same way `puts` is, since it must be usable as an
+  /// expression.
+  gets: FunctionValue<'ctx>,
+  /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
+  /// argv-and-gets`'s own dedicated construction site — never called
+  /// anywhere else).
+  build_argv: FunctionValue<'ctx>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -2381,6 +2409,24 @@ fn build_expr<'ctx>(
       };
       Ok((cmp.into(), ValKind::Bool))
     }
+    // Plan 45's Decision log: unlike `puts` (a dedicated `Stmt`-level
+    // keyword), `gets` must be usable as an expression — dispatched
+    // here directly, the same hard-coded-name shape `File`/String
+    // intrinsics use, checked before the generic `Expr::Call` arm below
+    // (`gets` is never in `ctx.user_func_ids`, so it could never reach
+    // that arm's lookup successfully anyway).
+    Expr::Call(name, args) if name == "gets" => {
+      if !args.is_empty() {
+        return Err(format!(
+          "codegen: `gets` expects 0 arguments, found {}",
+          args.len()
+        ));
+      }
+      let call = builder
+        .build_call(ctx.gets, &[], "getstmp")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Str))
+    }
     Expr::Call(name, args) => {
       let (result, ret_kind) = build_call_expr(
         context,
@@ -2671,6 +2717,90 @@ fn build_method_call<'ctx>(
       "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
     );
   };
+
+  // Plan 45's Decision log: `File` is a separate, hard-coded arm, not
+  // plan 12's real module-dispatch mechanism (`File` is never a
+  // `ModuleDef`, so it never populates `ctx.module_names`) — checked
+  // first purely for arm-ordering clarity, since it can never actually
+  // collide with the module check below.
+  if recv_name == "File" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    return match method {
+      "read" => {
+        let call = builder
+          .build_call(ctx.file_read, &call_args, "filereadtmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Str))
+      }
+      "write" => {
+        builder
+          .build_call(ctx.file_write, &call_args, "filewritetmp")
+          .map_err(|e| e.to_string())?;
+        Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
+      }
+      other => Err(format!("codegen: unsupported File method `{other}`")),
+    };
+  }
+
+  // Plan 45's Decision log: dispatched by checking `vars.get(recv_name)`'s
+  // stored `ValKind` for `Str`, before falling through to `local_classes`'
+  // class-name lookup below (which errors with "cannot determine the
+  // class" for any receiver that isn't a registered class — a
+  // String-typed local was always silently doomed to hit exactly that
+  // error before this plan).
+  if let Some((_, ValKind::Str)) = vars.get(recv_name) {
+    let (recv_val, _) = build_expr(
+      context,
+      builder,
+      recv,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "length" => (ctx.string_length, ValKind::Int64),
+      "upcase" => (ctx.string_upcase, ValKind::Str),
+      "downcase" => (ctx.string_downcase, ValKind::Str),
+      "strip" => (ctx.string_strip, ValKind::Str),
+      "to_i" => (ctx.string_to_i, ValKind::Int64),
+      "to_f" => (ctx.string_to_f, ValKind::Float64),
+      "slice" => (ctx.string_slice, ValKind::Str),
+      "split_count" => (ctx.string_split_count, ValKind::Int64),
+      "split" => (ctx.string_split, ValKind::Ptr),
+      other => return Err(format!("codegen: unsupported String method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "strmethodtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
 
   if ctx.module_names.contains(recv_name) {
     let key = format!("{recv_name}_{method}");
@@ -3313,6 +3443,20 @@ fn build_index<'ctx>(
       .build_load(value_llvm_ty, value_ptr, "hashval")
       .map_err(|e| e.to_string())?;
     return Ok((loaded, value_kind));
+  }
+  // Plan 45's Decision log: `str[i]` — a real one-character `String`
+  // (`emerald_string_char_at`), not an `Int64` byte value. Checked
+  // after `local_array_elem_types`/the Hash branch, alongside the
+  // existing `vars`-`ValKind` check `build_method_call` already uses
+  // for its own String dispatch.
+  if let Some((_, ValKind::Str)) = vars.get(arr_name) {
+    if idx_kind != ValKind::Int64 {
+      return Err("codegen: String index must be Int64".to_string());
+    }
+    let call = builder
+      .build_call(ctx.string_char_at, &[base.into(), idx.into()], "charattmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Str));
   }
   Err(format!(
     "codegen: cannot determine the element type of `{arr_name}` for indexing"
@@ -4401,6 +4545,22 @@ fn build_stmt<'a, 'ctx>(
         local_array_elem_types,
         ctx,
       )?;
+      Ok(false)
+    }
+    // Plan 45: a bare-statement `gets()` (its return value discarded) —
+    // `gets` is never in `ctx.user_func_ids`, so it could never reach
+    // the generic `Expr::Call` arm below successfully; mirrors
+    // `build_expr`'s own `gets` guard.
+    Stmt::Expr(Expr::Call(name, args)) if name == "gets" => {
+      if !args.is_empty() {
+        return Err(format!(
+          "codegen: `gets` expects 0 arguments, found {}",
+          args.len()
+        ));
+      }
+      builder
+        .build_call(ctx.gets, &[], "getstmp")
+        .map_err(|e| e.to_string())?;
       Ok(false)
     }
     // Plan 39: a bare-statement call to a `Void`-returning function
@@ -5780,9 +5940,11 @@ fn define_lambda<'ctx>(
   )
 }
 
-/// Builds `main` (`extern "C" fn() -> i32`): evaluates the top-level
-/// statements (including `puts` calls and lambda-creating `Let`s) via
-/// the already-declared runtime/user functions, and returns 0.
+/// Builds `main` (`extern "C" fn(i32, ptr) -> i32`): populates `ARGV`/
+/// `ARGC` from `main`'s own real `argc`/`argv` params (plan 45's
+/// Decision log) before evaluating the top-level statements (including
+/// `puts` calls and lambda-creating `Let`s) via the already-declared
+/// runtime/user functions, and returns 0.
 fn define_main<'ctx>(
   context: &'ctx Context,
   builder: &Builder<'ctx>,
@@ -5805,6 +5967,50 @@ fn define_main<'ctx>(
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
   let mut local_array_elem_types = HashMap::new();
+
+  // Plan 45's Decision log: `ARGV`/`ARGC` populated before `build_block`
+  // runs, from `main`'s own real `argc`/`argv` params — `emerald_
+  // build_argv` skips `argv[0]` (the program name, matching Ruby's own
+  // `ARGV`) and reuses the OS-owned string pointers directly, no copy.
+  let argc_param = main_fn
+    .get_nth_param(0)
+    .expect("main declares argc as its first param")
+    .into_int_value();
+  let argv_param = main_fn
+    .get_nth_param(1)
+    .expect("main declares argv as its second param")
+    .into_pointer_value();
+  let argv_call = builder
+    .build_call(
+      gen_ctx.build_argv,
+      &[argc_param.into(), argv_param.into()],
+      "argvtmp",
+    )
+    .map_err(|e| e.to_string())?;
+  let argv_val = call_result(argv_call)?;
+  let argv_alloca = builder
+    .build_alloca(local_llvm_type(context, ValKind::Ptr), "ARGV")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(argv_alloca, argv_val)
+    .map_err(|e| e.to_string())?;
+  vars.insert("ARGV".to_string(), (argv_alloca, ValKind::Ptr));
+  local_array_elem_types.insert("ARGV".to_string(), ValKind::Str);
+
+  let one = context.i32_type().const_int(1, false);
+  let argc_minus_one = builder
+    .build_int_sub(argc_param, one, "argcm1")
+    .map_err(|e| e.to_string())?;
+  let argc_i64 = builder
+    .build_int_z_extend(argc_minus_one, context.i64_type(), "argc64")
+    .map_err(|e| e.to_string())?;
+  let argc_alloca = builder
+    .build_alloca(local_llvm_type(context, ValKind::Int64), "ARGC")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(argc_alloca, argc_i64)
+    .map_err(|e| e.to_string())?;
+  vars.insert("ARGC".to_string(), (argc_alloca, ValKind::Int64));
   let mut decls = Vec::new();
   collect_lets(&top_stmts, &mut decls);
   prealloc_lets(context, builder, &decls, &mut vars)?;
@@ -6027,6 +6233,77 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 45 (stdlib strings and I/O).
+  let string_length = module.add_function(
+    "emerald_string_length",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_upcase = module.add_function(
+    "emerald_string_upcase",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_downcase = module.add_function(
+    "emerald_string_downcase",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_strip = module.add_function(
+    "emerald_string_strip",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_to_i = module.add_function(
+    "emerald_string_to_i",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_to_f = module.add_function(
+    "emerald_string_to_f",
+    f64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_char_at = module.add_function(
+    "emerald_string_char_at",
+    ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_slice = module.add_function(
+    "emerald_string_slice",
+    ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_split_count = module.add_function(
+    "emerald_string_split_count",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let string_split = module.add_function(
+    "emerald_string_split",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let file_read = module.add_function(
+    "emerald_file_read",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let file_write = module.add_function(
+    "emerald_file_write",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gets = module.add_function(
+    "emerald_gets",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let build_argv = module.add_function(
+    "emerald_build_argv",
+    ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 25 (stdlib expansion).
   let alloc_zeroed = module.add_function(
     "emerald_alloc_zeroed",
@@ -6165,6 +6442,20 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     func_defs: &func_defs,
     yield_target: None,
     symbol_table: &symbol_table,
+    string_length,
+    string_upcase,
+    string_downcase,
+    string_strip,
+    string_to_i,
+    string_to_f,
+    string_char_at,
+    string_slice,
+    string_split_count,
+    string_split,
+    file_read,
+    file_write,
+    gets,
+    build_argv,
   };
 
   for item in &program.items {
@@ -6254,7 +6545,13 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     }
   }
 
-  let main_ty = context.i32_type().fn_type(&[], false);
+  // Plan 45's Decision log: `fn(i32, ptr) -> i32` — the ordinary C
+  // `main(argc, argv)` ABI `cc`'s own linked `_start` already expects,
+  // so no change to `emerald-cli`'s link step is needed. A program that
+  // never references `ARGV`/`ARGC`/`gets()` is unaffected.
+  let main_ty = context
+    .i32_type()
+    .fn_type(&[context.i32_type().into(), ptr_ty.into()], false);
   let main_fn = module.add_function("main", main_ty, Some(Linkage::External));
   define_main(&context, &builder, main_fn, program, &gen_ctx)?;
 
@@ -6334,6 +6631,88 @@ mod tests {
     std::fs::remove_file(&bin_path).ok();
 
     String::from_utf8_lossy(&output.stdout).into_owned()
+  }
+
+  /// Plan 45's own general-purpose runner — `compile_link_run` above
+  /// covers every prior plan's own no-args/no-stdin/cwd-agnostic case
+  /// unchanged; this one adds exactly the three axes `ARGV`/`gets`/
+  /// `File` need (fixed argv, fixed stdin, a chosen working directory),
+  /// returning the full `Output` rather than just stdout so a negative
+  /// (non-zero exit, disclosed abort) case can be asserted too.
+  fn compile_link_run_full(
+    src: &str,
+    args: &[&str],
+    stdin_input: Option<&str>,
+    dir: Option<&std::path::Path>,
+  ) -> std::process::Output {
+    use std::io::Write;
+    let program = emerald_parser::parse(src).expect("should parse");
+    let temp_dir = std::env::temp_dir();
+    let unique = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+    let obj_path = temp_dir.join(format!("emerald_codegen_aot_{unique}.o"));
+    let bin_path = temp_dir.join(format!("emerald_codegen_aot_bin_{unique}"));
+
+    compile_to_object(&program, &obj_path).expect("should compile to object file");
+
+    let status = Command::new("cc")
+      .arg("-no-pie")
+      .arg(&obj_path)
+      .arg(runtime_path())
+      .arg("-o")
+      .arg(&bin_path)
+      .status()
+      .expect("failed to invoke cc");
+    assert!(status.success(), "linking should succeed");
+
+    let mut cmd = Command::new(&bin_path);
+    cmd.args(args);
+    if let Some(d) = dir {
+      cmd.current_dir(d);
+    }
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to run compiled binary");
+    if let Some(input) = stdin_input {
+      child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(input.as_bytes())
+        .expect("should write to stdin");
+    } else {
+      drop(child.stdin.take());
+    }
+    let output = child
+      .wait_with_output()
+      .expect("failed to wait on compiled binary");
+
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&bin_path).ok();
+
+    output
+  }
+
+  fn compile_link_run_with_stdin(src: &str, input: &str) -> String {
+    let output = compile_link_run_full(src, &[], Some(input), None);
+    assert!(output.status.success(), "compiled binary should exit 0");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+  }
+
+  fn compile_link_run_with_args(src: &str, args: &[&str]) -> String {
+    let output = compile_link_run_full(src, args, None, None);
+    assert!(output.status.success(), "compiled binary should exit 0");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+  }
+
+  fn fresh_temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+      "emerald_codegen_{tag}_{}_{:?}",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("should create a fresh temp dir");
+    dir
   }
 
   #[test]
@@ -7347,5 +7726,105 @@ mod tests {
     };
     let out = std::env::temp_dir().join("emerald_codegen_symbol_ordering_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  // Plan 45 (stdlib strings and I/O).
+
+  #[test]
+  fn string_length_upcase_downcase_linked_and_run() {
+    let src = "name: String = \"chicago\"\nputs name.length\nputs name.upcase\nshout: String = \"CHICAGO\"\nputs shout.downcase\n";
+    assert_eq!(compile_link_run(src), "7\nCHICAGO\nchicago\n");
+  }
+
+  #[test]
+  fn string_strip_linked_and_run() {
+    let src = "raw: String = \"  padded  \"\nputs raw.strip\n";
+    assert_eq!(compile_link_run(src), "padded\n");
+  }
+
+  #[test]
+  fn string_to_i_and_to_f_linked_and_run() {
+    let src = "digits: String = \"42abc\"\nputs digits.to_i\ndecimal: String = \"3.5\"\nputs decimal.to_f\n";
+    assert_eq!(compile_link_run(src), "42\n3.5\n");
+  }
+
+  #[test]
+  fn string_indexing_and_slicing_linked_and_run() {
+    let src = "s: String = \"hello\"\nputs s[1]\nputs s.slice(1, 3)\n";
+    assert_eq!(compile_link_run(src), "e\nell\n");
+  }
+
+  #[test]
+  fn split_and_split_count_linked_and_run() {
+    let src = "s: String = \"a b c\"\nputs s.split_count(\" \")\nwords: Array[String] = s.split(\" \")\nputs words[0]\nputs words[1]\nputs words[2]\n";
+    assert_eq!(compile_link_run(src), "3\na\nb\nc\n");
+  }
+
+  #[test]
+  fn empty_separator_split_is_a_disclosed_runtime_abort() {
+    // AC4 of leaf-string-split: a documented, expected failure mode —
+    // non-zero exit, a diagnostic on stderr — not silently looping
+    // forever or producing garbage.
+    let src = "s: String = \"abc\"\nn: Int64 = s.split_count(\"\")\nputs n\n";
+    let output = compile_link_run_full(src, &[], None, None);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("separator must not be empty"));
+  }
+
+  const PLAN_45_WORKED_EXAMPLE: &str = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
+
+  #[test]
+  fn plan_45_worked_example_linked_and_run() {
+    // Run from a fresh temporary working directory (`plan45_demo.txt`
+    // is created, not pre-existing) — real proof `.upcase` transforms
+    // the string, `File.write` persists it, `File.read` reads the same
+    // bytes back, `.split_count`/`.split` genuinely tokenize the
+    // reconstituted string, and existing `while`/indexing machinery
+    // iterates the result correctly.
+    let dir = fresh_temp_dir("plan45_worked_example");
+    let output = compile_link_run_full(PLAN_45_WORKED_EXAMPLE, &[], None, Some(&dir));
+    assert!(output.status.success());
+    assert_eq!(
+      String::from_utf8_lossy(&output.stdout),
+      "HELLO WORLD FOO\n3\nHELLO\nWORLD\nFOO\n"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn file_read_on_a_nonexistent_path_is_a_disclosed_runtime_abort() {
+    let dir = fresh_temp_dir("plan45_missing_file");
+    let src = "content: String = File.read(\"/nonexistent/path/plan45.txt\")\nputs content\n";
+    let output = compile_link_run_full(src, &[], None, Some(&dir));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not open"));
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn argv_and_argc_with_two_fixed_arguments_linked_and_run() {
+    let src = "puts ARGC\nputs ARGV[0]\nputs ARGV[1]\n";
+    assert_eq!(
+      compile_link_run_with_args(src, &["foo", "bar"]),
+      "2\nfoo\nbar\n"
+    );
+  }
+
+  #[test]
+  fn argc_with_zero_extra_arguments_linked_and_run() {
+    let src = "puts ARGC\n";
+    assert_eq!(compile_link_run_with_args(src, &[]), "0\n");
+  }
+
+  #[test]
+  fn gets_composes_with_strip_linked_and_run() {
+    let src = "line: String = gets()\nputs line.strip\n";
+    assert_eq!(compile_link_run_with_stdin(src, "hello\n"), "hello\n");
+  }
+
+  #[test]
+  fn gets_at_immediate_eof_returns_empty_string_not_a_hang() {
+    let src = "line: String = gets()\nputs line.length\n";
+    assert_eq!(compile_link_run_with_stdin(src, ""), "0\n");
   }
 }

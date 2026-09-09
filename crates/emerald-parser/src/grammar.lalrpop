@@ -597,6 +597,19 @@ StmtCallExpr: Expr = {
   StmtPrimaryExpr,
 };
 
+// Plan 45's Decision log: `.read` (`File.read`) needs this — plan 33's
+// class-field sugar (`"read" <p:Param>`) already reserved `read` as a
+// distinct terminal, globally, everywhere in this grammar (LALRPOP's
+// tokenizer is context-free), so a bare `<method:CallMethodName>` slot can never
+// match it. Widens exactly the method-name position in `.method(args)`/
+// `.method`/`&.method(args)`/`&.method` — mirrors plan 40's `MethodName`
+// widening for class-method *definitions*, applied here to call
+// *sites* instead.
+CallMethodName: String = {
+  <n:Ident> => n,
+  "read" => "read".to_string(),
+};
+
 StmtPrimaryExpr: Expr = {
   <name:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
     if let Some(b) = blk { args.push(b); }
@@ -606,19 +619,19 @@ StmtPrimaryExpr: Expr = {
   <name:Ident> "(" <kwargs:CallKwArgs> ")" => Expr::CallKw(name, kwargs),
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
   "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
-  <recv:Ident> "." <method:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
+  <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
     if let Some(b) = blk { args.push(b); }
     Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args)
   },
-  <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <recv:Ident> "." <method:CallMethodName> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
   // immediately above exactly, `"&."` in place of `"."` — a genuinely
   // new terminal, distinct from `"."`/`"&"` (bitwise/block-param
   // marker)/`"&&"`, so there's no FIRST-set overlap to disambiguate.
-  <recv:Ident> "&." <method:Ident> "(" <args:Args> ")" => {
+  <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" => {
     Expr::SafeCall(Box::new(Expr::Ident(recv)), method, args)
   },
-  <recv:Ident> "&." <method:Ident> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <recv:Ident> "&." <method:CallMethodName> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
   <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
@@ -873,14 +886,14 @@ PrimaryExpr: Expr = {
   // lookahead token.
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
   "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
-  <recv:Ident> "." <method:Ident> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
-  <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
+  <recv:Ident> "." <method:CallMethodName> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
   // immediately above exactly, `"&."` in place of `"."`.
-  <recv:Ident> "&." <method:Ident> "(" <args:Args> ")" => {
+  <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" => {
     Expr::SafeCall(Box::new(Expr::Ident(recv)), method, args)
   },
-  <recv:Ident> "&." <method:Ident> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  <recv:Ident> "&." <method:CallMethodName> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
   "[" <elements:Args> "]" => Expr::ArrayLit(elements),
   // `->(params) -> ReturnType { body }` — plan 10's lambda literal.
   // `"->"` doesn't start any other `PrimaryExpr` alternative, so this

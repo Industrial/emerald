@@ -460,6 +460,34 @@ fn check_numeric_binop(
   Ok(lt)
 }
 
+/// Plan 45's curated `String` intrinsic surface — a fixed name to
+/// `(expected argument types, return type)` table, checked via the
+/// existing generic `check_args` the same way an ordinary method call
+/// already is. `None` for any name outside this fixed set (never a
+/// general "look up a method on String" mechanism — see the plan's own
+/// Decision log).
+fn string_intrinsic_signature(method: &str) -> Option<(Vec<Type>, Type)> {
+  match method {
+    "length" => Some((vec![], Type::Int64)),
+    "upcase" => Some((vec![], Type::String)),
+    "downcase" => Some((vec![], Type::String)),
+    "strip" => Some((vec![], Type::String)),
+    "to_i" => Some((vec![], Type::Int64)),
+    "to_f" => Some((vec![], Type::Float64)),
+    // Ruby's own less-common `.slice(start, len)` method form —
+    // `Expr::Index` is single-argument only, so a two-argument bracket
+    // slice has no grammar shape to land in without a broader new
+    // production (plan 45's Decision log).
+    "slice" => Some((vec![Type::Int64, Type::Int64], Type::String)),
+    // `Array[T]` carries no runtime length metadata — `.split_count`
+    // is the companion scalar this representation limit forces (plan
+    // 45's Decision log); neither is useful without the other.
+    "split" => Some((vec![Type::String], Type::Array(Box::new(Type::String)))),
+    "split_count" => Some((vec![Type::String], Type::Int64)),
+    _ => None,
+  }
+}
+
 /// Plan 40's Decision log: routes an operator token (`"+"`, `"-"`,
 /// `"*"`, `"/"`, `"=="`, `"[]"`, `"[]="`, ...) on a class-typed operand
 /// to that class's own declared operator method — mirrors `Expr::
@@ -759,6 +787,18 @@ fn infer_expr_type(
       }
       Ok(Type::Void)
     }
+    // Plan 45's Decision log: unlike `puts`, `gets` must be usable as
+    // an expression (`line: String = gets()`) — checked the same way
+    // `puts` is, directly here, not via a `FunctionSig` in `sigs`.
+    Expr::Call(name, args) if name == "gets" => {
+      if !args.is_empty() {
+        return Err(Diagnostic::new(format!(
+          "`gets` expects 0 arguments, found {}",
+          args.len()
+        )));
+      }
+      Ok(Type::String)
+    }
     // Plan 41's Decision log: call-site checking is a separate, later
     // pass from body-checking, and only it ever touches a real concrete
     // type — checked before the ordinary `sigs.get(name)` fallback below
@@ -935,6 +975,36 @@ fn infer_expr_type(
       }
       Ok(Type::Class(class_name.clone()))
     }
+    // Plan 45's Decision log: `File` reuses plan 12's `Name.method(args)`
+    // dispatch *shape* but is a separate, hard-coded arm — `File` is
+    // never declared via a real `ModuleDef`, so it never populates
+    // `classes`/`is_module` and could never reach the module-dispatch
+    // arm below regardless; checked first purely for arm-ordering
+    // clarity, not to prevent an actual collision (verified: a program
+    // is free to write `module File ... end`, which registers into
+    // `classes` as normal — this arm never consults that registry at
+    // all, so there is nothing to shadow).
+    Expr::MethodCall(recv, method, args) if matches!(recv.as_ref(), Expr::Ident(n) if n == "File") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "read" => (vec![Type::String], Type::String),
+        "write" => (vec![Type::String, Type::String], Type::Void),
+        other => {
+          return Err(Diagnostic::new(format!("File has no method `{other}`")));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // `Name.method(args)` on a module (plan 12) dispatches straight to
     // its method table — checked *before* the `.call`/`Type::Proc` arm
     // below (a module could in principle declare a method named `call`)
@@ -1052,6 +1122,28 @@ fn infer_expr_type(
         return Err(Diagnostic::new(format!(
           "method call `.{method}` on a nullable receiver (type {recv_ty:?}) — use safe navigation `&.` or an explicit `== nil` check"
         )));
+      }
+      // Plan 45's Decision log: dispatched by checking the receiver's
+      // *inferred type* here, inside the existing generic `MethodCall`
+      // arm — not a new name-guarded arm, which would incorrectly
+      // intercept a user-defined class method sharing a name with a
+      // `String` intrinsic. Mirrors `puts`'s own "compiler intrinsic,
+      // not an overloaded function" precedent.
+      if recv_ty == Type::String {
+        let Some((expected_params, ret)) = string_intrinsic_signature(method) else {
+          return Err(Diagnostic::new(format!("String has no method `{method}`")));
+        };
+        check_args(
+          method,
+          args,
+          &expected_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(ret);
       }
       let Type::Class(class_name) = &recv_ty else {
         return Err(Diagnostic::new(format!(
@@ -1176,6 +1268,16 @@ fn infer_expr_type(
           self_fields,
           gctx,
         ),
+        // Plan 45's Decision log: `str[i]` — a real one-character
+        // `String`, not an `Int64` byte value.
+        Type::String => {
+          if index_ty != Type::Int64 {
+            return Err(Diagnostic::new(format!(
+              "String index must be Int64, found {index_ty:?}"
+            )));
+          }
+          Ok(Type::String)
+        }
         other => Err(Diagnostic::new(format!(
           "`[...]` indexing requires an Array or a Hash, found {other:?}"
         ))),
@@ -2676,7 +2778,13 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // Declared once, outside the loop: top-level statements share one
   // environment across the whole program in order (`x: Int64 = 10` then
   // `if x > 5 ...` needs `x` visible in a later Item::Stmt).
+  // Plan 45's Decision log: `ARGV`/`ARGC` need no new AST-visiting code
+  // at all — pre-seeding `top_env` is enough for the existing `Expr::
+  // Ident` arm's ordinary `env.get(name)` lookup to resolve both with
+  // zero special-casing beyond this seed.
   let mut top_env: HashMap<String, Type> = HashMap::new();
+  top_env.insert("ARGV".to_string(), Type::Array(Box::new(Type::String)));
+  top_env.insert("ARGC".to_string(), Type::Int64);
   for item in &program.items {
     match item {
       Item::Function(f) if !f.type_params.is_empty() => {
@@ -4157,6 +4265,93 @@ mod tests {
   #[test]
   fn accepts_the_symbols_worked_example() {
     let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 45 (stdlib strings and I/O).
+
+  #[test]
+  fn accepts_all_six_basic_string_intrinsics() {
+    let src = "s: String = \"chicago\"\nn: Int64 = s.length\nu: String = s.upcase\nd: String = s.downcase\nt: String = s.strip\ni: Int64 = s.to_i\nf: Float64 = s.to_f\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_string_intrinsic_name_on_a_non_string_receiver() {
+    let src = "x: Int64 = 5\ny: Int64 = x.length\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Int64 has no .length");
+    assert!(errs[0].message.contains("Int64"));
+  }
+
+  #[test]
+  fn rejects_a_string_intrinsic_called_with_the_wrong_arity() {
+    let src = "s: String = \"hi\"\nu: String = s.upcase(1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn accepts_string_indexing_and_slicing() {
+    let src = "s: String = \"hello\"\nc: String = s[1]\nsub: String = s.slice(1, 3)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_float_index_into_a_string() {
+    let src = "s: String = \"hello\"\nidx: Float64 = 1.0\nc: String = s[idx]\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn rejects_slice_called_with_the_wrong_arity() {
+    let src = "s: String = \"hello\"\nc: String = s.slice(1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn accepts_split_and_split_count() {
+    let src = "s: String = \"a b c\"\nn: Int64 = s.split_count(\" \")\nwords: Array[String] = s.split(\" \")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_file_read_and_write() {
+    let src = "File.write(\"x.txt\", \"hello\")\ncontent: String = File.read(\"x.txt\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_file_read_with_an_int64_argument() {
+    let src = "content: String = File.read(42)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn rejects_file_write_with_only_one_argument() {
+    let src = "File.write(\"only-one-arg.txt\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn accepts_argv_and_argc_and_gets() {
+    let src = "puts ARGC\nfirst: String = ARGV[0]\nline: String = gets()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_the_plan_45_worked_example() {
+    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
