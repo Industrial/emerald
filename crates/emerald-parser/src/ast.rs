@@ -107,6 +107,13 @@ pub enum Expr {
   /// arguments); plan `10` is the first to actually parse a non-empty
   /// argument list here.
   MethodCall(Box<Expr>, String, Vec<Expr>),
+  /// `receiver&.method(args)` (plan 43's Decision log) — kept distinct
+  /// from `MethodCall`, not a reuse: sema's dispatch (nullable receiver
+  /// only, pointer-representable return type only) and codegen (a real
+  /// is-nil-guarded branch + PHI, producing a `U?` result) are both
+  /// genuinely different, not just an evaluation-order variant of an
+  /// ordinary call.
+  SafeCall(Box<Expr>, String, Vec<Expr>),
   /// `@name` — instance-variable read, valid only inside a method body.
   InstanceVar(String),
   /// `[e1, e2, ...]` — an array literal.
@@ -273,6 +280,27 @@ pub enum Stmt {
   /// the `begin` construct at all, unlike `Return`/`Break`/`Next`/
   /// `Raise`.
   Retry,
+  /// `name ||= default` (plan 43's Decision log) — assign `default` only
+  /// if `name`'s current value is nil, restricted to a plain already-
+  /// declared local (never `@field`/an index target), the same
+  /// restriction plan 31's `+=`-family compound assignment already
+  /// makes. Genuinely conditional, not desugared into `Stmt::Assign`
+  /// the way `+=`/etc. are — sema additionally narrows `name`'s tracked
+  /// type from `Nullable(inner)` to `inner` immediately after this
+  /// statement (sound by construction: either branch leaves `name`
+  /// unconditionally `inner`-typed).
+  OrAssign {
+    name: String,
+    default: Expr,
+  },
+  /// `name &&= value` (plan 43's Decision log) — assign `value` only if
+  /// `name`'s current value is non-nil; the asymmetric twin of
+  /// `OrAssign` that does NOT narrow `name`'s tracked type (the
+  /// nil-and-skipped branch leaves it exactly as nilable as before).
+  AndAssign {
+    name: String,
+    value: Expr,
+  },
 }
 
 /// One `rescue` clause of a `Stmt::Begin` (plan 38's Decision log).

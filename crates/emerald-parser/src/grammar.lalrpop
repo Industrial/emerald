@@ -441,6 +441,23 @@ Stmt: Stmt = {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
   },
+  // Plan 43's Decision log: genuinely conditional, unlike `+=`/etc.
+  // above — NOT desugared into `Stmt::Assign` (`x = x + 1`'s rewrite
+  // works because `+` is unconditionally evaluated either way; `||=`/
+  // `&&=` are not). Same plain-local-target restriction as every
+  // compound-assignment form above.
+  <lhs:StmtExpr> "||=" <default:Expr> =>? match lhs {
+    Expr::Ident(name) => Ok(Stmt::OrAssign { name, default }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid compound-assignment target: {other:?}"),
+    }),
+  },
+  <lhs:StmtExpr> "&&=" <value:Expr> =>? match lhs {
+    Expr::Ident(name) => Ok(Stmt::AndAssign { name, value }),
+    other => Err(lalrpop_util::ParseError::User {
+      error: format!("invalid compound-assignment target: {other:?}"),
+    }),
+  },
   // Plan 31: fixed-arity multiple assignment (`a, b = b, a`) — a raw,
   // right-recursive `Ident`/`Expr` list (not routed through `StmtExpr`,
   // unlike every rule above), since the deciding factor between this
@@ -594,6 +611,14 @@ StmtPrimaryExpr: Expr = {
     Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args)
   },
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
+  // immediately above exactly, `"&."` in place of `"."` — a genuinely
+  // new terminal, distinct from `"."`/`"&"` (bitwise/block-param
+  // marker)/`"&&"`, so there's no FIRST-set overlap to disambiguate.
+  <recv:Ident> "&." <method:Ident> "(" <args:Args> ")" => {
+    Expr::SafeCall(Box::new(Expr::Ident(recv)), method, args)
+  },
+  <recv:Ident> "&." <method:Ident> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
   <f:FloatLit> => Expr::Float(f),
   <n:Num> => Expr::Int(n),
   <s:StringLitTok> =>? interpolate::parse_interpolated_string(&s)
@@ -849,6 +874,12 @@ PrimaryExpr: Expr = {
   "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
   <recv:Ident> "." <method:Ident> "(" <args:Args> ")" => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, args),
   <recv:Ident> "." <method:Ident> => Expr::MethodCall(Box::new(Expr::Ident(recv)), method, vec![]),
+  // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
+  // immediately above exactly, `"&."` in place of `"."`.
+  <recv:Ident> "&." <method:Ident> "(" <args:Args> ")" => {
+    Expr::SafeCall(Box::new(Expr::Ident(recv)), method, args)
+  },
+  <recv:Ident> "&." <method:Ident> => Expr::SafeCall(Box::new(Expr::Ident(recv)), method, vec![]),
   "[" <elements:Args> "]" => Expr::ArrayLit(elements),
   // `->(params) -> ReturnType { body }` — plan 10's lambda literal.
   // `"->"` doesn't start any other `PrimaryExpr` alternative, so this
@@ -920,11 +951,21 @@ Param: Param = {
 // need to enforce that narrowing (it's just a name here, same as
 // `Array[Elem]`'s own compound-string convention, plan 09's Decision
 // log).
+// Plan 43's Decision log: `<base:TypeName> "?"` is ordinary left
+// recursion (the same shape every other left-recursive production in
+// this grammar already uses, e.g. `AddExpr`) — `"?"` is a genuinely new
+// terminal, not reused from anywhere else. `Type::Nullable`'s own
+// reference-type-only restriction (rejecting `Int64?`/`Float64?`/
+// `Boolean?`/`Proc?`) is entirely `resolve_type`'s job, not the
+// grammar's — `T?` stays a plain compound-string annotation here,
+// mirroring `Array[Elem]`/`Hash[K, V]`'s own convention (plan 09's
+// Decision log).
 TypeName: String = {
   <name:Ident> => name,
   "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
   "Hash" "[" <k:Ident> "," <v:Ident> "]" => format!("Hash[{k}, {v}]"),
   "Proc" => "Proc".to_string(),
+  <base:TypeName> "?" => format!("{base}?"),
 };
 
 Num: i64 = <s:r"[0-9]+"> => s.parse().unwrap();

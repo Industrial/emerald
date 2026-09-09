@@ -293,7 +293,7 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
         collect_idents_in_expr(v, out);
       }
     }
-    Expr::MethodCall(recv, _, args) => {
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
       collect_idents_in_expr(recv, out);
       for a in args {
         collect_idents_in_expr(a, out);
@@ -340,6 +340,17 @@ fn collect_idents_in_stmt(stmt: &Stmt, referenced: &mut Vec<String>, bound: &mut
     // reassigning a captured outer variable still needs that name
     // captured, not treated as if declared here).
     Stmt::Assign { name, value } => {
+      referenced.push(name.clone());
+      collect_idents_in_expr(value, referenced);
+    }
+    // Plan 43's Decision log: mirrors `Stmt::Assign` immediately above
+    // exactly — always a reassignment of an already-bound outer name,
+    // never a fresh declaration.
+    Stmt::OrAssign { name, default } => {
+      referenced.push(name.clone());
+      collect_idents_in_expr(default, referenced);
+    }
+    Stmt::AndAssign { name, value } => {
       referenced.push(name.clone());
       collect_idents_in_expr(value, referenced);
     }
@@ -660,7 +671,7 @@ fn collect_specializations_in_expr(
         collect_specializations_in_expr(v, generic_fns, local_classes, out);
       }
     }
-    Expr::MethodCall(recv, _, args) => {
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
       collect_specializations_in_expr(recv, generic_fns, local_classes, out);
       for a in args {
         collect_specializations_in_expr(a, generic_fns, local_classes, out);
@@ -708,6 +719,12 @@ fn collect_specializations_in_stmt(
       collect_specializations_in_expr(value, generic_fns, local_classes, out);
     }
     Stmt::Assign { value, .. } => {
+      collect_specializations_in_expr(value, generic_fns, local_classes, out)
+    }
+    Stmt::OrAssign { default, .. } => {
+      collect_specializations_in_expr(default, generic_fns, local_classes, out)
+    }
+    Stmt::AndAssign { value, .. } => {
       collect_specializations_in_expr(value, generic_fns, local_classes, out)
     }
     Stmt::MultiAssign { values, .. } => {
@@ -2045,6 +2062,34 @@ fn build_expr<'ctx>(
             "codegen: `{op:?}` is not supported on Nil — only `==`/`!=` are"
           ));
         }
+        // Plan 43's Decision log: a `Nullable(_)` operand (`ValKind::
+        // Ptr`/`Str`, both real pointers) against a literal `nil`
+        // (`ValKind::Nil`, `Expr::Nil`'s fixed `i64` `0` sentinel —
+        // plan 25's design, NOT a pointer) — either order — lowers as a
+        // genuine null-pointer test on the pointer-backed side
+        // (`build_is_null`), not a general pointer-equality comparison.
+        // Distinct from the `(Nil, Nil)` case above (a bare `Nil`-typed
+        // variable's own comparison, e.g. `x: Nil` — unrelated to `T?`).
+        (ValKind::Ptr | ValKind::Str, ValKind::Nil)
+        | (ValKind::Nil, ValKind::Ptr | ValKind::Str)
+          if matches!(op, CompareOp::Eq | CompareOp::Ne) =>
+        {
+          let ptr_val = if lk == ValKind::Nil {
+            r.into_pointer_value()
+          } else {
+            l.into_pointer_value()
+          };
+          let is_null = builder
+            .build_is_null(ptr_val, "isniltest")
+            .map_err(|e| e.to_string())?;
+          if matches!(op, CompareOp::Ne) {
+            builder
+              .build_not(is_null, "nilnetmp")
+              .map_err(|e| e.to_string())?
+          } else {
+            is_null
+          }
+        }
         _ => return Err("codegen: comparison operands must both be Int64 or both Float64".into()),
       };
       Ok((cmp.into(), ValKind::Bool))
@@ -2130,6 +2175,17 @@ fn build_expr<'ctx>(
       Ok((ptr.into(), ValKind::Ptr))
     }
     Expr::MethodCall(recv, method, args) => build_method_call(
+      context,
+      builder,
+      recv,
+      method,
+      args,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
+    Expr::SafeCall(recv, method, args) => build_safe_call(
       context,
       builder,
       recv,
@@ -2414,6 +2470,96 @@ fn build_method_call<'ctx>(
     return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
   }
   Ok((call_result(call)?, ret_kind))
+}
+
+/// `obj&.method(args)` (plan 43's Decision log) — reuses `build_short_
+/// circuit`'s own is-null-guarded-basic-blocks-plus-PHI pattern
+/// wholesale: a real `is null` test on the receiver, `build_method_
+/// call` invoked only on the non-null path (never on a null pointer),
+/// merging both paths into one well-typed result via a real LLVM
+/// `phi` — `null` on the nil path, the method's own return value on
+/// the other. sema already restricts this to a class-typed nullable
+/// receiver whose dispatched method's return type is itself pointer-
+/// representable (`Class`/`String`/`Array`/`Hash`, all `ValKind::Ptr`/
+/// `Str`, both backed by a real LLVM `ptr`), so the `phi`'s type is
+/// always a bare `ptr` — codegen trusts that invariant, per every
+/// prior plan's "codegen runs on already-checked input" contract.
+#[allow(clippy::too_many_arguments)]
+fn build_safe_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  recv: &Expr,
+  method: &str,
+  args: &[Expr],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  if !matches!(recv, Expr::Ident(_)) {
+    return Err("codegen: `&.` is only supported on a plain local-variable receiver".to_string());
+  }
+  let (recv_val, recv_kind) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  if recv_kind != ValKind::Ptr {
+    return Err(format!(
+      "codegen: `&.` requires a pointer-backed receiver, found {recv_kind:?}"
+    ));
+  }
+  let is_null = builder
+    .build_is_null(recv_val.into_pointer_value(), "isnil")
+    .map_err(|e| e.to_string())?;
+
+  let entry_block = builder
+    .get_insert_block()
+    .ok_or("codegen: internal error — no current block")?;
+  let func = entry_block
+    .get_parent()
+    .ok_or("codegen: internal error — block has no parent function")?;
+  let call_block = context.append_basic_block(func, "safecall.call");
+  let merge_block = context.append_basic_block(func, "safecall.merge");
+
+  builder
+    .build_conditional_branch(is_null, merge_block, call_block)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(call_block);
+  let (call_val, call_kind) = build_method_call(
+    context,
+    builder,
+    recv,
+    method,
+    args,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let call_end_block = builder
+    .get_insert_block()
+    .ok_or("codegen: internal error — no current block after call")?;
+  builder
+    .build_unconditional_branch(merge_block)
+    .map_err(|e| e.to_string())?;
+
+  builder.position_at_end(merge_block);
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let phi = builder
+    .build_phi(ptr_ty, "safecallresult")
+    .map_err(|e| e.to_string())?;
+  let null_val = ptr_ty.const_null();
+  phi.add_incoming(&[
+    (&null_val, entry_block),
+    (&call_val.into_pointer_value(), call_end_block),
+  ]);
+  Ok((phi.as_basic_value(), call_kind))
 }
 
 /// `emerald_alloc`s a flat `elements.len() * 8`-byte buffer, then
@@ -3679,17 +3825,41 @@ fn build_stmt<'a, 'ctx>(
       Ok(false)
     }
     Stmt::Let { name, ty, value } => {
-      let (v, _) = build_expr(
-        context,
-        builder,
-        value,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
-      if ctx.classes.contains_key(ty.as_str()) {
-        local_classes.insert(name.clone(), ty.clone());
+      // Plan 43's Decision log: a `Greeter?`-typed local's storage is a
+      // `ptr` slot (`value_kind_for_type` falls through any non-
+      // primitive-named string, including `"Greeter?"`, to `ValKind::
+      // Ptr`) — `Expr::Nil`'s generic `build_expr` arm unconditionally
+      // emits a fixed `i64` `0` (plan 25's design), a real LLVM type
+      // mismatch when stored into that slot. A literal `nil` value into
+      // a pointer-backed declared type builds a real null pointer
+      // constant directly instead.
+      let expected_kind = value_kind_for_type(ty);
+      let v = if matches!(value, Expr::Nil) && matches!(expected_kind, ValKind::Ptr | ValKind::Str)
+      {
+        context
+          .ptr_type(AddressSpace::default())
+          .const_null()
+          .into()
+      } else {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          value,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        v
+      };
+      // Plan 43's Decision log: `local_classes` only ever needs a bare
+      // class name, independent of nullability — strip a trailing `?`
+      // before the lookup so a `Greeter?` local is still recorded as
+      // class `Greeter`, exactly what `&.`'s dispatch (`build_method_
+      // call`, reused by `build_safe_call`) needs to find.
+      let bare_ty = ty.strip_suffix('?').unwrap_or(ty);
+      if ctx.classes.contains_key(bare_ty) {
+        local_classes.insert(name.clone(), bare_ty.to_string());
       }
       if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
         local_array_elem_types.insert(name.clone(), value_kind_for_type(elem_name));
@@ -3717,19 +3887,120 @@ fn build_stmt<'a, 'ctx>(
     // it in the normal pipeline, but codegen alone shouldn't assume
     // that).
     Stmt::Assign { name, value } => {
-      let (v, _) = build_expr(
-        context,
-        builder,
-        value,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
-      let (ptr, _) = *vars
+      let (ptr, target_kind) = *vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot special
+      // case as `Stmt::Let` above, driven by the target's already-
+      // recorded `ValKind` in `vars` instead of a declared-type string.
+      let v = if matches!(value, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
+        context
+          .ptr_type(AddressSpace::default())
+          .const_null()
+          .into()
+      } else {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          value,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        v
+      };
       builder.build_store(ptr, v).map_err(|e| e.to_string())?;
+      Ok(false)
+    }
+    // Plan 43's Decision log: a real is-nil-guarded conditional store —
+    // two basic blocks plus a merge, no `phi` needed since (unlike
+    // `build_safe_call`) this statement produces no value at all.
+    // Assigns `default` only when `name`'s CURRENT value is nil.
+    Stmt::OrAssign { name, default } => {
+      let (ptr, kind) = *vars
+        .get(name)
+        .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      let current = builder
+        .build_load(local_llvm_type(context, kind), ptr, name)
+        .map_err(|e| e.to_string())?;
+      let is_null = builder
+        .build_is_null(current.into_pointer_value(), "orassign.isnil")
+        .map_err(|e| e.to_string())?;
+      let assign_block = context.append_basic_block(func, "orassign.assign");
+      let merge_block = context.append_basic_block(func, "orassign.merge");
+      builder
+        .build_conditional_branch(is_null, assign_block, merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(assign_block);
+      let v = if matches!(default, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
+        context
+          .ptr_type(AddressSpace::default())
+          .const_null()
+          .into()
+      } else {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          default,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        v
+      };
+      builder.build_store(ptr, v).map_err(|e| e.to_string())?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
+      Ok(false)
+    }
+    // Plan 43's Decision log: the asymmetric twin of `OrAssign` above —
+    // assigns `value` only when `name`'s CURRENT value is non-nil.
+    Stmt::AndAssign { name, value } => {
+      let (ptr, kind) = *vars
+        .get(name)
+        .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+      let current = builder
+        .build_load(local_llvm_type(context, kind), ptr, name)
+        .map_err(|e| e.to_string())?;
+      let is_null = builder
+        .build_is_null(current.into_pointer_value(), "andassign.isnil")
+        .map_err(|e| e.to_string())?;
+      let assign_block = context.append_basic_block(func, "andassign.assign");
+      let merge_block = context.append_basic_block(func, "andassign.merge");
+      builder
+        .build_conditional_branch(is_null, merge_block, assign_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(assign_block);
+      let v = if matches!(value, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
+        context
+          .ptr_type(AddressSpace::default())
+          .const_null()
+          .into()
+      } else {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          value,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        v
+      };
+      builder.build_store(ptr, v).map_err(|e| e.to_string())?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
       Ok(false)
     }
     // Plan 31: every `values` expression is built into a temporary SSA
@@ -3739,16 +4010,33 @@ fn build_stmt<'a, 'ctx>(
     // corrupts (`a = b` then `b = a` would print the new `a` twice).
     Stmt::MultiAssign { names, values } => {
       let mut evaluated = Vec::with_capacity(values.len());
-      for v in values {
-        let (val, _) = build_expr(
-          context,
-          builder,
-          v,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
+      for (name, v) in names.iter().zip(values) {
+        // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot
+        // special case, driven by each *target's* own already-recorded
+        // `ValKind` — peeking at it here is a read, not a write, so it
+        // doesn't disturb this statement's own "evaluate every value
+        // before writing any target" ordering (the Decision log's own
+        // reason `a, b = b, a` is a real swap).
+        let (_, target_kind) = *vars
+          .get(name)
+          .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
+        let val = if matches!(v, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
+          context
+            .ptr_type(AddressSpace::default())
+            .const_null()
+            .into()
+        } else {
+          let (val, _) = build_expr(
+            context,
+            builder,
+            v,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          val
+        };
         evaluated.push(val);
       }
       for (name, val) in names.iter().zip(evaluated) {
@@ -3874,15 +4162,26 @@ fn build_stmt<'a, 'ctx>(
       Ok(false)
     }
     Stmt::Return(Some(e)) => {
-      let (v, _) = build_expr(
-        context,
-        builder,
-        e,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
+      // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot special
+      // case, driven by `ret_kind` (already a `build_stmt` parameter —
+      // the enclosing function/method's own declared return kind).
+      let v = if matches!(e, Expr::Nil) && matches!(ret_kind, ValKind::Ptr | ValKind::Str) {
+        context
+          .ptr_type(AddressSpace::default())
+          .const_null()
+          .into()
+      } else {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          e,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        v
+      };
       emit_active_ensures(
         context,
         builder,
@@ -6658,5 +6957,52 @@ mod tests {
     let out =
       std::env::temp_dir().join("emerald_codegen_unresolvable_generic_call_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
+  }
+
+  // Plan 43 (nullable types and safe navigation).
+
+  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+
+  #[test]
+  fn nullable_worked_example_linked_and_run() {
+    // Real executed proof, combining all three leaves: a real non-null
+    // `Greeter` pointer (`greet(1)`) and a real null pointer
+    // (`greet(2)`, `find_greeter`'s "not found" path) both round-trip
+    // correctly through a `Greeter?`-typed local without crashing or
+    // misreading the wrong bit pattern; `g&.shout` actually skips
+    // calling `shout` on the null receiver and actually performs it on
+    // the non-null one, merging both paths via a real LLVM `phi`; and
+    // `||=` narrows `message` so `return message` type-checks and
+    // prints the right string on both paths.
+    assert_eq!(
+      compile_link_run(NULLABLE_WORKED_EXAMPLE),
+      "ada!\nnobody here\n"
+    );
+  }
+
+  const AND_ASSIGN_UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef upgrade(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
+
+  #[test]
+  fn and_assign_upgrade_worked_example_linked_and_run() {
+    // Real executed proof of `&&=`'s both branches: `upgrade(1)`'s `g`
+    // is non-nil, so `&&=` actually assigns (`g` becomes the
+    // `"upgraded"` Greeter, whose `shout` produces `"upgraded!"`);
+    // `upgrade(2)`'s `g` is nil, so `&&=` is genuinely skipped (`g`
+    // stays nil — a real is-nil-guarded conditional store, not an
+    // unconditional one), `g&.shout` short-circuits, and `||=` supplies
+    // the default.
+    assert_eq!(
+      compile_link_run(AND_ASSIGN_UPGRADE_EXAMPLE),
+      "upgraded!\nstill nobody\n"
+    );
+  }
+
+  #[test]
+  fn plan_25_nil_example_still_compiles_and_runs_unchanged() {
+    // Regression: a bare `Nil`-typed variable's own `== nil` comparison
+    // (plan 25, unrelated to `T?`) still flows through its own
+    // `(ValKind::Nil, ValKind::Nil)` codegen case, not the new
+    // `Ptr`/`Str`-vs-`Nil` null-pointer-test case this plan adds.
+    assert_eq!(compile_link_run(NIL_EXAMPLE), "1\n");
   }
 }

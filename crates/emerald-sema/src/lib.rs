@@ -49,6 +49,16 @@ pub enum Type {
   /// separately threaded "which interface bounds the parameter
   /// currently in scope" context value.
   Generic(String, String),
+  /// `T?` (plan 43's Decision log) — the union of `T` and `Nil`,
+  /// scoped to reference types only (`Class`/`String`/`Array`/`Hash` —
+  /// every kind that already lowers to a pointer-backed `ValKind` in
+  /// codegen, which has a spare `null` bit pattern to spend on nilness
+  /// for free). `resolve_type` never constructs this over `Int64`/
+  /// `Float64`/`Boolean`/`Proc`/`Nil`/`Generic` — boxing a value type
+  /// just to steal a spare bit is the exact cost this project already
+  /// declines to pay for arbitrary-precision `Integer` (`spec/
+  /// TYPE_SYSTEM.md` §3).
+  Nullable(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +175,24 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "Void" => Ok(Type::Void),
     "Boolean" => Ok(Type::Boolean),
     "Nil" => Ok(Type::Nil),
+    // Plan 43's Decision log: checked before every other compound-string
+    // case below (`Array[Elem]?`/`Hash[K, V]?` recurse cleanly through
+    // this) — scoped to reference types only (`Class`/`String`/`Array`/
+    // `Hash`); `Int64?`/`Float64?`/`Boolean?`/`Proc?`/`Nil?`/a `T?`
+    // referencing a generic type parameter are all rejected here, at the
+    // type-annotation boundary, naming the exact reason.
+    other if other.ends_with('?') => {
+      let inner_name = &other[..other.len() - 1];
+      let inner = resolve_type(inner_name, classes)?;
+      match inner {
+        Type::Class(_) | Type::String | Type::Array(_) | Type::Hash(_, _) => {
+          Ok(Type::Nullable(Box::new(inner)))
+        }
+        other_inner => Err(Diagnostic::new(format!(
+          "`{inner_name}?` is not supported — only reference types (a class, String, Array, or Hash) can be nullable, found {other_inner:?}"
+        ))),
+      }
+    }
     // Modules are namespaces, not types (plan 12's Decision log) — a
     // module name is excluded here so `x: MathUtils = ...` correctly
     // falls through to the `unknown type` error below, not `Type::Class`.
@@ -201,6 +229,24 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "Proc" => Ok(Type::Proc(Vec::new(), Box::new(Type::Void))),
     other => Err(Diagnostic::new(format!("unknown type `{other}`"))),
   }
+}
+
+/// Plan 43's Decision log: replaces the raw `actual != declared`
+/// equality check at every assignability check-site in this file —
+/// exact-equality for every non-nullable `declared` (so every
+/// non-`T?` program's accept/reject outcome is provably unchanged,
+/// same predicate, same answer), additionally accepting `Type::Nil` or
+/// the unwrapped inner type into a `Type::Nullable(inner)` `declared`,
+/// per `spec/TYPE_SYSTEM.md` §10's assignability table (`nil → T?` ✓,
+/// `T → T?` ✓ widens, `nil → T` ✗).
+fn is_assignable(actual: &Type, declared: &Type) -> bool {
+  if actual == declared {
+    return true;
+  }
+  if let Type::Nullable(inner) = declared {
+    return *actual == Type::Nil || actual == inner.as_ref();
+  }
+  false
 }
 
 fn function_signature(
@@ -662,6 +708,18 @@ fn infer_expr_type(
         };
       }
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
+      // Plan 43's Decision log: a `Nullable(_)` operand against `Nil` —
+      // either order — always type-checks to `Boolean`, the explicit
+      // nil-check alternative to `&.`. Scoped to exactly this shape
+      // (never `Nullable == Nullable` between two different nilable
+      // values), checked before the `lt != rt` strict-equality rule
+      // below, which stays completely unchanged for every other pair.
+      if matches!(
+        (&lt, &rt),
+        (Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nullable(_))
+      ) {
+        return Ok(Type::Boolean);
+      }
       if lt != rt {
         return Err(Diagnostic::new(format!(
           "type mismatch: `{op:?}` requires both operands to have the same type, found {lt:?} and {rt:?}"
@@ -971,6 +1029,17 @@ fn infer_expr_type(
     }
     Expr::MethodCall(recv, method, args) => {
       let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
+      // Plan 43's Decision log: the plan's actual payoff — a direct
+      // `.method` on a `T?` receiver is a compile-time diagnostic,
+      // checked before the existing `Type::Class` match below (which
+      // would otherwise reject it with the generic, less useful
+      // "non-class type" message this arm already produces for other
+      // mismatches).
+      if let Type::Nullable(_) = &recv_ty {
+        return Err(Diagnostic::new(format!(
+          "method call `.{method}` on a nullable receiver (type {recv_ty:?}) — use safe navigation `&.` or an explicit `== nil` check"
+        )));
+      }
       let Type::Class(class_name) = &recv_ty else {
         return Err(Diagnostic::new(format!(
           "method call `.{method}` on non-class type {recv_ty:?}"
@@ -994,6 +1063,54 @@ fn infer_expr_type(
         gctx,
       )?;
       Ok(sig.return_type.clone())
+    }
+    // Plan 43's Decision log: scoped to a class-typed nullable receiver
+    // whose dispatched method's return type is itself one of the four
+    // pointer-representable kinds (`Class`/`String`/`Array`/`Hash`) —
+    // `Int64`/`Float64`/`Boolean`/`Void`/`Nil` would need `&.`'s result
+    // to be a boxed `Int64?`/etc., the exact cost this plan already
+    // declines to pay. Reuses `check_args` for arity/type checking
+    // against the method's own declared signature, same as the
+    // ordinary `MethodCall` arm above.
+    Expr::SafeCall(recv, method, args) => {
+      let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
+      let Type::Nullable(inner) = &recv_ty else {
+        return Err(Diagnostic::new(format!(
+          "`&.{method}` requires a nullable receiver, found {recv_ty:?} — use `.` instead"
+        )));
+      };
+      let Type::Class(class_name) = inner.as_ref() else {
+        return Err(Diagnostic::new(format!(
+          "`&.{method}` is only supported on a nullable class-typed receiver, found {recv_ty:?}"
+        )));
+      };
+      let info = classes.get(class_name).ok_or_else(|| {
+        Diagnostic::new(format!("internal error: unregistered class `{class_name}`"))
+      })?;
+      let sig = info
+        .methods
+        .get(method)
+        .ok_or_else(|| Diagnostic::new(format!("class `{class_name}` has no method `{method}`")))?;
+      if !matches!(
+        sig.return_type,
+        Type::Class(_) | Type::String | Type::Array(_) | Type::Hash(_, _)
+      ) {
+        return Err(Diagnostic::new(format!(
+          "`&.{method}` returns {:?}, which cannot be wrapped as a nullable result — only a class, String, Array, or Hash return type is supported",
+          sig.return_type
+        )));
+      }
+      check_args(
+        method,
+        args,
+        &sig.params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Nullable(Box::new(sig.return_type.clone())))
     }
     Expr::InstanceVar(name) => {
       let fields = self_fields
@@ -1223,7 +1340,7 @@ fn check_args(
   }
   for (i, (arg, expected_ty)) in args.iter().zip(expected).enumerate() {
     let actual = infer_expr_type(arg, env, sigs, classes, self_fields, gctx)?;
-    if actual != *expected_ty {
+    if !is_assignable(&actual, expected_ty) {
       return Err(Diagnostic::new(format!(
         "argument {} to `{name}` has type {actual:?}, expected {expected_ty:?}",
         i + 1
@@ -1343,7 +1460,7 @@ fn check_set_index(
     )));
   }
   let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
-  if actual != elem_ty {
+  if !is_assignable(&actual, &elem_ty) {
     return Err(Diagnostic::new(format!(
       "type mismatch in {container} assignment: element type is {elem_ty:?}, value has type {actual:?}"
     )));
@@ -1383,7 +1500,7 @@ fn check_multi_assign(
       .get(name)
       .cloned()
       .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
-    if actual != declared {
+    if !is_assignable(&actual, &declared) {
       return Err(Diagnostic::new(format!(
         "type mismatch in multiple assignment at position {}: `{name}` has type {declared:?}, value has type {actual:?}",
         i + 1
@@ -1459,7 +1576,7 @@ fn check_stmt(
     Stmt::Let { name, ty, value } => {
       let declared = resolve_type(ty, classes)?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
-      if actual != declared {
+      if !is_assignable(&actual, &declared) {
         return Err(Diagnostic::new(format!(
           "type mismatch in `{name}: {ty} = ...`: declared type {declared:?}, value has type {actual:?}"
         )));
@@ -1475,7 +1592,7 @@ fn check_stmt(
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined field `@{name}`")))?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
-      if actual != declared {
+      if !is_assignable(&actual, &declared) {
         return Err(Diagnostic::new(format!(
           "type mismatch in `@{name} = ...`: field declared {declared:?}, value has type {actual:?}"
         )));
@@ -1498,9 +1615,60 @@ fn check_stmt(
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
-      if actual != declared {
+      if !is_assignable(&actual, &declared) {
         return Err(Diagnostic::new(format!(
           "type mismatch in `{name} = ...`: `{name}` has type {declared:?}, value has type {actual:?}"
+        )));
+      }
+      Ok(())
+    }
+    // Plan 43's Decision log: genuinely conditional — assigns `default`
+    // only when `name`'s current value is nil, then narrows `name`'s
+    // tracked type from `Nullable(inner)` to `inner` directly (sound by
+    // construction: either branch leaves `name` unconditionally
+    // `inner`-typed). `default` itself must be the *unwrapped* `inner`
+    // type, not `inner?` again — widening a still-nullable default
+    // would make the narrowing unsound.
+    Stmt::OrAssign { name, default } => {
+      let declared = env
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+      let Type::Nullable(inner) = &declared else {
+        return Err(Diagnostic::new(format!(
+          "`{name} ||= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
+        )));
+      };
+      let actual = infer_expr_type(default, env, sigs, classes, self_fields, gctx)?;
+      if !is_assignable(&actual, inner) {
+        return Err(Diagnostic::new(format!(
+          "type mismatch in `{name} ||= ...`: expected {inner:?}, found {actual:?}"
+        )));
+      }
+      env.insert(name.clone(), (**inner).clone());
+      Ok(())
+    }
+    // Plan 43's Decision log: the asymmetric twin of `OrAssign` above —
+    // assigns `value` only when `name`'s current value is non-nil, and
+    // deliberately does NOT narrow `name`'s tracked type (the
+    // nil-and-skipped branch leaves it exactly as nilable as before).
+    // `value` must be assignable to `name`'s *full* declared
+    // `Nullable(inner)` type (so widening a plain `inner`-typed value
+    // still works, via the same `is_assignable` helper).
+    Stmt::AndAssign { name, value } => {
+      let declared = env
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`")))?;
+      if !matches!(declared, Type::Nullable(_)) {
+        return Err(Diagnostic::new(format!(
+          "`{name} &&= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
+        )));
+      }
+      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
+      if !is_assignable(&actual, &declared) {
+        return Err(Diagnostic::new(format!(
+          "type mismatch in `{name} &&= ...`: expected {declared:?}, found {actual:?}"
         )));
       }
       Ok(())
@@ -1569,7 +1737,7 @@ fn check_stmt(
     }
     Stmt::Return(Some(e)) => {
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
-      if t != *return_type {
+      if !is_assignable(&t, return_type) {
         return Err(Diagnostic::new(format!(
           "type mismatch: `return` value has type {t:?} but the enclosing function declares {return_type:?}"
         )));
@@ -3813,5 +3981,124 @@ mod tests {
         .iter()
         .any(|d| d.message.contains("generic methods are not supported"))
     );
+  }
+
+  // Plan 43 (nullable types and safe navigation).
+
+  const GREETER_PREFIX: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\n";
+
+  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+
+  #[test]
+  fn accepts_the_nullable_worked_example() {
+    let program = emerald_parser::parse(NULLABLE_WORKED_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_a_real_class_value_and_nil_both_widening_into_a_nullable_let() {
+    let src = format!("{GREETER_PREFIX}g1: Greeter? = Greeter.new(\"ada\")\ng2: Greeter? = nil\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_nil_into_a_non_nullable_int64_let() {
+    let src = "x: Int64 = nil\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
+  }
+
+  #[test]
+  fn rejects_a_nullable_value_type_annotation() {
+    let src = "y: Int64? = 5\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Int64? is not supported");
+    assert!(errs[0].message.contains("nullable"));
+  }
+
+  #[test]
+  fn rejects_a_direct_method_call_on_a_nullable_receiver() {
+    let src = format!(
+      "{GREETER_PREFIX}def greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  return g.shout\nend\n"
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program).expect_err("g is nullable, .shout is unguarded");
+    assert!(errs[0].message.contains("&.") || errs[0].message.contains("nil"));
+  }
+
+  #[test]
+  fn nullable_vs_nil_comparison_type_checks_to_boolean() {
+    let src = format!(
+      "{GREETER_PREFIX}def is_missing(id: Int64) -> Boolean\n  g: Greeter? = find_greeter(id)\n  return g == nil\nend\n"
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn safe_call_on_a_nullable_class_receiver_type_checks_to_the_wrapped_return_type() {
+    let src = format!(
+      "{GREETER_PREFIX}def greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_safe_call_on_a_non_nullable_receiver() {
+    let src = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef greet -> String?\n  g: Greeter = Greeter.new(\"ada\")\n  return g&.shout\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("g is never nil, & . is illegal");
+    assert!(errs[0].message.contains("nullable"));
+  }
+
+  #[test]
+  fn rejects_safe_call_on_a_method_returning_a_value_type() {
+    let src = "class Greeter\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def years -> Int64\n    @age\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  return nil\nend\n\ndef ages(id: Int64) -> Int64\n  g: Greeter? = find_greeter(id)\n  x: Int64? = g&.years\n  return 0\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Int64 is not pointer-representable");
+    assert!(errs.iter().any(|d| d.message.contains("Int64")));
+  }
+
+  #[test]
+  fn or_assign_narrows_the_tracked_type_so_a_later_return_type_checks() {
+    let src = format!(
+      "{GREETER_PREFIX}def greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  const UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef upgrade(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
+
+  #[test]
+  fn accepts_the_and_assign_upgrade_worked_example() {
+    let program = emerald_parser::parse(UPGRADE_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_or_assign_on_a_non_nullable_target() {
+    let src = "s: String = \"x\"\ns ||= \"y\"\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("s is not nullable");
+    assert!(errs[0].message.contains("nullable"));
+  }
+
+  #[test]
+  fn rejects_and_assign_on_a_non_nullable_target() {
+    let src =
+      format!("{GREETER_PREFIX}s: Greeter = Greeter.new(\"ada\")\ns &&= Greeter.new(\"b\")\n");
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program).expect_err("s is not nullable");
+    assert!(errs[0].message.contains("nullable"));
+  }
+
+  #[test]
+  fn rejects_or_assign_default_that_is_itself_nullable() {
+    let src = "message: String? = nil\nother: String? = nil\nmessage ||= other\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert!(check_program(&program).is_err());
   }
 }

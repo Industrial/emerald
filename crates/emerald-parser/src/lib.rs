@@ -1883,4 +1883,110 @@ mod tests {
     let errs = parse(src).unwrap_err();
     assert!(!errs.is_empty());
   }
+
+  // Plan 43 (nullable types and safe navigation).
+
+  #[test]
+  fn nullable_suffix_parses_into_a_compound_type_string() {
+    let src = "g: Greeter? = nil\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Let { ty, .. }) = &program.items[0] else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
+    assert_eq!(ty, "Greeter?");
+  }
+
+  #[test]
+  fn safe_call_parses_to_expr_safe_call() {
+    let src = "message: String? = g&.shout\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      *value,
+      Expr::SafeCall(
+        Box::new(Expr::Ident("g".to_string())),
+        "shout".to_string(),
+        vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn safe_call_with_args_parses_to_expr_safe_call() {
+    let src = "x: Int64? = g&.add(1, 2)\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      *value,
+      Expr::SafeCall(
+        Box::new(Expr::Ident("g".to_string())),
+        "add".to_string(),
+        vec![Expr::Int(1), Expr::Int(2)]
+      )
+    );
+  }
+
+  #[test]
+  fn ordinary_dot_method_call_still_parses_to_expr_method_call_unchanged() {
+    let src = "x: Int64 = g.shout\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      *value,
+      Expr::MethodCall(
+        Box::new(Expr::Ident("g".to_string())),
+        "shout".to_string(),
+        vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn or_assign_parses_to_stmt_or_assign() {
+    let src = "message: String? = nil\nmessage ||= \"nobody here\"\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[1],
+      Item::Stmt(Stmt::OrAssign {
+        name: "message".to_string(),
+        default: Expr::StringLit("nobody here".to_string()),
+      })
+    );
+  }
+
+  #[test]
+  fn and_assign_parses_to_stmt_and_assign() {
+    let src = "g: Greeter? = nil\ng &&= Greeter.new(\"upgraded\")\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[1],
+      Item::Stmt(Stmt::AndAssign {
+        name: "g".to_string(),
+        value: Expr::New(
+          "Greeter".to_string(),
+          vec![Expr::StringLit("upgraded".to_string())]
+        ),
+      })
+    );
+  }
+
+  #[test]
+  fn or_assign_on_a_non_ident_target_is_a_parse_error_not_a_panic() {
+    let src = "arr[0] ||= 1\n";
+    let errs = parse(src).unwrap_err();
+    assert!(!errs.is_empty());
+  }
+
+  #[test]
+  fn nullable_worked_example_parses_end_to_end() {
+    let src = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(program.items.len(), 5);
+  }
 }
