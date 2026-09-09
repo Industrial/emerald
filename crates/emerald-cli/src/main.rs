@@ -177,6 +177,18 @@ fn jobs_requested(args: &[String]) -> Option<usize> {
     .map(|n| n.max(1))
 }
 
+/// Plan 61's Decision log: `--comptime-step-limit=N` — a real, strictly
+/// additive/opt-in flag exactly like `--verbose-cache`/`--jobs` above.
+/// `=`-joined (not space-separated like `--jobs N`), matching the task
+/// brief's own literal spelling; `None` (no flag) means `emerald_
+/// driver::compile`'s existing `1_000_000`-step default is unchanged.
+fn comptime_step_limit_requested(args: &[String]) -> Option<u64> {
+  args.iter().find_map(|a| {
+    a.strip_prefix("--comptime-step-limit=")
+      .and_then(|v| v.parse::<u64>().ok())
+  })
+}
+
 /// Plan 49: the source path is the first positional (non-flag) argument
 /// — `emerald --jobs 2 main.em -o main` (the plan's own worked-example
 /// invocation) puts a flag *before* the source path, so this can no
@@ -189,6 +201,7 @@ fn find_source_path(args: &[String]) -> Option<&String> {
     match args[i].as_str() {
       "-o" | "--jobs" => i += 2,
       "--verbose-cache" | "--emit=escape-report" => i += 1,
+      a if a.starts_with("--comptime-step-limit=") => i += 1,
       _ => return Some(&args[i]),
     }
   }
@@ -198,7 +211,7 @@ fn find_source_path(args: &[String]) -> Option<&String> {
 fn run_legacy(args: &[String]) {
   let Some(source_path) = find_source_path(args) else {
     eprintln!(
-      "usage: emerald <source.em> [-o <output>] [--verbose-cache] [--jobs N]  |  emerald new/build/run <name>"
+      "usage: emerald <source.em> [-o <output>] [--verbose-cache] [--jobs N] [--comptime-step-limit=N]  |  emerald new/build/run <name>"
     );
     process::exit(2);
   };
@@ -277,10 +290,18 @@ fn run_legacy(args: &[String]) {
   // Plan 48: `--verbose-cache` is strictly additive and opt-in — with
   // no such flag, this is the exact `emerald_driver::compile` call
   // every prior plan's test already proves, unchanged.
+  //
+  // Plan 61's Decision log: `--comptime-step-limit=N` is real, disclosed
+  // narrow scope — wired only into this plain (uncached) path, not
+  // `--verbose-cache`'s own cached one (threading it through `QueryCache`
+  // is `leaf-comptime-query-cache-integration`'s own job, not this
+  // leaf's).
   let result = if verbose_cache_requested(args) {
     let cache = emerald_driver::cache::QueryCache::new(cache_root());
     let reporter = emerald_driver::cache::VerboseReporter;
     emerald_driver::compile_cached(&source, source_path, &output_path, &cache, &reporter)
+  } else if let Some(limit) = comptime_step_limit_requested(args) {
+    emerald_driver::compile_with_comptime_step_limit(&source, source_path, &output_path, limit)
   } else {
     emerald_driver::compile(&source, source_path, &output_path)
   };

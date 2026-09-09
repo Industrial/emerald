@@ -1220,6 +1220,25 @@ fn build_flattened_class_info(
       field_owner.insert(f.name.clone(), class_name.clone());
     }
     for m in &c.methods {
+      // Plan 61's Decision log: `comptime` is legal only on a top-level
+      // function — mirrors `type_params`'s own top-level-only precedent
+      // (`function_signature`'s own "generic methods are not supported"
+      // check immediately below), but checked here directly rather than
+      // inside `function_signature` itself, since (unlike `type_params`)
+      // a legitimate top-level `comptime` function DOES reach
+      // `function_signature` (only a *generic* top-level function is
+      // filtered out before the call) — an unconditional check inside
+      // `function_signature` would incorrectly reject that legitimate
+      // top-level case too.
+      if m.is_comptime {
+        return Err(Diagnostic::new(
+          format!(
+            "`comptime` functions must be top-level — found on class method `{class_name}#{}`",
+            m.name
+          ),
+          (0, 0),
+        ));
+      }
       let sig = function_signature(m, classes)?;
       // `initialize` is exempt from the invariant-signature override
       // check: every class's constructor is inherently class-specific
@@ -1265,6 +1284,17 @@ fn module_info(
 ) -> Result<ClassInfo, Diagnostic> {
   let mut methods = HashMap::new();
   for f in &m.methods {
+    // Plan 61's Decision log: see `build_flattened_class_info`'s own
+    // identical check for the full rationale.
+    if f.is_comptime {
+      return Err(Diagnostic::new(
+        format!(
+          "`comptime` functions must be top-level — found on module method `{}#{}`",
+          m.name, f.name
+        ),
+        (0, 0),
+      ));
+    }
     methods.insert(f.name.clone(), function_signature(f, classes)?);
   }
   Ok(ClassInfo {
@@ -1307,6 +1337,22 @@ fn actor_info(a: &ActorDef, classes: &HashMap<String, ClassInfo>) -> Result<Clas
           "actor method `{}` must not declare a return type — cross-actor calls are asynchronous \
            and cannot return a value synchronously (only `initialize` is exempt)",
           m.name
+        ),
+        (0, 0),
+      ));
+    }
+    // Plan 61's Decision log: `MethodDef*` (the same grammar production
+    // `ClassDef` uses) is reachable here too, so a `comptime`-marked
+    // actor method parses — rejected the same way class/module methods
+    // are, a real extension beyond the task brief's own literal "class
+    // method or module method" wording, since actor methods are equally
+    // nonsensical `comptime` targets (asynchronous behaviors, not
+    // top-level pure functions).
+    if m.is_comptime {
+      return Err(Diagnostic::new(
+        format!(
+          "`comptime` functions must be top-level — found on actor method `{}#{}`",
+          a.name, m.name
         ),
         (0, 0),
       ));
@@ -2428,6 +2474,19 @@ fn infer_expr_type(
       }
       Ok(Type::Class(class.clone()))
     }
+    // Plan 61's Decision log: `comptime`'s own legal *position*
+    // restriction (a top-level `Let`'s direct value, `Array.new`'s
+    // direct size argument) is enforced by a separate, standalone walk
+    // — `check_comptime_positions`, invoked once from `check_program`,
+    // the same "separate walk, not woven into the shared type-inference
+    // plumbing" precedent `check_message_safety`/`check_block_call_
+    // sites` already establish (`infer_expr_type` has no "am I at the
+    // blessed position" context to thread without an invasive signature
+    // change touching every call site). Type inference itself is
+    // transparent: `comptime <expr>`'s type is simply `<expr>`'s own
+    // type — the interpreter's job (`emerald-codegen`) is producing the
+    // *value*, not changing the *type*.
+    Expr::Comptime(inner) => infer_expr_type(inner, env, sigs, classes, self_fields, gctx),
     // Plan 57 (supervision trees), `leaf-supervise-declaration`:
     // `supervise do ... end`'s body is restricted to a flat list of
     // bound-or-bare `<Class>.spawn(<args>)` statements (Decision log —
@@ -5058,7 +5117,8 @@ fn expr_moved_read(
     | Expr::ArrayNew(a)
     | Expr::Ok(a)
     | Expr::Err(a)
-    | Expr::Try(a) => expr_moved_read(a, moved),
+    | Expr::Try(a)
+    | Expr::Comptime(a) => expr_moved_read(a, moved),
     Expr::Call(_, args) | Expr::New(_, args) | Expr::Spawn(_, args) => {
       for a in args {
         expr_moved_read(a, moved)?;
@@ -5112,6 +5172,506 @@ fn expr_moved_read(
     Expr::Remote { addr, name, .. } => {
       expr_moved_read(addr, moved)?;
       expr_moved_read(name, moved)
+    }
+  }
+}
+
+/// Plan 61's Decision log: a concrete, enumerated ALLOW-list, not an
+/// implicit "everything except the ban-list" — a node kind absent from
+/// both the allow-list and the ban-list below is still rejected (via
+/// the final catch-all arms), just with a generic message rather than
+/// one naming the specific disallowed construct. Purely structural —
+/// walks the AST shape only, never evaluates anything, so (unlike the
+/// interpreter itself) this always terminates: no step ceiling needed
+/// here, only in `emerald-codegen`'s `ComptimeInterpreter::eval`.
+/// `comptime_fns` is every top-level function's own name known to be
+/// `is_comptime: true` — `Call`'s own arm is what makes this
+/// compositional (a `comptime` function may call another `comptime`
+/// function, itself independently checked against this exact same
+/// allow-list when `check_program` reaches its own top-level
+/// registration, never an ordinary one).
+fn check_comptime_legal(
+  body: &[Spanned<Stmt>],
+  comptime_fns: &HashSet<String>,
+) -> Result<(), Diagnostic> {
+  for stmt in body {
+    check_comptime_legal_stmt(stmt, comptime_fns)?;
+  }
+  Ok(())
+}
+
+fn check_comptime_legal_stmt(
+  stmt: &Spanned<Stmt>,
+  comptime_fns: &HashSet<String>,
+) -> Result<(), Diagnostic> {
+  match &stmt.node {
+    Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
+      check_comptime_legal_expr(value, comptime_fns)
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        check_comptime_legal_expr(v, comptime_fns)?;
+      }
+      Ok(())
+    }
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      check_comptime_legal_expr(cond, comptime_fns)?;
+      check_comptime_legal(then_branch, comptime_fns)?;
+      if let Some(eb) = else_branch {
+        check_comptime_legal(eb, comptime_fns)?;
+      }
+      Ok(())
+    }
+    Stmt::While { cond, body } => {
+      check_comptime_legal_expr(cond, comptime_fns)?;
+      check_comptime_legal(body, comptime_fns)
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        check_comptime_legal_expr(e, comptime_fns)?;
+      }
+      check_comptime_legal(body, comptime_fns)
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      check_comptime_legal_expr(start, comptime_fns)?;
+      check_comptime_legal_expr(end, comptime_fns)?;
+      check_comptime_legal(body, comptime_fns)
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      check_comptime_legal_expr(scrutinee, comptime_fns)?;
+      for (pat, arm_body) in arms {
+        if let CasePattern::Values(vs) = pat {
+          for v in vs {
+            check_comptime_legal_expr(v, comptime_fns)?;
+          }
+        }
+        check_comptime_legal(arm_body, comptime_fns)?;
+      }
+      if let Some(eb) = else_body {
+        check_comptime_legal(eb, comptime_fns)?;
+      }
+      Ok(())
+    }
+    Stmt::Return(Some(e)) => check_comptime_legal_expr(e, comptime_fns),
+    Stmt::Return(None) => Ok(()),
+    Stmt::Expr(e) => check_comptime_legal_expr(e, comptime_fns),
+    Stmt::Begin { .. } | Stmt::Raise(_) | Stmt::Retry => Err(Diagnostic::new(
+      "comptime evaluation may not `raise`/`rescue` — exception unwinding is not modeled by the compile-time interpreter",
+      stmt.span,
+    )),
+    Stmt::Yield(_) => Err(Diagnostic::new(
+      "comptime evaluation may not construct a lambda — closures capturing runtime state have no compile-time meaning",
+      stmt.span,
+    )),
+    Stmt::MatchResult { .. } => Err(Diagnostic::new(
+      "comptime evaluation may not use `Result[T, E]` — Result unwinding is not modeled by the compile-time interpreter",
+      stmt.span,
+    )),
+    Stmt::SetField { .. }
+    | Stmt::SetIndex { .. }
+    | Stmt::Break
+    | Stmt::Next
+    // `OrAssign`'s own field is named `default` (not `value` — see
+    // `ast.rs`'s own field name), unlike `AndAssign`'s; irrelevant here
+    // either way since both are rejected unconditionally.
+    | Stmt::OrAssign { .. }
+    | Stmt::AndAssign { .. } => Err(Diagnostic::new(
+      "this statement form is not part of the comptime-legal subset",
+      stmt.span,
+    )),
+  }
+}
+
+fn check_comptime_legal_expr(
+  expr: &Spanned<Expr>,
+  comptime_fns: &HashSet<String>,
+) -> Result<(), Diagnostic> {
+  match &expr.node {
+    Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::InstanceVar(_) => Ok(()),
+    // `ARGV`/`ARGC` (plan 45) are the only process-environment-dependent
+    // bare identifiers this stdlib surface has — every other `Ident` is
+    // an ordinary local/parameter read, legal.
+    Expr::Ident(name) if name == "ARGV" || name == "ARGC" => Err(Diagnostic::new(
+      format!(
+        "comptime evaluation may not reference `{name}` — I/O is not available at compile time"
+      ),
+      expr.span,
+    )),
+    Expr::Ident(_) => Ok(()),
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Rem(a, b)
+    | Expr::Div(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b) => {
+      check_comptime_legal_expr(a, comptime_fns)?;
+      check_comptime_legal_expr(b, comptime_fns)
+    }
+    Expr::Compare(a, _, b) => {
+      check_comptime_legal_expr(a, comptime_fns)?;
+      check_comptime_legal_expr(b, comptime_fns)
+    }
+    Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => check_comptime_legal_expr(a, comptime_fns),
+    Expr::New(_, args) => {
+      for a in args {
+        check_comptime_legal_expr(a, comptime_fns)?;
+      }
+      Ok(())
+    }
+    Expr::Call(name, args) if name == "puts" || name == "gets" => Err(Diagnostic::new(
+      format!("comptime evaluation may not call `{name}` — I/O is not available at compile time"),
+      expr.span,
+    )),
+    Expr::Call(name, args) if !comptime_fns.contains(name) => Err(Diagnostic::new(
+      format!(
+        "comptime evaluation may not call `{name}` — mark it `def comptime {name}(...)` if its body is a legal comptime subset"
+      ),
+      expr.span,
+    )),
+    Expr::Call(_, args) => {
+      for a in args {
+        check_comptime_legal_expr(a, comptime_fns)?;
+      }
+      Ok(())
+    }
+    Expr::MethodCall(recv, method, _)
+      if matches!(&recv.node, Expr::Ident(r) if r == "File")
+        && (method == "read" || method == "write") =>
+    {
+      Err(Diagnostic::new(
+        format!(
+          "comptime evaluation may not call `File.{method}` — I/O is not available at compile time"
+        ),
+        expr.span,
+      ))
+    }
+    Expr::Spawn(_, _) => Err(Diagnostic::new(
+      "comptime evaluation may not `.spawn` — actor isolation and message delivery are runtime concepts",
+      expr.span,
+    )),
+    Expr::Supervise(_) => Err(Diagnostic::new(
+      "comptime evaluation may not `supervise` — actor isolation and message delivery are runtime concepts",
+      expr.span,
+    )),
+    Expr::Lambda { .. } => Err(Diagnostic::new(
+      "comptime evaluation may not construct a lambda — closures capturing runtime state have no compile-time meaning",
+      expr.span,
+    )),
+    Expr::Ok(_) | Expr::Err(_) | Expr::Try(_) => Err(Diagnostic::new(
+      "comptime evaluation may not use `Result[T, E]` — Result unwinding is not modeled by the compile-time interpreter",
+      expr.span,
+    )),
+    Expr::StringLit(_)
+    | Expr::Interpolate(_)
+    | Expr::SymbolLit(_)
+    | Expr::CallKw(_, _)
+    | Expr::MethodCall(_, _, _)
+    | Expr::SafeCall(_, _, _)
+    | Expr::ArrayLit(_)
+    | Expr::Index(_, _)
+    | Expr::Nil
+    | Expr::HashLit(_)
+    | Expr::ArrayNew(_)
+    | Expr::TupleLit(_)
+    | Expr::Remote { .. }
+    | Expr::Comptime(_) => Err(Diagnostic::new(
+      "this expression form is not part of the comptime-legal subset",
+      expr.span,
+    )),
+  }
+}
+
+/// Plan 61's Decision log: `Expr::Comptime`'s own legal *position*
+/// restriction — exactly a top-level `Stmt::Let`'s direct value, or
+/// `Expr::ArrayNew`'s direct size argument — enforced by a standalone
+/// walk over the whole `Program`, the same "separate pass, not woven
+/// into `check_stmt`'s shared plumbing" precedent `check_message_safety`/
+/// `check_block_call_sites` already establish (`check_stmt`/`check_
+/// block` have no "am I at the top level" context to thread without an
+/// invasive signature change touching every call site).
+const COMPTIME_POSITION_MESSAGE: &str =
+  "`comptime` may only appear as a top-level constant's initializer or `Array.new`'s size argument";
+
+fn check_comptime_positions(program: &Program) -> Vec<Diagnostic> {
+  let mut diags = Vec::new();
+  for item in &program.items {
+    match item {
+      Item::Stmt(s) => scan_comptime_position_stmt(s, &mut diags, true),
+      Item::Function(f) => {
+        for s in &f.body {
+          scan_comptime_position_stmt(s, &mut diags, false);
+        }
+      }
+      Item::Class(c) => {
+        for m in &c.methods {
+          for s in &m.body {
+            scan_comptime_position_stmt(s, &mut diags, false);
+          }
+        }
+      }
+      Item::Module(m) => {
+        for f in &m.methods {
+          for s in &f.body {
+            scan_comptime_position_stmt(s, &mut diags, false);
+          }
+        }
+      }
+      Item::Actor(a) => {
+        for m in &a.methods {
+          for s in &m.body {
+            scan_comptime_position_stmt(s, &mut diags, false);
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  diags
+}
+
+fn scan_comptime_position_stmt(stmt: &Spanned<Stmt>, diags: &mut Vec<Diagnostic>, top_level: bool) {
+  match &stmt.node {
+    Stmt::Let { value, .. } => {
+      if top_level {
+        if let Expr::Comptime(inner) = &value.node {
+          scan_comptime_position_expr(inner, diags);
+          return;
+        }
+      }
+      scan_comptime_position_expr(value, diags);
+    }
+    Stmt::SetField { value, .. } | Stmt::Assign { value, .. } | Stmt::AndAssign { value, .. } => {
+      scan_comptime_position_expr(value, diags)
+    }
+    // `OrAssign`'s own field is named `default`, not `value` (see
+    // `ast.rs`'s own field name).
+    Stmt::OrAssign { default, .. } => scan_comptime_position_expr(default, diags),
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      scan_comptime_position_expr(array, diags);
+      scan_comptime_position_expr(index, diags);
+      scan_comptime_position_expr(value, diags);
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        scan_comptime_position_expr(v, diags);
+      }
+    }
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      scan_comptime_position_expr(cond, diags);
+      for s in then_branch {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+      if let Some(eb) = else_branch {
+        for s in eb {
+          scan_comptime_position_stmt(s, diags, false);
+        }
+      }
+    }
+    Stmt::While { cond, body } => {
+      scan_comptime_position_expr(cond, diags);
+      for s in body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+    }
+    Stmt::Return(Some(e)) => scan_comptime_position_expr(e, diags),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => {}
+    Stmt::Expr(e) => scan_comptime_position_expr(e, diags),
+    Stmt::Raise(e) => scan_comptime_position_expr(e, diags),
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+      for r in rescues {
+        for s in &r.body {
+          scan_comptime_position_stmt(s, diags, false);
+        }
+      }
+      if let Some(en) = ensure {
+        for s in en {
+          scan_comptime_position_stmt(s, diags, false);
+        }
+      }
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      scan_comptime_position_expr(scrutinee, diags);
+      for (pat, body) in arms {
+        if let CasePattern::Values(vs) = pat {
+          for v in vs {
+            scan_comptime_position_expr(v, diags);
+          }
+        }
+        for s in body {
+          scan_comptime_position_stmt(s, diags, false);
+        }
+      }
+      if let Some(eb) = else_body {
+        for s in eb {
+          scan_comptime_position_stmt(s, diags, false);
+        }
+      }
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        scan_comptime_position_expr(e, diags);
+      }
+      for s in body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+    }
+    Stmt::Yield(args) => {
+      for a in args {
+        scan_comptime_position_expr(a, diags);
+      }
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      scan_comptime_position_expr(start, diags);
+      scan_comptime_position_expr(end, diags);
+      for s in body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      scan_comptime_position_expr(scrutinee, diags);
+      for s in ok_body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+      for s in err_body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+    }
+  }
+}
+
+fn scan_comptime_position_expr(expr: &Spanned<Expr>, diags: &mut Vec<Diagnostic>) {
+  match &expr.node {
+    Expr::Comptime(inner) => {
+      diags.push(Diagnostic::new(COMPTIME_POSITION_MESSAGE, expr.span));
+      scan_comptime_position_expr(inner, diags);
+    }
+    Expr::ArrayNew(size) => {
+      if let Expr::Comptime(inner) = &size.node {
+        scan_comptime_position_expr(inner, diags);
+      } else {
+        scan_comptime_position_expr(size, diags);
+      }
+    }
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::InstanceVar(_)
+    | Expr::Bool(_)
+    | Expr::Nil => {}
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          scan_comptime_position_expr(e, diags);
+        }
+      }
+    }
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b) => {
+      scan_comptime_position_expr(a, diags);
+      scan_comptime_position_expr(b, diags);
+    }
+    Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) | Expr::Ok(a) | Expr::Err(a) | Expr::Try(a) => {
+      scan_comptime_position_expr(a, diags);
+    }
+    Expr::Compare(a, _, b) => {
+      scan_comptime_position_expr(a, diags);
+      scan_comptime_position_expr(b, diags);
+    }
+    Expr::Call(_, args) | Expr::New(_, args) | Expr::Spawn(_, args) => {
+      for a in args {
+        scan_comptime_position_expr(a, diags);
+      }
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        scan_comptime_position_expr(v, diags);
+      }
+    }
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
+      scan_comptime_position_expr(recv, diags);
+      for a in args {
+        scan_comptime_position_expr(a, diags);
+      }
+    }
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for e in elems {
+        scan_comptime_position_expr(e, diags);
+      }
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        scan_comptime_position_expr(k, diags);
+        scan_comptime_position_expr(v, diags);
+      }
+    }
+    Expr::Lambda { body, .. } => {
+      for s in body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+    }
+    Expr::Supervise(body) => {
+      for s in body {
+        scan_comptime_position_stmt(s, diags, false);
+      }
+    }
+    Expr::Remote { addr, name, .. } => {
+      scan_comptime_position_expr(addr, diags);
+      scan_comptime_position_expr(name, diags);
     }
   }
 }
@@ -6147,6 +6707,19 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   let mut top_env: HashMap<String, Type> = HashMap::new();
   top_env.insert("ARGV".to_string(), Type::Array(Box::new(Type::String)));
   top_env.insert("ARGC".to_string(), Type::Int64);
+  // Plan 61's Decision log: every top-level function's own name known to
+  // be `is_comptime: true` — `check_comptime_legal`'s own `Call` arm
+  // uses this to make comptime evaluation compositional (a `comptime`
+  // function may call another `comptime` function, never an ordinary
+  // one).
+  let comptime_fns: HashSet<String> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Function(f) if f.is_comptime => Some(f.name.clone()),
+      _ => None,
+    })
+    .collect();
   for item in &program.items {
     match item {
       Item::Function(f) if !f.type_params.is_empty() => {
@@ -6159,6 +6732,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         }
       }
       Item::Function(f) => {
+        if f.is_comptime {
+          if let Err(d) = check_comptime_legal(&f.body, &comptime_fns) {
+            diags.push(d);
+          }
+        }
         if let Err(d) = check_function_body(f, &sigs, &classes, &gctx) {
           diags.push(d);
         }
@@ -6233,6 +6811,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           block_param: None,
           splat_param: None,
           type_params: Vec::new(),
+          is_comptime: false,
         };
         if let Err(d) = check_function_body(&synthetic, &sigs, &classes, &gctx) {
           diags.push(d);
@@ -6256,6 +6835,8 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   diags.extend(check_block_call_sites(
     program, &sigs, &classes, &func_defs, &gctx,
   ));
+
+  diags.extend(check_comptime_positions(program));
 
   if diags.is_empty() { Ok(()) } else { Err(diags) }
 }

@@ -87,7 +87,7 @@ ClassDef: ClassDef = {
   // immediately after the class name, before `SuperclassClause?` —
   // reuses `TypeParamClause`/`TypeParamList` (plan 41's own generic-
   // function `[T: Bound]` clause) verbatim, no new grammar production.
-  "class" <name:Ident> <type_params:TypeParamClause?> <superclass:SuperclassClause?> <implements:ImplementsClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
+  "class" <name:Ident> <type_params:TypeParamClause?> <superclass:SuperclassClause?> <implements:ImplementsClause?> <derive:DeriveClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
     let mut fields = Vec::new();
     let mut all_methods = Vec::new();
     for (p, synthesized) in class_fields {
@@ -95,7 +95,7 @@ ClassDef: ClassDef = {
       all_methods.extend(synthesized);
     }
     all_methods.extend(methods);
-    ClassDef { name, superclass, implements, fields, methods: all_methods, type_params: type_params.unwrap_or_default() }
+    ClassDef { name, superclass, implements, derive, fields, methods: all_methods, type_params: type_params.unwrap_or_default() }
   }
 };
 
@@ -105,6 +105,17 @@ ClassDef: ClassDef = {
 // structurally rather than as a separately-checked sema invariant.
 ImplementsClause: String = {
   "implements" <i:Ident> => i,
+};
+
+// `class Point derive Comparable` (plan 61's Decision log) — mirrors
+// `ImplementsClause` exactly: a single, arbitrary `Ident`, not restricted
+// to a fixed keyword set at the grammar level (`emerald_parser::
+// expand_derives` rejects any name other than `"Comparable"` with a real
+// diagnostic naming it, the same "grammar stays general, a later pass
+// narrows" split `ImplementsClause`'s own class-only reachability
+// already uses).
+DeriveClause: String = {
+  "derive" <i:Ident> => i,
 };
 
 // Plan 33: an opt-in `read <name>: <Type>` field marker synthesizes a
@@ -124,6 +135,7 @@ ClassField: (Param, Vec<Function>) = {
       block_param: None,
       splat_param: None,
       type_params: Vec::new(),
+      is_comptime: false,
     };
     (p, vec![accessor])
   },
@@ -164,8 +176,16 @@ ActorDef: ActorDef = {
   }
 };
 
+// Plan 61's Decision log: `<comptime:"comptime"?>` slots in before
+// `"def"` — grammatically reachable on every `FuncDef` (a top-level
+// function AND, since `ModuleDef` also calls this same production, a
+// module method too), even though only a top-level function's
+// `is_comptime: true` is ever accepted: `emerald-sema` rejects one found
+// on a module method with a real "comptime functions must be top-level"
+// diagnostic, mirroring `type_params`'s own top-level-only precedent
+// (`MethodDef`'s identical mirror below) exactly.
 FuncDef: Function = {
-  "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+  <comptime:"comptime"?> "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
@@ -173,6 +193,7 @@ FuncDef: Function = {
     block_param: parts.2,
     splat_param: parts.1,
     type_params: type_params.unwrap_or_default(),
+    is_comptime: comptime.is_some(),
   }
 };
 
@@ -307,7 +328,7 @@ MethodDef: Function = {
   // `type_params` found while registering a class method with a real
   // "generic methods are not supported" diagnostic, never a panic and
   // never a silent accept.
-  "def" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+  <comptime:"comptime"?> "def" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
@@ -315,6 +336,7 @@ MethodDef: Function = {
     block_param: parts.2,
     splat_param: parts.1,
     type_params: type_params.unwrap_or_default(),
+    is_comptime: comptime.is_some(),
   }
 };
 
@@ -742,7 +764,19 @@ StmtMulExpr: Spanned<Expr> = {
 // reachable from the same state. Unary `-`/`!` remain fully available
 // everywhere else (Let's RHS, a call argument, nested inside a binary
 // operator's operand) via the ordinary, non-`Stmt` `UnaryExpr`.
+// Plan 61's Decision log: `comptime` joins this mirror too, unlike `-`/
+// `!` above it — safe here for a genuinely different reason than why
+// they're excluded. `-`/`!` are excluded because they ALSO serve as
+// binary-continuation tokens at this same Stmt tier (`StmtAddExpr`'s own
+// "-", `StmtCompareExpr`'s own operators use "!="), so a fresh statement
+// beginning with one collides with "keep extending the previous
+// statement's expression" in the parser state reachable right after a
+// completed statement. `"comptime"` is a single-purpose reserved keyword
+// with no such double duty — nothing else in this grammar's FOLLOW(Stmt)
+// position is spelled `"comptime"` — so adding it here is conflict-free
+// the same way adding it to `UnaryExpr` above already proved to be.
 StmtUnaryExpr: Spanned<Expr> = {
+  <l:@L> "comptime" <e:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Comptime(Box::new(e)) },
   StmtCallExpr,
 };
 
@@ -1065,6 +1099,25 @@ UnaryExpr: Spanned<Expr> = {
   // Plan 28: `~` joins `-`/`!` at this tier, additively — same shape,
   // no restructuring (see the Decision log).
   <l:@L> "~" <e:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitNot(Box::new(e)) },
+  // Plan 61's Decision log: `comptime` joins `-`/`!`/`~` at this exact
+  // tier — a real, disclosed, build-verified-necessary placement, not
+  // the task brief's own literal `"comptime" <e:Expr>` snippet (an
+  // un-delimited prefix keyword whose operand can itself be extended by
+  // a trailing binary operator or postfix `[...]`/`?` is genuinely
+  // ambiguous either way: at `Expr` tier, `comptime a + b` admits both
+  // `Add(Comptime(a), b)` and `Comptime(Add(a, b))`; even down at
+  // `PrimaryExpr` tier — this plan's first attempt — `comptime a[0]`
+  // still admits both `Index(Comptime(a), 0)` and `Comptime(Index(a,
+  // 0))`, since a `PrimaryExpr`-tier result feeds back into `CallExpr`'s
+  // own postfix continuation. `UnaryExpr` is the one tier whose result
+  // is never re-fed into `CallExpr`'s postfix rules — exactly why `-`/
+  // `!`/`~` already live here and nowhere lower). `emerald-sema` narrows
+  // this further to exactly two legal *positions* (see `leaf-comptime-
+  // const-context-integration`); neither of this plan's own worked
+  // examples (`comptime factorial(10)`, `Array.new(comptime
+  // factorial(5))`) needs anything looser — both operands are plain
+  // calls, already reachable via this tier's `CallExpr` fallthrough.
+  <l:@L> "comptime" <e:UnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Comptime(Box::new(e)) },
   CallExpr,
 };
 

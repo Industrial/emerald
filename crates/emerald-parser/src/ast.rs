@@ -114,6 +114,174 @@ pub fn decode_string_lit(raw: &str) -> String {
   out
 }
 
+/// `class Point derive Comparable ... end` (plan 61's Decision log) —
+/// runs once, between `require`-splicing and `emerald_sema::
+/// check_program` (a real, new pipeline stage `emerald-cli`'s own
+/// `main.rs` wires in — `check_program` takes `&Program`, not `&mut
+/// Program`, so no sema-internal pass could inject a synthesized method
+/// into the AST even if this ran later). A strict no-op for any
+/// `ClassDef` with `derive: None` — every prior plan's example parses,
+/// type-checks, and compiles identically either way.
+///
+/// Colocated with the AST it rewrites, the same place `decode_string_
+/// lit` above already lives as an AST-adjacent free function, rather
+/// than living in `lib.rs` alongside the LALRPOP-driven parse entry
+/// points.
+pub fn expand_derives(program: &mut Program) -> Result<(), String> {
+  use std::collections::HashMap;
+
+  let indices: Vec<usize> = program
+    .items
+    .iter()
+    .enumerate()
+    .filter_map(|(i, item)| match item {
+      Item::Class(c) if c.derive.is_some() => Some(i),
+      _ => None,
+    })
+    .collect();
+
+  for i in indices {
+    let (class_name, derive_name, superclass) = match &program.items[i] {
+      Item::Class(c) => (
+        c.name.clone(),
+        c.derive.clone().unwrap(),
+        c.superclass.clone(),
+      ),
+      _ => unreachable!("indices were collected from Item::Class matches above"),
+    };
+    if derive_name != "Comparable" {
+      return Err(format!(
+        "class `{class_name}` declares an unsupported derive target `{derive_name}` — only `Comparable` is supported"
+      ));
+    }
+    let already_has_eq = match &program.items[i] {
+      Item::Class(c) => c.methods.iter().any(|m| m.name == "=="),
+      _ => unreachable!(),
+    };
+    if already_has_eq {
+      return Err(format!(
+        "class `{class_name}` already defines `==`; remove it or drop `derive Comparable`"
+      ));
+    }
+
+    // Walk `superclass` across the already-`require`-merged `Program.
+    // items`, collecting each ancestor's own `ClassDef`, nearest-parent
+    // first — reversed below to root-ancestor-first, so a subclass's own
+    // (possibly shadowing) field declaration is inserted into `fields`
+    // last, the same "self wins over an inherited name" precedent
+    // `emerald-sema`'s own `ClassInfo.fields` flattening already uses.
+    let mut ancestors: Vec<ClassDef> = Vec::new();
+    let mut cur = superclass;
+    while let Some(name) = cur {
+      let parent = program.items.iter().find_map(|item| match item {
+        Item::Class(c) if c.name == name => Some(c.clone()),
+        _ => None,
+      });
+      let Some(parent) = parent else {
+        return Err(format!(
+          "class `{class_name}` (transitively) extends unknown class `{name}`"
+        ));
+      };
+      cur = parent.superclass.clone();
+      ancestors.push(parent);
+    }
+    ancestors.reverse();
+
+    let mut fields: HashMap<String, String> = HashMap::new();
+    for anc in &ancestors {
+      for f in &anc.fields {
+        fields.insert(f.name.clone(), f.ty.clone());
+      }
+    }
+    if let Item::Class(c) = &program.items[i] {
+      for f in &c.fields {
+        fields.insert(f.name.clone(), f.ty.clone());
+      }
+    }
+
+    // Determinism pitfall (Decision log): both `ClassInfo.fields` and
+    // `ClassLayout.fields` are `HashMap`s with no guaranteed iteration
+    // order; this flattened map inherits the same property. Sorting
+    // alphabetically here keeps the synthesized `&&`-chain's own IR
+    // deterministic across compiler runs.
+    let mut field_names: Vec<String> = fields.keys().cloned().collect();
+    field_names.sort();
+
+    let has_accessor = |field: &str| -> bool {
+      let self_has = match &program.items[i] {
+        Item::Class(c) => c
+          .methods
+          .iter()
+          .any(|m| m.name == field && m.params.is_empty()),
+        _ => unreachable!(),
+      };
+      self_has
+        || ancestors.iter().any(|a| {
+          a.methods
+            .iter()
+            .any(|m| m.name == field && m.params.is_empty())
+        })
+    };
+    let missing_accessors: Vec<(String, String)> = field_names
+      .iter()
+      .filter(|f| !has_accessor(f))
+      .map(|f| (f.clone(), fields[f].clone()))
+      .collect();
+
+    let cmp_chain = field_names.iter().fold(None, |acc, name| {
+      let cmp = Spanned::synthetic(Expr::Compare(
+        Box::new(Spanned::synthetic(Expr::InstanceVar(name.clone()))),
+        CompareOp::Eq,
+        Box::new(Spanned::synthetic(Expr::MethodCall(
+          Box::new(Spanned::synthetic(Expr::Ident("other".to_string()))),
+          name.clone(),
+          vec![],
+        ))),
+      ));
+      match acc {
+        None => Some(cmp),
+        Some(prev) => Some(Spanned::synthetic(Expr::And(Box::new(prev), Box::new(cmp)))),
+      }
+    });
+    let body_expr = cmp_chain.unwrap_or_else(|| Spanned::synthetic(Expr::Bool(true)));
+    let eq_fn = Function {
+      name: "==".to_string(),
+      params: vec![Param {
+        name: "other".to_string(),
+        ty: class_name.clone(),
+        default: None,
+      }],
+      return_type: "Boolean".to_string(),
+      body: vec![Spanned::synthetic(Stmt::Return(Some(body_expr)))],
+      block_param: None,
+      splat_param: None,
+      type_params: Vec::new(),
+      is_comptime: false,
+    };
+
+    let Item::Class(c) = &mut program.items[i] else {
+      unreachable!("indices were collected from Item::Class matches above")
+    };
+    for (fname, fty) in missing_accessors {
+      c.methods.push(Function {
+        name: fname.clone(),
+        params: vec![],
+        return_type: fty,
+        body: vec![Spanned::synthetic(Stmt::Expr(Spanned::synthetic(
+          Expr::InstanceVar(fname),
+        )))],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+        is_comptime: false,
+      });
+    }
+    c.methods.push(eq_fn);
+  }
+
+  Ok(())
+}
+
 /// One piece of an interpolated string (plan 36's Decision log) — a
 /// run of literal text, or a `#{...}` span's already-parsed `Expr`.
 #[derive(Debug, Clone, PartialEq)]
@@ -289,6 +457,27 @@ pub enum Expr {
     addr: Box<Spanned<Expr>>,
     name: Box<Spanned<Expr>>,
   },
+  /// `comptime <expr>` (plan 61's Decision log) — the operand binds at
+  /// `UnaryExpr`'s tight precedence tier, the exact same real, build-
+  /// verified-necessary placement `-`/`!`/`~` already use (an
+  /// un-delimited prefix keyword whose operand could itself extend via a
+  /// trailing binary operator or postfix `[...]`/`?` is genuinely
+  /// ambiguous at any looser tier — see `UnaryExpr`'s own grammar
+  /// comment for the two concrete counter-derivations LALRPOP's build
+  /// actually reported), a real deviation from the task brief's own
+  /// literal `<e:Expr>` snippet, not the brief's own worked examples,
+  /// which are both plain calls. Legal grammatically wherever a
+  /// `UnaryExpr` is reachable, narrowed further to exactly two positions
+  /// (a top-level constant's
+  /// initializer, `Array.new`'s size argument) by `emerald-sema`, the
+  /// same "grammar stays general, sema narrows" discipline plan 31
+  /// already established. Evaluated by
+  /// `emerald-codegen`'s tree-walking `ComptimeInterpreter`, never by a
+  /// JIT and never at sema time (sema only checks the inner expression's
+  /// *shape* against the legal-node allow-list, which always terminates;
+  /// only codegen actually runs it, which is why the step ceiling lives
+  /// there).
+  Comptime(Box<Spanned<Expr>>),
 }
 
 /// One statement in a block (a function body or the program's top level).
@@ -517,6 +706,18 @@ pub struct Function {
   /// `Vec` for every function that doesn't declare one — additive,
   /// source-compatible with every prior plan.
   pub type_params: Vec<TypeParam>,
+  /// `comptime def <name>(...) -> T ... end` (plan 61's Decision log) —
+  /// `false` for every pre-existing declaration, additive and
+  /// source-compatible. Legal only on a top-level function; `emerald-
+  /// sema` rejects `true` found on a class or module method with a real
+  /// diagnostic, mirroring `type_params`'s own top-level-only precedent
+  /// immediately above. A function with `is_comptime: true` is checked,
+  /// once at registration, against `check_comptime_legal`'s allow-list
+  /// (recursively re-checked for every `comptime` function it itself
+  /// calls) — never lowered to LLVM IR unless some ordinary, non-
+  /// `comptime` call site also reaches it (see `leaf-comptime-const-
+  /// context-integration`'s Decision log).
+  pub is_comptime: bool,
 }
 
 /// `T: Comparable` inside a generic function's or generic class's `[...]`
@@ -568,6 +769,14 @@ pub struct ClassDef {
   pub implements: Option<String>,
   pub fields: Vec<Param>,
   pub methods: Vec<Function>,
+  /// `class Point derive Comparable ... end` (plan 61's Decision log) —
+  /// `None` for every class that doesn't declare one. The only accepted
+  /// value is `Some("Comparable".to_string())`; any other name is a real
+  /// `emerald_parser::expand_derives` diagnostic, not a grammar-level
+  /// restriction (the grammar accepts an arbitrary `Ident` here, the
+  /// same "grammar stays general" split `implements`'s own class-only
+  /// reachability already uses).
+  pub derive: Option<String>,
   /// `class Stack[T]`/`class Box[T: Comparable]` (plan 58's Decision
   /// log) — empty `Vec` for every class that doesn't declare one,
   /// additive and source-compatible, mirroring `Function.type_params`'s

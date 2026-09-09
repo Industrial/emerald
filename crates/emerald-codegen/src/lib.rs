@@ -530,6 +530,7 @@ fn instantiate_generic_class_defs(
         name: mangled.clone(),
         superclass: None,
         implements: None,
+        derive: None,
         fields: Vec::new(),
         methods: Vec::new(),
         type_params: Vec::new(),
@@ -606,6 +607,7 @@ fn instantiate_generic_class_defs(
         default: None,
       }),
       type_params: Vec::new(),
+      is_comptime: false,
     })
     .collect();
 
@@ -617,6 +619,7 @@ fn instantiate_generic_class_defs(
       name: mangled.clone(),
       superclass: c.superclass.clone(),
       implements: c.implements.clone(),
+      derive: c.derive.clone(),
       fields,
       methods,
       type_params: Vec::new(),
@@ -890,6 +893,7 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
     | Expr::Bool(_)
     | Expr::Nil => {}
     Expr::ArrayNew(size) => collect_idents_in_expr(size, out),
+    Expr::Comptime(inner) => collect_idents_in_expr(inner, out),
     Expr::HashLit(pairs) => {
       for (k, v) in pairs {
         collect_idents_in_expr(k, out);
@@ -1307,6 +1311,7 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
     | Expr::Bool(_)
     | Expr::Nil => {}
     Expr::ArrayNew(size) => collect_symbols_in_expr(size, table),
+    Expr::Comptime(inner) => collect_symbols_in_expr(inner, table),
     Expr::HashLit(pairs) => {
       for (k, v) in pairs {
         collect_symbols_in_expr(k, table);
@@ -1724,6 +1729,9 @@ fn collect_specializations_in_expr(
     | Expr::Bool(_)
     | Expr::Nil => {}
     Expr::ArrayNew(size) => collect_specializations_in_expr(size, generic_fns, local_classes, out),
+    Expr::Comptime(inner) => {
+      collect_specializations_in_expr(inner, generic_fns, local_classes, out)
+    }
     Expr::HashLit(pairs) => {
       for (k, v) in pairs {
         collect_specializations_in_expr(k, generic_fns, local_classes, out);
@@ -1983,6 +1991,7 @@ fn substitute_generic_function(
     block_param: f.block_param.clone(),
     splat_param: f.splat_param.clone(),
     type_params: Vec::new(),
+    is_comptime: f.is_comptime,
   }
 }
 
@@ -2436,6 +2445,7 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
       mark_expr(&addr.node, out);
       mark_expr(&name.node, out);
     }
+    Expr::Comptime(inner) => mark_expr(&inner.node, out),
   }
 }
 
@@ -3908,6 +3918,13 @@ struct Ctx<'a, 'ctx> {
   actor_method_tags: &'a HashMap<String, i32>,
   actor_method_tables: &'a HashMap<String, PointerValue<'ctx>>,
   actor_method_counts: &'a HashMap<String, i64>,
+  /// Plan 61's Decision log: the hard step ceiling `ComptimeInterpreter`
+  /// enforces — `1_000_000` by default (`compile_to_object_impl`'s own
+  /// resolution of the `Option<u64>` a caller may override), configurable
+  /// via `emerald-cli`'s `--comptime-step-limit` flag. A real, disclosed
+  /// engineering compromise (Rice's theorem: general termination is
+  /// undecidable), not a termination proof.
+  comptime_step_limit: u64,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -5470,6 +5487,33 @@ fn build_expr<'ctx>(
           .into_struct_value();
       }
       Ok((agg.into(), ValKind::Tuple(kinds)))
+    }
+    // Plan 61's Decision log: reached from either of `comptime`'s own
+    // two legal positions (a top-level constant's initializer, `Array.
+    // new`'s size argument — `emerald-sema`'s `check_comptime_positions`
+    // already rejects every other reachable position before codegen
+    // ever runs). Evaluates `inner` via the tree-walking interpreter and
+    // bakes the result as a literal LLVM constant — no `alloca`, no
+    // `call`, the "zero runtime computation" proof this leaf's own
+    // worked example needs. `env` starts empty: a top-level `comptime`
+    // expression has no enclosing local scope of its own to read from
+    // (only a `comptime` FUNCTION's own body ever binds parameters —
+    // see `ComptimeInterpreter::eval`'s own `Expr::Call` arm for that).
+    Expr::Comptime(inner) => {
+      let comptime_fns: HashMap<String, &AstFunction> = ctx
+        .func_defs
+        .iter()
+        .filter(|(_, f)| f.is_comptime)
+        .map(|(k, f)| (k.clone(), *f))
+        .collect();
+      let mut interp = ComptimeInterpreter::new(ctx.comptime_step_limit);
+      let value = interp.eval(
+        inner,
+        &HashMap::new(),
+        &comptime_fns,
+        "<comptime expression>",
+      )?;
+      Ok(comptime_value_to_llvm_constant(context, &value))
     }
   }
 }
@@ -11750,16 +11794,781 @@ fn define_main<'ctx>(
 /// shape as the old Cranelift backend's `declare_function`-before-
 /// `define_function` discipline) — so a call to a function declared
 /// later in source order, or a mutually-referencing pair, both resolve.
+/// Plan 61's Decision log: `comptime`'s own tree-walking runtime value —
+/// a small, closed set (`Int64`/`Float64`/`Boolean`), NOT the fuller
+/// `Int`/`Float`/`Bool`/`Struct`/`Variant` shape the task brief's own
+/// text sketches. A real, disclosed v1 scope cut: `New`/`InstanceVar`
+/// stay on `check_comptime_legal`'s allow-list exactly as the brief
+/// specifies (so a `comptime` function that never touches them still
+/// type-checks and interprets today), but this interpreter itself
+/// doesn't yet construct/read struct values — reaching either node
+/// produces a real, clear `Err` (see `ComptimeInterpreter::eval`'s own
+/// arm) rather than a silent wrong answer or a panic. Reading a
+/// constructed value's field back out would need `Expr::MethodCall`
+/// (this language's only field-read syntax — plan 33's "always a method
+/// call" rule, verified this session), which `check_comptime_legal`
+/// bans outright; closing that gap for real is legitimate future work,
+/// not attempted here. This plan's own flagship worked proof
+/// (`comptime factorial(10)`) never needs more than `Int64` anyway.
+/// `pub` — `leaf-comptime-query-cache-integration`'s own `emerald-
+/// driver::cache::comptime_eval_query` needs to name this type directly
+/// to persist/reconstruct a cached result (`emerald-driver` depends on
+/// `emerald-codegen`, never the reverse, so this crate's own interpreter
+/// stays the single source of truth for what a `comptime` value even
+/// is).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComptimeValue {
+  Int(i64),
+  Float(f64),
+  Bool(bool),
+}
+
+/// A hard, disclosed step ceiling, not a termination proof (Rice's
+/// theorem: general termination is undecidable) — `steps` increments on
+/// every statement executed, every loop-condition re-check, and every
+/// expression evaluated; exceeding `limit` is a real compile failure
+/// (`Err`, propagated all the way up through `build_expr`/`define_main`
+/// to a real diagnostic), never a hang, never a panic.
+struct ComptimeInterpreter {
+  steps: u64,
+  limit: u64,
+}
+
+impl ComptimeInterpreter {
+  fn new(limit: u64) -> Self {
+    ComptimeInterpreter { steps: 0, limit }
+  }
+
+  fn tick(&mut self, label: &str) -> Result<(), String> {
+    self.steps += 1;
+    if self.steps > self.limit {
+      return Err(format!(
+        "comptime evaluation of `{label}` exceeded {} steps (possible infinite loop); pass --comptime-step-limit=N to raise it",
+        self.limit
+      ));
+    }
+    Ok(())
+  }
+
+  fn eval(
+    &mut self,
+    expr: &Spanned<Expr>,
+    env: &HashMap<String, ComptimeValue>,
+    comptime_fns: &HashMap<String, &AstFunction>,
+    label: &str,
+  ) -> Result<ComptimeValue, String> {
+    self.tick(label)?;
+    match &expr.node {
+      Expr::Int(n) => Ok(ComptimeValue::Int(*n)),
+      Expr::Float(f) => Ok(ComptimeValue::Float(*f)),
+      Expr::Bool(b) => Ok(ComptimeValue::Bool(*b)),
+      Expr::Ident(name) => env
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("comptime evaluation: undefined variable `{name}`")),
+      Expr::Add(a, b) => self.eval_arith("+", a, b, env, comptime_fns, label),
+      Expr::Sub(a, b) => self.eval_arith("-", a, b, env, comptime_fns, label),
+      Expr::Mul(a, b) => self.eval_arith("*", a, b, env, comptime_fns, label),
+      Expr::Div(a, b) => self.eval_arith("/", a, b, env, comptime_fns, label),
+      Expr::Rem(a, b) => self.eval_arith("%", a, b, env, comptime_fns, label),
+      Expr::Neg(a) => match self.eval(a, env, comptime_fns, label)? {
+        ComptimeValue::Int(x) => Ok(ComptimeValue::Int(-x)),
+        ComptimeValue::Float(x) => Ok(ComptimeValue::Float(-x)),
+        ComptimeValue::Bool(_) => Err("comptime evaluation: cannot negate a Boolean".to_string()),
+      },
+      Expr::Not(a) => Ok(ComptimeValue::Bool(!self.eval_bool(
+        a,
+        env,
+        comptime_fns,
+        label,
+      )?)),
+      Expr::And(a, b) => {
+        if !self.eval_bool(a, env, comptime_fns, label)? {
+          Ok(ComptimeValue::Bool(false))
+        } else {
+          Ok(ComptimeValue::Bool(self.eval_bool(
+            b,
+            env,
+            comptime_fns,
+            label,
+          )?))
+        }
+      }
+      Expr::Or(a, b) => {
+        if self.eval_bool(a, env, comptime_fns, label)? {
+          Ok(ComptimeValue::Bool(true))
+        } else {
+          Ok(ComptimeValue::Bool(self.eval_bool(
+            b,
+            env,
+            comptime_fns,
+            label,
+          )?))
+        }
+      }
+      Expr::Compare(a, op, b) => {
+        let av = self.eval(a, env, comptime_fns, label)?;
+        let bv = self.eval(b, env, comptime_fns, label)?;
+        self.eval_compare(op, &av, &bv)
+      }
+      Expr::BitAnd(a, b) => self.eval_bit(a, b, env, comptime_fns, label, |x, y| x & y),
+      Expr::BitOr(a, b) => self.eval_bit(a, b, env, comptime_fns, label, |x, y| x | y),
+      Expr::BitXor(a, b) => self.eval_bit(a, b, env, comptime_fns, label, |x, y| x ^ y),
+      Expr::Shl(a, b) => self.eval_bit(a, b, env, comptime_fns, label, |x, y| x << y),
+      Expr::Shr(a, b) => self.eval_bit(a, b, env, comptime_fns, label, |x, y| x >> y),
+      Expr::BitNot(a) => Ok(ComptimeValue::Int(!self.eval_int(
+        a,
+        env,
+        comptime_fns,
+        label,
+      )?)),
+      Expr::Call(name, args) => {
+        let argvals = args
+          .iter()
+          .map(|a| self.eval(a, env, comptime_fns, label))
+          .collect::<Result<Vec<_>, _>>()?;
+        let f = comptime_fns.get(name.as_str()).ok_or_else(|| {
+          format!("comptime evaluation: `{name}` is not a known comptime function")
+        })?;
+        let mut call_env = HashMap::new();
+        for (p, v) in f.params.iter().zip(argvals) {
+          call_env.insert(p.name.clone(), v);
+        }
+        match self.exec_block(&f.body, &mut call_env, comptime_fns, name)? {
+          Some(v) => Ok(v),
+          None => Err(format!(
+            "comptime evaluation: `{name}` did not return a value"
+          )),
+        }
+      }
+      Expr::New(..) | Expr::InstanceVar(_) => Err(
+        "comptime evaluation of struct/enum values is not yet supported by the interpreter"
+          .to_string(),
+      ),
+      _ => Err(
+        "comptime evaluation encountered an expression form outside the comptime-legal subset"
+          .to_string(),
+      ),
+    }
+  }
+
+  fn eval_bool(
+    &mut self,
+    e: &Spanned<Expr>,
+    env: &HashMap<String, ComptimeValue>,
+    comptime_fns: &HashMap<String, &AstFunction>,
+    label: &str,
+  ) -> Result<bool, String> {
+    match self.eval(e, env, comptime_fns, label)? {
+      ComptimeValue::Bool(b) => Ok(b),
+      _ => Err("comptime evaluation: expected a Boolean value".to_string()),
+    }
+  }
+
+  fn eval_int(
+    &mut self,
+    e: &Spanned<Expr>,
+    env: &HashMap<String, ComptimeValue>,
+    comptime_fns: &HashMap<String, &AstFunction>,
+    label: &str,
+  ) -> Result<i64, String> {
+    match self.eval(e, env, comptime_fns, label)? {
+      ComptimeValue::Int(n) => Ok(n),
+      _ => Err("comptime evaluation: expected an Int64 value".to_string()),
+    }
+  }
+
+  fn eval_arith(
+    &mut self,
+    op: &str,
+    a: &Spanned<Expr>,
+    b: &Spanned<Expr>,
+    env: &HashMap<String, ComptimeValue>,
+    comptime_fns: &HashMap<String, &AstFunction>,
+    label: &str,
+  ) -> Result<ComptimeValue, String> {
+    let av = self.eval(a, env, comptime_fns, label)?;
+    let bv = self.eval(b, env, comptime_fns, label)?;
+    match (av, bv) {
+      (ComptimeValue::Int(x), ComptimeValue::Int(y)) => {
+        let r = match op {
+          "+" => x.checked_add(y),
+          "-" => x.checked_sub(y),
+          "*" => x.checked_mul(y),
+          "/" => {
+            if y == 0 {
+              return Err("comptime evaluation: division by zero".to_string());
+            }
+            x.checked_div(y)
+          }
+          "%" => {
+            if y == 0 {
+              return Err("comptime evaluation: division by zero".to_string());
+            }
+            x.checked_rem(y)
+          }
+          _ => unreachable!("eval_arith is only ever called with one of +-*/%"),
+        };
+        r.map(ComptimeValue::Int)
+          .ok_or_else(|| "comptime evaluation: integer overflow".to_string())
+      }
+      (ComptimeValue::Float(x), ComptimeValue::Float(y)) => {
+        let r = match op {
+          "+" => x + y,
+          "-" => x - y,
+          "*" => x * y,
+          "/" => x / y,
+          "%" => x % y,
+          _ => unreachable!("eval_arith is only ever called with one of +-*/%"),
+        };
+        Ok(ComptimeValue::Float(r))
+      }
+      _ => Err("comptime evaluation: mismatched operand types in arithmetic".to_string()),
+    }
+  }
+
+  fn eval_bit(
+    &mut self,
+    a: &Spanned<Expr>,
+    b: &Spanned<Expr>,
+    env: &HashMap<String, ComptimeValue>,
+    comptime_fns: &HashMap<String, &AstFunction>,
+    label: &str,
+    op: impl Fn(i64, i64) -> i64,
+  ) -> Result<ComptimeValue, String> {
+    let x = self.eval_int(a, env, comptime_fns, label)?;
+    let y = self.eval_int(b, env, comptime_fns, label)?;
+    Ok(ComptimeValue::Int(op(x, y)))
+  }
+
+  fn eval_compare(
+    &self,
+    op: &CompareOp,
+    a: &ComptimeValue,
+    b: &ComptimeValue,
+  ) -> Result<ComptimeValue, String> {
+    let ordering = match (a, b) {
+      (ComptimeValue::Int(x), ComptimeValue::Int(y)) => x.partial_cmp(y),
+      (ComptimeValue::Float(x), ComptimeValue::Float(y)) => x.partial_cmp(y),
+      (ComptimeValue::Bool(x), ComptimeValue::Bool(y)) => x.partial_cmp(y),
+      _ => {
+        return Err("comptime evaluation: mismatched operand types in a comparison".to_string());
+      }
+    };
+    let Some(ord) = ordering else {
+      return Err("comptime evaluation: an unorderable comparison (e.g. NaN)".to_string());
+    };
+    let result = match op {
+      CompareOp::Lt => ord.is_lt(),
+      CompareOp::Gt => ord.is_gt(),
+      CompareOp::Le => ord.is_le(),
+      CompareOp::Ge => ord.is_ge(),
+      CompareOp::Eq => ord.is_eq(),
+      CompareOp::Ne => ord.is_ne(),
+    };
+    Ok(ComptimeValue::Bool(result))
+  }
+
+  /// `Ok(Some(v))`: a `Return` fired, unwinding the rest of `body`.
+  /// `Ok(None)`: `body` ran to completion with no `Return`.
+  fn exec_block(
+    &mut self,
+    body: &[Spanned<Stmt>],
+    env: &mut HashMap<String, ComptimeValue>,
+    comptime_fns: &HashMap<String, &AstFunction>,
+    label: &str,
+  ) -> Result<Option<ComptimeValue>, String> {
+    for stmt in body {
+      if let Some(v) = self.exec_stmt(stmt, env, comptime_fns, label)? {
+        return Ok(Some(v));
+      }
+    }
+    Ok(None)
+  }
+
+  fn exec_stmt(
+    &mut self,
+    stmt: &Spanned<Stmt>,
+    env: &mut HashMap<String, ComptimeValue>,
+    comptime_fns: &HashMap<String, &AstFunction>,
+    label: &str,
+  ) -> Result<Option<ComptimeValue>, String> {
+    self.tick(label)?;
+    match &stmt.node {
+      Stmt::Let { name, value, .. } | Stmt::Assign { name, value } => {
+        let v = self.eval(value, env, comptime_fns, label)?;
+        env.insert(name.clone(), v);
+        Ok(None)
+      }
+      Stmt::MultiAssign { names, values } => {
+        let vs = values
+          .iter()
+          .map(|v| self.eval(v, env, comptime_fns, label))
+          .collect::<Result<Vec<_>, _>>()?;
+        for (n, v) in names.iter().zip(vs) {
+          env.insert(n.clone(), v);
+        }
+        Ok(None)
+      }
+      Stmt::If {
+        cond,
+        then_branch,
+        else_branch,
+      } => {
+        if self.eval_bool(cond, env, comptime_fns, label)? {
+          self.exec_block(then_branch, env, comptime_fns, label)
+        } else if let Some(eb) = else_branch {
+          self.exec_block(eb, env, comptime_fns, label)
+        } else {
+          Ok(None)
+        }
+      }
+      Stmt::While { cond, body } => {
+        while self.eval_bool(cond, env, comptime_fns, label)? {
+          if let Some(v) = self.exec_block(body, env, comptime_fns, label)? {
+            return Ok(Some(v));
+          }
+        }
+        Ok(None)
+      }
+      Stmt::For {
+        var,
+        elements,
+        body,
+      } => {
+        for e in elements {
+          let v = self.eval(e, env, comptime_fns, label)?;
+          env.insert(var.clone(), v);
+          if let Some(rv) = self.exec_block(body, env, comptime_fns, label)? {
+            return Ok(Some(rv));
+          }
+        }
+        Ok(None)
+      }
+      Stmt::ForRange {
+        var,
+        start,
+        end,
+        exclusive,
+        body,
+      } => {
+        let s = self.eval_int(start, env, comptime_fns, label)?;
+        let e = self.eval_int(end, env, comptime_fns, label)?;
+        let mut i = s;
+        while if *exclusive { i < e } else { i <= e } {
+          self.tick(label)?;
+          env.insert(var.clone(), ComptimeValue::Int(i));
+          if let Some(rv) = self.exec_block(body, env, comptime_fns, label)? {
+            return Ok(Some(rv));
+          }
+          i += 1;
+        }
+        Ok(None)
+      }
+      Stmt::Case {
+        scrutinee,
+        arms,
+        else_body,
+      } => {
+        let sv = self.eval(scrutinee, env, comptime_fns, label)?;
+        for (pat, arm_body) in arms {
+          let CasePattern::Values(vs) = pat else {
+            return Err(
+              "comptime evaluation does not yet support enum-variant `case` patterns".to_string(),
+            );
+          };
+          for v in vs {
+            let cv = self.eval(v, env, comptime_fns, label)?;
+            if cv == sv {
+              return self.exec_block(arm_body, env, comptime_fns, label);
+            }
+          }
+        }
+        if let Some(eb) = else_body {
+          self.exec_block(eb, env, comptime_fns, label)
+        } else {
+          Ok(None)
+        }
+      }
+      Stmt::Return(Some(e)) => Ok(Some(self.eval(e, env, comptime_fns, label)?)),
+      Stmt::Return(None) => {
+        Err("comptime evaluation: a comptime function must return a value".to_string())
+      }
+      Stmt::Expr(e) => {
+        self.eval(e, env, comptime_fns, label)?;
+        Ok(None)
+      }
+      _ => Err(
+        "comptime evaluation encountered a statement form outside the comptime-legal subset"
+          .to_string(),
+      ),
+    }
+  }
+}
+
+/// `pub` entry point for `leaf-comptime-query-cache-integration`'s own
+/// MISS path — `emerald-driver::cache::comptime_eval_query` calls this
+/// directly rather than reaching into `build_expr`'s own LLVM-emitting
+/// codegen (which needs a live `inkwell::Context`/`Builder`/`Ctx`, none
+/// of which a cache-layer MISS has, or wants — it only needs the real
+/// *value*, not any IR). Builds `comptime_fns` from `program` the same
+/// way `build_expr`'s own `Expr::Comptime` arm does.
+pub fn eval_comptime_expr(
+  expr: &Spanned<Expr>,
+  program: &Program,
+  limit: u64,
+) -> Result<ComptimeValue, String> {
+  let comptime_fns: HashMap<String, &AstFunction> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Function(f) if f.is_comptime => Some((f.name.clone(), f)),
+      _ => None,
+    })
+    .collect();
+  let mut interp = ComptimeInterpreter::new(limit);
+  interp.eval(
+    expr,
+    &HashMap::new(),
+    &comptime_fns,
+    "<comptime expression>",
+  )
+}
+
+/// Bakes a fully-evaluated `ComptimeValue` into a literal LLVM constant —
+/// never an `alloca`, never a `call`, exactly the "zero runtime
+/// computation" proof this leaf's own worked example needs.
+fn comptime_value_to_llvm_constant<'ctx>(
+  context: &'ctx Context,
+  value: &ComptimeValue,
+) -> (BasicValueEnum<'ctx>, ValKind) {
+  match value {
+    ComptimeValue::Int(n) => (
+      context.i64_type().const_int(*n as u64, true).into(),
+      ValKind::Int64,
+    ),
+    ComptimeValue::Float(f) => (context.f64_type().const_float(*f).into(), ValKind::Float64),
+    ComptimeValue::Bool(b) => (
+      context.bool_type().const_int(*b as u64, false).into(),
+      ValKind::Bool,
+    ),
+  }
+}
+
+/// Plan 61's Decision log (AC2's own second half): a `comptime`-marked
+/// function that is never referenced outside a `comptime` expression
+/// anywhere in the program is never emitted as an LLVM function at all —
+/// nothing at runtime could ever reach it. Computed once, program-wide,
+/// before `declare_user_functions`/the function-body-definition loop
+/// both consult it.
+fn comptime_only_function_names(program: &Program) -> HashSet<String> {
+  let comptime_names: HashSet<String> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Function(f) if f.is_comptime => Some(f.name.clone()),
+      _ => None,
+    })
+    .collect();
+  if comptime_names.is_empty() {
+    return HashSet::new();
+  }
+  let mut runtime_called: HashSet<String> = HashSet::new();
+  for item in &program.items {
+    match item {
+      Item::Stmt(s) => collect_runtime_call_names_stmt(s, &mut runtime_called),
+      // A `comptime` function's OWN body is only ever interpreted, never
+      // compiled to LLVM (as long as it stays comptime-only) — a real
+      // bug this leaf's own white-box test caught: `factorial`'s own
+      // recursive `factorial(n - 1)` self-call was wrongly counted as a
+      // "runtime" call site, keeping `factorial` emitted as a real LLVM
+      // function even though nothing at runtime ever calls it. Skipped
+      // here entirely; an ordinary (non-`comptime`) function's body is
+      // still walked unconditionally below.
+      Item::Function(f) if f.is_comptime => {}
+      Item::Function(f) => {
+        for s in &f.body {
+          collect_runtime_call_names_stmt(s, &mut runtime_called);
+        }
+      }
+      Item::Class(c) => {
+        for m in &c.methods {
+          for s in &m.body {
+            collect_runtime_call_names_stmt(s, &mut runtime_called);
+          }
+        }
+      }
+      Item::Module(m) => {
+        for f in &m.methods {
+          for s in &f.body {
+            collect_runtime_call_names_stmt(s, &mut runtime_called);
+          }
+        }
+      }
+      Item::Actor(a) => {
+        for m in &a.methods {
+          for s in &m.body {
+            collect_runtime_call_names_stmt(s, &mut runtime_called);
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  comptime_names
+    .difference(&runtime_called)
+    .cloned()
+    .collect()
+}
+
+/// Records every `Expr::Call` callee name reachable WITHOUT crossing
+/// into an `Expr::Comptime` subtree (a call made only at compile time,
+/// inside a `comptime` expression, is not an "ordinary" runtime call
+/// site — `comptime_only_function_names` is exactly the set difference
+/// this produces).
+fn collect_runtime_call_names_stmt(stmt: &Spanned<Stmt>, out: &mut HashSet<String>) {
+  match &stmt.node {
+    Stmt::Let { value, .. }
+    | Stmt::SetField { value, .. }
+    | Stmt::Assign { value, .. }
+    | Stmt::AndAssign { value, .. }
+    | Stmt::Raise(value)
+    | Stmt::Expr(value) => collect_runtime_call_names_expr(value, out),
+    Stmt::OrAssign { default, .. } => collect_runtime_call_names_expr(default, out),
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      collect_runtime_call_names_expr(array, out);
+      collect_runtime_call_names_expr(index, out);
+      collect_runtime_call_names_expr(value, out);
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        collect_runtime_call_names_expr(v, out);
+      }
+    }
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      collect_runtime_call_names_expr(cond, out);
+      for s in then_branch {
+        collect_runtime_call_names_stmt(s, out);
+      }
+      if let Some(eb) = else_branch {
+        for s in eb {
+          collect_runtime_call_names_stmt(s, out);
+        }
+      }
+    }
+    Stmt::While { cond, body } => {
+      collect_runtime_call_names_expr(cond, out);
+      for s in body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        collect_runtime_call_names_expr(e, out);
+      }
+      for s in body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      collect_runtime_call_names_expr(start, out);
+      collect_runtime_call_names_expr(end, out);
+      for s in body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      collect_runtime_call_names_expr(scrutinee, out);
+      for (pat, body) in arms {
+        if let CasePattern::Values(vs) = pat {
+          for v in vs {
+            collect_runtime_call_names_expr(v, out);
+          }
+        }
+        for s in body {
+          collect_runtime_call_names_stmt(s, out);
+        }
+      }
+      if let Some(eb) = else_body {
+        for s in eb {
+          collect_runtime_call_names_stmt(s, out);
+        }
+      }
+    }
+    Stmt::Return(Some(e)) => collect_runtime_call_names_expr(e, out),
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => {}
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      for s in body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+      for r in rescues {
+        for s in &r.body {
+          collect_runtime_call_names_stmt(s, out);
+        }
+      }
+      if let Some(en) = ensure {
+        for s in en {
+          collect_runtime_call_names_stmt(s, out);
+        }
+      }
+    }
+    Stmt::Yield(args) => {
+      for a in args {
+        collect_runtime_call_names_expr(a, out);
+      }
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      collect_runtime_call_names_expr(scrutinee, out);
+      for s in ok_body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+      for s in err_body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+    }
+  }
+}
+
+fn collect_runtime_call_names_expr(expr: &Spanned<Expr>, out: &mut HashSet<String>) {
+  match &expr.node {
+    // The one subtree this walk never descends into as an "ordinary"
+    // call site — a call made only inside a `comptime` expression
+    // doesn't count as a reason to keep the callee's LLVM function
+    // around.
+    Expr::Comptime(_) => {}
+    Expr::Call(name, args) => {
+      out.insert(name.clone());
+      for a in args {
+        collect_runtime_call_names_expr(a, out);
+      }
+    }
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::InstanceVar(_)
+    | Expr::Bool(_)
+    | Expr::Nil => {}
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          collect_runtime_call_names_expr(e, out);
+        }
+      }
+    }
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b) => {
+      collect_runtime_call_names_expr(a, out);
+      collect_runtime_call_names_expr(b, out);
+    }
+    Expr::Neg(a)
+    | Expr::Not(a)
+    | Expr::BitNot(a)
+    | Expr::ArrayNew(a)
+    | Expr::Ok(a)
+    | Expr::Err(a)
+    | Expr::Try(a) => collect_runtime_call_names_expr(a, out),
+    Expr::Compare(a, _, b) => {
+      collect_runtime_call_names_expr(a, out);
+      collect_runtime_call_names_expr(b, out);
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        collect_runtime_call_names_expr(v, out);
+      }
+    }
+    Expr::New(_, args) | Expr::Spawn(_, args) => {
+      for a in args {
+        collect_runtime_call_names_expr(a, out);
+      }
+    }
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
+      collect_runtime_call_names_expr(recv, out);
+      for a in args {
+        collect_runtime_call_names_expr(a, out);
+      }
+    }
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for e in elems {
+        collect_runtime_call_names_expr(e, out);
+      }
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        collect_runtime_call_names_expr(k, out);
+        collect_runtime_call_names_expr(v, out);
+      }
+    }
+    Expr::Lambda { body, .. } => {
+      for s in body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+    }
+    Expr::Supervise(body) => {
+      for s in body {
+        collect_runtime_call_names_stmt(s, out);
+      }
+    }
+    Expr::Remote { addr, name, .. } => {
+      collect_runtime_call_names_expr(addr, out);
+      collect_runtime_call_names_expr(name, out);
+    }
+  }
+}
+
 fn declare_user_functions<'ctx>(
   context: &'ctx Context,
   module: &Module<'ctx>,
   program: &Program,
   classes: &HashMap<String, ClassLayout>,
   generic_instances: &HashMap<String, ClassDef>,
+  // Plan 61's Decision log (AC2's own second half): a `comptime`-marked
+  // function never referenced outside a `comptime` expression anywhere
+  // in the program — see `comptime_only_function_names`'s own doc
+  // comment. Never given an LLVM symbol at all, the same "dead code with
+  // no valid caller" reasoning `block_param`'s own arm immediately below
+  // already establishes.
+  comptime_only_fns: &HashSet<String>,
 ) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
   let mut user_func_ids = HashMap::new();
   for item in &program.items {
     match item {
+      Item::Function(f) if comptime_only_fns.contains(&f.name) => {}
       // Plan 34: a `block_param`-declaring function is never compiled
       // as an ordinary, reusable LLVM function at all — every call site
       // must attach a literal block (sema-enforced), and `yield` has no
@@ -11919,7 +12728,20 @@ fn declare_lambda_functions<'ctx>(
 /// `__lambda_{name}` per top-level `Proc` `Let`, plus a `main`
 /// (`extern "C" fn() -> i32`) that evaluates the top-level statements.
 pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, None, None, None, None)
+  compile_to_object_impl(program, out_path, None, None, None, None, None)
+}
+
+/// Plan 61's Decision log: identical to `compile_to_object`, except
+/// `limit` overrides `ComptimeInterpreter`'s default `1_000_000`-step
+/// ceiling — `emerald-cli`'s own `--comptime-step-limit` flag's real,
+/// end-to-end entry point (also the small-ceiling seam a test wants,
+/// without waiting out a million real iterations).
+pub fn compile_to_object_with_comptime_step_limit(
+  program: &Program,
+  out_path: &Path,
+  limit: u64,
+) -> Result<(), String> {
+  compile_to_object_impl(program, out_path, None, None, None, None, Some(limit))
 }
 
 /// Plan 50's `leaf-escape-instrumentation-and-report`: identical to
@@ -11932,7 +12754,7 @@ pub fn compile_to_object_with_stats(
   out_path: &Path,
 ) -> Result<EscapeStats, String> {
   let stats = RefCell::new(EscapeStats::default());
-  compile_to_object_impl(program, out_path, None, None, Some(&stats), None)?;
+  compile_to_object_impl(program, out_path, None, None, Some(&stats), None, None)?;
   Ok(stats.into_inner())
 }
 
@@ -11947,7 +12769,7 @@ fn compile_to_object_ir_text_for_test(
   out_path: &Path,
 ) -> Result<String, String> {
   let ir_text = RefCell::new(String::new());
-  compile_to_object_impl(program, out_path, None, None, None, Some(&ir_text))?;
+  compile_to_object_impl(program, out_path, None, None, None, Some(&ir_text), None)?;
   Ok(ir_text.into_inner())
 }
 
@@ -11984,6 +12806,7 @@ pub fn compile_to_object_scoped(
     Some((own_names, is_entry)),
     None,
     None,
+    None,
   )
 }
 
@@ -11994,11 +12817,20 @@ pub fn compile_to_object_scoped(
 /// `source`'s real text and `file_name`'s path via plan 22's
 /// `Spanned<T>` byte-offset spans, already threaded through every AST
 /// node this backend consumes.
+///
+/// Plan 61's Decision log: `comptime_step_limit` widens this entry point
+/// rather than adding a third, debug-info-plus-comptime-limit variant —
+/// `emerald-driver`'s own `compile` (the ordinary `emerald <file>` CLI
+/// path) always supplies real source text here, so this is the one real
+/// entry point `--comptime-step-limit` needs to actually reach for a
+/// plain compile. `None` (every pre-existing caller) is the real default
+/// (`1_000_000`), unchanged behavior.
 pub fn compile_to_object_with_debug_info(
   program: &Program,
   out_path: &Path,
   source: &str,
   file_name: &str,
+  comptime_step_limit: Option<u64>,
 ) -> Result<(), String> {
   compile_to_object_impl(
     program,
@@ -12007,6 +12839,7 @@ pub fn compile_to_object_with_debug_info(
     None,
     None,
     None,
+    comptime_step_limit,
   )
 }
 
@@ -12035,6 +12868,13 @@ fn compile_to_object_impl(
   // `Module`'s textual IR (see this function's own skip-optimization
   // branch below for why).
   ir_text_out: Option<&RefCell<String>>,
+  // Plan 61's Decision log: `Some(n)` only from `compile_to_object_with_
+  // comptime_step_limit` (`emerald-cli`'s own `--comptime-step-limit`
+  // flag) — every other, pre-existing caller passes `None`, resolved to
+  // the real default (`1_000_000`) right where `Ctx::comptime_step_
+  // limit` is built, so this function's behavior is unchanged for every
+  // caller that doesn't pass `Some`.
+  comptime_step_limit: Option<u64>,
 ) -> Result<(), String> {
   // Plan 47's Decision log: a `test "..." do ... end` block only ever
   // compiles through `compile_test_harness` (`emerald test`) — reaching
@@ -12308,6 +13148,7 @@ fn compile_to_object_impl(
         name: a.name.clone(),
         superclass: None,
         implements: None,
+        derive: None,
         fields: a.fields.clone(),
         methods: a.methods.clone(),
         type_params: Vec::new(),
@@ -12445,6 +13286,7 @@ fn compile_to_object_impl(
           block_param: None,
           splat_param: None,
           type_params: Vec::new(),
+          is_comptime: false,
         })
         .collect::<Vec<_>>(),
       _ => Vec::new(),
@@ -12464,8 +13306,15 @@ fn compile_to_object_impl(
     .collect();
 
   let lambda_infos = collect_lambda_infos(program)?;
-  let mut user_func_ids =
-    declare_user_functions(&context, &module, program, &classes, &generic_instances);
+  let comptime_only_fns = comptime_only_function_names(program);
+  let mut user_func_ids = declare_user_functions(
+    &context,
+    &module,
+    program,
+    &classes,
+    &generic_instances,
+    &comptime_only_fns,
+  );
   let lambda_func_ids = declare_lambda_functions(&context, &module, program, &lambda_infos);
 
   // Plan 41's Decision log: one specialization cache entry per distinct
@@ -12655,10 +13504,14 @@ fn compile_to_object_impl(
     actor_method_tags: &actor_method_tags,
     actor_method_tables: &actor_method_tables,
     actor_method_counts: &actor_method_counts,
+    comptime_step_limit: comptime_step_limit.unwrap_or(1_000_000),
   };
 
   for item in &program.items {
     match item {
+      // Plan 61: never declared in `user_func_ids` above either — see
+      // `declare_user_functions`'s matching arm.
+      Item::Function(f) if comptime_only_fns.contains(&f.name) => {}
       // Plan 34: never declared in `user_func_ids` above — see
       // `declare_user_functions`'s matching arm.
       Item::Function(f) if f.block_param.is_some() => {}
@@ -13106,6 +13959,7 @@ fn assertion_error_class_item() -> Item {
     name: "AssertionError".to_string(),
     superclass: None,
     implements: None,
+    derive: None,
     fields: vec![Param {
       name: "message".to_string(),
       ty: "String".to_string(),
@@ -13127,6 +13981,7 @@ fn assertion_error_class_item() -> Item {
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
+        is_comptime: false,
       },
       AstFunction {
         name: "message".to_string(),
@@ -13138,6 +13993,7 @@ fn assertion_error_class_item() -> Item {
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
+        is_comptime: false,
       },
     ],
     type_params: Vec::new(),
@@ -13165,6 +14021,7 @@ fn remote_actor_error_class_item() -> Item {
     name: "RemoteActorError".to_string(),
     superclass: None,
     implements: None,
+    derive: None,
     fields: vec![Param {
       name: "message".to_string(),
       ty: "String".to_string(),
@@ -13186,6 +14043,7 @@ fn remote_actor_error_class_item() -> Item {
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
+        is_comptime: false,
       },
       AstFunction {
         name: "message".to_string(),
@@ -13197,6 +14055,7 @@ fn remote_actor_error_class_item() -> Item {
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
+        is_comptime: false,
       },
     ],
     type_params: Vec::new(),
@@ -13273,6 +14132,7 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
       block_param: None,
       splat_param: None,
       type_params: Vec::new(),
+      is_comptime: false,
     }));
 
     harness_stmts.push(syn(Stmt::Begin {
@@ -14083,6 +14943,7 @@ mod tests {
           block_param: Some("blk".into()),
           splat_param: None,
           type_params: Vec::new(),
+          is_comptime: false,
         }),
         Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
           "repeat".into(),
@@ -15742,5 +16603,91 @@ int main(void) {
     // `EMERALD_REMOTE_TIMEOUT_MS` wait needed for this specific gate).
     let src = "actor Counter\n  count: Int64\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nbegin\n  handle: Counter = Counter.remote(\"127.0.0.1:1\", \"counter1\")\n  puts \"should not reach here\"\nrescue RemoteActorError => e\n  puts \"caught\"\nend\n";
     assert_eq!(compile_link_run(src), "caught\n");
+  }
+
+  // Plan 61 (comptime execution).
+
+  const FACTORIAL_SRC: &str = "comptime def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\nputs FACT10\n";
+
+  #[test]
+  fn comptime_factorial_worked_example_prints_3628800() {
+    assert_eq!(compile_link_run(FACTORIAL_SRC), "3628800\n");
+  }
+
+  #[test]
+  fn comptime_factorial_bakes_a_literal_constant_with_no_factorial_symbol_or_call_surviving() {
+    // AC2's own white-box proof: inspect the emitted LLVM module
+    // directly, not stdout — `FACT10` stores a literal constant (`store
+    // i64 3628800`), with no `call` computing it, and no `factorial`
+    // symbol anywhere in the module at all (`comptime_only_function_
+    // names`'s own dead-code-elimination: `factorial` is never called
+    // outside this one `comptime` expression, so it's never declared).
+    let program = emerald_parser::parse(FACTORIAL_SRC).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+    let obj_path = dir.join(format!("emerald_codegen_comptime_ir_{unique}.o"));
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile to object file");
+    std::fs::remove_file(&obj_path).ok();
+    assert!(
+      ir.contains("store i64 3628800"),
+      "expected a literal `store i64 3628800`, got:\n{ir}"
+    );
+    assert!(
+      !ir.contains("@factorial"),
+      "expected no `factorial` symbol to survive in the emitted module, got:\n{ir}"
+    );
+  }
+
+  #[test]
+  fn comptime_expr_as_array_news_size_argument_produces_a_real_runtime_sized_array() {
+    // AC4: the size argument was computed at compile time, but the
+    // allocation itself still happens at runtime, unchanged — proven by
+    // filling and reading back every index up to 119 successfully.
+    let src = "comptime def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\na: Array[Int64] = Array.new(comptime factorial(5))\ni: Int64 = 0\nwhile i < 120\n  a[i] = i\n  i = i + 1\nend\nputs a[119]\n";
+    assert_eq!(compile_link_run(src), "119\n");
+  }
+
+  #[test]
+  fn comptime_step_limit_flag_fails_the_whole_compilation_not_a_hang() {
+    // AC5 (leaf-comptime-const-context-integration): a small, injected
+    // ceiling well below a real infinite loop's own iteration count —
+    // the same "injectable seam in tests, not a full million-iteration
+    // wait" style plan 48 already used for its own fingerprint-override
+    // tests.
+    let src = "comptime def spin(n: Int64) -> Int64\n  i: Int64 = 0\n  while true\n    i = i + 1\n  end\n  return i\nend\n\nX: Int64 = comptime spin(1)\nputs X\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+    let obj_path = dir.join(format!("emerald_codegen_comptime_limit_{unique}.o"));
+    let err = compile_to_object_with_comptime_step_limit(&program, &obj_path, 100)
+      .expect_err("should fail, not hang");
+    std::fs::remove_file(&obj_path).ok();
+    assert!(
+      err.contains("exceeded 100 steps"),
+      "expected the step-ceiling diagnostic, got: {err}"
+    );
+  }
+
+  #[test]
+  fn comptime_interpreter_step_ceiling_fires_after_exactly_limit_steps_not_a_hang() {
+    // AC5 (leaf-comptime-interpreter-core): the interpreter itself,
+    // exercised directly against a hand-built runaway-loop AST with an
+    // injected `limit: 100` — no compile pipeline involved at all.
+    let src = "while true\n  i: Int64 = 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let Item::Stmt(while_stmt) = &program.items[0] else {
+      panic!("expected a top-level Stmt::While");
+    };
+    let mut interp = ComptimeInterpreter::new(100);
+    let mut env = HashMap::new();
+    let comptime_fns = HashMap::new();
+    let err = interp
+      .exec_stmt(while_stmt, &mut env, &comptime_fns, "spin")
+      .expect_err("should fail, not hang");
+    assert!(
+      err.contains("exceeded 100 steps"),
+      "expected the step-ceiling diagnostic, got: {err}"
+    );
   }
 }

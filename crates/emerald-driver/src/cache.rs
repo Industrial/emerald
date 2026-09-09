@@ -250,6 +250,80 @@ impl QueryCache {
     }
     Ok(())
   }
+
+  fn comptime_value_path(&self, key: CacheKey) -> PathBuf {
+    self.root.join("comptime").join(format!("{key}.txt"))
+  }
+
+  /// Plan 61's `leaf-comptime-query-cache-integration`: mirrors `codegen_
+  /// query`'s own MISS/fallback/persist shape exactly — a MISS always
+  /// falls back to `emerald_codegen::eval_comptime_expr` verbatim, a HIT
+  /// deserializes a small persisted value file instead of re-
+  /// interpreting. `key` is the caller's own responsibility, the same
+  /// way it already is for `type_check_query`/`codegen_query` — the
+  /// real content it should be derived from is the compiler fingerprint
+  /// combined with a content hash of the `comptime`-marked function's
+  /// own source span (this crate's own established "content hash of the
+  /// bytes that produced this value" precedent). No `serde` dependency:
+  /// `ComptimeValue`'s three variants persist as one plain tagged line
+  /// (`int:<n>` / `float:<bits>` / `bool:<0|1>`) — `Float`'s own bits
+  /// round-trip via `f64::to_bits`/`from_bits` rather than a lossy
+  /// decimal `Display`/`FromStr` pair.
+  pub fn comptime_eval_query(
+    &self,
+    key: CacheKey,
+    expr: &emerald_parser::Spanned<emerald_parser::Expr>,
+    program: &Program,
+    limit: u64,
+    label: &str,
+    reporter: &dyn CacheReporter,
+  ) -> Result<emerald_codegen::ComptimeValue, String> {
+    let path = self.comptime_value_path(key);
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+      if let Some(value) = decode_comptime_value(contents.trim()) {
+        reporter.report("comptime", label, true);
+        return Ok(value);
+      }
+      // A corrupted (not just deleted) cache entry — real, disclosed
+      // fallthrough to a fresh MISS below, the same
+      // `corrupting_the_cached_object_file_forces_a_real_recompile_not_
+      // an_error` precedent `codegen_query` already establishes.
+    }
+    reporter.report("comptime", label, false);
+    let value = emerald_codegen::eval_comptime_expr(expr, program, limit)?;
+    if let Some(parent) = path.parent() {
+      std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, encode_comptime_value(&value)).ok();
+    Ok(value)
+  }
+}
+
+fn encode_comptime_value(value: &emerald_codegen::ComptimeValue) -> String {
+  match value {
+    emerald_codegen::ComptimeValue::Int(n) => format!("int:{n}"),
+    emerald_codegen::ComptimeValue::Float(f) => format!("float:{}", f.to_bits()),
+    emerald_codegen::ComptimeValue::Bool(b) => format!("bool:{}", i32::from(*b)),
+  }
+}
+
+fn decode_comptime_value(line: &str) -> Option<emerald_codegen::ComptimeValue> {
+  let (tag, rest) = line.split_once(':')?;
+  match tag {
+    "int" => rest
+      .parse::<i64>()
+      .ok()
+      .map(emerald_codegen::ComptimeValue::Int),
+    "float" => rest
+      .parse::<u64>()
+      .ok()
+      .map(|bits| emerald_codegen::ComptimeValue::Float(f64::from_bits(bits))),
+    "bool" => rest
+      .parse::<i32>()
+      .ok()
+      .map(|n| emerald_codegen::ComptimeValue::Bool(n != 0)),
+    _ => None,
+  }
 }
 
 #[cfg(test)]
@@ -523,5 +597,146 @@ mod tests {
         other => panic!("first and second run disagreed on pass/fail: {other:?}"),
       }
     }
+  }
+
+  // Plan 61's `leaf-comptime-query-cache-integration`.
+
+  const FACTORIAL_SRC: &str = "comptime def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\n";
+
+  /// Pulls the one `comptime` expression out of `FACTORIAL_SRC`'s own
+  /// top-level `FACT10` `Let` — the unwrapped inner `factorial(10)`
+  /// node, matching exactly what `build_expr`'s own `Expr::Comptime`
+  /// arm hands `ComptimeInterpreter::eval`.
+  fn factorial_comptime_expr(program: &Program) -> emerald_parser::Spanned<emerald_parser::Expr> {
+    let emerald_parser::Item::Stmt(stmt) = &program.items[1] else {
+      panic!("expected the FACT10 top-level Let");
+    };
+    let emerald_parser::Stmt::Let { value, .. } = &stmt.node else {
+      panic!("expected a Stmt::Let");
+    };
+    let emerald_parser::Expr::Comptime(inner) = &value.node else {
+      panic!("expected an Expr::Comptime value");
+    };
+    (**inner).clone()
+  }
+
+  #[test]
+  fn comptime_eval_query_two_calls_with_the_same_content_are_hit_then_miss() {
+    let root = fresh_root("comptime-hit-miss");
+    let cache = QueryCache::with_fingerprint(root, blake3::hash(b"fingerprint-comptime-a"));
+    let reporter = CountingReporter::default();
+    let program = emerald_parser::parse_named(FACTORIAL_SRC, "factorial.em").unwrap();
+    let expr = factorial_comptime_expr(&program);
+    let key = cache.key_for(raw_hash(FACTORIAL_SRC.as_bytes()));
+
+    let first = cache.comptime_eval_query(key, &expr, &program, 1_000_000, "FACT10", &reporter);
+    let second = cache.comptime_eval_query(key, &expr, &program, 1_000_000, "FACT10", &reporter);
+
+    assert_eq!(first, Ok(emerald_codegen::ComptimeValue::Int(3628800)));
+    assert_eq!(second, Ok(emerald_codegen::ComptimeValue::Int(3628800)));
+
+    let calls = reporter.calls.borrow();
+    assert_eq!(
+      calls[0],
+      ("comptime".to_string(), "FACT10".to_string(), false)
+    );
+    assert_eq!(
+      calls[1],
+      ("comptime".to_string(), "FACT10".to_string(), true)
+    );
+  }
+
+  #[test]
+  fn comptime_eval_query_editing_the_function_forces_a_miss_on_the_next_build() {
+    let root = fresh_root("comptime-edit");
+    let cache = QueryCache::with_fingerprint(root, blake3::hash(b"fingerprint-comptime-b"));
+    let reporter = CountingReporter::default();
+    let program = emerald_parser::parse_named(FACTORIAL_SRC, "factorial.em").unwrap();
+    let expr = factorial_comptime_expr(&program);
+    let key = cache.key_for(raw_hash(FACTORIAL_SRC.as_bytes()));
+    cache
+      .comptime_eval_query(key, &expr, &program, 1_000_000, "FACT10", &reporter)
+      .unwrap();
+
+    // A one-byte edit anywhere in the file changes its own content hash
+    // — this crate's own already-disclosed whole-file granularity
+    // (`changing_one_byte_of_source_changes_the_key_and_forces_miss`'s
+    // own precedent above), not a claim of finer-grained invalidation
+    // than the rest of this cache provides anywhere else.
+    let edited_src = FACTORIAL_SRC.replace("factorial(10)", "factorial(11)");
+    let edited_program = emerald_parser::parse_named(&edited_src, "factorial.em").unwrap();
+    let edited_expr = factorial_comptime_expr(&edited_program);
+    let edited_key = cache.key_for(raw_hash(edited_src.as_bytes()));
+    assert_ne!(key, edited_key, "editing the source must change the key");
+    let result = cache.comptime_eval_query(
+      edited_key,
+      &edited_expr,
+      &edited_program,
+      1_000_000,
+      "FACT10",
+      &reporter,
+    );
+    assert_eq!(result, Ok(emerald_codegen::ComptimeValue::Int(39916800)));
+
+    let calls = reporter.calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert!(!calls[0].2 && !calls[1].2, "both calls should MISS");
+  }
+
+  #[test]
+  fn comptime_eval_query_corrupting_the_cached_entry_forces_a_real_recompute_not_an_error() {
+    let root = fresh_root("comptime-corrupt");
+    let cache = QueryCache::with_fingerprint(root.clone(), blake3::hash(b"fingerprint-comptime-c"));
+    let reporter = CountingReporter::default();
+    let program = emerald_parser::parse_named(FACTORIAL_SRC, "factorial.em").unwrap();
+    let expr = factorial_comptime_expr(&program);
+    let key = cache.key_for(raw_hash(FACTORIAL_SRC.as_bytes()));
+    cache
+      .comptime_eval_query(key, &expr, &program, 1_000_000, "FACT10", &reporter)
+      .unwrap();
+
+    let cached = root.join("comptime").join(format!("{key}.txt"));
+    std::fs::write(&cached, "not a real comptime value").unwrap();
+
+    let result = cache.comptime_eval_query(key, &expr, &program, 1_000_000, "FACT10", &reporter);
+    assert_eq!(
+      result,
+      Ok(emerald_codegen::ComptimeValue::Int(3628800)),
+      "a corrupted cache entry must fall back to a real recompute, not error"
+    );
+    let calls = reporter.calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert!(!calls[0].2 && !calls[1].2, "both calls should MISS");
+  }
+
+  #[test]
+  fn comptime_eval_query_overriding_the_fingerprint_forces_a_miss() {
+    let root = fresh_root("comptime-fingerprint");
+    let cache_a =
+      QueryCache::with_fingerprint(root.clone(), blake3::hash(b"fingerprint-comptime-d1"));
+    let reporter = CountingReporter::default();
+    let program = emerald_parser::parse_named(FACTORIAL_SRC, "factorial.em").unwrap();
+    let expr = factorial_comptime_expr(&program);
+    let key_a = cache_a.key_for(raw_hash(FACTORIAL_SRC.as_bytes()));
+    cache_a
+      .comptime_eval_query(key_a, &expr, &program, 1_000_000, "FACT10", &reporter)
+      .unwrap();
+
+    let cache_b = QueryCache::with_fingerprint(root, blake3::hash(b"fingerprint-comptime-d2"));
+    let key_b = cache_b.key_for(raw_hash(FACTORIAL_SRC.as_bytes()));
+    assert_ne!(
+      key_a, key_b,
+      "a rebuilt compiler's own fingerprint must change the key"
+    );
+    cache_b
+      .comptime_eval_query(key_b, &expr, &program, 1_000_000, "FACT10", &reporter)
+      .unwrap();
+
+    let calls = reporter.calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert!(
+      !calls[0].2 && !calls[1].2,
+      "both calls should MISS — a rebuilt compiler never silently reuses a stale value"
+    );
   }
 }

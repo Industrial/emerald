@@ -54,8 +54,28 @@ fn parse_stage(source: String, name: String) -> Effect<Program, DriverError, ()>
   })
 }
 
-fn check_stage(program: Program) -> Effect<Program, DriverError, ()> {
+// Plan 61's Decision log: `expand_derives` runs here, right before
+// `emerald_sema::check_program` — the single real choke point shared by
+// every compile path this crate exposes (`compile`/`compile_program`/
+// `compile_program_with_libs`/`compile_with_comptime_step_limit`/`check`
+// all `flat_map` through this same stage), the same "between require-
+// splicing and check_program" positioning the task brief calls for.
+// `check_program(program: &Program)`'s own borrowed-reference entry
+// point (used by the LSP's live-typing diagnostics) is a real, disclosed
+// gap this doesn't cover — it can't mutate its caller's `Program` by
+// design, so a `derive Comparable` class checked only that way won't yet
+// see its synthesized `==`.
+fn check_stage(mut program: Program) -> Effect<Program, DriverError, ()> {
   Effect::new(move |_env: &mut ()| {
+    if let Err(e) = emerald_parser::expand_derives(&mut program) {
+      // `Diagnostic::new` is crate-private to `emerald-sema` — its two
+      // fields are `pub`, so a plain struct literal is the real,
+      // available construction path from here.
+      return Err(DriverError::Sema(vec![emerald_sema::Diagnostic {
+        message: e,
+        span: (0, 0),
+      }]));
+    }
     emerald_sema::check_program(&program)
       .map(|()| program)
       .map_err(DriverError::Sema)
@@ -67,20 +87,63 @@ fn check_stage(program: Program) -> Effect<Program, DriverError, ()> {
 /// program`'s already-parsed-`Program` entry point has no source text to
 /// derive DWARF line numbers from, so it passes `None` and gets the same
 /// debug-info-free object file this crate always produced.
+// Plan 61's Decision log: `comptime_step_limit` is `Some(n)` only from
+// `compile_with_comptime_step_limit` (`emerald-cli`'s own
+// `--comptime-step-limit` flag's real, end-to-end entry point) — every
+// other, pre-existing caller passes `None`, so this stage's behavior is
+// unchanged for them. Threaded into whichever codegen entry point this
+// stage would have called anyway (`compile_to_object_with_debug_info`
+// widened to accept it directly — see that function's own Decision-log
+// note — since `compile`'s own ordinary CLI path always supplies real
+// source text here).
 fn codegen_stage(
   program: Program,
   obj_path: PathBuf,
   source_info: Option<(String, String)>,
+  comptime_step_limit: Option<u64>,
 ) -> Effect<PathBuf, DriverError, ()> {
   Effect::new(move |_env: &mut ()| {
     let result = match &source_info {
-      Some((source, name)) => {
-        emerald_codegen::compile_to_object_with_debug_info(&program, &obj_path, source, name)
-      }
-      None => emerald_codegen::compile_to_object(&program, &obj_path),
+      Some((source, name)) => emerald_codegen::compile_to_object_with_debug_info(
+        &program,
+        &obj_path,
+        source,
+        name,
+        comptime_step_limit,
+      ),
+      None => match comptime_step_limit {
+        Some(limit) => {
+          emerald_codegen::compile_to_object_with_comptime_step_limit(&program, &obj_path, limit)
+        }
+        None => emerald_codegen::compile_to_object(&program, &obj_path),
+      },
     };
     result.map(|()| obj_path).map_err(DriverError::Codegen)
   })
+}
+
+/// A real, pre-existing bug this leaf's own new tests surfaced (not
+/// caused by them): every one of this crate's temp object-file names
+/// used to be keyed on `process::id()` alone — fine for a single
+/// compile, but every entry point in this file shares one OS process
+/// during `cargo test`'s own default multi-threaded run, so two tests
+/// compiling concurrently raced on the exact same path and corrupted
+/// each other's object file mid-write. Confirmed via `--test-threads=1`
+/// (deterministic pass) vs. the default parallel run (`compile_links_a_
+/// real_binary_that_runs_and_prints_42`/`compile_program_compiles_an_
+/// already_parsed_program` failing with unrelated stdout, e.g. a
+/// DIFFERENT test's own compiled binary's output). Fixed here rather
+/// than left as a "known flaky test" — unlike plan 60's own genuine
+/// actor-scheduling nondeterminism, this one is a real, fixable bug,
+/// not the compiled program's own inherent behavior. `std::thread::
+/// current().id()` disambiguates, the same fix this crate's own
+/// `emerald-codegen` test helpers already use for the identical reason.
+fn obj_file_name(prefix: &str) -> String {
+  format!(
+    "{prefix}_{}_{:?}.o",
+    process::id(),
+    std::thread::current().id()
+  )
 }
 
 /// Plan 27: the compiled runtime archive's real bytes, embedded at
@@ -200,12 +263,32 @@ pub fn check(source: &str, name: &str) -> Result<(), DriverError> {
 /// The full pipeline: parse, check, codegen, link — writes a real
 /// executable to `output_path`.
 pub fn compile(source: &str, name: &str, output_path: &Path) -> Result<(), DriverError> {
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
   let output_path = output_path.to_path_buf();
   let source_info = Some((source.to_string(), name.to_string()));
   let pipeline = parse_stage(source.to_string(), name.to_string())
     .flat_map(check_stage)
-    .flat_map(move |program| codegen_stage(program, obj_path, source_info))
+    .flat_map(move |program| codegen_stage(program, obj_path, source_info, None))
+    .flat_map(move |obj_path| link_stage(obj_path, output_path));
+  run_blocking(pipeline, ())
+}
+
+/// Plan 61's Decision log: identical to `compile`, except `limit`
+/// overrides `ComptimeInterpreter`'s default `1_000_000`-step ceiling —
+/// `emerald-cli`'s own `--comptime-step-limit` flag's real, end-to-end
+/// entry point.
+pub fn compile_with_comptime_step_limit(
+  source: &str,
+  name: &str,
+  output_path: &Path,
+  limit: u64,
+) -> Result<(), DriverError> {
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
+  let output_path = output_path.to_path_buf();
+  let source_info = Some((source.to_string(), name.to_string()));
+  let pipeline = parse_stage(source.to_string(), name.to_string())
+    .flat_map(check_stage)
+    .flat_map(move |program| codegen_stage(program, obj_path, source_info, Some(limit)))
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
   run_blocking(pipeline, ())
 }
@@ -217,7 +300,7 @@ pub fn compile(source: &str, name: &str, output_path: &Path) -> Result<(), Drive
 /// itself already wraps `compile_to_object`. Returns the number of
 /// `test` blocks found.
 pub fn compile_test(source: &str, name: &str, output_path: &Path) -> Result<usize, DriverError> {
-  let obj_path = std::env::temp_dir().join(format!("emerald_test_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald_test"));
   let output_path = output_path.to_path_buf();
   let pipeline = parse_stage(source.to_string(), name.to_string())
     .flat_map(check_stage)
@@ -260,10 +343,10 @@ pub fn check_program(program: &Program) -> Result<(), DriverError> {
 
 /// Compiles and links an already-parsed `Program` directly.
 pub fn compile_program(program: Program, output_path: &Path) -> Result<(), DriverError> {
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
   let output_path = output_path.to_path_buf();
   let pipeline = check_stage(program)
-    .flat_map(move |program| codegen_stage(program, obj_path, None))
+    .flat_map(move |program| codegen_stage(program, obj_path, None, None))
     .flat_map(move |obj_path| link_stage(obj_path, output_path));
   run_blocking(pipeline, ())
 }
@@ -277,11 +360,11 @@ pub fn compile_program_with_libs(
   output_path: &Path,
   extra_libs: &[String],
 ) -> Result<(), DriverError> {
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
   let output_path = output_path.to_path_buf();
   let extra_libs = extra_libs.to_vec();
   let pipeline = check_stage(program)
-    .flat_map(move |program| codegen_stage(program, obj_path, None))
+    .flat_map(move |program| codegen_stage(program, obj_path, None, None))
     .flat_map(move |obj_path| link_stage_with_libs(obj_path, output_path, extra_libs));
   run_blocking(pipeline, ())
 }
@@ -330,7 +413,7 @@ pub fn compile_cached(
   cache
     .type_check_query(key, &program, name, reporter)
     .map_err(DriverError::Sema)?;
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
   cache
     .codegen_query(key, &program, &obj_path, name, reporter)
     .map_err(DriverError::Codegen)?;
@@ -354,7 +437,7 @@ pub fn compile_program_cached(
   cache
     .type_check_query(key, &program, label, reporter)
     .map_err(DriverError::Sema)?;
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
   cache
     .codegen_query(key, &program, &obj_path, label, reporter)
     .map_err(DriverError::Codegen)?;
@@ -378,7 +461,7 @@ pub fn compile_program_cached_with_libs(
   cache
     .type_check_query(key, &program, label, reporter)
     .map_err(DriverError::Sema)?;
-  let obj_path = std::env::temp_dir().join(format!("emerald_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald"));
   cache
     .codegen_query(key, &program, &obj_path, label, reporter)
     .map_err(DriverError::Codegen)?;
@@ -400,7 +483,7 @@ pub fn compile_with_escape_report(
 ) -> Result<emerald_codegen::EscapeStats, DriverError> {
   let program = emerald_parser::parse_named(source, name).map_err(DriverError::Parse)?;
   emerald_sema::check_program(&program).map_err(DriverError::Sema)?;
-  let obj_path = std::env::temp_dir().join(format!("emerald_escape_{}.o", process::id()));
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald_escape"));
   let stats = emerald_codegen::compile_to_object_with_stats(&program, &obj_path)
     .map_err(DriverError::Codegen)?;
   link(obj_path, output_path.to_path_buf())?;
@@ -442,6 +525,27 @@ mod tests {
     compile(HELLO_SRC, "hello.em", &output).unwrap();
     let run = Command::new(&output).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // Plan 61 (comptime execution) — `leaf-derive-comparable`'s own
+  // worked proof: `p1 == p2` (equal instances) prints `true`; `p3 == p4`
+  // (unequal instances) prints `false`. Real, executed proof the
+  // generated `==` method is correct, not just present — and the
+  // pipeline placement proof that `check_stage`'s own `expand_derives`
+  // call actually reaches every real compile path.
+  #[test]
+  fn derive_comparable_worked_example_prints_true_then_false() {
+    let src = "class Point derive Comparable\n  x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np1: Point = Point.new(1, 2)\np2: Point = Point.new(1, 2)\np3: Point = Point.new(1, 2)\np4: Point = Point.new(3, 4)\nif p1 == p2\n  puts \"true\"\nelse\n  puts \"false\"\nend\nif p3 == p4\n  puts \"true\"\nelse\n  puts \"false\"\nend\n";
+    let dir = std::env::temp_dir().join(format!(
+      "emerald-driver-derive-comparable-test-{}",
+      process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = dir.join("derive_out");
+    compile(src, "derive.em", &output).unwrap();
+    let run = Command::new(&output).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "true\nfalse\n");
     std::fs::remove_dir_all(&dir).ok();
   }
 

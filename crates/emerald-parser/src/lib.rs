@@ -21,7 +21,7 @@ mod interpolate;
 pub use ast::{
   ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, EnumDef, EnumVariant, Expr, ExternBlock,
   ExternFn, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
-  StringPart, TypeParam,
+  StringPart, TypeParam, expand_derives,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -270,7 +270,7 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
       rewrite_expr(a, name, source);
       rewrite_expr(b, name, source);
     }
-    Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) | Expr::ArrayNew(a) => {
+    Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) | Expr::ArrayNew(a) | Expr::Comptime(a) => {
       rewrite_expr(a, name, source)
     }
     Expr::Compare(a, _, b) => {
@@ -1102,6 +1102,7 @@ mod tests {
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
+        is_comptime: false,
       }
     );
   }
@@ -3210,5 +3211,238 @@ mod tests {
         ..
       }) if method == "register"
     ));
+  }
+
+  #[test]
+  fn comptime_prefixed_def_parses_with_is_comptime_true() {
+    let src = "comptime def fact(n: Int64) -> Int64\n  n\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function, got {:?}", program.items[0]);
+    };
+    assert!(f.is_comptime);
+  }
+
+  #[test]
+  fn an_ordinary_def_has_is_comptime_false() {
+    let src = "def fact(n: Int64) -> Int64\n  n\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a function, got {:?}", program.items[0]);
+    };
+    assert!(!f.is_comptime);
+  }
+
+  #[test]
+  fn comptime_expr_parses_as_a_top_level_lets_value() {
+    let src = "FACT10: Int64 = comptime fact(10)\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a top-level Let, got {:?}", program.items[0]);
+    };
+    assert!(matches!(value.node, Expr::Comptime(_)));
+  }
+
+  #[test]
+  fn comptime_expr_parses_as_array_news_size_argument() {
+    let src = "a: Array[Int64] = Array.new(comptime fact(5))\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a top-level Let, got {:?}", program.items[0]);
+    };
+    let Expr::ArrayNew(size) = &value.node else {
+      panic!("expected Expr::ArrayNew, got {:?}", value.node);
+    };
+    assert!(matches!(size.node, Expr::Comptime(_)));
+  }
+
+  #[test]
+  fn comptime_expr_parses_as_a_bare_top_level_statement() {
+    let src = "comptime fact(5)\n";
+    let program = parse(src).expect("should parse");
+    assert!(matches!(
+      &program.items[0],
+      Item::Stmt(Spanned {
+        node: Stmt::Expr(Spanned {
+          node: Expr::Comptime(_),
+          ..
+        }),
+        ..
+      })
+    ));
+  }
+
+  #[test]
+  fn comptime_binds_tighter_than_add_the_same_tier_as_unary_minus() {
+    // `comptime` binds at `UnaryExpr`'s tight tier (see this plan's
+    // Decision log for why any looser tier is genuinely ambiguous), so
+    // `comptime a + b` parses as `Add(Comptime(a), b)`, not
+    // `Comptime(Add(a, b))` — the same precedence `-a + b` already has.
+    let src = "x: Int64 = comptime a + b\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a top-level Let, got {:?}", program.items[0]);
+    };
+    let Expr::Add(lhs, _rhs) = &value.node else {
+      panic!("expected Expr::Add at the top, got {:?}", value.node);
+    };
+    assert!(matches!(lhs.node, Expr::Comptime(_)));
+  }
+
+  #[test]
+  fn derive_comparable_clause_parses_into_class_def_derive() {
+    let src = "class Point derive Comparable\n  x: Int64\n  y: Int64\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class, got {:?}", program.items[0]);
+    };
+    assert_eq!(c.derive, Some("Comparable".to_string()));
+  }
+
+  #[test]
+  fn a_class_with_no_derive_clause_parses_with_none() {
+    let src = "class Point\n  x: Int64\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class, got {:?}", program.items[0]);
+    };
+    assert_eq!(c.derive, None);
+  }
+
+  #[test]
+  fn expand_derives_synthesizes_read_accessors_and_an_alphabetically_ordered_eq() {
+    let src = "class Point derive Comparable\n  x: Int64\n  y: Int64\nend\n";
+    let mut program = parse(src).expect("should parse");
+    crate::expand_derives(&mut program).expect("should expand");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    assert!(
+      c.methods
+        .iter()
+        .any(|m| m.name == "x" && m.params.is_empty())
+    );
+    assert!(
+      c.methods
+        .iter()
+        .any(|m| m.name == "y" && m.params.is_empty())
+    );
+    let eq = c
+      .methods
+      .iter()
+      .find(|m| m.name == "==")
+      .expect("expected a synthesized ==");
+    assert_eq!(
+      eq.params,
+      vec![Param {
+        name: "other".to_string(),
+        ty: "Point".to_string(),
+        default: None
+      }]
+    );
+    assert_eq!(eq.return_type, "Boolean");
+    let expected_body = vec![s(Stmt::Return(Some(s(Expr::And(
+      Box::new(s(Expr::Compare(
+        Box::new(s(Expr::InstanceVar("x".to_string()))),
+        CompareOp::Eq,
+        Box::new(s(Expr::MethodCall(
+          Box::new(s(Expr::Ident("other".to_string()))),
+          "x".to_string(),
+          vec![],
+        ))),
+      ))),
+      Box::new(s(Expr::Compare(
+        Box::new(s(Expr::InstanceVar("y".to_string()))),
+        CompareOp::Eq,
+        Box::new(s(Expr::MethodCall(
+          Box::new(s(Expr::Ident("other".to_string()))),
+          "y".to_string(),
+          vec![],
+        ))),
+      ))),
+    )))))];
+    assert_eq!(eq.body, expected_body);
+  }
+
+  #[test]
+  fn expand_derives_rejects_an_unknown_derive_target() {
+    let src = "class Point derive Serializable\n  x: Int64\nend\n";
+    let mut program = parse(src).expect("should parse");
+    let err = crate::expand_derives(&mut program).expect_err("should reject");
+    assert!(err.contains("Serializable"));
+  }
+
+  #[test]
+  fn expand_derives_rejects_a_class_that_already_hand_writes_eq() {
+    let src = "class Point derive Comparable\n  x: Int64\n  def ==(other: Point) -> Boolean\n    true\n  end\nend\n";
+    let mut program = parse(src).expect("should parse");
+    let err = crate::expand_derives(&mut program).expect_err("should reject");
+    assert!(err.contains("Point"));
+    assert!(err.contains("=="));
+  }
+
+  #[test]
+  fn expand_derives_on_a_subclass_covers_inherited_fields_too() {
+    let src = "class Point derive Comparable\n  x: Int64\n  y: Int64\nend\n\nclass Point3D < Point derive Comparable\n  z: Int64\nend\n";
+    let mut program = parse(src).expect("should parse");
+    crate::expand_derives(&mut program).expect("should expand");
+    let Item::Class(c) = &program.items[1] else {
+      panic!("expected the subclass");
+    };
+    let eq = c
+      .methods
+      .iter()
+      .find(|m| m.name == "==")
+      .expect("expected a synthesized ==");
+    let Stmt::Return(Some(body)) = &eq.body[0].node else {
+      panic!("expected a Return");
+    };
+    let mut fields_compared = Vec::new();
+    let mut cur = body;
+    loop {
+      match &cur.node {
+        Expr::And(l, r) => {
+          if let Expr::Compare(lhs, _, _) = &r.node {
+            if let Expr::InstanceVar(n) = &lhs.node {
+              fields_compared.push(n.clone());
+            }
+          }
+          cur = l;
+        }
+        Expr::Compare(lhs, _, _) => {
+          if let Expr::InstanceVar(n) = &lhs.node {
+            fields_compared.push(n.clone());
+          }
+          break;
+        }
+        _ => break,
+      }
+    }
+    fields_compared.sort();
+    assert_eq!(
+      fields_compared,
+      vec!["x".to_string(), "y".to_string(), "z".to_string()]
+    );
+  }
+
+  #[test]
+  fn expand_derives_is_a_strict_no_op_for_a_class_with_no_derive_clause() {
+    let src = "class Point\n  x: Int64\nend\n";
+    let mut program = parse(src).expect("should parse");
+    let before = program.clone();
+    crate::expand_derives(&mut program).expect("should be a no-op");
+    assert_eq!(program, before);
   }
 }
