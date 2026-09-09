@@ -155,6 +155,14 @@ fn verbose_cache_requested(args: &[String]) -> bool {
   args.iter().any(|a| a == "--verbose-cache")
 }
 
+/// Plan 50's `leaf-escape-instrumentation-and-report`: a strictly
+/// additive/opt-in flag exactly like `--verbose-cache` above — with no
+/// such flag, `run_legacy`'s existing branches are completely
+/// unchanged.
+fn escape_report_requested(args: &[String]) -> bool {
+  args.iter().any(|a| a == "--emit=escape-report")
+}
+
 /// Plan 49's `leaf-parallel-codegen-and-jobs-flag`: `--jobs N` — a new,
 /// strictly additive/opt-in flag exactly like `--verbose-cache` above.
 /// `None` (no flag) means every pre-plan-49 code path here is
@@ -180,7 +188,7 @@ fn find_source_path(args: &[String]) -> Option<&String> {
   while i < args.len() {
     match args[i].as_str() {
       "-o" | "--jobs" => i += 2,
-      "--verbose-cache" => i += 1,
+      "--verbose-cache" | "--emit=escape-report" => i += 1,
       _ => return Some(&args[i]),
     }
   }
@@ -201,6 +209,31 @@ fn run_legacy(args: &[String]) {
     .and_then(|i| args.get(i + 1))
     .map(PathBuf::from)
     .unwrap_or_else(|| PathBuf::from("a.out"));
+
+  // Plan 50: `--emit=escape-report` — strictly additive/opt-in,
+  // checked ahead of `--jobs`/`--verbose-cache` and handled as its own
+  // complete compile+report+exit cycle (not composed with either —
+  // real, disclosed scope narrowing; neither plan 48 nor plan 49
+  // anticipated this flag).
+  if escape_report_requested(args) {
+    let source = std::fs::read_to_string(source_path).unwrap_or_else(|e| {
+      eprintln!("error: cannot read `{source_path}`: {e}");
+      process::exit(1);
+    });
+    match emerald_driver::compile_with_escape_report(&source, source_path, &output_path) {
+      Ok(stats) => {
+        eprintln!(
+          "{} instances stack-allocated, {} heap-allocated",
+          stats.stack_allocated, stats.heap_allocated
+        );
+      }
+      Err(e) => {
+        report_driver_error(e, Some((source_path, &source)));
+        process::exit(1);
+      }
+    }
+    return;
+  }
 
   // Plan 49: `--jobs N` builds and levels `source_path`'s own require
   // graph directly (never `require::resolve_program`'s single-flattened

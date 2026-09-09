@@ -43,6 +43,7 @@ use inkwell::values::{
   BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue, ValueKind,
 };
 use inkwell::{IntPredicate, OptimizationLevel};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -230,6 +231,18 @@ struct FieldInfo {
 struct ClassLayout {
   fields: HashMap<String, FieldInfo>,
   size: u64,
+}
+
+/// Plan 50's `leaf-escape-instrumentation-and-report`: how many
+/// `ClassName.new(...)` sites a compile actually stack- vs. heap-
+/// allocated — the only proof surface for the escape-analysis
+/// optimization, since a stack- and a heap-allocated instance are
+/// behaviorally indistinguishable from a compiled program's own
+/// stdout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EscapeStats {
+  pub stack_allocated: u64,
+  pub heap_allocated: u64,
 }
 
 /// Codegen independently re-derives the class hierarchy from the raw
@@ -1393,6 +1406,313 @@ fn prealloc_lets<'ctx>(
   Ok(())
 }
 
+/// Plan 50's `leaf-escape-detection`: every `Stmt::Let{ name, value:
+/// Expr::New(class_name, ..), .. }` site reachable from `stmts`, at any
+/// nesting depth — mirrors `collect_lets`'s own traversal shape.
+/// Candidates only; `find_non_escaping_news` is what actually filters
+/// this down to the provably-non-escaping subset.
+fn collect_new_let_classes(stmts: &[Spanned<Stmt>], out: &mut HashMap<String, String>) {
+  for stmt in stmts {
+    match &stmt.node {
+      Stmt::Let {
+        name,
+        value: Spanned {
+          node: Expr::New(class_name, _),
+          ..
+        },
+        ..
+      } => {
+        out.insert(name.clone(), class_name.clone());
+      }
+      Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ForRange { body, .. } => {
+        collect_new_let_classes(body, out);
+      }
+      Stmt::If {
+        then_branch,
+        else_branch,
+        ..
+      } => {
+        collect_new_let_classes(then_branch, out);
+        if let Some(else_b) = else_branch {
+          collect_new_let_classes(else_b, out);
+        }
+      }
+      Stmt::Begin {
+        body,
+        rescues,
+        ensure,
+      } => {
+        collect_new_let_classes(body, out);
+        for rescue in rescues {
+          collect_new_let_classes(&rescue.body, out);
+        }
+        if let Some(ensure_body) = ensure {
+          collect_new_let_classes(ensure_body, out);
+        }
+      }
+      Stmt::Case {
+        arms, else_body, ..
+      } => {
+        for (_, body) in arms {
+          collect_new_let_classes(body, out);
+        }
+        if let Some(else_b) = else_body {
+          collect_new_let_classes(else_b, out);
+        }
+      }
+      _ => {}
+    }
+  }
+}
+
+/// Plan 50's `leaf-escape-detection`: every name referenced anywhere in
+/// `stmts` (at any nesting depth, including inside a nested `Expr::
+/// Lambda`'s own body) via a plain `Expr::Ident` use. This is a
+/// deliberately broader check than the plan's own three literally-
+/// enumerated escape rules (return position, `SetField`/`SetIndex`
+/// value position, call/`New`/`MethodCall` argument-including-receiver
+/// position) — it is their exact union, since every one of those
+/// positions is itself an expression this function already walks, and
+/// closes one real soundness gap the three rules don't individually
+/// name: a reference from inside a nested lambda literal. Plan 10's
+/// Decision log establishes by-value capture — a lambda body
+/// referencing a candidate name copies that name's *pointer value*
+/// into the lambda's own heap-allocated capture environment at lambda-
+/// creation time, which can genuinely outlive the enclosing function
+/// (the lambda itself can be returned, stored, or called later) — not
+/// treating that as an escape would be unsound.
+fn collect_referenced_idents(stmts: &[Spanned<Stmt>], out: &mut HashSet<String>) {
+  for stmt in stmts {
+    match &stmt.node {
+      Stmt::Let { value, .. } => mark_expr(&value.node, out),
+      Stmt::SetField { value, .. } => mark_expr(&value.node, out),
+      Stmt::SetIndex {
+        array,
+        index,
+        value,
+      } => {
+        mark_expr(&array.node, out);
+        mark_expr(&index.node, out);
+        mark_expr(&value.node, out);
+      }
+      Stmt::Assign { value, .. } => mark_expr(&value.node, out),
+      Stmt::MultiAssign { values, .. } => {
+        for v in values {
+          mark_expr(&v.node, out);
+        }
+      }
+      Stmt::If {
+        cond,
+        then_branch,
+        else_branch,
+      } => {
+        mark_expr(&cond.node, out);
+        collect_referenced_idents(then_branch, out);
+        if let Some(else_b) = else_branch {
+          collect_referenced_idents(else_b, out);
+        }
+      }
+      Stmt::While { cond, body } => {
+        mark_expr(&cond.node, out);
+        collect_referenced_idents(body, out);
+      }
+      Stmt::Return(Some(e)) => mark_expr(&e.node, out),
+      Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => {}
+      Stmt::Expr(e) => mark_expr(&e.node, out),
+      Stmt::Raise(e) => mark_expr(&e.node, out),
+      Stmt::Begin {
+        body,
+        rescues,
+        ensure,
+      } => {
+        collect_referenced_idents(body, out);
+        for rescue in rescues {
+          collect_referenced_idents(&rescue.body, out);
+        }
+        if let Some(ensure_body) = ensure {
+          collect_referenced_idents(ensure_body, out);
+        }
+      }
+      Stmt::Case {
+        scrutinee,
+        arms,
+        else_body,
+      } => {
+        mark_expr(&scrutinee.node, out);
+        for (values, body) in arms {
+          for v in values {
+            mark_expr(&v.node, out);
+          }
+          collect_referenced_idents(body, out);
+        }
+        if let Some(else_b) = else_body {
+          collect_referenced_idents(else_b, out);
+        }
+      }
+      Stmt::For { elements, body, .. } => {
+        for e in elements {
+          mark_expr(&e.node, out);
+        }
+        collect_referenced_idents(body, out);
+      }
+      Stmt::Yield(args) => {
+        for a in args {
+          mark_expr(&a.node, out);
+        }
+      }
+      Stmt::ForRange {
+        start, end, body, ..
+      } => {
+        mark_expr(&start.node, out);
+        mark_expr(&end.node, out);
+        collect_referenced_idents(body, out);
+      }
+      Stmt::OrAssign { default, .. } => mark_expr(&default.node, out),
+      Stmt::AndAssign { value, .. } => mark_expr(&value.node, out),
+    }
+  }
+}
+
+/// One `Expr` tree's worth of `mark_expr` — every variant that can
+/// contain a nested `Expr` is walked; `Expr::Lambda`'s `body` recurses
+/// back into `collect_referenced_idents` (see that function's own doc
+/// comment for why this matters).
+fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
+  match e {
+    Expr::Ident(n) => {
+      out.insert(n.clone());
+    }
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b) => {
+      mark_expr(&a.node, out);
+      mark_expr(&b.node, out);
+    }
+    Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => mark_expr(&a.node, out),
+    Expr::Compare(a, _, b) => {
+      mark_expr(&a.node, out);
+      mark_expr(&b.node, out);
+    }
+    Expr::Call(_, args) => {
+      for a in args {
+        mark_expr(&a.node, out);
+      }
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        mark_expr(&v.node, out);
+      }
+    }
+    Expr::New(_, args) => {
+      for a in args {
+        mark_expr(&a.node, out);
+      }
+    }
+    Expr::MethodCall(recv, _, args) | Expr::SafeCall(recv, _, args) => {
+      mark_expr(&recv.node, out);
+      for a in args {
+        mark_expr(&a.node, out);
+      }
+    }
+    Expr::InstanceVar(_) => {}
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for e in elems {
+        mark_expr(&e.node, out);
+      }
+    }
+    Expr::Index(base, idx) => {
+      mark_expr(&base.node, out);
+      mark_expr(&idx.node, out);
+    }
+    Expr::Lambda { body, .. } => collect_referenced_idents(body, out),
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        mark_expr(&k.node, out);
+        mark_expr(&v.node, out);
+      }
+    }
+    Expr::ArrayNew(size) => mark_expr(&size.node, out),
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          mark_expr(&e.node, out);
+        }
+      }
+    }
+    Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::Bool(_)
+    | Expr::Nil => {}
+  }
+}
+
+/// Plan 50's `leaf-escape-detection`: a `Stmt::Let`-bound `ClassName.
+/// new(...)` instance named `n` is non-escaping iff `n` is never
+/// referenced again anywhere in `body` after its own binding — see
+/// `collect_referenced_idents`'s doc comment for why "never referenced
+/// again" is exactly the union of the plan's own three enumerated
+/// escape rules (return, `SetField`/`SetIndex` value, call/`New`/
+/// `MethodCall` argument-including-receiver), plus the nested-lambda
+/// soundness fix. The compiler-generated `initialize` call `Expr::New`
+/// itself triggers is synthesized later, in codegen — it is not part
+/// of the source AST this walks, so no special-casing is needed here
+/// to exclude it.
+fn find_non_escaping_news(body: &[Spanned<Stmt>]) -> HashSet<String> {
+  let mut candidates = HashMap::new();
+  collect_new_let_classes(body, &mut candidates);
+  let mut referenced = HashSet::new();
+  collect_referenced_idents(body, &mut referenced);
+  candidates
+    .into_keys()
+    .filter(|name| !referenced.contains(name))
+    .collect()
+}
+
+/// Plan 50's `leaf-stack-allocation-codegen`: one raw byte-array
+/// `alloca` per non-escaping `Let`-bound `New`, sized to the class's
+/// own `ClassLayout.size` (the exact same size the heap path
+/// allocates via `ctx.alloc`) — built once, in the function's current
+/// (entry) block, before `build_function_body` walks the body. Placing
+/// it here rather than at the `Let` statement's own program point is
+/// what keeps a non-escaping `New` written inside a loop body from
+/// growing the stack frame's live-alloca count on every iteration
+/// (`alloca` is not popped until the function returns) — the identical
+/// discipline `prealloc_lets` already applies to ordinary named
+/// locals.
+fn prealloc_stack_objects<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  non_escaping: &HashSet<String>,
+  new_let_classes: &HashMap<String, String>,
+  classes: &HashMap<String, ClassLayout>,
+) -> Result<HashMap<String, PointerValue<'ctx>>, String> {
+  let mut object_allocas = HashMap::new();
+  for name in non_escaping {
+    let class_name = new_let_classes
+      .get(name)
+      .expect("every non-escaping name came from collect_new_let_classes");
+    let layout = classes
+      .get(class_name)
+      .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
+    let alloca = builder
+      .build_alloca(context.i8_type().array_type(layout.size as u32), name)
+      .map_err(|e| e.to_string())?;
+    object_allocas.insert(name.clone(), alloca);
+  }
+  Ok(object_allocas)
+}
+
 /// The `setjmp`/longjmp-based exception runtime's imported functions
 /// (NOT true native unwinding — see `runtime/emerald_runtime.c`'s own
 /// comment for the full rationale). `setjmp` is called *directly* by
@@ -1679,6 +1999,31 @@ struct Ctx<'a, 'ctx> {
   /// `define_lambda`/`define_main` call — `build_stmt` reads this to
   /// build each statement's debug location.
   current_di_scope: Option<DIScope<'ctx>>,
+  /// Plan 50's `leaf-stack-allocation-codegen`: `Some(&table)` only
+  /// while compiling one function/method/lambda/`main` body — the
+  /// stack `PointerValue` for every `Let`-bound `New` this function's
+  /// own `find_non_escaping_news` proved non-escaping, built once in
+  /// the entry block by `prealloc_stack_objects`. Set fresh per
+  /// `define_user_function`/`define_method`/`define_lambda`/
+  /// `define_main` call, unlike every other field here — each
+  /// function's own non-escaping set is unrelated to any other's.
+  /// `build_stmt`'s `Stmt::Let` arm consults this to skip `ctx.alloc`
+  /// entirely for a matching name.
+  object_allocas: Option<&'a HashMap<String, PointerValue<'ctx>>>,
+  /// Plan 50's `leaf-escape-instrumentation-and-report`: `Some(&counter)`
+  /// only from `compile_to_object_with_stats`'s own entry point —
+  /// accumulates one count per `Expr::New` site actually compiled,
+  /// program-wide (set once in `compile_to_object_impl`, never
+  /// overridden per-function, unlike `object_allocas` above). A
+  /// `RefCell`, not a loose `&mut EscapeStats` parameter threaded
+  /// through the whole `build_stmt`/`build_block`/`build_for`/... call
+  /// graph — sound because one `Ctx` (and the `RefCell` it points at)
+  /// is never shared across threads: plan 49's own per-thread
+  /// `Context` rule already guarantees each worker builds its own,
+  /// entirely separate `gen_ctx` for its own file, so this adds no
+  /// cross-thread/cross-process race despite plan 49's parallel
+  /// codegen already existing in this same crate.
+  escape_stats: Option<&'a RefCell<EscapeStats>>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -2025,6 +2370,56 @@ fn build_interpolate<'ctx>(
   }
   let result = acc.ok_or("codegen: internal error — empty string interpolation")?;
   Ok((result.into(), ValKind::Str))
+}
+
+/// Plan 50: dispatches `ClassName.new(args)`'s compiler-generated
+/// `initialize` call against an already-obtained instance pointer
+/// `ptr` — factored out so `Expr::New`'s heap-allocating arm below and
+/// `build_stmt`'s stack-allocating `Stmt::Let` arm can share it,
+/// dispatching construction identically regardless of which allocation
+/// strategy produced `ptr`. Not a source-level use of any name `args`
+/// might reference — this call is intrinsic to construction, not part
+/// of the AST `find_non_escaping_news` walks, so it needs no
+/// escape-analysis special-casing.
+#[allow(clippy::too_many_arguments)]
+fn build_initialize_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  class_name: &str,
+  args: &[Spanned<Expr>],
+  ptr: PointerValue<'ctx>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  // Plan 32: `initialize` resolves through `method_owners` too — a
+  // subclass that doesn't declare its own `initialize` inherits the
+  // nearest ancestor's, same as any other method.
+  let init_key = ctx
+    .method_owners
+    .get(class_name)
+    .and_then(|owners| owners.get("initialize"))
+    .map(|owner| format!("{owner}_initialize"));
+  if let Some(&(init_fv, _)) = init_key.as_deref().and_then(|k| ctx.user_func_ids.get(k)) {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![ptr.into()];
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    builder
+      .build_call(init_fv, &call_args, "inittmp")
+      .map_err(|e| e.to_string())?;
+  }
+  Ok(())
 }
 
 fn build_expr<'ctx>(
@@ -2621,32 +3016,23 @@ fn build_expr<'ctx>(
         .build_call(ctx.alloc, &[size_val.into()], "newtmp")
         .map_err(|e| e.to_string())?;
       let ptr = call_result(alloc_call)?.into_pointer_value();
-
-      // Plan 32: `initialize` resolves through `method_owners` too — a
-      // subclass that doesn't declare its own `initialize` inherits the
-      // nearest ancestor's, same as any other method.
-      let init_key = ctx
-        .method_owners
-        .get(class_name.as_str())
-        .and_then(|owners| owners.get("initialize"))
-        .map(|owner| format!("{owner}_initialize"));
-      if let Some(&(init_fv, _)) = init_key.as_deref().and_then(|k| ctx.user_func_ids.get(k)) {
-        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![ptr.into()];
-        for a in args {
-          let (v, _) = build_expr(
-            context,
-            builder,
-            a,
-            vars,
-            local_classes,
-            local_array_elem_types,
-            ctx,
-          )?;
-          call_args.push(v.into());
-        }
-        builder
-          .build_call(init_fv, &call_args, "inittmp")
-          .map_err(|e| e.to_string())?;
+      build_initialize_call(
+        context,
+        builder,
+        class_name,
+        args,
+        ptr,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      // Plan 50's `leaf-escape-instrumentation-and-report`: this arm is
+      // reached for every heap-allocating `New` — a non-escaping `Let`-
+      // bound `New` never reaches `build_expr` at all (`build_stmt`'s
+      // own stack-allocating special case handles it first).
+      if let Some(stats) = ctx.escape_stats {
+        stats.borrow_mut().heap_allocated += 1;
       }
       Ok((ptr.into(), ValKind::Ptr))
     }
@@ -4492,6 +4878,54 @@ fn build_stmt<'a, 'ctx>(
       builder.build_store(dst, ptr).map_err(|e| e.to_string())?;
       Ok(false)
     }
+    // Plan 50's `leaf-stack-allocation-codegen`: a `Let`-bound `New`
+    // this function's own `find_non_escaping_news` proved never leaves
+    // the function — `prealloc_stack_objects` already built its stack
+    // `PointerValue` in the entry block; this arm skips `ctx.alloc`
+    // entirely and dispatches `initialize` against that pre-built
+    // pointer instead. Ordered before the generic `Stmt::Let` arm
+    // below, alongside its `Expr::Lambda`/`Expr::ArrayNew` special
+    // cases.
+    Stmt::Let {
+      name,
+      ty,
+      value: Spanned {
+        node: Expr::New(class_name, args),
+        ..
+      },
+    } if ctx
+      .object_allocas
+      .is_some_and(|allocas| allocas.contains_key(name)) =>
+    {
+      let ptr = *ctx.object_allocas.unwrap().get(name).unwrap();
+      build_initialize_call(
+        context,
+        builder,
+        class_name,
+        args,
+        ptr,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      // Same `local_classes` bookkeeping the generic `Stmt::Let` arm
+      // below performs — a later method call on `name` still needs to
+      // resolve its class via this side table regardless of which
+      // allocation strategy backs it.
+      let bare_ty = ty.strip_suffix('?').unwrap_or(ty.as_str());
+      if ctx.classes.contains_key(bare_ty) {
+        local_classes.insert(name.clone(), bare_ty.to_string());
+      }
+      let (dst, _) = *vars
+        .get(name)
+        .expect("pre-allocated by prealloc_lets for every reachable Let");
+      builder.build_store(dst, ptr).map_err(|e| e.to_string())?;
+      if let Some(stats) = ctx.escape_stats {
+        stats.borrow_mut().stack_allocated += 1;
+      }
+      Ok(false)
+    }
     Stmt::Let { name, ty, value } => {
       // Plan 43's Decision log: a `Greeter?`-typed local's storage is a
       // `ptr` slot (`value_kind_for_type` falls through any non-
@@ -6131,8 +6565,26 @@ fn define_user_function<'ctx>(
     &f.name,
     f.body.first().map(|s| s.span),
   );
+
+  // Plan 50's `leaf-stack-allocation-codegen`: computed before `fn_ctx`
+  // so its own `object_allocas` field can borrow this function's table
+  // for the rest of the call — `object_allocas` is unrelated to any
+  // other function's own non-escaping set, unlike every other `Ctx`
+  // field here.
+  let mut new_let_classes = HashMap::new();
+  collect_new_let_classes(&f.body, &mut new_let_classes);
+  let non_escaping = find_non_escaping_news(&f.body);
+  let object_allocas = prealloc_stack_objects(
+    context,
+    builder,
+    &non_escaping,
+    &new_let_classes,
+    gen_ctx.classes,
+  )?;
+
   let fn_ctx = Ctx {
     current_di_scope: di_scope,
+    object_allocas: Some(&object_allocas),
     ..*gen_ctx
   };
 
@@ -6198,9 +6650,24 @@ fn define_method<'ctx>(
     &m.name,
     m.body.first().map(|s| s.span),
   );
+
+  // Plan 50's `leaf-stack-allocation-codegen` — see `define_user_
+  // function`'s identical comment.
+  let mut new_let_classes = HashMap::new();
+  collect_new_let_classes(&m.body, &mut new_let_classes);
+  let non_escaping = find_non_escaping_news(&m.body);
+  let object_allocas = prealloc_stack_objects(
+    context,
+    builder,
+    &non_escaping,
+    &new_let_classes,
+    gen_ctx.classes,
+  )?;
+
   let method_ctx = Ctx {
     self_ctx: Some((self_ptr, self_fields)),
     current_di_scope: di_scope,
+    object_allocas: Some(&object_allocas),
     ..*gen_ctx
   };
 
@@ -6271,8 +6738,23 @@ fn define_lambda<'ctx>(
     name,
     body.first().map(|s| s.span),
   );
+
+  // Plan 50's `leaf-stack-allocation-codegen` — see `define_user_
+  // function`'s identical comment.
+  let mut new_let_classes = HashMap::new();
+  collect_new_let_classes(body, &mut new_let_classes);
+  let non_escaping = find_non_escaping_news(body);
+  let object_allocas = prealloc_stack_objects(
+    context,
+    builder,
+    &non_escaping,
+    &new_let_classes,
+    gen_ctx.classes,
+  )?;
+
   let fn_ctx = Ctx {
     current_di_scope: di_scope,
+    object_allocas: Some(&object_allocas),
     ..*gen_ctx
   };
 
@@ -6358,8 +6840,23 @@ fn define_main<'ctx>(
     "main",
     top_stmts.first().map(|s| s.span),
   );
+
+  // Plan 50's `leaf-stack-allocation-codegen` — see `define_user_
+  // function`'s identical comment.
+  let mut new_let_classes = HashMap::new();
+  collect_new_let_classes(&top_stmts, &mut new_let_classes);
+  let non_escaping = find_non_escaping_news(&top_stmts);
+  let object_allocas = prealloc_stack_objects(
+    context,
+    builder,
+    &non_escaping,
+    &new_let_classes,
+    gen_ctx.classes,
+  )?;
+
   let fn_ctx = Ctx {
     current_di_scope: di_scope,
+    object_allocas: Some(&object_allocas),
     ..*gen_ctx
   };
 
@@ -6569,7 +7066,36 @@ fn declare_lambda_functions<'ctx>(
 /// `__lambda_{name}` per top-level `Proc` `Let`, plus a `main`
 /// (`extern "C" fn() -> i32`) that evaluates the top-level statements.
 pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, None, None)
+  compile_to_object_impl(program, out_path, None, None, None, None)
+}
+
+/// Plan 50's `leaf-escape-instrumentation-and-report`: identical to
+/// `compile_to_object`, additionally returning how many `ClassName.
+/// new(...)` sites were stack- vs. heap-allocated — the only proof
+/// surface for the escape-analysis optimization (see `EscapeStats`'s
+/// own doc comment for why stdout alone can't distinguish the two).
+pub fn compile_to_object_with_stats(
+  program: &Program,
+  out_path: &Path,
+) -> Result<EscapeStats, String> {
+  let stats = RefCell::new(EscapeStats::default());
+  compile_to_object_impl(program, out_path, None, None, Some(&stats), None)?;
+  Ok(stats.into_inner())
+}
+
+/// Plan 50's `leaf-stack-allocation-codegen` AC5's own test-only sibling
+/// entry point — returns the compiled `Module`'s textual LLVM IR
+/// alongside compiling, so a test can inspect real emitted `alloca`
+/// placement directly (see `compile_to_object_impl`'s own skip-
+/// optimization branch for why this always compiles unoptimized).
+#[cfg(test)]
+fn compile_to_object_ir_text_for_test(
+  program: &Program,
+  out_path: &Path,
+) -> Result<String, String> {
+  let ir_text = RefCell::new(String::new());
+  compile_to_object_impl(program, out_path, None, None, None, Some(&ir_text))?;
+  Ok(ir_text.into_inner())
 }
 
 /// Plan 49's `leaf-parallel-codegen-and-jobs-flag`: compiles `program`
@@ -6598,7 +7124,14 @@ pub fn compile_to_object_scoped(
   is_entry: bool,
   out_path: &Path,
 ) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, None, Some((own_names, is_entry)))
+  compile_to_object_impl(
+    program,
+    out_path,
+    None,
+    Some((own_names, is_entry)),
+    None,
+    None,
+  )
 }
 
 /// Plan 35's `leaf-line-table-generation`: identical to
@@ -6614,7 +7147,14 @@ pub fn compile_to_object_with_debug_info(
   source: &str,
   file_name: &str,
 ) -> Result<(), String> {
-  compile_to_object_impl(program, out_path, Some((source, file_name)), None)
+  compile_to_object_impl(
+    program,
+    out_path,
+    Some((source, file_name)),
+    None,
+    None,
+    None,
+  )
 }
 
 fn compile_to_object_impl(
@@ -6629,6 +7169,19 @@ fn compile_to_object_impl(
   // "define everything, always add main" — this function's behavior is
   // completely unchanged for every caller that doesn't pass `Some`.
   scope: Option<(&std::collections::HashSet<String>, bool)>,
+  // Plan 50's `leaf-escape-instrumentation-and-report`: `Some(&stats)`
+  // only from `compile_to_object_with_stats` — every other caller
+  // passes `None`, so this function's own behavior (and every existing
+  // caller's) is completely unchanged; see `Ctx::escape_stats`'s own
+  // doc comment for why this is a `RefCell`, not a loose `&mut`
+  // parameter threaded through the whole codegen call graph.
+  stats: Option<&RefCell<EscapeStats>>,
+  // Plan 50's `leaf-stack-allocation-codegen` AC5's own test-only IR-
+  // inspection proof — `Some(&out)` only from `#[cfg(test)]`'s
+  // `compile_to_object_ir_text_for_test`, populated with the compiled
+  // `Module`'s textual IR (see this function's own skip-optimization
+  // branch below for why).
+  ir_text_out: Option<&RefCell<String>>,
 ) -> Result<(), String> {
   // Plan 47's Decision log: a `test "..." do ... end` block only ever
   // compiles through `compile_test_harness` (`emerald test`) — reaching
@@ -6998,6 +7551,8 @@ fn compile_to_object_impl(
     di_file,
     newline_offsets: newline_offsets_owner.as_deref(),
     current_di_scope: None,
+    object_allocas: None,
+    escape_stats: stats,
   };
 
   for item in &program.items {
@@ -7166,7 +7721,22 @@ fn compile_to_object_impl(
   // — skipping optimization whenever debug info is attached is the
   // same "-O0 -g" tradeoff virtually every real compiler makes for
   // debug builds: correct, steppable control flow over speed.
-  if program_uses_retry(program) || debug_info.is_some() {
+  // Plan 50's `leaf-stack-allocation-codegen` AC5's own IR-inspection
+  // proof needs *this crate's own emission*, isolated from whatever
+  // LLVM's optimizer independently decides to keep or discard (`p`'s
+  // fields genuinely going unread after construction is exactly the
+  // shape `default<O3>`'s dead-store elimination is entitled to strip
+  // — a real, correct optimization outcome that would make an
+  // optimized-IR assertion flaky for reasons unrelated to whether
+  // `prealloc_stack_objects` itself placed one `alloca` per site
+  // correctly). `ir_text_out.is_some()` therefore takes the same
+  // skip-optimization path `program_uses_retry`/`debug_info` already
+  // do, for the identical "unoptimized IR is always correct, just
+  // slower" reason.
+  if program_uses_retry(program) || debug_info.is_some() || ir_text_out.is_some() {
+    if let Some(out) = ir_text_out {
+      *out.borrow_mut() = module.print_to_string().to_string();
+    }
     return target_machine
       .write_to_file(&module, FileType::Object, out_path)
       .map_err(|e| e.to_string());
@@ -8986,5 +9556,238 @@ mod tests {
       .expect_err("a top-level test block must be rejected by the ordinary compile path");
     assert!(err.contains("only valid under `emerald test`"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // Plan 50 (escape analysis and stack allocation).
+
+  fn ident(name: &str) -> Spanned<Expr> {
+    Spanned::synthetic(Expr::Ident(name.to_string()))
+  }
+
+  fn new_point(args: Vec<Spanned<Expr>>) -> Spanned<Expr> {
+    Spanned::synthetic(Expr::New("Point".to_string(), args))
+  }
+
+  fn let_point(name: &str, args: Vec<Spanned<Expr>>) -> Spanned<Stmt> {
+    Spanned::synthetic(Stmt::Let {
+      name: name.to_string(),
+      ty: "Point".to_string(),
+      value: new_point(args),
+    })
+  }
+
+  #[test]
+  fn find_non_escaping_news_includes_a_p_never_referenced_again() {
+    // AC1 + AC5: `distance_squared`'s own body — `p` is bound, then
+    // never referenced again anywhere in the function (the base case
+    // this worked example itself exercises).
+    let body = vec![
+      let_point("p", vec![ident("x"), ident("y")]),
+      Spanned::synthetic(Stmt::Expr(Spanned::synthetic(Expr::Add(
+        Box::new(Spanned::synthetic(Expr::Mul(
+          Box::new(ident("x")),
+          Box::new(ident("x")),
+        ))),
+        Box::new(Spanned::synthetic(Expr::Mul(
+          Box::new(ident("y")),
+          Box::new(ident("y")),
+        ))),
+      )))),
+    ];
+    assert_eq!(
+      find_non_escaping_news(&body),
+      HashSet::from(["p".to_string()])
+    );
+  }
+
+  #[test]
+  fn find_non_escaping_news_excludes_p_returned_directly() {
+    // AC2: `make_point`'s own body — `p` is bound, then returned.
+    let body = vec![
+      let_point("p", vec![ident("x"), ident("y")]),
+      Spanned::synthetic(Stmt::Return(Some(ident("p")))),
+    ];
+    assert_eq!(find_non_escaping_news(&body), HashSet::new());
+  }
+
+  #[test]
+  fn find_non_escaping_news_excludes_p_stored_into_a_field() {
+    // AC3 (first of the two): `p` later passed as a `Stmt::SetField`'s
+    // `value`.
+    let body = vec![
+      let_point("p", vec![ident("x")]),
+      Spanned::synthetic(Stmt::SetField {
+        name: "stored".to_string(),
+        value: ident("p"),
+      }),
+    ];
+    assert_eq!(find_non_escaping_news(&body), HashSet::new());
+  }
+
+  #[test]
+  fn find_non_escaping_news_excludes_p_passed_as_a_call_argument() {
+    // AC3 (second of the two): `p` later passed as an ordinary
+    // `Expr::Call` argument.
+    let body = vec![
+      let_point("p", vec![ident("x")]),
+      Spanned::synthetic(Stmt::Expr(Spanned::synthetic(Expr::Call(
+        "some_func".to_string(),
+        vec![ident("p")],
+      )))),
+    ];
+    assert_eq!(find_non_escaping_news(&body), HashSet::new());
+  }
+
+  #[test]
+  fn find_non_escaping_news_excludes_p_used_only_as_a_method_call_receiver() {
+    // AC4: `p` used only as `Expr::MethodCall(Ident("p"), _, _)`'s
+    // receiver, with an otherwise-empty argument list — proves rule
+    // (c)'s receiver-position clause is real, not just documented.
+    let body = vec![
+      let_point("p", vec![ident("x")]),
+      Spanned::synthetic(Stmt::Expr(Spanned::synthetic(Expr::MethodCall(
+        Box::new(ident("p")),
+        "touch".to_string(),
+        vec![],
+      )))),
+    ];
+    assert_eq!(find_non_escaping_news(&body), HashSet::new());
+  }
+
+  #[test]
+  fn find_non_escaping_news_excludes_p_captured_into_a_nested_lambda() {
+    // A real soundness case beyond the plan's own literally-enumerated
+    // three rules (see `collect_referenced_idents`'s doc comment): a
+    // reference from inside a nested lambda body copies `p`'s pointer
+    // into the lambda's own capture environment, which can outlive
+    // this function.
+    let body = vec![
+      let_point("p", vec![ident("x")]),
+      Spanned::synthetic(Stmt::Let {
+        name: "f".to_string(),
+        ty: "Proc".to_string(),
+        value: Spanned::synthetic(Expr::Lambda {
+          params: vec![],
+          return_type: "Void".to_string(),
+          body: vec![Spanned::synthetic(Stmt::Expr(ident("p")))],
+        }),
+      }),
+    ];
+    assert_eq!(find_non_escaping_news(&body), HashSet::new());
+  }
+
+  const DISTANCE_SQUARED_AND_MAKE_POINT: &str = "class Point\n  x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\ndef distance_squared(x: Int64, y: Int64) -> Int64\n  p: Point = Point.new(x, y)\n  x * x + y * y\nend\n\ndef make_point(x: Int64, y: Int64) -> Point\n  p: Point = Point.new(x, y)\n  p\nend\n\nputs distance_squared(3, 4)\n";
+
+  #[test]
+  fn distance_squared_worked_example_stack_allocates_and_prints_25() {
+    // leaf-stack-allocation-codegen AC1: identical output to the
+    // unmodified heap-only baseline — behavior must not change.
+    assert_eq!(compile_link_run(DISTANCE_SQUARED_AND_MAKE_POINT), "25\n");
+  }
+
+  #[test]
+  fn make_point_still_returns_a_usable_escaping_instance() {
+    // leaf-stack-allocation-codegen AC2: the escaping path (`make_
+    // point`, which returns `p` directly) is untouched — a caller can
+    // still read a field back through it via a `read`-sugared accessor
+    // (plan 33).
+    let src = "class Point\n  read x: Int64\n  read y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\ndef make_point(x: Int64, y: Int64) -> Point\n  p: Point = Point.new(x, y)\n  p\nend\n\nq: Point = make_point(7, 9)\nputs q.x\nputs q.y\n";
+    assert_eq!(compile_link_run(src), "7\n9\n");
+  }
+
+  #[test]
+  fn a_non_escaping_new_inside_a_while_loop_gets_exactly_one_alloca() {
+    // leaf-stack-allocation-codegen AC5: a non-escaping `New` written
+    // inside a loop body must not produce a different alloca per
+    // iteration — inspected directly in the emitted LLVM IR text via
+    // `compile_to_object_ir_text_for_test`.
+    let src = "class Point\n  x: Int64\n\n  def initialize(x: Int64) -> Void\n    @x = x\n  end\nend\n\ndef touch_loop(n: Int64) -> Int64\n  i: Int64 = 0\n  while i < n\n    p: Point = Point.new(i)\n    i += 1\n  end\n  i\nend\n\nputs touch_loop(5)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("loop_single_alloca");
+    let obj_path = dir.join("out.o");
+
+    let stats =
+      compile_to_object_with_stats(&program, &obj_path).expect("should compile with stats");
+    assert_eq!(stats.stack_allocated, 1, "{stats:?}");
+    assert_eq!(stats.heap_allocated, 0, "{stats:?}");
+    std::fs::remove_file(&obj_path).ok();
+
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile and return IR text");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let mut in_target_fn = false;
+    let mut alloca_count = 0usize;
+    for line in ir.lines() {
+      if line.starts_with("define i64 @touch_loop(") {
+        in_target_fn = true;
+        continue;
+      }
+      if in_target_fn {
+        if line.starts_with('}') {
+          break;
+        }
+        if line.contains("= alloca [") {
+          alloca_count += 1;
+        }
+      }
+    }
+    assert_eq!(
+      alloca_count, 1,
+      "expected exactly one byte-array `alloca` for the non-escaping `p` site inside the loop, got {alloca_count}:\n{ir}"
+    );
+  }
+
+  #[test]
+  fn escape_stats_on_distance_squared_is_one_stack_zero_heap() {
+    // leaf-escape-instrumentation-and-report AC1: the plan's own
+    // headline internal proof.
+    let program = emerald_parser::parse(DISTANCE_SQUARED_AND_MAKE_POINT).expect("should parse");
+    let dir = fresh_temp_dir("escape_stats_distance_squared");
+    let obj_path = dir.join("out.o");
+    let stats =
+      compile_to_object_with_stats(&program, &obj_path).expect("should compile with stats");
+    assert_eq!(
+      stats,
+      EscapeStats {
+        stack_allocated: 1,
+        heap_allocated: 1,
+      },
+      "{stats:?}"
+    );
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn escape_stats_on_make_point_alone_is_zero_stack_one_heap() {
+    // leaf-escape-instrumentation-and-report AC2: the contrasting
+    // proof — isolated so no other `New` site in the program
+    // contributes to either count.
+    let src = "class Point\n  x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\ndef make_point(x: Int64, y: Int64) -> Point\n  p: Point = Point.new(x, y)\n  p\nend\n\nq: Point = make_point(3, 4)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("escape_stats_make_point");
+    let obj_path = dir.join("out.o");
+    let stats =
+      compile_to_object_with_stats(&program, &obj_path).expect("should compile with stats");
+    assert_eq!(
+      stats,
+      EscapeStats {
+        stack_allocated: 0,
+        heap_allocated: 1,
+      },
+      "{stats:?}"
+    );
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn compile_to_object_unmodified_signature_still_works_for_every_caller() {
+    // leaf-escape-instrumentation-and-report AC3: the wrapper refactor
+    // is behavior-preserving — `compile_to_object` still compiles and
+    // links a real program via its pre-existing, unmodified signature.
+    assert_eq!(compile_link_run(DISTANCE_SQUARED_AND_MAKE_POINT), "25\n");
   }
 }

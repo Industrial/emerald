@@ -286,6 +286,28 @@ pub fn compile_program_cached(
   link(obj_path, output_path.to_path_buf())
 }
 
+/// Plan 50's `leaf-escape-instrumentation-and-report`: identical to
+/// `compile`, additionally returning how many `ClassName.new(...)`
+/// sites were stack- vs. heap-allocated — `emerald-cli`'s `--emit=
+/// escape-report` flag prints this before proceeding with linking as
+/// normal. Not built on the `Effect` pipeline `compile`/`check` share
+/// (there is no existing `codegen_stage` shape that returns anything
+/// but `PathBuf`) — a small, direct sequence instead, matching
+/// `compile_program_cached`'s own directness just above.
+pub fn compile_with_escape_report(
+  source: &str,
+  name: &str,
+  output_path: &Path,
+) -> Result<emerald_codegen::EscapeStats, DriverError> {
+  let program = emerald_parser::parse_named(source, name).map_err(DriverError::Parse)?;
+  emerald_sema::check_program(&program).map_err(DriverError::Sema)?;
+  let obj_path = std::env::temp_dir().join(format!("emerald_escape_{}.o", process::id()));
+  let stats = emerald_codegen::compile_to_object_with_stats(&program, &obj_path)
+    .map_err(DriverError::Codegen)?;
+  link(obj_path, output_path.to_path_buf())?;
+  Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
