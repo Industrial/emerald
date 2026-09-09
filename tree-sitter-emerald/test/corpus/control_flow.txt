@@ -1,0 +1,267 @@
+==================
+control_flow.em — if/elsif/else/unless/until/for-in/case-when, break/next
+==================
+
+def classify(n: Int64) -> Int64
+  if n == 0
+    return 0
+  end
+  if n < 10
+    return 1
+  end
+  return 2
+end
+
+a: Int64 = 5
+b: Int64 = 10
+
+if a < b
+  puts 1
+else
+  puts 0
+end
+
+if b > a
+  puts 1
+end
+
+if a <= 5
+  puts 1
+end
+
+if b >= 10
+  puts 1
+end
+
+if a != b
+  puts 1
+end
+
+if a == 5
+  puts 1
+end
+
+i: Int64 = 0
+while i < 5
+  if i == 2
+    i: Int64 = i + 1
+    next
+  end
+  if i == 4
+    break
+  end
+  puts i
+  i: Int64 = i + 1
+end
+
+puts classify(0)
+puts classify(5)
+puts classify(20)
+
+c: Int64 = 7
+if c == 1
+  puts 100
+elsif c == 7
+  puts 101
+else
+  puts 102
+end
+
+unless c == 1
+  puts 103
+end
+
+u: Int64 = 0
+until u == 2
+  puts u
+  u: Int64 = u + 1
+end
+
+for x in [5, 6, 7]
+  puts x
+end
+
+case c
+when 7
+  puts 200
+when 8
+  puts 201
+end
+
+---
+
+(source_file
+  (function_definition
+    name: (identifier)
+    (param_clause
+      (parameter
+        name: (identifier)
+        type: (identifier)))
+    return_type: (identifier)
+    body: (if_statement
+      condition: (binary_expression
+        left: (identifier)
+        right: (integer))
+      consequence: (return_statement
+        value: (integer)))
+    body: (if_statement
+      condition: (binary_expression
+        left: (identifier)
+        right: (integer))
+      consequence: (return_statement
+        value: (integer)))
+    body: (return_statement
+      value: (integer)))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (identifier))
+    consequence: (puts_statement
+      argument: (integer))
+    (else_clause
+      body: (puts_statement
+        argument: (integer))))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (identifier))
+    consequence: (puts_statement
+      argument: (integer)))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    consequence: (puts_statement
+      argument: (integer)))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    consequence: (puts_statement
+      argument: (integer)))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (identifier))
+    consequence: (puts_statement
+      argument: (integer)))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    consequence: (puts_statement
+      argument: (integer)))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (while_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    body: (if_statement
+      condition: (binary_expression
+        left: (identifier)
+        right: (integer))
+      consequence: (let_statement
+        name: (identifier)
+        type: (identifier)
+        value: (binary_expression
+          left: (identifier)
+          right: (integer)))
+      consequence: (next_statement))
+    body: (if_statement
+      condition: (binary_expression
+        left: (identifier)
+        right: (integer))
+      consequence: (break_statement))
+    body: (puts_statement
+      argument: (identifier))
+    body: (let_statement
+      name: (identifier)
+      type: (identifier)
+      value: (binary_expression
+        left: (identifier)
+        right: (integer))))
+  (puts_statement
+    argument: (call_expression
+      function: (identifier)
+      (argument_list
+        (integer))))
+  (puts_statement
+    argument: (call_expression
+      function: (identifier)
+      (argument_list
+        (integer))))
+  (puts_statement
+    argument: (call_expression
+      function: (identifier)
+      (argument_list
+        (integer))))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    consequence: (puts_statement
+      argument: (integer))
+    (elsif_clause
+      condition: (binary_expression
+        left: (identifier)
+        right: (integer))
+      consequence: (puts_statement
+        argument: (integer))
+      (else_clause
+        body: (puts_statement
+          argument: (integer)))))
+  (unless_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    consequence: (puts_statement
+      argument: (integer)))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (until_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    body: (puts_statement
+      argument: (identifier))
+    body: (let_statement
+      name: (identifier)
+      type: (identifier)
+      value: (binary_expression
+        left: (identifier)
+        right: (integer))))
+  (for_statement
+    variable: (identifier)
+    elements: (argument_list
+      (integer)
+      (integer)
+      (integer))
+    body: (puts_statement
+      argument: (identifier)))
+  (case_statement
+    scrutinee: (identifier)
+    (case_arm
+      values: (integer)
+      body: (puts_statement
+        argument: (integer)))
+    (case_arm
+      values: (integer)
+      body: (puts_statement
+        argument: (integer)))))

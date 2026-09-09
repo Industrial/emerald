@@ -1,0 +1,135 @@
+==================
+classes.em — fields, initialize, instance vars, .new, method calls
+==================
+
+class Counter
+  value: Int64
+
+  def initialize(start: Int64) -> Void
+    @value = start
+  end
+
+  def value -> Int64
+    @value
+  end
+
+  def add(n: Int64) -> Int64
+    @value + n
+  end
+end
+
+c: Counter = Counter.new(10)
+puts c.value
+puts c.add(5)
+
+class Point
+  x: Float64
+  y: Float64
+
+  def initialize(x: Float64, y: Float64) -> Void
+    @x = x
+    @y = y
+  end
+
+  def sum -> Float64
+    @x + @y
+  end
+end
+
+p: Point = Point.new(2.0, 3.0)
+puts p.sum
+
+---
+
+(source_file
+  (class_definition
+    name: (identifier)
+    (field_declaration
+      name: (identifier)
+      type: (identifier))
+    (method_definition
+      name: (identifier)
+      (param_clause
+        (parameter
+          name: (identifier)
+          type: (identifier)))
+      return_type: (identifier)
+      body: (assignment_statement
+        target: (instance_variable)
+        value: (identifier)))
+    (method_definition
+      name: (identifier)
+      return_type: (identifier)
+      body: (expression_statement
+        (instance_variable)))
+    (method_definition
+      name: (identifier)
+      (param_clause
+        (parameter
+          name: (identifier)
+          type: (identifier)))
+      return_type: (identifier)
+      body: (expression_statement
+        (binary_expression
+          left: (instance_variable)
+          right: (identifier)))))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (new_expression
+      class: (identifier)
+      (argument_list
+        (integer))))
+  (puts_statement
+    argument: (method_call_expression
+      receiver: (identifier)
+      method: (identifier)))
+  (puts_statement
+    argument: (method_call_expression
+      receiver: (identifier)
+      method: (identifier)
+      (argument_list
+        (integer))))
+  (class_definition
+    name: (identifier)
+    (field_declaration
+      name: (identifier)
+      type: (identifier))
+    (field_declaration
+      name: (identifier)
+      type: (identifier))
+    (method_definition
+      name: (identifier)
+      (param_clause
+        (parameter
+          name: (identifier)
+          type: (identifier))
+        (parameter
+          name: (identifier)
+          type: (identifier)))
+      return_type: (identifier)
+      body: (assignment_statement
+        target: (instance_variable)
+        value: (identifier))
+      body: (assignment_statement
+        target: (instance_variable)
+        value: (identifier)))
+    (method_definition
+      name: (identifier)
+      return_type: (identifier)
+      body: (expression_statement
+        (binary_expression
+          left: (instance_variable)
+          right: (instance_variable)))))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (new_expression
+      class: (identifier)
+      (argument_list
+        (float)
+        (float))))
+  (puts_statement
+    argument: (method_call_expression
+      receiver: (identifier)
+      method: (identifier))))

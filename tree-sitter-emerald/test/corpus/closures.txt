@@ -1,0 +1,100 @@
+==================
+closures.em — lambda literals, .call, block arguments and yield
+==================
+
+x: Int64 = 10
+add_x: Proc = ->(y: Int64) -> Int64 { y + x }
+puts add_x.call(5)
+
+add_one: Proc = ->(y: Int64) -> Int64 { y + 1 }
+puts add_one.call(41)
+
+def repeat(n: Int64, &blk) -> Void
+  i: Int64 = 0
+  while i < n
+    yield i
+    i: Int64 = i + 1
+  end
+end
+
+repeat(3) { |i: Int64| puts i }
+
+---
+
+(source_file
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (let_statement
+    name: (identifier)
+    value: (lambda_expression
+      (parameter_list
+        (parameter
+          name: (identifier)
+          type: (identifier)))
+      return_type: (identifier)
+      body: (expression_statement
+        (binary_expression
+          left: (identifier)
+          right: (identifier)))))
+  (puts_statement
+    argument: (method_call_expression
+      receiver: (identifier)
+      method: (identifier)
+      (argument_list
+        (integer))))
+  (let_statement
+    name: (identifier)
+    value: (lambda_expression
+      (parameter_list
+        (parameter
+          name: (identifier)
+          type: (identifier)))
+      return_type: (identifier)
+      body: (expression_statement
+        (binary_expression
+          left: (identifier)
+          right: (integer)))))
+  (puts_statement
+    argument: (method_call_expression
+      receiver: (identifier)
+      method: (identifier)
+      (argument_list
+        (integer))))
+  (function_definition
+    name: (identifier)
+    (param_clause
+      (parameter
+        name: (identifier)
+        type: (identifier))
+      block_param: (identifier))
+    return_type: (identifier)
+    body: (let_statement
+      name: (identifier)
+      type: (identifier)
+      value: (integer))
+    body: (while_statement
+      condition: (binary_expression
+        left: (identifier)
+        right: (identifier))
+      body: (yield_statement
+        arguments: (identifier))
+      body: (let_statement
+        name: (identifier)
+        type: (identifier)
+        value: (binary_expression
+          left: (identifier)
+          right: (integer)))))
+  (expression_statement
+    (call_expression
+      function: (identifier)
+      (argument_list
+        (integer))
+      block: (block
+        (parameter_list
+          (parameter
+            name: (identifier)
+            type: (identifier)))
+        (puts_statement
+          argument: (identifier))))))

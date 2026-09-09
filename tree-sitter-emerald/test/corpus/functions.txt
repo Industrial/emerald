@@ -1,0 +1,33 @@
+==================
+hello.em — a top-level function definition and a puts call
+==================
+
+def add(a: Int64, b: Int64) -> Int64
+  a + b
+end
+
+puts add(20, 22)
+
+---
+
+(source_file
+  (function_definition
+    name: (identifier)
+    (param_clause
+      (parameter
+        name: (identifier)
+        type: (identifier))
+      (parameter
+        name: (identifier)
+        type: (identifier)))
+    return_type: (identifier)
+    body: (expression_statement
+      (binary_expression
+        left: (identifier)
+        right: (identifier))))
+  (puts_statement
+    argument: (call_expression
+      function: (identifier)
+      (argument_list
+        (integer)
+        (integer)))))

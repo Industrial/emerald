@@ -1,0 +1,6042 @@
+[
+	{
+		"type": "and_assign_statement",
+		"named": true,
+		"fields": {
+			"target": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "argument_list",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "array_literal",
+					"named": true
+				},
+				{
+					"type": "array_new_expression",
+					"named": true
+				},
+				{
+					"type": "binary_expression",
+					"named": true
+				},
+				{
+					"type": "call_expression",
+					"named": true
+				},
+				{
+					"type": "call_kw_expression",
+					"named": true
+				},
+				{
+					"type": "float",
+					"named": true
+				},
+				{
+					"type": "hash_literal",
+					"named": true
+				},
+				{
+					"type": "identifier",
+					"named": true
+				},
+				{
+					"type": "index_expression",
+					"named": true
+				},
+				{
+					"type": "instance_variable",
+					"named": true
+				},
+				{
+					"type": "integer",
+					"named": true
+				},
+				{
+					"type": "lambda_expression",
+					"named": true
+				},
+				{
+					"type": "method_call_expression",
+					"named": true
+				},
+				{
+					"type": "new_expression",
+					"named": true
+				},
+				{
+					"type": "safe_call_expression",
+					"named": true
+				},
+				{
+					"type": "string",
+					"named": true
+				},
+				{
+					"type": "symbol",
+					"named": true
+				},
+				{
+					"type": "unary_expression",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "array_literal",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "argument_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "array_new_expression",
+		"named": true,
+		"fields": {
+			"size": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "array_type",
+		"named": true,
+		"fields": {
+			"element": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "assignment_statement",
+		"named": true,
+		"fields": {
+			"target": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					}
+				]
+			},
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "begin_statement",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": true,
+			"required": true,
+			"types": [
+				{
+					"type": "ensure_clause",
+					"named": true
+				},
+				{
+					"type": "rescue_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "binary_expression",
+		"named": true,
+		"fields": {
+			"left": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"operator": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "!=",
+						"named": false
+					},
+					{
+						"type": "%",
+						"named": false
+					},
+					{
+						"type": "&",
+						"named": false
+					},
+					{
+						"type": "&&",
+						"named": false
+					},
+					{
+						"type": "*",
+						"named": false
+					},
+					{
+						"type": "+",
+						"named": false
+					},
+					{
+						"type": "-",
+						"named": false
+					},
+					{
+						"type": "/",
+						"named": false
+					},
+					{
+						"type": "<",
+						"named": false
+					},
+					{
+						"type": "<<",
+						"named": false
+					},
+					{
+						"type": "<=",
+						"named": false
+					},
+					{
+						"type": "==",
+						"named": false
+					},
+					{
+						"type": ">",
+						"named": false
+					},
+					{
+						"type": ">=",
+						"named": false
+					},
+					{
+						"type": ">>",
+						"named": false
+					},
+					{
+						"type": "^",
+						"named": false
+					},
+					{
+						"type": "|",
+						"named": false
+					},
+					{
+						"type": "||",
+						"named": false
+					}
+				]
+			},
+			"right": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "block",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "and_assign_statement",
+					"named": true
+				},
+				{
+					"type": "assignment_statement",
+					"named": true
+				},
+				{
+					"type": "begin_statement",
+					"named": true
+				},
+				{
+					"type": "break_statement",
+					"named": true
+				},
+				{
+					"type": "case_statement",
+					"named": true
+				},
+				{
+					"type": "compound_assignment_statement",
+					"named": true
+				},
+				{
+					"type": "expression_statement",
+					"named": true
+				},
+				{
+					"type": "for_range_statement",
+					"named": true
+				},
+				{
+					"type": "for_statement",
+					"named": true
+				},
+				{
+					"type": "if_statement",
+					"named": true
+				},
+				{
+					"type": "let_statement",
+					"named": true
+				},
+				{
+					"type": "multiple_assignment_statement",
+					"named": true
+				},
+				{
+					"type": "next_statement",
+					"named": true
+				},
+				{
+					"type": "or_assign_statement",
+					"named": true
+				},
+				{
+					"type": "parameter_list",
+					"named": true
+				},
+				{
+					"type": "puts_statement",
+					"named": true
+				},
+				{
+					"type": "raise_statement",
+					"named": true
+				},
+				{
+					"type": "retry_statement",
+					"named": true
+				},
+				{
+					"type": "return_statement",
+					"named": true
+				},
+				{
+					"type": "unless_statement",
+					"named": true
+				},
+				{
+					"type": "until_statement",
+					"named": true
+				},
+				{
+					"type": "while_statement",
+					"named": true
+				},
+				{
+					"type": "yield_statement",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "call_expression",
+		"named": true,
+		"fields": {
+			"block": {
+				"multiple": false,
+				"required": false,
+				"types": [
+					{
+						"type": "block",
+						"named": true
+					}
+				]
+			},
+			"function": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "argument_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "call_kw_expression",
+		"named": true,
+		"fields": {
+			"function": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": true,
+			"types": [
+				{
+					"type": "keyword_argument_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "case_arm",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"values": {
+				"multiple": true,
+				"required": true,
+				"types": [
+					{
+						"type": ",",
+						"named": false
+					},
+					{
+						"type": "integer",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "case_statement",
+		"named": true,
+		"fields": {
+			"scrutinee": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": true,
+			"required": true,
+			"types": [
+				{
+					"type": "case_arm",
+					"named": true
+				},
+				{
+					"type": "else_clause",
+					"named": true
+				},
+				{
+					"type": "elsif_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "class_definition",
+		"named": true,
+		"fields": {
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "field_declaration",
+					"named": true
+				},
+				{
+					"type": "implements_clause",
+					"named": true
+				},
+				{
+					"type": "method_definition",
+					"named": true
+				},
+				{
+					"type": "superclass_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "compound_assignment_statement",
+		"named": true,
+		"fields": {
+			"operator": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "%=",
+						"named": false
+					},
+					{
+						"type": "*=",
+						"named": false
+					},
+					{
+						"type": "+=",
+						"named": false
+					},
+					{
+						"type": "-=",
+						"named": false
+					},
+					{
+						"type": "/=",
+						"named": false
+					}
+				]
+			},
+			"target": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "else_clause",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "elsif_clause",
+		"named": true,
+		"fields": {
+			"condition": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"consequence": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "else_clause",
+					"named": true
+				},
+				{
+					"type": "elsif_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "ensure_clause",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "expression_statement",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "array_literal",
+					"named": true
+				},
+				{
+					"type": "array_new_expression",
+					"named": true
+				},
+				{
+					"type": "binary_expression",
+					"named": true
+				},
+				{
+					"type": "call_expression",
+					"named": true
+				},
+				{
+					"type": "call_kw_expression",
+					"named": true
+				},
+				{
+					"type": "float",
+					"named": true
+				},
+				{
+					"type": "hash_literal",
+					"named": true
+				},
+				{
+					"type": "identifier",
+					"named": true
+				},
+				{
+					"type": "index_expression",
+					"named": true
+				},
+				{
+					"type": "instance_variable",
+					"named": true
+				},
+				{
+					"type": "integer",
+					"named": true
+				},
+				{
+					"type": "lambda_expression",
+					"named": true
+				},
+				{
+					"type": "method_call_expression",
+					"named": true
+				},
+				{
+					"type": "new_expression",
+					"named": true
+				},
+				{
+					"type": "safe_call_expression",
+					"named": true
+				},
+				{
+					"type": "string",
+					"named": true
+				},
+				{
+					"type": "symbol",
+					"named": true
+				},
+				{
+					"type": "unary_expression",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "field_declaration",
+		"named": true,
+		"fields": {
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "for_range_statement",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"end": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"operator": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "..",
+						"named": false
+					},
+					{
+						"type": "...",
+						"named": false
+					}
+				]
+			},
+			"start": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"variable": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "for_statement",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"elements": {
+				"multiple": false,
+				"required": false,
+				"types": [
+					{
+						"type": "argument_list",
+						"named": true
+					}
+				]
+			},
+			"variable": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "function_definition",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"return_type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "param_clause",
+					"named": true
+				},
+				{
+					"type": "type_param_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "hash_literal",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "hash_pair",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "hash_pair",
+		"named": true,
+		"fields": {
+			"key": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "hash_type",
+		"named": true,
+		"fields": {
+			"key": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "if_statement",
+		"named": true,
+		"fields": {
+			"condition": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"consequence": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "else_clause",
+					"named": true
+				},
+				{
+					"type": "elsif_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "implements_clause",
+		"named": true,
+		"fields": {
+			"interface": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "index_expression",
+		"named": true,
+		"fields": {
+			"array": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"index": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "interface_definition",
+		"named": true,
+		"fields": {
+			"method_name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"return_type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "parameter_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "keyword_argument_list",
+		"named": true,
+		"fields": {
+			"name": {
+				"multiple": true,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"value": {
+				"multiple": true,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "lambda_expression",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"return_type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "parameter_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "let_statement",
+		"named": true,
+		"fields": {
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			},
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "method_call_expression",
+		"named": true,
+		"fields": {
+			"block": {
+				"multiple": false,
+				"required": false,
+				"types": [
+					{
+						"type": "block",
+						"named": true
+					}
+				]
+			},
+			"method": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "read",
+						"named": false
+					}
+				]
+			},
+			"receiver": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "argument_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "method_definition",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"name": {
+				"multiple": true,
+				"required": true,
+				"types": [
+					{
+						"type": "*",
+						"named": false
+					},
+					{
+						"type": "+",
+						"named": false
+					},
+					{
+						"type": "-",
+						"named": false
+					},
+					{
+						"type": "/",
+						"named": false
+					},
+					{
+						"type": "<=>",
+						"named": false
+					},
+					{
+						"type": "=",
+						"named": false
+					},
+					{
+						"type": "==",
+						"named": false
+					},
+					{
+						"type": "[",
+						"named": false
+					},
+					{
+						"type": "]",
+						"named": false
+					},
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"return_type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "param_clause",
+					"named": true
+				},
+				{
+					"type": "type_param_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "module_definition",
+		"named": true,
+		"fields": {
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "method_definition",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "multiple_assignment_statement",
+		"named": true,
+		"fields": {
+			"names": {
+				"multiple": true,
+				"required": true,
+				"types": [
+					{
+						"type": ",",
+						"named": false
+					},
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"values": {
+				"multiple": true,
+				"required": true,
+				"types": [
+					{
+						"type": ",",
+						"named": false
+					},
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "new_expression",
+		"named": true,
+		"fields": {
+			"class": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "argument_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "nullable_type",
+		"named": true,
+		"fields": {
+			"base": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "or_assign_statement",
+		"named": true,
+		"fields": {
+			"default": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"target": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "param_clause",
+		"named": true,
+		"fields": {
+			"block_param": {
+				"multiple": false,
+				"required": false,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "parameter",
+					"named": true
+				},
+				{
+					"type": "splat_parameter",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "parameter",
+		"named": true,
+		"fields": {
+			"default": {
+				"multiple": false,
+				"required": false,
+				"types": [
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					}
+				]
+			},
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "parameter_list",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": true,
+			"required": true,
+			"types": [
+				{
+					"type": "parameter",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "puts_statement",
+		"named": true,
+		"fields": {
+			"argument": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "raise_statement",
+		"named": true,
+		"fields": {
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "require_path",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": true,
+			"required": true,
+			"types": [
+				{
+					"type": "identifier",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "require_statement",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": false,
+			"required": true,
+			"types": [
+				{
+					"type": "require_path",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "rescue_clause",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"class": {
+				"multiple": false,
+				"required": false,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"variable": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "return_statement",
+		"named": true,
+		"fields": {
+			"value": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "safe_call_expression",
+		"named": true,
+		"fields": {
+			"method": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "read",
+						"named": false
+					}
+				]
+			},
+			"receiver": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "argument_list",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "source_file",
+		"named": true,
+		"root": true,
+		"fields": {},
+		"children": {
+			"multiple": true,
+			"required": false,
+			"types": [
+				{
+					"type": "and_assign_statement",
+					"named": true
+				},
+				{
+					"type": "assignment_statement",
+					"named": true
+				},
+				{
+					"type": "begin_statement",
+					"named": true
+				},
+				{
+					"type": "break_statement",
+					"named": true
+				},
+				{
+					"type": "case_statement",
+					"named": true
+				},
+				{
+					"type": "class_definition",
+					"named": true
+				},
+				{
+					"type": "compound_assignment_statement",
+					"named": true
+				},
+				{
+					"type": "expression_statement",
+					"named": true
+				},
+				{
+					"type": "for_range_statement",
+					"named": true
+				},
+				{
+					"type": "for_statement",
+					"named": true
+				},
+				{
+					"type": "function_definition",
+					"named": true
+				},
+				{
+					"type": "if_statement",
+					"named": true
+				},
+				{
+					"type": "interface_definition",
+					"named": true
+				},
+				{
+					"type": "let_statement",
+					"named": true
+				},
+				{
+					"type": "module_definition",
+					"named": true
+				},
+				{
+					"type": "multiple_assignment_statement",
+					"named": true
+				},
+				{
+					"type": "next_statement",
+					"named": true
+				},
+				{
+					"type": "or_assign_statement",
+					"named": true
+				},
+				{
+					"type": "puts_statement",
+					"named": true
+				},
+				{
+					"type": "raise_statement",
+					"named": true
+				},
+				{
+					"type": "require_statement",
+					"named": true
+				},
+				{
+					"type": "retry_statement",
+					"named": true
+				},
+				{
+					"type": "return_statement",
+					"named": true
+				},
+				{
+					"type": "unless_statement",
+					"named": true
+				},
+				{
+					"type": "until_statement",
+					"named": true
+				},
+				{
+					"type": "while_statement",
+					"named": true
+				},
+				{
+					"type": "yield_statement",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "splat_parameter",
+		"named": true,
+		"fields": {
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"type": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "Proc",
+						"named": false
+					},
+					{
+						"type": "array_type",
+						"named": true
+					},
+					{
+						"type": "hash_type",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "nullable_type",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "superclass_clause",
+		"named": true,
+		"fields": {
+			"superclass": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "type_param",
+		"named": true,
+		"fields": {
+			"bound": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			},
+			"name": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "identifier",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "type_param_clause",
+		"named": true,
+		"fields": {},
+		"children": {
+			"multiple": true,
+			"required": true,
+			"types": [
+				{
+					"type": "type_param",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "unary_expression",
+		"named": true,
+		"fields": {
+			"operand": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"operator": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "!",
+						"named": false
+					},
+					{
+						"type": "-",
+						"named": false
+					},
+					{
+						"type": "~",
+						"named": false
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "unless_statement",
+		"named": true,
+		"fields": {
+			"condition": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			},
+			"consequence": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			}
+		},
+		"children": {
+			"multiple": false,
+			"required": false,
+			"types": [
+				{
+					"type": "else_clause",
+					"named": true
+				},
+				{
+					"type": "elsif_clause",
+					"named": true
+				}
+			]
+		}
+	},
+	{
+		"type": "until_statement",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"condition": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "while_statement",
+		"named": true,
+		"fields": {
+			"body": {
+				"multiple": true,
+				"required": false,
+				"types": [
+					{
+						"type": "and_assign_statement",
+						"named": true
+					},
+					{
+						"type": "assignment_statement",
+						"named": true
+					},
+					{
+						"type": "begin_statement",
+						"named": true
+					},
+					{
+						"type": "break_statement",
+						"named": true
+					},
+					{
+						"type": "case_statement",
+						"named": true
+					},
+					{
+						"type": "compound_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "expression_statement",
+						"named": true
+					},
+					{
+						"type": "for_range_statement",
+						"named": true
+					},
+					{
+						"type": "for_statement",
+						"named": true
+					},
+					{
+						"type": "if_statement",
+						"named": true
+					},
+					{
+						"type": "let_statement",
+						"named": true
+					},
+					{
+						"type": "multiple_assignment_statement",
+						"named": true
+					},
+					{
+						"type": "next_statement",
+						"named": true
+					},
+					{
+						"type": "or_assign_statement",
+						"named": true
+					},
+					{
+						"type": "puts_statement",
+						"named": true
+					},
+					{
+						"type": "raise_statement",
+						"named": true
+					},
+					{
+						"type": "retry_statement",
+						"named": true
+					},
+					{
+						"type": "return_statement",
+						"named": true
+					},
+					{
+						"type": "unless_statement",
+						"named": true
+					},
+					{
+						"type": "until_statement",
+						"named": true
+					},
+					{
+						"type": "while_statement",
+						"named": true
+					},
+					{
+						"type": "yield_statement",
+						"named": true
+					}
+				]
+			},
+			"condition": {
+				"multiple": false,
+				"required": true,
+				"types": [
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "yield_statement",
+		"named": true,
+		"fields": {
+			"arguments": {
+				"multiple": true,
+				"required": true,
+				"types": [
+					{
+						"type": ",",
+						"named": false
+					},
+					{
+						"type": "array_literal",
+						"named": true
+					},
+					{
+						"type": "array_new_expression",
+						"named": true
+					},
+					{
+						"type": "binary_expression",
+						"named": true
+					},
+					{
+						"type": "call_expression",
+						"named": true
+					},
+					{
+						"type": "call_kw_expression",
+						"named": true
+					},
+					{
+						"type": "false",
+						"named": false
+					},
+					{
+						"type": "float",
+						"named": true
+					},
+					{
+						"type": "hash_literal",
+						"named": true
+					},
+					{
+						"type": "identifier",
+						"named": true
+					},
+					{
+						"type": "index_expression",
+						"named": true
+					},
+					{
+						"type": "instance_variable",
+						"named": true
+					},
+					{
+						"type": "integer",
+						"named": true
+					},
+					{
+						"type": "lambda_expression",
+						"named": true
+					},
+					{
+						"type": "method_call_expression",
+						"named": true
+					},
+					{
+						"type": "new_expression",
+						"named": true
+					},
+					{
+						"type": "nil",
+						"named": false
+					},
+					{
+						"type": "safe_call_expression",
+						"named": true
+					},
+					{
+						"type": "string",
+						"named": true
+					},
+					{
+						"type": "symbol",
+						"named": true
+					},
+					{
+						"type": "true",
+						"named": false
+					},
+					{
+						"type": "unary_expression",
+						"named": true
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "!",
+		"named": false
+	},
+	{
+		"type": "!=",
+		"named": false
+	},
+	{
+		"type": "%",
+		"named": false
+	},
+	{
+		"type": "%=",
+		"named": false
+	},
+	{
+		"type": "&",
+		"named": false
+	},
+	{
+		"type": "&&",
+		"named": false
+	},
+	{
+		"type": "&&=",
+		"named": false
+	},
+	{
+		"type": "&.",
+		"named": false
+	},
+	{
+		"type": "(",
+		"named": false
+	},
+	{
+		"type": ")",
+		"named": false
+	},
+	{
+		"type": "*",
+		"named": false
+	},
+	{
+		"type": "*=",
+		"named": false
+	},
+	{
+		"type": "+",
+		"named": false
+	},
+	{
+		"type": "+=",
+		"named": false
+	},
+	{
+		"type": ",",
+		"named": false
+	},
+	{
+		"type": "-",
+		"named": false
+	},
+	{
+		"type": "-=",
+		"named": false
+	},
+	{
+		"type": "->",
+		"named": false
+	},
+	{
+		"type": ".",
+		"named": false
+	},
+	{
+		"type": "..",
+		"named": false
+	},
+	{
+		"type": "...",
+		"named": false
+	},
+	{
+		"type": "/",
+		"named": false
+	},
+	{
+		"type": "/=",
+		"named": false
+	},
+	{
+		"type": ":",
+		"named": false
+	},
+	{
+		"type": "<",
+		"named": false
+	},
+	{
+		"type": "<<",
+		"named": false
+	},
+	{
+		"type": "<=",
+		"named": false
+	},
+	{
+		"type": "<=>",
+		"named": false
+	},
+	{
+		"type": "=",
+		"named": false
+	},
+	{
+		"type": "==",
+		"named": false
+	},
+	{
+		"type": "=>",
+		"named": false
+	},
+	{
+		"type": ">",
+		"named": false
+	},
+	{
+		"type": ">=",
+		"named": false
+	},
+	{
+		"type": ">>",
+		"named": false
+	},
+	{
+		"type": "?",
+		"named": false
+	},
+	{
+		"type": "Array",
+		"named": false
+	},
+	{
+		"type": "Hash",
+		"named": false
+	},
+	{
+		"type": "Proc",
+		"named": false
+	},
+	{
+		"type": "[",
+		"named": false
+	},
+	{
+		"type": "]",
+		"named": false
+	},
+	{
+		"type": "^",
+		"named": false
+	},
+	{
+		"type": "begin",
+		"named": false
+	},
+	{
+		"type": "break_statement",
+		"named": true
+	},
+	{
+		"type": "case",
+		"named": false
+	},
+	{
+		"type": "class",
+		"named": false
+	},
+	{
+		"type": "comment",
+		"named": true,
+		"extra": true
+	},
+	{
+		"type": "def",
+		"named": false
+	},
+	{
+		"type": "else",
+		"named": false
+	},
+	{
+		"type": "elsif",
+		"named": false
+	},
+	{
+		"type": "end",
+		"named": false
+	},
+	{
+		"type": "ensure",
+		"named": false
+	},
+	{
+		"type": "false",
+		"named": false
+	},
+	{
+		"type": "float",
+		"named": true
+	},
+	{
+		"type": "for",
+		"named": false
+	},
+	{
+		"type": "identifier",
+		"named": true
+	},
+	{
+		"type": "if",
+		"named": false
+	},
+	{
+		"type": "implements",
+		"named": false
+	},
+	{
+		"type": "in",
+		"named": false
+	},
+	{
+		"type": "instance_variable",
+		"named": true
+	},
+	{
+		"type": "integer",
+		"named": true
+	},
+	{
+		"type": "interface",
+		"named": false
+	},
+	{
+		"type": "module",
+		"named": false
+	},
+	{
+		"type": "new",
+		"named": false
+	},
+	{
+		"type": "next_statement",
+		"named": true
+	},
+	{
+		"type": "nil",
+		"named": false
+	},
+	{
+		"type": "puts",
+		"named": false
+	},
+	{
+		"type": "raise",
+		"named": false
+	},
+	{
+		"type": "read",
+		"named": false
+	},
+	{
+		"type": "require",
+		"named": false
+	},
+	{
+		"type": "rescue",
+		"named": false
+	},
+	{
+		"type": "retry_statement",
+		"named": true
+	},
+	{
+		"type": "return",
+		"named": false
+	},
+	{
+		"type": "string",
+		"named": true
+	},
+	{
+		"type": "symbol",
+		"named": true
+	},
+	{
+		"type": "true",
+		"named": false
+	},
+	{
+		"type": "unless",
+		"named": false
+	},
+	{
+		"type": "until",
+		"named": false
+	},
+	{
+		"type": "when",
+		"named": false
+	},
+	{
+		"type": "while",
+		"named": false
+	},
+	{
+		"type": "yield",
+		"named": false
+	},
+	{
+		"type": "{",
+		"named": false
+	},
+	{
+		"type": "|",
+		"named": false
+	},
+	{
+		"type": "||",
+		"named": false
+	},
+	{
+		"type": "||=",
+		"named": false
+	},
+	{
+		"type": "}",
+		"named": false
+	},
+	{
+		"type": "~",
+		"named": false
+	}
+]

@@ -1,0 +1,9 @@
+# Compiled parser build products (`tree-sitter build`) — not the
+# generated `src/` sources, which are committed per this plan's own
+# Decision log (downstream consumers compile `src/parser.c` with their
+# own toolchain rather than running `tree-sitter generate` themselves).
+*.so
+*.dylib
+*.dll
+*.wasm
+build/

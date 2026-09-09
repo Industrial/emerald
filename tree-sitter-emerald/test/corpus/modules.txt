@@ -1,0 +1,34 @@
+==================
+modules.em — namespace-only module with a static method call
+==================
+
+module MathUtils
+  def double(x: Int64) -> Int64
+    x + x
+  end
+end
+
+puts MathUtils.double(21)
+
+---
+
+(source_file
+  (module_definition
+    name: (identifier)
+    (method_definition
+      name: (identifier)
+      (param_clause
+        (parameter
+          name: (identifier)
+          type: (identifier)))
+      return_type: (identifier)
+      body: (expression_statement
+        (binary_expression
+          left: (identifier)
+          right: (identifier)))))
+  (puts_statement
+    argument: (method_call_expression
+      receiver: (identifier)
+      method: (identifier)
+      (argument_list
+        (integer)))))

@@ -1,0 +1,149 @@
+==================
+collections.em — array/hash literals, indexing, nullable types
+==================
+
+arr: Array[Int64] = [10, 20, 30]
+sum: Int64 = 0
+i: Int64 = 0
+while i < 3
+  sum: Int64 = sum + arr[i]
+  i: Int64 = i + 1
+end
+arr[1] = 99
+puts sum
+puts arr[1]
+
+floats: Array[Float64] = [1.5, 2.5]
+puts floats[0] + floats[1]
+
+h: Hash[Int64, Int64] = {1 => 10, 2 => 20}
+puts h[1]
+puts h[2]
+
+flag: Boolean = true
+other: Boolean = false
+if flag
+  puts 1
+end
+if other
+  puts 2
+else
+  puts 3
+end
+
+s: String? = nil
+if s == nil
+  puts 4
+end
+
+---
+
+(source_file
+  (let_statement
+    name: (identifier)
+    type: (array_type
+      element: (identifier))
+    value: (array_literal
+      (argument_list
+        (integer)
+        (integer)
+        (integer))))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (let_statement
+    name: (identifier)
+    type: (identifier)
+    value: (integer))
+  (while_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (integer))
+    body: (let_statement
+      name: (identifier)
+      type: (identifier)
+      value: (binary_expression
+        left: (identifier)
+        right: (index_expression
+          array: (identifier)
+          index: (identifier))))
+    body: (let_statement
+      name: (identifier)
+      type: (identifier)
+      value: (binary_expression
+        left: (identifier)
+        right: (integer))))
+  (assignment_statement
+    target: (index_expression
+      array: (identifier)
+      index: (integer))
+    value: (integer))
+  (puts_statement
+    argument: (identifier))
+  (puts_statement
+    argument: (index_expression
+      array: (identifier)
+      index: (integer)))
+  (let_statement
+    name: (identifier)
+    type: (array_type
+      element: (identifier))
+    value: (array_literal
+      (argument_list
+        (float)
+        (float))))
+  (puts_statement
+    argument: (binary_expression
+      left: (index_expression
+        array: (identifier)
+        index: (integer))
+      right: (index_expression
+        array: (identifier)
+        index: (integer))))
+  (let_statement
+    name: (identifier)
+    type: (hash_type
+      key: (identifier)
+      value: (identifier))
+    value: (hash_literal
+      (hash_pair
+        key: (integer)
+        value: (integer))
+      (hash_pair
+        key: (integer)
+        value: (integer))))
+  (puts_statement
+    argument: (index_expression
+      array: (identifier)
+      index: (integer)))
+  (puts_statement
+    argument: (index_expression
+      array: (identifier)
+      index: (integer)))
+  (let_statement
+    name: (identifier)
+    type: (identifier))
+  (let_statement
+    name: (identifier)
+    type: (identifier))
+  (if_statement
+    condition: (identifier)
+    consequence: (puts_statement
+      argument: (integer)))
+  (if_statement
+    condition: (identifier)
+    consequence: (puts_statement
+      argument: (integer))
+    (else_clause
+      body: (puts_statement
+        argument: (integer))))
+  (let_statement
+    name: (identifier)
+    type: (nullable_type
+      base: (identifier)))
+  (if_statement
+    condition: (binary_expression
+      left: (identifier))
+    consequence: (puts_statement
+      argument: (integer))))
