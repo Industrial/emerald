@@ -131,11 +131,13 @@ mod tests {
       vec![
         Param {
           name: "a".into(),
-          ty: "Int64".into()
+          ty: "Int64".into(),
+          default: None
         },
         Param {
           name: "b".into(),
-          ty: "Int64".into()
+          ty: "Int64".into(),
+          default: None
         }
       ]
     );
@@ -303,11 +305,13 @@ mod tests {
       vec![
         Param {
           name: "x".into(),
-          ty: "Float64".into()
+          ty: "Float64".into(),
+          default: None
         },
         Param {
           name: "y".into(),
-          ty: "Float64".into()
+          ty: "Float64".into(),
+          default: None
         }
       ]
     );
@@ -459,7 +463,8 @@ mod tests {
       Expr::Lambda {
         params: vec![Param {
           name: "y".into(),
-          ty: "Int64".into()
+          ty: "Int64".into(),
+          default: None
         }],
         return_type: "Int64".into(),
         body: vec![Stmt::Expr(Expr::Add(
@@ -616,6 +621,79 @@ mod tests {
     assert_eq!(rescues[0].body, vec![Stmt::Retry]);
   }
 
+  // Plan 39 (function signature completeness).
+
+  #[test]
+  fn default_param_value_parses_into_param_default() {
+    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert_eq!(f.params[0].default, None);
+    assert_eq!(f.params[1].default, Some(Expr::Int(1)));
+  }
+
+  #[test]
+  fn default_referencing_another_parameter_is_a_parse_error() {
+    let src = "def bad(n: Int64, step: Int64 = n) -> Int64\n  n + step\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "DefaultLit admits only literal tokens, never an Expr::Ident"
+    );
+  }
+
+  #[test]
+  fn splat_param_parses_into_function_splat_param() {
+    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert!(f.params.is_empty());
+    let splat = f.splat_param.as_ref().expect("splat_param should be Some");
+    assert_eq!(splat.name, "xs");
+    assert_eq!(splat.ty, "Int64");
+  }
+
+  #[test]
+  fn ordinary_param_then_splat_param_parses() {
+    let src = "def f(a: Int64, *xs: Int64) -> Int64\n  0\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert_eq!(f.params.len(), 1);
+    assert_eq!(f.params[0].name, "a");
+    assert_eq!(f.splat_param.as_ref().unwrap().name, "xs");
+  }
+
+  #[test]
+  fn keyword_call_parses_to_expr_call_kw() {
+    let src = "greet(name: \"yo\")\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::CallKw(
+        "greet".to_string(),
+        vec![("name".to_string(), Expr::StringLit("yo".to_string()))]
+      )))
+    );
+  }
+
+  #[test]
+  fn positional_call_still_parses_to_expr_call_unchanged() {
+    let src = "greet(\"yo\")\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(
+      program.items[0],
+      Item::Stmt(Stmt::Expr(Expr::Call(
+        "greet".to_string(),
+        vec![Expr::StringLit("yo".to_string())]
+      )))
+    );
+  }
+
   const MODULE_EXAMPLE: &str = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
 
   #[test]
@@ -636,7 +714,8 @@ mod tests {
       m.methods[0].params,
       vec![Param {
         name: "x".into(),
-        ty: "Int64".into()
+        ty: "Int64".into(),
+        default: None
       }]
     );
     assert_eq!(m.methods[0].return_type, "Int64");
@@ -1079,7 +1158,8 @@ mod tests {
       f.params,
       vec![Param {
         name: "n".to_string(),
-        ty: "Int64".to_string()
+        ty: "Int64".to_string(),
+        default: None
       }]
     );
     assert_eq!(f.block_param, Some("blk".to_string()));
@@ -1119,7 +1199,8 @@ mod tests {
           Expr::Lambda {
             params: vec![Param {
               name: "i".to_string(),
-              ty: "Int64".to_string()
+              ty: "Int64".to_string(),
+              default: None
             }],
             return_type: "Void".to_string(),
             body: vec![Stmt::Expr(Expr::Call(
@@ -1248,11 +1329,13 @@ mod tests {
       vec![
         Param {
           name: "x".to_string(),
-          ty: "Int64".to_string()
+          ty: "Int64".to_string(),
+          default: None
         },
         Param {
           name: "y".to_string(),
-          ty: "Int64".to_string()
+          ty: "Int64".to_string(),
+          default: None
         },
       ]
     );

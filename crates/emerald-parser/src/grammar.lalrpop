@@ -99,6 +99,7 @@ ClassField: (Param, Vec<Function>) = {
       return_type: p.ty.clone(),
       body: vec![Stmt::Expr(Expr::InstanceVar(p.name.clone()))],
       block_param: None,
+      splat_param: None,
     };
     (p, vec![accessor])
   },
@@ -124,7 +125,8 @@ FuncDef: Function = {
     params: parts.0,
     return_type,
     body,
-    block_param: parts.1,
+    block_param: parts.2,
+    splat_param: parts.1,
   }
 };
 
@@ -132,18 +134,72 @@ FuncDef: Function = {
 // inception §17's Point example) — Ruby allows omitting an empty
 // parameter list entirely. Plan 34: an optional trailing `&blk` marker
 // (`def repeat(n: Int64, &blk)`) — NOT a separate `"," "&" Ident`
-// alternative, since `Params`'s own `(<Param> ",")*` repetition already
-// eagerly consumes a trailing comma whenever the token after it can't
-// start another `Param` (the same "stop the repetition, don't shift
-// the comma into a phantom next iteration" behavior every trailing-
-// comma-list use in this grammar already relies on) — by the time
-// `Params` reduces, any `n: Int64,` prefix has already swallowed its
-// own comma, leaving a bare `&blk` (no comma) for this rule to match
-// directly.
-ParenParams: (Vec<Param>, Option<String>) = {
-  "(" <params:Params> "&" <blk:Ident> ")" => (params, Some(blk)),
-  "(" <params:Params> ")" => (params, None),
+// alternative, since `FuncParams`'s own comma-list already eagerly
+// consumes a trailing comma whenever the token after it can't start
+// another parameter (the same "stop the repetition, don't shift the
+// comma into a phantom next iteration" behavior every trailing-comma-
+// list use in this grammar already relies on) — by the time
+// `FuncParams` reduces, any `n: Int64,` prefix has already swallowed
+// its own comma, leaving a bare `&blk` (no comma) for this rule to
+// match directly. Plan 39: `FuncParams` (function-only — `ParenParams`
+// is the only caller) replaces the shared `Params`/`Param` this rule
+// used before, so a `def` parameter list alone can carry defaults/a
+// trailing splat; `ClassField`/lambda/block parameter lists keep using
+// the original, untouched `Params`/`Param`.
+ParenParams: (Vec<Param>, Option<Param>, Option<String>) = {
+  "(" <parts:FuncParams> "&" <blk:Ident> ")" => (parts.0, parts.1, Some(blk)),
+  "(" <parts:FuncParams> ")" => (parts.0, parts.1, None),
+  => (Vec::new(), None, None),
+};
+
+// Plan 39's Decision log: ordinary/defaulted parameters, then an
+// optional trailing splat — never interleaved (a splat, if present, is
+// always this list's last element). Right-recursive, mirroring every
+// other comma-list in this grammar (`CaseValues`, `YieldArgs`, ...).
+FuncParams: (Vec<Param>, Option<Param>) = {
   => (Vec::new(), None),
+  <p:SplatParam> => (Vec::new(), Some(p)),
+  <p:FuncParam> => (vec![p], None),
+  <p:FuncParam> "," <rest:FuncParams> => {
+    let mut v = vec![p];
+    v.extend(rest.0);
+    (v, rest.1)
+  },
+};
+
+FuncParam: Param = {
+  <name:Ident> ":" <ty:TypeName> => Param { name, ty, default: None },
+  // Plan 39's Decision log: `DefaultLit` admits only literal tokens —
+  // never an `Expr::Ident` — so `def f(x: Int64, y: Int64 = x)` (a
+  // default referencing another parameter) is a parse error here, at
+  // the grammar level, not a sema diagnostic.
+  <name:Ident> ":" <ty:TypeName> "=" <d:DefaultLit> => Param { name, ty, default: Some(d) },
+};
+
+DefaultLit: Expr = {
+  <n:Num> => Expr::Int(n),
+  <f:FloatLit> => Expr::Float(f),
+  <s:StringLitTok> => Expr::StringLit(decode_string_lit(&s)),
+  "true" => Expr::Bool(true),
+  "false" => Expr::Bool(false),
+  "nil" => Expr::Nil,
+};
+
+SplatParam: Param = {
+  "*" <name:Ident> ":" <ty:TypeName> => Param { name, ty, default: None },
+};
+
+// Plan 39: a mandatory-first-element, right-recursive `name: Expr` list
+// (mirrors `CaseValues`/`YieldArgs`) — at least one keyword argument,
+// since a zero-argument call already parses via the ordinary `Args`
+// path (`Expr::Call`), never this one.
+CallKwArgs: Vec<(String, Expr)> = {
+  <n:Ident> ":" <e:Expr> => vec![(n, e)],
+  <n:Ident> ":" <e:Expr> "," <rest:CallKwArgs> => {
+    let mut v = vec![(n, e)];
+    v.extend(rest);
+    v
+  },
 };
 
 // `puts` is a reserved keyword, not a generic identifier — see plan 07's
@@ -445,6 +501,8 @@ StmtPrimaryExpr: Expr = {
     if let Some(b) = blk { args.push(b); }
     Expr::Call(name, args)
   },
+  // Plan 39's Decision log: see `PrimaryExpr`'s own mirror alternative.
+  <name:Ident> "(" <kwargs:CallKwArgs> ")" => Expr::CallKw(name, kwargs),
   <recv:Ident> "." "new" "(" <args:Args> ")" => Expr::New(recv, args),
   "Array" "." "new" "(" <size:Expr> ")" => Expr::ArrayNew(Box::new(size)),
   <recv:Ident> "." <method:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> => {
@@ -693,6 +751,11 @@ PrimaryExpr: Expr = {
   // worked example (`repeat(3) { ... }` as a bare top-level statement)
   // needs.
   <name:Ident> "(" <args:Args> ")" => Expr::Call(name, args),
+  // Plan 39's Decision log: keyword-argument calls are scoped to plain
+  // function calls only (never `.method(...)`/`.new(...)`) and to
+  // all-keyword-or-all-positional call sites — a call with any `name:`
+  // argument parses as `Expr::CallKw` instead, never mixed with `Args`.
+  <name:Ident> "(" <kwargs:CallKwArgs> ")" => Expr::CallKw(name, kwargs),
   // `new` is a reserved keyword (see plan 08's Decision log): LALRPOP
   // tokenizes the literal `"new"` distinctly from the generic `Ident`
   // regex wherever it appears verbatim, so this and the bare
@@ -753,7 +816,7 @@ Params: Vec<Param> = {
 };
 
 Param: Param = {
-  <name:Ident> ":" <ty:TypeName> => Param { name, ty }
+  <name:Ident> ":" <ty:TypeName> => Param { name, ty, default: None }
 };
 
 // `Array` is a reserved keyword (same LALR(1) reason `puts`/`new` were

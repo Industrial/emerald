@@ -33,7 +33,9 @@ use inkwell::targets::{
   CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
-use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue, ValueKind};
+use inkwell::values::{
+  BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue, ValueKind,
+};
 use inkwell::{IntPredicate, OptimizationLevel};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -281,6 +283,14 @@ fn collect_idents_in_expr(expr: &Expr, out: &mut Vec<String>) {
     Expr::Call(_, args) | Expr::New(_, args) => {
       for a in args {
         collect_idents_in_expr(a, out);
+      }
+    }
+    // Plan 39: only each keyword's own *value* expression is a
+    // free-variable site — the keyword names themselves are just
+    // parameter-name labels, not identifier references.
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        collect_idents_in_expr(v, out);
       }
     }
     Expr::MethodCall(recv, _, args) => {
@@ -840,6 +850,14 @@ struct Ctx<'a, 'ctx> {
   /// inline-expanded per call site by `build_inline_block_call`, which
   /// needs the callee's real `params`/`body` to do that.
   block_funcs: &'a HashMap<String, &'a AstFunction>,
+  /// Plan 39's Decision log: `{name} -> its raw AST}` for EVERY
+  /// top-level free function (unlike `block_funcs` above, not just
+  /// `block_param`-declaring ones) — `Expr::Call`/`Expr::CallKw`'s own
+  /// codegen needs the callee's real `Function.params[i].default`/
+  /// `splat_param` to fill in omitted trailing arguments and pack a
+  /// splat's variadic tail, neither of which `user_func_ids` (compiled
+  /// LLVM handles only, no parameter-level detail) can answer.
+  func_defs: &'a HashMap<String, &'a AstFunction>,
   /// `Some((block's params, block's body))` while compiling a
   /// `block_param`-declaring function's body inline at one specific
   /// call site that attached a literal block — `Stmt::Yield`'s codegen
@@ -1574,31 +1592,44 @@ fn build_expr<'ctx>(
       Ok((cmp.into(), ValKind::Bool))
     }
     Expr::Call(name, args) => {
-      let (fv, ret_kind) = *ctx.user_func_ids.get(name).ok_or_else(|| {
-        format!("codegen: unsupported call to `{name}` (not a compiled user function)")
-      })?;
+      let (result, ret_kind) = build_call_expr(
+        context,
+        builder,
+        name,
+        args,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       if ret_kind == ValKind::Void {
         return Err(format!(
           "codegen: `{name}` returns Void and can't be used as a value"
         ));
       }
-      let mut arg_vals = Vec::with_capacity(args.len());
-      for a in args {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          a,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        arg_vals.push(v.into());
+      Ok((result, ret_kind))
+    }
+    // Plan 39's Decision log: resolved entirely at compile time — every
+    // supplied `name: value` is matched against the callee's declared
+    // parameter names (sema already guarantees no unknown/duplicate/
+    // missing-required name reaches codegen), and any parameter left
+    // unsupplied is filled from its declared default.
+    Expr::CallKw(name, kwargs) => {
+      let (result, ret_kind) = build_call_kw_expr(
+        context,
+        builder,
+        name,
+        kwargs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if ret_kind == ValKind::Void {
+        return Err(format!(
+          "codegen: `{name}` returns Void and can't be used as a value"
+        ));
       }
-      let call = builder
-        .build_call(fv, &arg_vals, "calltmp")
-        .map_err(|e| e.to_string())?;
-      let result = call_result(call)?;
       Ok((result, ret_kind))
     }
     Expr::New(class_name, args) => {
@@ -1957,6 +1988,180 @@ fn build_array_lit<'ctx>(
       .map_err(|e| e.to_string())?;
   }
   Ok(ptr)
+}
+
+/// Plan 39's Decision log: `Expr::Call`'s own positional argument-value
+/// builder — fills any missing trailing arguments from the callee's
+/// declared defaults, and — when the callee declares a splat parameter
+/// — packs every argument beyond its ordinary parameter count into a
+/// freshly allocated `Array[Elem]` (reusing `build_array_lit`'s own
+/// alloc-and-store loop wholesale), appended as one final argument. The
+/// compiled callee itself is always fixed-arity — this is purely a
+/// call-site concern.
+#[allow(clippy::too_many_arguments)]
+fn build_call_arg_vals<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  name: &str,
+  args: &[Expr],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<Vec<BasicMetadataValueEnum<'ctx>>, String> {
+  let f = ctx
+    .func_defs
+    .get(name)
+    .ok_or_else(|| format!("codegen: internal error — `{name}` has no known declaration"))?;
+  let ordinary_count = f.params.len();
+  let mut arg_vals = Vec::with_capacity(ordinary_count + usize::from(f.splat_param.is_some()));
+  for (i, param) in f.params.iter().enumerate() {
+    let expr = if i < args.len() {
+      &args[i]
+    } else {
+      param.default.as_ref().ok_or_else(|| {
+        format!(
+          "codegen: internal error — `{name}` is missing required argument `{}` (sema should have rejected this)",
+          param.name
+        )
+      })?
+    };
+    let (v, _) = build_expr(
+      context,
+      builder,
+      expr,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    arg_vals.push(v.into());
+  }
+  if f.splat_param.is_some() {
+    let trailing: &[Expr] = if args.len() > ordinary_count {
+      &args[ordinary_count..]
+    } else {
+      &[]
+    };
+    let packed = build_array_lit(
+      context,
+      builder,
+      trailing,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    arg_vals.push(packed.into());
+  }
+  Ok(arg_vals)
+}
+
+/// Plan 39: builds a plain positional call — shared by `Expr::Call`
+/// (which rejects a `Void` result, since it's being used as a value)
+/// and `Stmt::Expr(Expr::Call(...))`'s own bare-statement dispatch
+/// (which must NOT reject `Void`, the overwhelmingly common case for a
+/// statement-position call). Deliberately does not itself decide
+/// whether `Void` is acceptable — that's each caller's own call.
+#[allow(clippy::too_many_arguments)]
+fn build_call_expr<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  name: &str,
+  args: &[Expr],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (fv, ret_kind) = *ctx.user_func_ids.get(name).ok_or_else(|| {
+    format!("codegen: unsupported call to `{name}` (not a compiled user function)")
+  })?;
+  let arg_vals = build_call_arg_vals(
+    context,
+    builder,
+    name,
+    args,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let call = builder
+    .build_call(fv, &arg_vals, "calltmp")
+    .map_err(|e| e.to_string())?;
+  if ret_kind == ValKind::Void {
+    // No value to extract — the caller (a bare-statement dispatch) is
+    // only here for the call's side effects.
+    return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+  }
+  let result = call_result(call)?;
+  Ok((result, ret_kind))
+}
+
+/// Plan 39: `Expr::CallKw`'s own call builder — see `build_call_expr`'s
+/// doc comment for why this doesn't reject `Void` itself either.
+#[allow(clippy::too_many_arguments)]
+fn build_call_kw_expr<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  name: &str,
+  kwargs: &[(String, Expr)],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (fv, ret_kind) = *ctx.user_func_ids.get(name).ok_or_else(|| {
+    format!("codegen: unsupported call to `{name}` (not a compiled user function)")
+  })?;
+  let f = ctx
+    .func_defs
+    .get(name)
+    .ok_or_else(|| format!("codegen: internal error — `{name}` has no known declaration"))?;
+  let mut resolved: Vec<Option<&Expr>> = vec![None; f.params.len()];
+  for (kw_name, kw_value) in kwargs {
+    let pos = f
+      .params
+      .iter()
+      .position(|p| &p.name == kw_name)
+      .ok_or_else(|| {
+        format!(
+          "codegen: internal error — unrecognized keyword `{kw_name}` for `{name}` (sema should have rejected this)"
+        )
+      })?;
+    resolved[pos] = Some(kw_value);
+  }
+  let mut arg_vals = Vec::with_capacity(resolved.len());
+  for (i, slot) in resolved.iter().enumerate() {
+    let expr = match slot {
+      Some(e) => *e,
+      None => f.params[i].default.as_ref().ok_or_else(|| {
+        format!(
+          "codegen: internal error — missing required keyword `{}` for `{name}` (sema should have rejected this)",
+          f.params[i].name
+        )
+      })?,
+    };
+    let (v, _) = build_expr(
+      context,
+      builder,
+      expr,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    arg_vals.push(v.into());
+  }
+  let call = builder
+    .build_call(fv, &arg_vals, "callkwtmp")
+    .map_err(|e| e.to_string())?;
+  if ret_kind == ValKind::Void {
+    return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+  }
+  let result = call_result(call)?;
+  Ok((result, ret_kind))
 }
 
 /// `"Hash[K, V]"` -> `(K's kind, V's kind)` — the same compound-string
@@ -3078,6 +3283,39 @@ fn build_stmt<'a, 'ctx>(
       )?;
       Ok(false)
     }
+    // Plan 39: a bare-statement call to a `Void`-returning function
+    // (`greet(name: "yo")` with no `puts`/assignment around it) must
+    // NOT hit `Expr::Call`/`Expr::CallKw`'s own `Void`-rejection —
+    // `build_expr` is a value-producing context, and this one isn't.
+    // `build_call_expr`/`build_call_kw_expr` (unlike `build_expr`'s own
+    // arms) never reject `Void`, exactly because they're shared with
+    // this statement-position dispatch.
+    Stmt::Expr(Expr::Call(name, args)) => {
+      build_call_expr(
+        context,
+        builder,
+        name,
+        args,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      Ok(false)
+    }
+    Stmt::Expr(Expr::CallKw(name, kwargs)) => {
+      build_call_kw_expr(
+        context,
+        builder,
+        name,
+        kwargs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      Ok(false)
+    }
     Stmt::Expr(e) => {
       build_expr(
         context,
@@ -4147,6 +4385,26 @@ fn param_kinds(params: &[Param]) -> Vec<ValKind> {
   params.iter().map(|p| value_kind_for_type(&p.ty)).collect()
 }
 
+/// Plan 39's Decision log: the params list codegen actually uses for a
+/// function's LLVM signature/binding — ordinary params plus, when
+/// `f.splat_param` is declared, one synthetic trailing `Array[Elem]`-
+/// typed `Param` appended. Reuses `bind_params`'s own existing
+/// `"Array[...]"`-prefix detection for `local_array_elem_types`
+/// bookkeeping, rather than a second, parallel binding path — the
+/// compiled function itself stays fixed-arity, never a variadic LLVM
+/// signature.
+fn effective_params(f: &AstFunction) -> Vec<Param> {
+  let mut params = f.params.clone();
+  if let Some(splat) = &f.splat_param {
+    params.push(Param {
+      name: splat.name.clone(),
+      ty: format!("Array[{}]", splat.ty),
+      default: None,
+    });
+  }
+  params
+}
+
 /// Binds `f`'s declared params to fresh entry-block `alloca`s (storing
 /// each incoming SSA parameter value into its slot), populating
 /// `local_classes`/`local_array_elem_types` bookkeeping for any
@@ -4206,7 +4464,7 @@ fn define_user_function<'ctx>(
     context,
     builder,
     fv,
-    &f.params,
+    &effective_params(f),
     0,
     gen_ctx.classes,
     &mut vars,
@@ -4445,7 +4703,7 @@ fn declare_user_functions<'ctx>(
       Item::Function(f) if f.block_param.is_some() => {}
       Item::Function(f) => {
         let ret_kind = value_kind_for_type(&f.return_type);
-        let fn_ty = make_fn_type(context, &param_kinds(&f.params), ret_kind);
+        let fn_ty = make_fn_type(context, &param_kinds(&effective_params(f)), ret_kind);
         let fv = module.add_function(&f.name, fn_ty, Some(Linkage::External));
         user_func_ids.insert(f.name.clone(), (fv, ret_kind));
       }
@@ -4655,11 +4913,15 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
   // Plan 34: every `block_param`-declaring free function, keyed by
   // name — see `Ctx::block_funcs`'s own doc comment.
   let mut block_funcs: HashMap<String, &AstFunction> = HashMap::new();
+  // Plan 39: EVERY top-level free function, keyed by name — see
+  // `Ctx::func_defs`'s own doc comment.
+  let mut func_defs: HashMap<String, &AstFunction> = HashMap::new();
   for item in &program.items {
     if let Item::Function(f) = item {
       if f.block_param.is_some() {
         block_funcs.insert(f.name.clone(), f);
       }
+      func_defs.insert(f.name.clone(), f);
     }
   }
 
@@ -4699,6 +4961,7 @@ pub fn compile_to_object(program: &Program, out_path: &Path) -> Result<(), Strin
     alloc_zeroed,
     hash_key_not_found,
     block_funcs: &block_funcs,
+    func_defs: &func_defs,
     yield_target: None,
   };
 
@@ -5443,10 +5706,12 @@ mod tests {
           params: vec![Param {
             name: "n".into(),
             ty: "Int64".into(),
+            default: None,
           }],
           return_type: "Void".into(),
           body: vec![Stmt::Yield(vec![Expr::Ident("n".into())])],
           block_param: Some("blk".into()),
+          splat_param: None,
         }),
         Item::Stmt(Stmt::Expr(Expr::Call("repeat".into(), vec![Expr::Int(3)]))),
       ],
@@ -5600,5 +5865,48 @@ mod tests {
     let result = compile_to_object(&program, &out);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("retry"));
+  }
+
+  // Plan 39 (function signature completeness).
+
+  #[test]
+  fn default_param_omitted_uses_the_default_value() {
+    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5)\n";
+    assert_eq!(compile_link_run(src), "6\n");
+  }
+
+  #[test]
+  fn default_param_overridden_by_explicit_argument() {
+    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5, 10)\n";
+    assert_eq!(compile_link_run(src), "15\n");
+  }
+
+  const GREET_EXAMPLE: &str = "def greet(name: String, times: Int64 = 1) -> Void\n  i: Int64 = 0\n  while i < times\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
+
+  #[test]
+  fn greet_worked_example_keyword_calls_and_defaults_linked_and_run() {
+    // Real distinguishing proof: keyword resolution and default-filling
+    // compose correctly together (`greet(name: "yo")` uses `times`'s
+    // default; `greet(name: "hi", times: 2)` overrides it).
+    assert_eq!(compile_link_run(GREET_EXAMPLE), "yo\nhi\nhi\n");
+  }
+
+  #[test]
+  fn positional_call_still_compiles_and_runs_unchanged() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    assert_eq!(compile_link_run(src), "42\n");
+  }
+
+  const SUM_ALL_EXAMPLE: &str = "def sum_all(*xs: Int64) -> Int64\n  total: Int64 = 0\n  i: Int64 = 0\n  while i < 4\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
+
+  #[test]
+  fn splat_param_sums_a_packed_trailing_argument_list() {
+    assert_eq!(compile_link_run(SUM_ALL_EXAMPLE), "10\n");
+  }
+
+  #[test]
+  fn splat_param_with_zero_trailing_arguments_is_a_zero_length_capture() {
+    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all()\n";
+    assert_eq!(compile_link_run(src), "0\n");
   }
 }

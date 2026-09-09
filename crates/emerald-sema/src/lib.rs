@@ -61,6 +61,21 @@ struct FunctionSig {
   /// literal — mirrors `Function.block_param` (see its own doc comment
   /// for why this is a bare name, not a checkable `Type::Proc`).
   block_param: Option<String>,
+  /// Plan 39's Decision log: `params[i]`'s declared name, parallel to
+  /// `params`/`defaults` — lets a keyword-argument call site (`Expr::
+  /// CallKw`) resolve each supplied name to its position, entirely at
+  /// compile time.
+  param_names: Vec<String>,
+  /// Plan 39's Decision log: `params[i]`'s default value expression, if
+  /// declared (`None` for every parameter without one — always `None`
+  /// for every pre-plan-39 declaration). Filled into a call site's
+  /// trailing omitted arguments, both positional and keyword.
+  defaults: Vec<Option<Expr>>,
+  /// Plan 39's Decision log: `Some(elem_ty)` when this function declares
+  /// a trailing `*xs: Elem` splat parameter — every call-site argument
+  /// beyond `params.len()` must have this type. `None` for every
+  /// function that doesn't declare one.
+  splat_elem: Option<Type>,
 }
 
 /// Shared by classes and modules (plan 12's Decision log — modules reuse
@@ -143,10 +158,20 @@ fn function_signature(
     .map(|p| resolve_type(&p.ty, classes))
     .collect::<Result<Vec<_>, _>>()?;
   let return_type = resolve_type(&f.return_type, classes)?;
+  let param_names = f.params.iter().map(|p| p.name.clone()).collect();
+  let defaults = f.params.iter().map(|p| p.default.clone()).collect();
+  let splat_elem = f
+    .splat_param
+    .as_ref()
+    .map(|p| resolve_type(&p.ty, classes))
+    .transpose()?;
   Ok(FunctionSig {
     params,
     return_type,
     block_param: f.block_param.clone(),
+    param_names,
+    defaults,
+    splat_elem,
   })
 }
 
@@ -500,15 +525,50 @@ fn infer_expr_type(
         } else {
           args.as_slice()
         };
-      check_args(
-        name,
-        positional,
-        &sig.params,
-        env,
-        sigs,
-        classes,
-        self_fields,
-      )?;
+      check_call_args(name, positional, sig, env, sigs, classes, self_fields)?;
+      Ok(sig.return_type.clone())
+    }
+    // Plan 39's Decision log: resolved entirely at compile time by
+    // name-to-position matching against `sig.param_names` — never a
+    // runtime hash/dispatch. An unknown name, a duplicate name, or a
+    // missing required (no-default) parameter is a real diagnostic
+    // naming the offending keyword, not a panic.
+    Expr::CallKw(name, kwargs) => {
+      let sig = sigs
+        .get(name)
+        .ok_or_else(|| Diagnostic::new(format!("undefined function `{name}`")))?;
+      let mut positional: Vec<Option<&Expr>> = vec![None; sig.param_names.len()];
+      for (kw_name, kw_value) in kwargs {
+        let Some(pos) = sig.param_names.iter().position(|p| p == kw_name) else {
+          return Err(Diagnostic::new(format!(
+            "unrecognized keyword `{kw_name}` for `{name}`"
+          )));
+        };
+        if positional[pos].is_some() {
+          return Err(Diagnostic::new(format!(
+            "duplicate keyword `{kw_name}` in call to `{name}`"
+          )));
+        }
+        positional[pos] = Some(kw_value);
+      }
+      for (i, slot) in positional.iter().enumerate() {
+        if slot.is_none() && sig.defaults[i].is_none() {
+          return Err(Diagnostic::new(format!(
+            "`{name}` is missing required keyword `{}`",
+            sig.param_names[i]
+          )));
+        }
+      }
+      for (i, slot) in positional.iter().enumerate() {
+        let Some(value) = slot else { continue };
+        let actual = infer_expr_type(value, env, sigs, classes, self_fields)?;
+        if actual != sig.params[i] {
+          return Err(Diagnostic::new(format!(
+            "keyword `{}` to `{name}` has type {actual:?}, expected {:?}",
+            sig.param_names[i], sig.params[i]
+          )));
+        }
+      }
       Ok(sig.return_type.clone())
     }
     Expr::New(class_name, args) => {
@@ -801,6 +861,66 @@ fn check_args(
         "argument {} to `{name}` has type {actual:?}, expected {expected_ty:?}",
         i + 1
       )));
+    }
+  }
+  Ok(())
+}
+
+/// Plan 39: `Expr::Call`'s own arity/type checking — unlike `check_args`
+/// above (reused verbatim by `Expr::New`/module-method calls, which get
+/// none of this plan's four features, per its Decision log's method/
+/// non-function scoping), this accepts fewer than `sig.params.len()`
+/// arguments as long as every missing trailing one has a declared
+/// default, and — when `sig.splat_elem` is `Some` — accepts any number
+/// of trailing arguments beyond `sig.params.len()`, type-checked
+/// against the splat's declared element type.
+#[allow(clippy::too_many_arguments)]
+fn check_call_args(
+  name: &str,
+  args: &[Expr],
+  sig: &FunctionSig,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+) -> Result<(), Diagnostic> {
+  let required = sig.params.len();
+  if sig.splat_elem.is_none() && args.len() > required {
+    return Err(Diagnostic::new(format!(
+      "`{name}` expects {required} argument(s), found {}",
+      args.len()
+    )));
+  }
+  if args.len() < required {
+    for (i, default) in sig.defaults.iter().enumerate().skip(args.len()) {
+      if default.is_none() {
+        return Err(Diagnostic::new(format!(
+          "`{name}` is missing required argument `{}`",
+          sig.param_names[i]
+        )));
+      }
+    }
+  }
+  let checked = args.len().min(required);
+  for (i, arg) in args.iter().enumerate().take(checked) {
+    let actual = infer_expr_type(arg, env, sigs, classes, self_fields)?;
+    if actual != sig.params[i] {
+      return Err(Diagnostic::new(format!(
+        "argument {} to `{name}` has type {actual:?}, expected {:?}",
+        i + 1,
+        sig.params[i]
+      )));
+    }
+  }
+  if let Some(splat_ty) = &sig.splat_elem {
+    for (i, arg) in args.iter().enumerate().skip(required) {
+      let actual = infer_expr_type(arg, env, sigs, classes, self_fields)?;
+      if actual != *splat_ty {
+        return Err(Diagnostic::new(format!(
+          "trailing (splat) argument {} to `{name}` has type {actual:?}, expected {splat_ty:?}",
+          i + 1
+        )));
+      }
     }
   }
   Ok(())
@@ -1418,6 +1538,14 @@ fn check_function_body(
   for p in &f.params {
     env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
   }
+  // Plan 39: a splat parameter is bound inside the body as a real
+  // `Array[Elem]` — call sites pack it into one at each call site (the
+  // same representation plan 09 already proved), so the body indexes
+  // it exactly like any other array-typed local.
+  if let Some(p) = &f.splat_param {
+    let elem_ty = resolve_type(&p.ty, classes)?;
+    env.insert(p.name.clone(), Type::Array(Box::new(elem_ty)));
+  }
   let declared_return = resolve_type(&f.return_type, classes)?;
   check_block(
     &f.body,
@@ -1448,6 +1576,22 @@ fn check_method_body(
   classes: &HashMap<String, ClassInfo>,
   fields: &HashMap<String, Type>,
 ) -> Result<(), Diagnostic> {
+  // Plan 39's Decision log: default parameter values and splat capture
+  // are scoped to plain top-level `def` functions only — a real,
+  // disclosed diagnostic here, not a silently-ignored parsed-but-dead
+  // AST field.
+  if let Some(p) = m.params.iter().find(|p| p.default.is_some()) {
+    return Err(Diagnostic::new(format!(
+      "default parameter values are not supported on methods yet (`{class_name}#{}`'s `{}`)",
+      m.name, p.name
+    )));
+  }
+  if m.splat_param.is_some() {
+    return Err(Diagnostic::new(format!(
+      "splat parameters are not supported on methods yet (`{class_name}#{}`)",
+      m.name
+    )));
+  }
   let mut env = HashMap::new();
   for p in &m.params {
     env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
@@ -1935,9 +2079,26 @@ mod tests {
 
   #[test]
   fn rejects_arity_mismatch_at_call_site() {
+    // Plan 39: a call omitting a required (no-default) trailing
+    // parameter now names it directly, rather than a blanket "expects N
+    // argument(s)" — a real, plan-required diagnostic improvement (AC4:
+    // "a compile-time arity diagnostic naming the missing required
+    // parameter").
     let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject 1-arg call to 2-arg add");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("missing required argument `b`"))
+    );
+  }
+
+  #[test]
+  fn rejects_too_many_arguments_to_a_non_splat_function() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(1, 2, 3)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a 3-arg call to a 2-arg add");
     assert!(
       errs
         .iter()
@@ -2741,5 +2902,109 @@ mod tests {
     let src = "begin\n  puts 1\nrescue => e\n  retry\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 39 (function signature completeness).
+
+  #[test]
+  fn accepts_call_omitting_a_defaulted_trailing_argument() {
+    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_call_overriding_a_default_with_an_explicit_argument() {
+    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5, 10)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_call_omitting_a_required_no_default_argument() {
+    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`n` has no default — must be required");
+    assert!(errs[0].message.contains("missing required argument `n`"));
+  }
+
+  #[test]
+  fn rejects_default_parameter_on_a_method() {
+    let src = "class Foo\n  def m(x: Int64 = 0) -> Int64\n    x\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("default parameter values are not supported on methods yet");
+    assert!(errs[0].message.contains("not supported on methods"));
+  }
+
+  const GREET_EXAMPLE: &str = "def greet(name: String, times: Int64 = 1) -> Void\n  i: Int64 = 0\n  while i < times\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
+
+  #[test]
+  fn accepts_the_greet_worked_example_keyword_calls_and_defaults() {
+    let program = emerald_parser::parse(GREET_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_misspelled_keyword_argument() {
+    let src = "def greet(name: String) -> Void\n  puts name\nend\n\ngreet(nam: \"hi\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`nam` is not a declared parameter of greet");
+    assert!(errs[0].message.contains("unrecognized keyword `nam`"));
+  }
+
+  #[test]
+  fn rejects_call_missing_a_required_keyword() {
+    // A bare `greet()` (no `name:` at all) would parse as an ordinary,
+    // zero-arg `Expr::Call`, not `Expr::CallKw` — this test instead
+    // supplies the defaulted keyword while omitting the required one,
+    // to genuinely exercise `Expr::CallKw`'s own missing-keyword path.
+    let src =
+      "def greet(name: String, times: Int64 = 1) -> Void\n  puts name\nend\n\ngreet(times: 5)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`name` has no default — must be required");
+    assert!(errs[0].message.contains("missing required keyword `name`"));
+  }
+
+  #[test]
+  fn rejects_duplicate_keyword_argument() {
+    let src =
+      "def greet(name: String) -> Void\n  puts name\nend\n\ngreet(name: \"hi\", name: \"yo\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("must reject a duplicate keyword");
+    assert!(errs[0].message.contains("duplicate keyword `name`"));
+  }
+
+  const SUM_ALL_EXAMPLE: &str = "def sum_all(*xs: Int64) -> Int64\n  total: Int64 = 0\n  i: Int64 = 0\n  while i < 4\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
+
+  #[test]
+  fn accepts_splat_call_type_checking_trailing_arguments() {
+    let program = emerald_parser::parse(SUM_ALL_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn accepts_splat_call_with_zero_trailing_arguments() {
+    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_splat_call_with_a_mismatched_trailing_argument_type() {
+    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all(1, \"x\")\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("a String trailing argument must not match Int64");
+    assert!(errs[0].message.contains("trailing (splat) argument 2"));
+  }
+
+  #[test]
+  fn rejects_splat_parameter_on_a_method() {
+    let src = "class Foo\n  def m(*xs: Int64) -> Int64\n    0\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("splat parameters are not supported on methods yet");
+    assert!(errs[0].message.contains("not supported on methods"));
   }
 }

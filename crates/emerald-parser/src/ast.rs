@@ -1,7 +1,16 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Param {
   pub name: String,
   pub ty: String,
+  /// Plan 39's Decision log: `Some(_)` only for a `def` function
+  /// parameter declared with a trailing `= <literal>` — always `None`
+  /// for a class field, a lambda parameter, or a block parameter (the
+  /// shared `Param`/`Params` grammar productions those reuse can never
+  /// produce `Some`; only the function-only `FuncParam` production
+  /// can). Restricted to compile-time-evaluable literal tokens
+  /// (`Int`/`Float`/`StringLit`/`Bool`/`Nil`) — never an arbitrary
+  /// expression, and never a reference to another parameter.
+  pub default: Option<Expr>,
 }
 
 /// Decodes a raw `"..."` token's `\"`/`\n` escapes into the literal's
@@ -82,6 +91,15 @@ pub enum Expr {
   Or(Box<Expr>, Box<Expr>),
   Compare(Box<Expr>, CompareOp, Box<Expr>),
   Call(String, Vec<Expr>),
+  /// `f(name: value, ...)` (plan 39's Decision log) — a plain function
+  /// call whose arguments are resolved entirely at compile time by
+  /// name-to-position matching against the callee's declared parameter
+  /// names, never a runtime hash/dispatch. Scoped to bare function
+  /// calls only (never `.method(...)`/`.new(...)`) and to all-keyword
+  /// call sites (mixing positional and keyword arguments in one call is
+  /// out of scope) — a call with any `name:` argument parses as this
+  /// node instead of `Expr::Call`.
+  CallKw(String, Vec<(String, Expr)>),
   /// `ClassName.new(args)`.
   New(String, Vec<Expr>),
   /// `receiver.method(args)` — `args` is empty for a bare `receiver.method`
@@ -283,6 +301,14 @@ pub struct Function {
   /// every function that doesn't declare one — unchanged from before
   /// this plan.
   pub block_param: Option<String>,
+  /// `*xs: Int64` (plan 39's Decision log) — the trailing splat
+  /// parameter's *element* type only (e.g. `Int64`, not `Array[Int64]`).
+  /// Ordered after ordinary/defaulted parameters and before an optional
+  /// `&blk`; packed into a real `Array[Elem]` at each call site (plan
+  /// 09's actual representation), never a variadic LLVM signature — the
+  /// compiled function itself stays fixed-arity. `None` for every
+  /// function that doesn't declare one.
+  pub splat_param: Option<Param>,
 }
 
 /// A class declaration: fields (reusing `Param`'s `{name, ty}` shape —
