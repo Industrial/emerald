@@ -21,6 +21,13 @@ use id_effect::{Effect, run_blocking};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
+// Plan 21's Decision log: `emerald-lsp` keeps depending only on this
+// crate, never directly on `emerald-parser`/`emerald-sema` (the same
+// boundary plan 17's `leaf-lsp-server` already established) — this
+// re-export is what lets it name `SymbolTable`'s own type without a
+// second dependency edge.
+pub use emerald_sema::{ClassSymbol, FunctionSymbol, SymbolTable};
+
 #[derive(Debug)]
 pub enum DriverError {
   /// Plan 26: `emerald_parser::parse_named` reports every top-level
@@ -144,6 +151,17 @@ fn codegen_test_stage(
   })
 }
 
+/// Plan 21's `leaf-symbol-table`: parses `source` and returns
+/// `emerald_sema::collect_symbols`'s best-effort table — sitting
+/// alongside `check`/`compile`, reusing the existing `DriverError::
+/// Parse` variant for a parse failure rather than inventing a new
+/// error path. `emerald-lsp` reaches this instead of depending on
+/// `emerald-parser`/`emerald-sema` directly (plan 17's own boundary).
+pub fn symbols(source: &str, name: &str) -> Result<emerald_sema::SymbolTable, DriverError> {
+  let program = emerald_parser::parse_named(source, name).map_err(DriverError::Parse)?;
+  Ok(emerald_sema::collect_symbols(&program))
+}
+
 /// Type-checks an already-parsed `Program` directly.
 pub fn check_program(program: &Program) -> Result<(), DriverError> {
   emerald_sema::check_program(program).map_err(DriverError::Sema)
@@ -211,5 +229,30 @@ mod tests {
     let run = Command::new(&output).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // Plan 21 (LSP symbols and navigation).
+
+  #[test]
+  fn symbols_returns_a_table_for_hello_em_in_memory_with_no_filesystem_write() {
+    let table = symbols(HELLO_SRC, "hello.em").expect("should collect symbols");
+    let add = table.functions.get("add").expect("`add` should be present");
+    assert_eq!(add.params.len(), 2);
+  }
+
+  #[test]
+  fn symbols_returns_a_table_for_classes_em() {
+    let src = "class Counter\n  value: Int64\n\n  def initialize(start: Int64) -> Void\n    @value = start\n  end\nend\n";
+    let table = symbols(src, "classes.em").expect("should collect symbols");
+    assert!(table.classes.contains_key("Counter"));
+  }
+
+  #[test]
+  fn symbols_rejects_an_unparseable_buffer() {
+    let source = "def add(a: Int64\n";
+    assert!(matches!(
+      symbols(source, "bad.em"),
+      Err(DriverError::Parse(_))
+    ));
   }
 }

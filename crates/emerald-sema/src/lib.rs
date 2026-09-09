@@ -2667,6 +2667,131 @@ fn check_yields_against_block(
 /// registered here (see plan 08's Decision log) — free functions are
 /// enough two-pass ordering for a top-level call to a function defined
 /// later in the same `Item*` list to still resolve.
+/// One function or method's public signature (plan 21's Decision log:
+/// a thin DTO over the private `FunctionSig` this crate already
+/// computes internally, not new analysis).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionSymbol {
+  pub params: Vec<Type>,
+  pub return_type: Type,
+}
+
+/// One class or module's public shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassSymbol {
+  pub is_module: bool,
+  pub fields: HashMap<String, Type>,
+  pub methods: HashMap<String, FunctionSymbol>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SymbolTable {
+  pub functions: HashMap<String, FunctionSymbol>,
+  pub classes: HashMap<String, ClassSymbol>,
+}
+
+fn function_symbol_from_sig(sig: FunctionSig) -> FunctionSymbol {
+  FunctionSymbol {
+    params: sig.params,
+    return_type: sig.return_type,
+  }
+}
+
+/// Plan 21's Decision log: a thin, disclosed export of the exact same
+/// two-pass class/module + non-generic-function registration
+/// `check_program` already runs internally before it ever checks a
+/// single body — best-effort and never fails on a body-level type
+/// error (this never checks a body at all, only signatures), and a
+/// per-declaration graceful degrade: a class/function whose own
+/// signature fails to resolve is simply omitted from the returned
+/// table, not an all-or-nothing abort. Implemented as its own
+/// self-contained duplicate of `check_program`'s registration passes,
+/// deliberately not a literal shared-helper refactor of `check_program`
+/// itself — zero risk of changing that function's own, already-tested
+/// behavior to get a read-only export of what it already computes.
+/// Interfaces/generic functions are out of scope here — `SymbolTable`
+/// has no shape for either, matching how `check_program`'s own
+/// non-generic `sigs` map already excludes a generic function's name.
+pub fn collect_symbols(program: &Program) -> SymbolTable {
+  let mut classes: HashMap<String, ClassInfo> = HashMap::new();
+  let mut class_defs: HashMap<String, &ClassDef> = HashMap::new();
+  for item in &program.items {
+    if let Item::Class(c) = item {
+      class_defs.insert(c.name.clone(), c);
+      classes.insert(
+        c.name.clone(),
+        ClassInfo {
+          fields: HashMap::new(),
+          methods: HashMap::new(),
+          is_module: false,
+          superclass: c.superclass.clone(),
+          implements: c.implements.clone(),
+        },
+      );
+    }
+    if let Item::Module(m) = item {
+      classes.insert(
+        m.name.clone(),
+        ClassInfo {
+          fields: HashMap::new(),
+          methods: HashMap::new(),
+          is_module: true,
+          superclass: None,
+          implements: None,
+        },
+      );
+    }
+  }
+
+  let mut resolved_classes: HashMap<String, ClassInfo> = HashMap::new();
+  for item in &program.items {
+    if let Item::Class(c) = item {
+      if let Ok(info) = build_flattened_class_info(&c.name, &class_defs, &classes) {
+        classes.insert(c.name.clone(), info.clone());
+        resolved_classes.insert(c.name.clone(), info);
+      }
+    }
+    if let Item::Module(m) = item {
+      if let Ok(info) = module_info(m, &classes) {
+        classes.insert(m.name.clone(), info.clone());
+        resolved_classes.insert(m.name.clone(), info);
+      }
+    }
+  }
+
+  let mut functions: HashMap<String, FunctionSymbol> = HashMap::new();
+  for item in &program.items {
+    if let Item::Function(f) = item {
+      if f.type_params.is_empty() {
+        if let Ok(sig) = function_signature(f, &classes) {
+          functions.insert(f.name.clone(), function_symbol_from_sig(sig));
+        }
+      }
+    }
+  }
+
+  let classes = resolved_classes
+    .into_iter()
+    .map(|(name, info)| {
+      let methods = info
+        .methods
+        .into_iter()
+        .map(|(m_name, sig)| (m_name, function_symbol_from_sig(sig)))
+        .collect();
+      (
+        name,
+        ClassSymbol {
+          is_module: info.is_module,
+          fields: info.fields,
+          methods,
+        },
+      )
+    })
+    .collect();
+
+  SymbolTable { functions, classes }
+}
+
 pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   let mut diags = Vec::new();
 
@@ -4457,5 +4582,57 @@ mod tests {
     let src = "assert(1 + 1 == 2)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
+  }
+
+  // Plan 21 (LSP symbols and navigation).
+
+  #[test]
+  fn collect_symbols_on_hello_em_finds_add() {
+    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let table = collect_symbols(&program);
+    let add = table
+      .functions
+      .get("add")
+      .expect("`add` should be in the table");
+    assert_eq!(add.params, vec![Type::Int64, Type::Int64]);
+    assert_eq!(add.return_type, Type::Int64);
+  }
+
+  #[test]
+  fn collect_symbols_on_classes_em_finds_both_classes_and_their_methods() {
+    let src = "class Counter\n  value: Int64\n\n  def initialize(start: Int64) -> Void\n    @value = start\n  end\n\n  def value -> Int64\n    @value\n  end\n\n  def add(n: Int64) -> Int64\n    @value + n\n  end\nend\n\nclass Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let table = collect_symbols(&program);
+
+    let counter = table
+      .classes
+      .get("Counter")
+      .expect("Counter should be in the table");
+    assert!(!counter.is_module);
+    assert_eq!(counter.fields.get("value"), Some(&Type::Int64));
+    assert!(counter.methods.contains_key("initialize"));
+    assert!(counter.methods.contains_key("value"));
+    assert!(counter.methods.contains_key("add"));
+
+    let point = table
+      .classes
+      .get("Point")
+      .expect("Point should be in the table");
+    assert_eq!(point.fields.get("x"), Some(&Type::Float64));
+    assert_eq!(point.fields.get("y"), Some(&Type::Float64));
+    assert!(point.methods.contains_key("initialize"));
+    assert!(point.methods.contains_key("sum"));
+  }
+
+  #[test]
+  fn collect_symbols_omits_only_the_class_with_an_unresolvable_field_type() {
+    // AC3: the degrade is per-declaration, not all-or-nothing.
+    let src = "class Bad\n  x: NoSuchType\nend\n\nclass Good\n  y: Int64\nend\n\ndef ok() -> Int64\n  1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let table = collect_symbols(&program);
+    assert!(!table.classes.contains_key("Bad"));
+    assert!(table.classes.contains_key("Good"));
+    assert!(table.functions.contains_key("ok"));
   }
 }
