@@ -231,6 +231,14 @@ struct FieldInfo {
 struct ClassLayout {
   fields: HashMap<String, FieldInfo>,
   size: u64,
+  /// `{field name} -> its raw declared TypeName string}` (plan 55's own
+  /// addition) — `build_method_call`'s cross-actor dispatch check needs
+  /// to know a `Ptr`-kind field's declared CLASS name (e.g. `@peer:
+  /// PingPong`), which `FieldInfo.kind` alone can't carry (`ValKind::
+  /// Ptr` is shared by every class/actor type, with no name attached).
+  /// Populated for every field regardless of kind — cheap, and a
+  /// non-`Ptr` field's entry is simply never consulted by anything.
+  field_classes: HashMap<String, String>,
 }
 
 /// Plan 52's Decision log: a tagged union — `[tag: i64][payload: 8 *
@@ -356,6 +364,7 @@ fn build_class_layout(
 ) -> Result<ClassLayout, String> {
   let chain = resolve_class_chain(name, class_defs)?;
   let mut fields = HashMap::new();
+  let mut field_classes = HashMap::new();
   let mut offset = 0u64;
   for class_name in &chain {
     let c = class_defs[class_name.as_str()];
@@ -367,12 +376,14 @@ fn build_class_layout(
           kind: value_kind_for_type(&f.ty),
         },
       );
+      field_classes.insert(f.name.clone(), f.ty.clone());
       offset += 8;
     }
   }
   Ok(ClassLayout {
     fields,
     size: offset,
+    field_classes,
   })
 }
 
@@ -1952,6 +1963,13 @@ fn program_uses_retry(program: &Program) -> bool {
     Item::Function(f) => body_uses_retry(&f.body),
     Item::Class(c) => c.methods.iter().any(|m| body_uses_retry(&m.body)),
     Item::Module(m) => m.methods.iter().any(|m| body_uses_retry(&m.body)),
+    // Plan 55: a pre-existing gap from plan 54's own `Item::Actor`
+    // addition (silently fell into the wildcard below, meaning an
+    // actor method using `retry` could have been wrongly optimized) —
+    // fixed here since this plan is what makes actor method bodies
+    // genuinely execute (and therefore genuinely `raise`/`rescue`/
+    // `retry`) for the first time.
+    Item::Actor(a) => a.methods.iter().any(|m| body_uses_retry(&m.body)),
     Item::Stmt(s) => stmt_contains_retry(s),
     _ => false,
   })
@@ -2033,6 +2051,171 @@ fn declare_exception_runtime_funcs<'ctx>(
   }
 }
 
+/// Plan 55's own imported functions from `runtime/emerald_runtime.c`'s
+/// mailbox/worker-pool — declared as a sibling to
+/// `ExceptionRuntimeFuncs`/`declare_exception_runtime_funcs` above,
+/// same shape of work. `enqueue`'s uniform trampoline signature
+/// (`void(i8*, i64*)`) is shared with every per-method trampoline this
+/// leaf itself generates (see `declare_actor_runtime_funcs`'s own call
+/// site).
+#[derive(Clone, Copy)]
+struct ActorRuntimeFuncs<'ctx> {
+  init_header: FunctionValue<'ctx>,
+  enqueue: FunctionValue<'ctx>,
+  pool_start: FunctionValue<'ctx>,
+  pool_drain_and_join: FunctionValue<'ctx>,
+  current_thread_id: FunctionValue<'ctx>,
+}
+
+fn declare_actor_runtime_funcs<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+) -> ActorRuntimeFuncs<'ctx> {
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let i64_ty = context.i64_type();
+  let void_ty = context.void_type();
+
+  let init_header = module.add_function(
+    "emerald_actor_init_header",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let enqueue = module.add_function(
+    "emerald_actor_enqueue",
+    void_ty.fn_type(
+      &[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let pool_start = module.add_function(
+    "emerald_worker_pool_start",
+    void_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let pool_drain_and_join = module.add_function(
+    "emerald_worker_pool_drain_and_join",
+    void_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let current_thread_id = module.add_function(
+    "emerald_current_thread_id",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+
+  ActorRuntimeFuncs {
+    init_header,
+    enqueue,
+    pool_start,
+    pool_drain_and_join,
+    current_thread_id,
+  }
+}
+
+/// One small, uniform-ABI (`void(i8*, i64*)`) trampoline `FunctionValue`
+/// per actor method — `emerald_actor_enqueue`'s message payload is
+/// exactly `{self, argv}`, so a worker thread can run ANY actor
+/// method through the identical call shape. Each trampoline unpacks
+/// `argv` per that specific method's own already-known static `Param`
+/// types (mirroring `local_llvm_type`'s existing `ValKind`-to-LLVM-type
+/// mapping, in the encoding the plan's own Decision log states: an
+/// `Int64`/`Symbol`/`Nil` word as-is, a `Float64` bit-cast, a `Ptr`/
+/// `Str` `inttoptr`, a `Bool` truncated down from its full-width word)
+/// and calls the real, already-declared method function — structurally
+/// the same one-more-`FunctionValue`-per-item shape `declare_lambda_
+/// functions`/`define_lambda` already do per lambda. Keyed by the
+/// identical `"{Actor}_{method}"` mangled name `declare_user_functions`/
+/// the define-pass already use for the method itself, so `leaf-cross-
+/// actor-dispatch`'s own enqueue call site can look up "this call's
+/// trampoline" the same way it already looks up "this call's target
+/// function." Must run after `user_func_ids` is fully populated (its
+/// `method_fv` lookup below reads straight from it), but needs none of
+/// `declare_user_functions`'s own internal state — a fully separate,
+/// later pass, not a change to that function.
+fn declare_actor_trampolines<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  program: &Program,
+  user_func_ids: &HashMap<String, (FunctionValue<'ctx>, ValKind)>,
+) -> Result<HashMap<String, FunctionValue<'ctx>>, String> {
+  let ptr_ty = context.ptr_type(AddressSpace::default());
+  let i64_ty = context.i64_type();
+  let void_ty = context.void_type();
+  let builder = context.create_builder();
+  let trampoline_ty = void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+
+  let mut trampolines = HashMap::new();
+  for item in &program.items {
+    let Item::Actor(a) = item else { continue };
+    for m in &a.methods {
+      let mangled = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
+      let Some(&(method_fv, _)) = user_func_ids.get(&mangled) else {
+        continue;
+      };
+      let trampoline_fv = module.add_function(
+        &format!("{mangled}__trampoline"),
+        trampoline_ty,
+        Some(Linkage::External),
+      );
+
+      let entry = context.append_basic_block(trampoline_fv, "entry");
+      builder.position_at_end(entry);
+      let self_param = trampoline_fv
+        .get_nth_param(0)
+        .expect("trampoline always has a self param")
+        .into_pointer_value();
+      let argv_param = trampoline_fv
+        .get_nth_param(1)
+        .expect("trampoline always has an argv param")
+        .into_pointer_value();
+
+      let mut call_args: Vec<BasicMetadataValueEnum> = vec![self_param.into()];
+      for (i, p) in m.params.iter().enumerate() {
+        let idx = i64_ty.const_int(i as u64, false);
+        let slot_ptr = unsafe {
+          builder
+            .build_in_bounds_gep(i64_ty, argv_param, &[idx], "argvslot")
+            .map_err(|e| e.to_string())?
+        };
+        let raw = builder
+          .build_load(i64_ty, slot_ptr, "argraw")
+          .map_err(|e| e.to_string())?
+          .into_int_value();
+        let value: BasicMetadataValueEnum = match value_kind_for_type(&p.ty) {
+          ValKind::Int64 | ValKind::Nil | ValKind::Symbol => raw.into(),
+          ValKind::Float64 => builder
+            .build_bit_cast(raw, context.f64_type(), "argf64")
+            .map_err(|e| e.to_string())?
+            .into(),
+          ValKind::Ptr | ValKind::Str => builder
+            .build_int_to_ptr(raw, ptr_ty, "argptr")
+            .map_err(|e| e.to_string())?
+            .into(),
+          ValKind::Bool => builder
+            .build_int_truncate(raw, context.bool_type(), "argbool")
+            .map_err(|e| e.to_string())?
+            .into(),
+          ValKind::Void | ValKind::Tuple(_) => {
+            return Err(format!(
+              "codegen: internal — `{}` is not a valid actor method param kind",
+              p.ty
+            ));
+          }
+        };
+        call_args.push(value);
+      }
+      builder
+        .build_call(method_fv, &call_args, "trampolinecall")
+        .map_err(|e| e.to_string())?;
+      builder.build_return(None).map_err(|e| e.to_string())?;
+
+      trampolines.insert(mangled, trampoline_fv);
+    }
+  }
+  Ok(trampolines)
+}
+
 /// The header/exit blocks of the innermost enclosing loop, for `break`
 /// (jump to `exit`) / `next` (jump back to `header`) to target.
 /// `Copy` (plan 38): `Stmt::Break`/`Stmt::Next` need to read the target
@@ -2044,9 +2227,20 @@ struct LoopTargets<'ctx> {
   exit: BasicBlock<'ctx>,
 }
 
+/// `(self_ptr, &class.fields, &class.field_classes)` — the shape
+/// `Ctx::self_ctx` carries while compiling a method body. Its own named
+/// alias, per clippy's `type_complexity` (the third element is plan
+/// 55's own addition, see `ClassLayout.field_classes`'s own doc
+/// comment).
+type SelfCtx<'a, 'ctx> = (
+  PointerValue<'ctx>,
+  &'a HashMap<String, FieldInfo>,
+  &'a HashMap<String, String>,
+);
+
 /// Context that's fixed for the duration of compiling one function/
-/// method/lambda body. `self_ctx` is `Some((self_ptr, &class.fields))`
-/// only while compiling a method body.
+/// method/lambda body. `self_ctx` is `Some(...)` (see `SelfCtx`'s own
+/// doc comment) only while compiling a method body.
 #[derive(Clone, Copy)]
 struct Ctx<'a, 'ctx> {
   user_func_ids: &'a HashMap<String, (FunctionValue<'ctx>, ValKind)>,
@@ -2066,7 +2260,7 @@ struct Ctx<'a, 'ctx> {
   int64_to_string: FunctionValue<'ctx>,
   float64_to_string: FunctionValue<'ctx>,
   bool_to_string: FunctionValue<'ctx>,
-  self_ctx: Option<(PointerValue<'ctx>, &'a HashMap<String, FieldInfo>)>,
+  self_ctx: Option<SelfCtx<'a, 'ctx>>,
   /// `{lambda's Let name} -> (its synthesized `__lambda_{name}` function,
   /// its declared return kind)`, for statically dispatching `.call`.
   lambda_func_ids: &'a HashMap<String, (FunctionValue<'ctx>, ValKind)>,
@@ -2210,6 +2404,18 @@ struct Ctx<'a, 'ctx> {
   /// non-goals.
   region_create_fn: FunctionValue<'ctx>,
   region_alloc_fn: FunctionValue<'ctx>,
+  /// Plan 55's own imported mailbox/worker-pool functions — see
+  /// `ActorRuntimeFuncs`'s own doc comment.
+  actor_funcs: ActorRuntimeFuncs<'ctx>,
+  /// `{"{Actor}_{method}"} -> that method's own trampoline FunctionValue`
+  /// — see `declare_actor_trampolines`'s own doc comment.
+  actor_trampolines: &'a HashMap<String, FunctionValue<'ctx>>,
+  /// Every declared `actor`'s name — `build_method_call`'s own
+  /// dispatch-rule check (Plan 55's Decision log: a literal `self`
+  /// receiver is always a direct call; any OTHER receiver whose static
+  /// class is IN this set becomes a cross-actor `emerald_actor_enqueue`
+  /// call instead).
+  actor_names: &'a HashSet<String>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -3202,6 +3408,22 @@ fn build_expr<'ctx>(
         Ok((raw, ValKind::Int64))
       }
     }
+    // Plan 55's Decision log: `current_thread_id()` — supplementary,
+    // best-effort observability only, the same hardcoded-name
+    // dispatch convention as `is_valid_int`/`parse_digits` immediately
+    // above.
+    Expr::Call(name, args) if name == "current_thread_id" => {
+      if !args.is_empty() {
+        return Err(format!(
+          "codegen: `current_thread_id` expects 0 arguments, found {}",
+          args.len()
+        ));
+      }
+      let call = builder
+        .build_call(ctx.actor_funcs.current_thread_id, &[], "curthreadid")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Int64))
+    }
     // Plan 53's Decision log: `Ok(inner)`/`Err(inner)`, ordinary
     // `build_expr` arms — no `Stmt`-level special case needed (unlike
     // `Try` below), since the payload's kind comes from evaluating
@@ -3322,20 +3544,36 @@ fn build_expr<'ctx>(
       }
       Ok((ptr.into(), ValKind::Ptr))
     }
-    // Plan 54: `.spawn`'s exact structural mirror of `Expr::New` above —
-    // same `layout`/`build_initialize_call`, the one difference being
-    // the allocation call site itself: plan 51's real two-call region
-    // API (`create` then `alloc`) in place of `Expr::New`'s single
-    // `ctx.alloc` call. Never counted in `escape_stats` — plan 50's
-    // stack-allocation optimization is `Expr::New`-only by design (see
-    // this plan's own Decision log): an actor instance always
-    // heap-allocates into its own region.
+    // Plan 54/55: `.spawn`'s exact structural mirror of `Expr::New`
+    // above — same `layout`/`build_initialize_call`, the one
+    // difference being the allocation call site itself: plan 51's real
+    // two-call region API (`create` then `alloc`) in place of
+    // `Expr::New`'s single `ctx.alloc` call. Never counted in
+    // `escape_stats` — plan 50's stack-allocation optimization is
+    // `Expr::New`-only by design (see plan 54's Decision log): an
+    // actor instance always heap-allocates into its own region.
+    //
+    // Plan 55's own addition: the allocated region reserves 8 extra
+    // leading bytes (one pointer width) ahead of the instance's own
+    // `layout.size` fields — `runtime/emerald_runtime.c`'s own real
+    // header-prefix contract (see its `EmeraldActorHeader` doc comment)
+    // — filled in by `emerald_actor_init_header`. `self`, from here on
+    // (the value `build_initialize_call` receives and this expression
+    // itself evaluates to), is `raw_ptr` offset past that slot via the
+    // exact same `field_ptr` helper ordinary field access already
+    // uses — never a change to `ClassLayout`/`FieldInfo`'s own 0-based
+    // field offsets, so every other piece of actor-method codegen
+    // (`@field` reads/writes, same-actor `self` calls) stays completely
+    // unaware this header prefix exists.
     Expr::Spawn(class_name, args) => {
       let layout = ctx
         .classes
         .get(class_name)
         .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
-      let size_val = context.i64_type().const_int(layout.size, false);
+      let header_size = 8u64;
+      let size_val = context
+        .i64_type()
+        .const_int(layout.size + header_size, false);
       let region_call = builder
         .build_call(ctx.region_create_fn, &[], "spawnregion")
         .map_err(|e| e.to_string())?;
@@ -3347,19 +3585,27 @@ fn build_expr<'ctx>(
           "spawntmp",
         )
         .map_err(|e| e.to_string())?;
-      let ptr = call_result(alloc_call)?.into_pointer_value();
+      let raw_ptr = call_result(alloc_call)?.into_pointer_value();
+      builder
+        .build_call(
+          ctx.actor_funcs.init_header,
+          &[raw_ptr.into()],
+          "spawnheader",
+        )
+        .map_err(|e| e.to_string())?;
+      let self_ptr = field_ptr(context, builder, raw_ptr, header_size)?;
       build_initialize_call(
         context,
         builder,
         class_name,
         args,
-        ptr,
+        self_ptr,
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )?;
-      Ok((ptr.into(), ValKind::Ptr))
+      Ok((self_ptr.into(), ValKind::Ptr))
     }
     Expr::MethodCall(recv, method, args) => build_method_call(
       context,
@@ -3384,7 +3630,7 @@ fn build_expr<'ctx>(
       ctx,
     ),
     Expr::InstanceVar(name) => {
-      let (self_ptr, fields) = ctx
+      let (self_ptr, fields, _) = ctx
         .self_ctx
         .ok_or_else(|| format!("codegen: `@{name}` used outside of a method body"))?;
       let field = fields
@@ -3620,6 +3866,38 @@ fn build_method_call<'ctx>(
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  // Plan 55's Decision log: the one receiver shape beyond a plain local
+  // this backend supports — and only for this one purpose — is `@field.
+  // method(args)` where `@field`'s own declared type is a known actor
+  // (this plan's own `@peer.hit` shape). Checked before the `Expr::
+  // Ident`-only guard below, which stays completely unchanged for every
+  // other receiver shape (an ordinary class-typed field still isn't a
+  // supported method-call receiver — real, disclosed, narrow scope:
+  // this plan only needs the actor case, not general field-based
+  // dispatch). Actors never have a superclass (plan 54's own grammar
+  // constraint), so the field's own declared class name IS always the
+  // defining class — no `method_owners` chain walk needed here.
+  if let Expr::InstanceVar(field_name) = &recv.node {
+    if let Some((_, _, field_classes)) = ctx.self_ctx {
+      if let Some(field_class) = field_classes.get(field_name) {
+        if ctx.actor_names.contains(field_class.as_str()) {
+          let key = format!("{field_class}_{}", mangled_operator_symbol(method));
+          return build_actor_enqueue_call(
+            context,
+            builder,
+            recv,
+            &key,
+            args,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          );
+        }
+      }
+    }
+  }
+
   let Expr::Ident(recv_name) = &recv.node else {
     return Err(
       "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
@@ -3764,6 +4042,33 @@ fn build_method_call<'ctx>(
       .and_then(|owners| owners.get(method))
       .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
     let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
+
+    // Plan 55's Decision log: the dispatch rule is purely syntactic —
+    // a literal `self` receiver is always a direct call (AC4: zero
+    // enqueue overhead for the same-actor case); any OTHER receiver
+    // whose static class is a declared actor becomes a cross-actor
+    // `emerald_actor_enqueue` call instead, even one that happens to
+    // alias `self` at runtime (deliberately conservative — no runtime
+    // identity check exists anywhere in this backend to tell the
+    // difference). Checked here, before the ordinary direct-call
+    // lookup below, so it applies uniformly to every actor-typed
+    // receiver shape `local_classes` can name (a field, a parameter, a
+    // local — this function's own receiver is always a plain
+    // `Expr::Ident`, per the check at its very top).
+    if recv_name != "self" && ctx.actor_names.contains(class_name.as_str()) {
+      return build_actor_enqueue_call(
+        context,
+        builder,
+        recv,
+        &key,
+        args,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      );
+    }
+
     ctx
       .user_func_ids
       .get(&key)
@@ -3803,6 +4108,112 @@ fn build_method_call<'ctx>(
     return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
   }
   Ok((call_result(call)?, ret_kind))
+}
+
+/// Plan 55's Decision log: builds a cross-actor `emerald_actor_enqueue`
+/// call in place of an ordinary direct call — `build_method_call`'s own
+/// dispatch-rule branch, factored out for readability. `argv` is a
+/// fixed 16-word (`EMERALD_MESSAGE_ARGV_MAX`, `runtime/emerald_
+/// runtime.c`) stack buffer, packed with each argument's own raw
+/// 64-bit encoding (an `Int64`/`Nil`/`Symbol` word as-is, a `Float64`
+/// bit-cast, a `Ptr`/`Str` `ptrtoint`, a `Bool` zero-extended) — the
+/// exact reverse of `declare_actor_trampolines`'s own unpacking, so a
+/// message built here decodes correctly on whichever worker thread
+/// eventually dequeues it. Always evaluates to `(0, Void)` — a
+/// cross-actor call is genuinely asynchronous and never produces a
+/// value synchronously (sema's own return-type rule already guarantees
+/// every callable method here is declared `Void`).
+#[allow(clippy::too_many_arguments)]
+fn build_actor_enqueue_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  recv: &Spanned<Expr>,
+  key: &str,
+  args: &[Spanned<Expr>],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  const ARGV_MAX: usize = 16;
+  if args.len() > ARGV_MAX {
+    return Err(format!(
+      "codegen: cross-actor call `{key}` takes {} arguments, exceeding the {ARGV_MAX}-word mailbox message cap",
+      args.len()
+    ));
+  }
+  let trampoline_fv = *ctx
+    .actor_trampolines
+    .get(key)
+    .ok_or_else(|| format!("codegen: no trampoline compiled for cross-actor call `{key}`"))?;
+  let trampoline_ptr = trampoline_fv.as_global_value().as_pointer_value();
+
+  let (self_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+
+  let i64_ty = context.i64_type();
+  let argv_alloca = builder
+    .build_alloca(i64_ty.array_type(ARGV_MAX as u32), "argv")
+    .map_err(|e| e.to_string())?;
+  for (i, a) in args.iter().enumerate() {
+    let (v, kind) = build_expr(
+      context,
+      builder,
+      a,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let raw = match kind {
+      ValKind::Int64 | ValKind::Nil | ValKind::Symbol => v.into_int_value(),
+      ValKind::Float64 => builder
+        .build_bit_cast(v, i64_ty, "argraw")
+        .map_err(|e| e.to_string())?
+        .into_int_value(),
+      ValKind::Ptr | ValKind::Str => builder
+        .build_ptr_to_int(v.into_pointer_value(), i64_ty, "argraw")
+        .map_err(|e| e.to_string())?,
+      ValKind::Bool => builder
+        .build_int_z_extend(v.into_int_value(), i64_ty, "argraw")
+        .map_err(|e| e.to_string())?,
+      ValKind::Void | ValKind::Tuple(_) => {
+        return Err("codegen: internal — not a valid cross-actor argument kind".to_string());
+      }
+    };
+    let idx = i64_ty.const_int(i as u64, false);
+    let slot_ptr = unsafe {
+      builder
+        .build_in_bounds_gep(i64_ty, argv_alloca, &[idx], "argvslot")
+        .map_err(|e| e.to_string())?
+    };
+    builder
+      .build_store(slot_ptr, raw)
+      .map_err(|e| e.to_string())?;
+  }
+
+  let argc = i64_ty.const_int(args.len() as u64, false);
+  builder
+    .build_call(
+      ctx.actor_funcs.enqueue,
+      &[
+        self_val.into(),
+        trampoline_ptr.into(),
+        argv_alloca.into(),
+        argc.into(),
+      ],
+      "enqueuetmp",
+    )
+    .map_err(|e| e.to_string())?;
+
+  Ok((i64_ty.const_int(0, false).into(), ValKind::Void))
 }
 
 /// `obj&.method(args)` (plan 43's Decision log) — reuses `build_short_
@@ -5728,7 +6139,7 @@ fn build_stmt<'a, 'ctx>(
       Ok(false)
     }
     Stmt::SetField { name, value } => {
-      let (self_ptr, fields) = ctx
+      let (self_ptr, fields, _) = ctx
         .self_ctx
         .ok_or_else(|| format!("codegen: `@{name} = ...` used outside of a method body"))?;
       let field_offset = fields
@@ -7323,7 +7734,22 @@ fn build_function_body<'a, 'ctx>(
   }
 
   match &last.node {
-    Stmt::Expr(e) => {
+    // Plan 55's own disclosed fix to pre-existing code: this arm used
+    // to match ANY `Stmt::Expr(e)` unconditionally, evaluating `e` via
+    // `build_expr` and building a return with its value — wrong for a
+    // `Void`-returning body, since `build_expr` has no dispatch for a
+    // statement-only intrinsic like `puts`/`gets` (those only exist as
+    // `build_stmt`'s own special-cased arms) and building `ret void <v>`
+    // out of a `Void` function is a real LLVM verifier error regardless.
+    // A real, previously-latent gap: nothing in this whole test suite
+    // happened to have a `Void`-returning function/method whose LAST
+    // statement was one of those statement-only forms until this
+    // plan's own `Spinner` worked example (`spin`'s body ends in a bare
+    // `puts ...`) — the `ret_kind != Void` guard below routes a `Void`
+    // body's last statement through the exact same full `build_stmt`
+    // dispatch (including the `puts`/`gets` special cases) every other
+    // statement in the body already gets, via the `_` arm.
+    Stmt::Expr(e) if ret_kind != ValKind::Void => {
       let (v, _) = build_expr(
         context,
         builder,
@@ -7604,6 +8030,7 @@ fn define_method<'ctx>(
   m: &AstFunction,
   fv: FunctionValue<'ctx>,
   self_fields: &HashMap<String, FieldInfo>,
+  self_field_classes: &HashMap<String, String>,
   gen_ctx: &Ctx<'_, 'ctx>,
 ) -> Result<(), String> {
   let entry = context.append_basic_block(fv, "entry");
@@ -7637,7 +8064,7 @@ fn define_method<'ctx>(
   )?;
 
   let method_ctx = Ctx {
-    self_ctx: Some((self_ptr, self_fields)),
+    self_ctx: Some((self_ptr, self_fields, self_field_classes)),
     current_di_scope: di_scope,
     object_allocas: Some(&object_allocas),
     ..*gen_ctx
@@ -7795,6 +8222,31 @@ fn define_main<'ctx>(
   let entry = context.append_basic_block(main_fn, "entry");
   builder.position_at_end(entry);
 
+  // Plan 55's Decision log: a compiler-inserted implicit barrier, not a
+  // language-visible `await`/join primitive — Emerald still has no
+  // `async`/`await` keyword anywhere in its grammar after this plan.
+  // Started unconditionally (even for a program with no actors at
+  // all — no cost worth special-casing: an idle pool with zero
+  // messages ever enqueued drains and joins immediately) so every
+  // compiled program's `main` is symmetric, with no separate "does
+  // this program need a pool" analysis anywhere in codegen.
+  //
+  // `unset_current_debug_location` before this call, when debug info is
+  // active (`compile_to_object_with_debug_info`, `emerald-cli`'s own
+  // real compile path): this synthesized call has no real source line
+  // of its own, and — a real bug this leaf found and fixed — the
+  // builder's debug location is otherwise still whatever the PREVIOUS
+  // function compiled left it at (e.g. a free function defined earlier
+  // in the same program), which LLVM's module verifier correctly
+  // rejects as a `!dbg` attachment pointing at the wrong subprogram.
+  // No-op (there is no location to unset) when debug info is off.
+  if gen_ctx.dibuilder.is_some() {
+    builder.unset_current_debug_location();
+  }
+  builder
+    .build_call(gen_ctx.actor_funcs.pool_start, &[], "poolstart")
+    .map_err(|e| e.to_string())?;
+
   let top_stmts: Vec<Spanned<Stmt>> = program
     .items
     .iter()
@@ -7901,6 +8353,12 @@ fn define_main<'ctx>(
     &fn_ctx,
   )?;
   if !terminated {
+    if gen_ctx.dibuilder.is_some() {
+      builder.unset_current_debug_location();
+    }
+    builder
+      .build_call(gen_ctx.actor_funcs.pool_drain_and_join, &[], "pooldrain")
+      .map_err(|e| e.to_string())?;
     let zero = context.i32_type().const_int(0, false);
     builder
       .build_return(Some(&zero))
@@ -8422,6 +8880,7 @@ fn compile_to_object_impl(
     Some(Linkage::External),
   );
   let exc_funcs = declare_exception_runtime_funcs(&context, &module);
+  let actor_funcs = declare_actor_runtime_funcs(&context, &module);
 
   // Plan 32: raw `ClassDef`s keyed by name, so `build_class_layout`/
   // `build_method_owners` can walk any class's inheritance chain by
@@ -8563,6 +9022,16 @@ fn compile_to_object_impl(
     }
   }
 
+  let actor_trampolines = declare_actor_trampolines(&context, &module, program, &user_func_ids)?;
+  let actor_names: HashSet<String> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Actor(a) => Some(a.name.clone()),
+      _ => None,
+    })
+    .collect();
+
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
     classes: &classes,
@@ -8614,6 +9083,9 @@ fn compile_to_object_impl(
     parse_digits_fn,
     region_create_fn,
     region_alloc_fn,
+    actor_funcs,
+    actor_trampolines: &actor_trampolines,
+    actor_names: &actor_names,
   };
 
   for item in &program.items {
@@ -8641,7 +9113,15 @@ fn compile_to_object_impl(
         for m in &c.methods {
           let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
           let (fv, _) = user_func_ids[&mangled];
-          define_method(&context, &builder, m, fv, &layout.fields, &gen_ctx)?;
+          define_method(
+            &context,
+            &builder,
+            m,
+            fv,
+            &layout.fields,
+            &layout.field_classes,
+            &gen_ctx,
+          )?;
         }
       }
       Item::Module(m) => {
@@ -8663,7 +9143,15 @@ fn compile_to_object_impl(
         for m in &a.methods {
           let mangled = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
           let (fv, _) = user_func_ids[&mangled];
-          define_method(&context, &builder, m, fv, &layout.fields, &gen_ctx)?;
+          define_method(
+            &context,
+            &builder,
+            m,
+            fv,
+            &layout.fields,
+            &layout.field_classes,
+            &gen_ctx,
+          )?;
         }
       }
       Item::Stmt(Spanned {
@@ -11032,7 +11520,12 @@ mod tests {
 
   // Plan 54 (actor declarations and isolated heaps).
 
-  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\nputs a.value\nputs b.value\n";
+  // Plan 55's Decision log tightened this worked example (originally
+  // authored under plan 54, before that rule existed): an actor
+  // method other than `initialize` may no longer declare a return
+  // type — `value` now prints `@count` itself (`puts @count`) rather
+  // than returning it for a top-level `puts a.value` to print.
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
 
   #[test]
   fn actor_worked_example_compiled_linked_and_run_prints_2_and_101() {
@@ -11059,5 +11552,203 @@ mod tests {
       region_create_calls, 2,
       "each of the two `.spawn` sites must call emerald_region_create independently:\n{ir}"
     );
+  }
+
+  #[test]
+  fn a_void_method_whose_last_statement_is_a_bare_puts_call_compiles_and_runs() {
+    // Regression for a real, pre-existing bug this plan found and fixed
+    // in `build_function_body` (see its own updated doc comment): a
+    // `Void`-returning method whose LAST statement is a statement-only
+    // intrinsic like `puts` used to be wrongly routed through
+    // `build_expr` (which has no dispatch for `puts` at all) instead of
+    // the full `build_stmt` dispatch every other statement gets.
+    let src = "class Foo\n  x: Int64\n\n  def initialize(x: Int64) -> Void\n    @x = x\n  end\n\n  def show -> Void\n    puts @x\n  end\nend\n\nf: Foo = Foo.new(5)\nf.show\n";
+    let out = compile_link_run(src);
+    assert_eq!(out, "5\n");
+  }
+
+  // Plan 55's own `PingPong` worked example. `.to_s` is not a real,
+  // implemented method anywhere in this codegen backend (verified this
+  // session — zero hits for `"to_s"` in this whole file) despite the
+  // plan's own literal text using it; adapted to `puts "#{@name}
+  // #{@count}"`, plan 36's already-real string interpolation, which
+  // prints the exact same output.
+  const PINGPONG_EXAMPLE: &str = "actor PingPong\n  name: String\n  limit: Int64\n  count: Int64\n  peer: PingPong\n\n  def initialize(name: String, limit: Int64) -> Void\n    @name = name\n    @limit = limit\n    @count = 0\n  end\n\n  def set_peer(other: PingPong) -> Void\n    @peer = other\n  end\n\n  def hit -> Void\n    @count = @count + 1\n    puts \"#{@name} #{@count}\"\n    if @count < @limit\n      @peer.hit\n    end\n  end\nend\n\na: PingPong = PingPong.spawn(\"A\", 5)\nb: PingPong = PingPong.spawn(\"B\", 5)\na.set_peer(b)\nb.set_peer(a)\na.hit\n";
+
+  #[test]
+  fn pingpong_worked_example_compiled_linked_and_run_prints_the_expected_nine_lines() {
+    // AC1: real per-actor FIFO ordering under a real multi-worker pool.
+    // AC2 (documented here, not just in the plan): by construction, this
+    // example never has both actors simultaneously runnable — `A`
+    // cannot process hop 3 until it has sent and `B` has fully
+    // processed hop 2 — so this is ONLY a correctness/ordering proof,
+    // never offered as the concurrency proof (see `SPINNER_EXAMPLE`'s
+    // own test for that).
+    for _ in 0..5 {
+      assert_eq!(
+        compile_link_run(PINGPONG_EXAMPLE),
+        "A 1\nB 1\nA 2\nB 2\nA 3\nB 3\nA 4\nB 4\nA 5\n"
+      );
+    }
+  }
+
+  #[test]
+  fn a_field_typed_actor_receiver_compiles_to_an_enqueue_call() {
+    // AC3: `@peer.hit` inspected via the emitted LLVM IR, not merely
+    // the program's eventual output (the test above already covers
+    // that black-box angle).
+    let program = emerald_parser::parse(PINGPONG_EXAMPLE).expect("should parse");
+    let dir = fresh_temp_dir("pingpong_enqueue_ir");
+    let obj_path = dir.join("out.o");
+    let ir =
+      compile_to_object_ir_text_for_test(&program, &obj_path).expect("should compile to IR text");
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+      ir.contains("call void @emerald_actor_enqueue("),
+      "`@peer.hit` must compile to a real emerald_actor_enqueue call:\n{ir}"
+    );
+  }
+
+  // Plan 55's own `Spinner` worked example — this crate's own copy is a
+  // template taking `iterations` (`crates/emerald-cli/tests/actor_
+  // concurrency.rs` owns the real, large-iteration-count wall-clock
+  // concurrency proof this plan's own AC actually needs; this crate has
+  // no `std::process::Command` timing harness of its own, matching
+  // every prior plan's boundary between "this crate proves compiled
+  // output is correct" and "the CLI crate proves the compiled binary's
+  // own process-level behavior"). `.to_s` is, again, not a real,
+  // implemented method here — adapted to `"spinner #{@id} done"`.
+  fn spinner_example(iterations: u64) -> String {
+    format!(
+      "actor Spinner\n  id: Int64\n  total: Int64\n\n  def initialize(id: Int64) -> Void\n    @id = id\n    @total = 0\n  end\n\n  def spin(iterations: Int64) -> Void\n    i: Int64 = 0\n    while i < iterations\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns2: Spinner = Spinner.spawn(2)\ns1.spin({iterations})\ns2.spin({iterations})\n"
+    )
+  }
+
+  #[test]
+  fn spinner_worked_example_compiled_linked_and_run_prints_both_spinners_done() {
+    // A fast smoke/regression proof that the worked example itself
+    // compiles, links, and runs correctly — the real, large-iteration
+    // wall-clock concurrency proof lives in `emerald-cli`'s own
+    // `actor_concurrency.rs` (see `spinner_example`'s own doc comment).
+    let out = compile_link_run(&spinner_example(1000));
+    let mut lines: Vec<&str> = out.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec!["spinner 1 done", "spinner 2 done"]);
+  }
+
+  // Plan 55 (scheduler and message passing), `leaf-actor-header-and-
+  // trampolines`.
+
+  #[test]
+  fn a_two_method_actor_gets_exactly_two_trampoline_functions() {
+    // AC2: one uniform-ABI trampoline per actor method, real generated
+    // functions (inspected via the emitted LLVM IR text), not stubs.
+    let src = "actor Pair\n  a: Int64\n  b: Int64\n\n  def set_a(v: Int64) -> Void\n    @a = v\n  end\n\n  def set_b(v: Int64) -> Void\n    @b = v\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("actor_trampoline_count_ir");
+    let obj_path = dir.join("out.o");
+    let ir =
+      compile_to_object_ir_text_for_test(&program, &obj_path).expect("should compile to IR text");
+    std::fs::remove_dir_all(&dir).ok();
+    let trampoline_defs = ir.matches("__trampoline(").count();
+    assert_eq!(
+      trampoline_defs, 2,
+      "a two-method actor must produce exactly two trampoline functions:\n{ir}"
+    );
+  }
+
+  #[test]
+  fn a_trampoline_called_directly_produces_the_same_result_as_the_method_itself() {
+    // AC3 + AC4: a small, hand-written C harness (bypassing the
+    // mailbox/scheduler entirely) links directly against this actor's
+    // own compiled methods AND its trampoline, plus the real runtime's
+    // `emerald_actor_init_header` — a real `compile_to_object` + `cc`
+    // link + run, proving the trampoline's own `argv`-unpacking is
+    // correct independent of the scheduler, and that this leaf's
+    // declared runtime signatures link successfully against
+    // `leaf-thread-safe-runtime`'s actual implementations.
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("actor_trampoline_direct_call");
+    let obj_path = dir.join("actor.o");
+    // `is_entry: false` — an actor-only program with no top-level
+    // statements still gets a `main` from `compile_to_object` (empty
+    // but present); `compile_to_object_scoped` is the existing,
+    // real mechanism (plan 49) for suppressing that, so this harness's
+    // own hand-written `main` below is the only one in the link.
+    compile_to_object_scoped(
+      &program,
+      &std::collections::HashSet::new(),
+      false,
+      &obj_path,
+    )
+    .expect("should compile actor-only object file with no main");
+
+    let harness_path = dir.join("harness.c");
+    std::fs::write(
+      &harness_path,
+      r#"
+#include <stdio.h>
+#include <stdlib.h>
+
+extern void *emerald_actor_init_header(void *arena_base);
+extern void Counter_initialize(void *self, long long start);
+extern long long Counter_value(void *self);
+extern void Counter_initialize__trampoline(void *self, long long *argv);
+
+static void *new_actor(void) {
+  void *arena = malloc(sizeof(void *) + 8);
+  emerald_actor_init_header(arena);
+  return (char *) arena + sizeof(void *);
+}
+
+int main(void) {
+  void *direct_self = new_actor();
+  Counter_initialize(direct_self, 42);
+  long long direct_result = Counter_value(direct_self);
+
+  void *trampoline_self = new_actor();
+  long long argv[16];
+  argv[0] = 42;
+  Counter_initialize__trampoline(trampoline_self, argv);
+  long long trampoline_result = Counter_value(trampoline_self);
+
+  if (direct_result != trampoline_result) {
+    fprintf(stderr, "mismatch: direct=%lld trampoline=%lld\n", direct_result, trampoline_result);
+    return 1;
+  }
+  printf("%lld\n", trampoline_result);
+  return 0;
+}
+"#,
+    )
+    .expect("should write harness");
+
+    let bin_path = dir.join("harness_bin");
+    let status = Command::new("cc")
+      .arg("-no-pie")
+      .arg(&harness_path)
+      .arg(&obj_path)
+      .arg(runtime_path())
+      .arg("-o")
+      .arg(&bin_path)
+      .status()
+      .expect("failed to invoke cc");
+    assert!(
+      status.success(),
+      "linking the direct-vs-trampoline harness should succeed"
+    );
+
+    let output = Command::new(&bin_path)
+      .output()
+      .expect("failed to run harness");
+    assert!(
+      output.status.success(),
+      "harness exited non-zero: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+
+    std::fs::remove_dir_all(&dir).ok();
   }
 }

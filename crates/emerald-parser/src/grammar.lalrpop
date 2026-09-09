@@ -759,6 +759,23 @@ StmtPrimaryExpr: Spanned<Expr> = {
     Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  // Plan 55's Decision log: `@field.method(args)` — this plan's own
+  // `@peer.hit` cross-actor call shape. Mirrors the two `Ident`-headed
+  // `MethodCall` alternatives immediately above exactly, `InstanceVarTok`
+  // in place of `Ident` as the receiver token — no FIRST-set overlap to
+  // disambiguate, since `@`-prefixed and bare-identifier receivers are
+  // already two distinct terminals everywhere else in this grammar
+  // (see `InstanceVarTok`'s own bare-expression alternative below).
+  // Deliberately narrower than a general "any receiver expression" rule
+  // (this crate's own established incremental-scope convention): only
+  // `@field.method(...)`, not `@field&.method(...)`/arbitrary nesting —
+  // sema/codegen's own real scope for this plan is exactly this one
+  // shape.
+  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
+    if let Some(b) = blk { args.push(b); }
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) }
+  },
+  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, vec![]) },
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
   // immediately above exactly, `"&."` in place of `"."` — a genuinely
   // new terminal, distinct from `"."`/`"&"` (bitwise/block-param
@@ -1060,6 +1077,10 @@ PrimaryExpr: Spanned<Expr> = {
   <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  // Plan 55's Decision log: see `StmtPrimaryExpr`'s own identical
+  // `InstanceVarTok`-headed mirror alternative for the full rationale.
+  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) },
+  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, vec![]) },
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
   // immediately above exactly, `"&."` in place of `"."`.
   <l:@L> <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {

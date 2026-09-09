@@ -611,6 +611,24 @@ fn actor_info(a: &ActorDef, classes: &HashMap<String, ClassInfo>) -> Result<Clas
   }
   let mut methods = HashMap::new();
   for m in &a.methods {
+    // Plan 55's Decision log: every actor method except `initialize`
+    // must declare no return type (defaults to `"Void"` when omitted —
+    // `crates/emerald-parser/src/grammar.lalrpop`'s own `FuncDef`
+    // production) — a cross-actor call is genuinely asynchronous now,
+    // so a real return value can never come back from one synchronously
+    // (mirrors Pony's "behaviours always return `None`" rule).
+    // `initialize` is exempt: `.spawn` still calls it directly and
+    // synchronously, before any mailbox exists to send anything to.
+    if m.name != "initialize" && m.return_type != "Void" {
+      return Err(Diagnostic::new(
+        format!(
+          "actor method `{}` must not declare a return type — cross-actor calls are asynchronous \
+           and cannot return a value synchronously (only `initialize` is exempt)",
+          m.name
+        ),
+        (0, 0),
+      ));
+    }
     methods.insert(m.name.clone(), function_signature(m, classes)?);
   }
   Ok(ClassInfo {
@@ -1209,6 +1227,23 @@ fn infer_expr_type(
       } else {
         Type::Int64
       })
+    }
+    // Plan 55's Decision log: `current_thread_id()` is supplementary,
+    // best-effort observability only (never consulted by any dispatch/
+    // safety logic) — a compiler-known intrinsic builtin, the same
+    // hardcoded-name convention `is_valid_int`/`parse_digits` above
+    // already established.
+    Expr::Call(name, args) if name == "current_thread_id" => {
+      if !args.is_empty() {
+        return Err(Diagnostic::new(
+          format!(
+            "`current_thread_id` expects 0 arguments, found {}",
+            args.len()
+          ),
+          expr.span,
+        ));
+      }
+      Ok(Type::Int64)
     }
     // Plan 52's Decision log: `Circle(2.0)` parses as an ordinary
     // `Expr::Call` (no new grammar production — the parser can't tell
@@ -6176,7 +6211,12 @@ mod tests {
 
   // Plan 54 (actor declarations and isolated heaps).
 
-  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\nputs a.value\nputs b.value\n";
+  // Plan 55's Decision log tightened this worked example (originally
+  // authored under plan 54, before that rule existed): an actor
+  // method other than `initialize` may no longer declare a return
+  // type — `value` now prints `@count` itself (`puts @count`) rather
+  // than returning it for a top-level `puts a.value` to print.
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
 
   #[test]
   fn accepts_the_actor_worked_example() {
@@ -6216,5 +6256,48 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`initialize` expects Int64, not String");
     assert!(!errs.is_empty());
+  }
+
+  // Plan 55 (scheduler and message passing).
+
+  #[test]
+  fn rejects_a_non_initialize_actor_method_declaring_a_return_type() {
+    let src = "actor Counter\n  count: Int64\n\n  def get -> Int64\n    @count\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("cross-actor calls are asynchronous — a method can't return a value");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("get") && d.message.contains("return type"))
+    );
+  }
+
+  #[test]
+  fn initialize_is_exempt_from_the_no_return_type_rule_in_either_direction() {
+    // "exactly one exception" (the plan's own Decision log wording):
+    // `initialize` is accepted whether it declares `Void` (the grammar's
+    // own "no return type" default) or a real value type — unlike
+    // every other actor method, which is unconditionally rejected for
+    // declaring anything but `Void`.
+    let void_src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(0)\n";
+    let program = emerald_parser::parse(void_src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+
+    let value_src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Int64\n    @count = start\n    start\n  end\nend\n";
+    let program = emerald_parser::parse(value_src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "`initialize` may declare a real return type — `.spawn` calls it directly and \
+       synchronously, before any mailbox exists"
+    );
+  }
+
+  #[test]
+  fn accepts_every_non_initialize_method_declaring_no_return_type() {
+    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def bump -> Void\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.spawn(0)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 }

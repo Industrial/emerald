@@ -2963,7 +2963,12 @@ mod tests {
 
   // Plan 54 (actor declarations and isolated heaps).
 
-  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\nputs a.value\nputs b.value\n";
+  // Plan 55's Decision log tightened this worked example (originally
+  // authored under plan 54, before that rule existed): an actor
+  // method other than `initialize` may no longer declare a return
+  // type — `value` now prints `@count` itself (`puts @count`) rather
+  // than returning it for a top-level `puts a.value` to print.
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
 
   #[test]
   fn actor_worked_example_parses_into_expected_shapes() {

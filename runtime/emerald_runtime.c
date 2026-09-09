@@ -12,10 +12,14 @@
 
 #include <ctype.h>
 #include <setjmp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+/* Plan 55 (scheduler and message passing). */
+#include <pthread.h>
+#include <unistd.h>
 
 void emerald_print_i64(long long n) {
   printf("%lld\n", n);
@@ -37,15 +41,27 @@ void emerald_print_f64(double n) {
  * real number instead of trusting the design argument alone. */
 static long long emerald_bytes_outstanding_counter = 0;
 
+/* Plan 55's own mandatory, disclosed second fix to existing code
+ * (alongside the exception handler stack becoming thread-local, below):
+ * an actor method body can now genuinely run concurrently with another
+ * on a separate OS thread and allocate (a `String` concat, an `Array.
+ * new`, ...) at the same time — a plain non-atomic `+=`/`-=` on this
+ * shared global would be a real, not hypothetical, data race (this
+ * plan's own `Spinner` concurrency proof deliberately runs two actor
+ * method bodies at once). Every update site below uses
+ * `__atomic_fetch_add`/`__atomic_load_n` (a GCC/Clang builtin, no new
+ * dependency) with relaxed ordering — sufficient since this counter is
+ * only ever read back for diagnostic/test purposes, never used to gate
+ * another memory access. */
 long long emerald_bytes_outstanding(void) {
-  return emerald_bytes_outstanding_counter;
+  return __atomic_load_n(&emerald_bytes_outstanding_counter, __ATOMIC_RELAXED);
 }
 
 /* Thin malloc wrapper backing `ClassName.new` (plan 08). No corresponding
  * free — no GC, no lifetime tracking yet; matches inception §12 (no
  * ownership system, no GC pressure, for now). */
 void *emerald_alloc(long long size) {
-  emerald_bytes_outstanding_counter += size;
+  __atomic_fetch_add(&emerald_bytes_outstanding_counter, size, __ATOMIC_RELAXED);
   return malloc((size_t) size);
 }
 
@@ -54,7 +70,7 @@ void *emerald_alloc(long long size) {
  * `malloc`. No length tracking, matching `emerald_alloc`'s own
  * no-bounds-info contract. */
 void *emerald_alloc_zeroed(long long size) {
-  emerald_bytes_outstanding_counter += size;
+  __atomic_fetch_add(&emerald_bytes_outstanding_counter, size, __ATOMIC_RELAXED);
   return calloc((size_t) size, 1);
 }
 
@@ -93,14 +109,16 @@ static EmeraldRegionChunk *emerald_region_new_chunk(size_t min_capacity) {
   chunk->next = NULL;
   chunk->capacity = capacity;
   chunk->used = 0;
-  emerald_bytes_outstanding_counter +=
-      (long long) (sizeof(EmeraldRegionChunk) + capacity);
+  __atomic_fetch_add(&emerald_bytes_outstanding_counter,
+                      (long long) (sizeof(EmeraldRegionChunk) + capacity),
+                      __ATOMIC_RELAXED);
   return chunk;
 }
 
 void *emerald_region_create(void) {
   EmeraldRegion *region = malloc(sizeof(EmeraldRegion));
-  emerald_bytes_outstanding_counter += (long long) sizeof(EmeraldRegion);
+  __atomic_fetch_add(&emerald_bytes_outstanding_counter,
+                      (long long) sizeof(EmeraldRegion), __ATOMIC_RELAXED);
   region->head = emerald_region_new_chunk(EMERALD_REGION_DEFAULT_CHUNK_SIZE);
   return region;
 }
@@ -139,12 +157,14 @@ void emerald_region_destroy(void *region_ptr) {
   EmeraldRegionChunk *chunk = region->head;
   while (chunk != NULL) {
     EmeraldRegionChunk *next = chunk->next;
-    emerald_bytes_outstanding_counter -=
-        (long long) (sizeof(EmeraldRegionChunk) + chunk->capacity);
+    __atomic_fetch_sub(&emerald_bytes_outstanding_counter,
+                        (long long) (sizeof(EmeraldRegionChunk) + chunk->capacity),
+                        __ATOMIC_RELAXED);
     free(chunk);
     chunk = next;
   }
-  emerald_bytes_outstanding_counter -= (long long) sizeof(EmeraldRegion);
+  __atomic_fetch_sub(&emerald_bytes_outstanding_counter,
+                      (long long) sizeof(EmeraldRegion), __ATOMIC_RELAXED);
   free(region);
 }
 
@@ -226,8 +246,15 @@ char *emerald_bool_to_string(long long b) {
  * the frame it's called from to still be live when `longjmp` targets it,
  * so a wrapper would jump back into an already-returned stack frame.
  * These helpers only manage the handler *stack itself*, which has no such
- * restriction. Single-threaded only (no ownership/concurrency in v1 —
- * inception §12/§20), so a plain global linked list is enough. */
+ * restriction. Plan 55's own mandatory, disclosed fix to this existing
+ * code: with a real worker pool now running actor method bodies
+ * concurrently on separate OS threads, two threads can each `raise`/
+ * `rescue` at once — a single shared global handler stack would let one
+ * thread's `push_handler`/`raise` corrupt another's. `_Thread_local`
+ * gives each OS thread (including every worker) its own independent
+ * stack with the exact same single-threaded semantics as before from
+ * any one thread's own point of view — no other change to this
+ * mechanism. */
 typedef struct EmeraldHandler {
   jmp_buf buf;
   long long exception_tag;
@@ -235,7 +262,7 @@ typedef struct EmeraldHandler {
   struct EmeraldHandler *prev;
 } EmeraldHandler;
 
-static EmeraldHandler *emerald_handler_stack = NULL;
+static _Thread_local EmeraldHandler *emerald_handler_stack = NULL;
 
 void *emerald_push_handler(void) {
   EmeraldHandler *h = malloc(sizeof(EmeraldHandler));
@@ -519,4 +546,262 @@ char *emerald_gets(void) {
   out[n] = '\0';
   free(line);
   return out;
+}
+
+/* Plan 55 (scheduler and message passing) — "N actors over M OS
+ * threads" (see the plan's own Decision log for why this is not a
+ * green-thread M:N scheduler): a fixed pool of pthread workers, a
+ * mutex/condvar-guarded mailbox per actor, and one shared mutex/
+ * condvar-guarded runnable-actor queue all M workers consume from.
+ *
+ * Actor arena layout (codegen's own contract with this file): every
+ * `.spawn`-allocated arena reserves its own leading 8 bytes (one
+ * pointer width — the same uniform width every other field in this
+ * backend already uses) as a header-pointer slot, holding a pointer to
+ * this file's own, separately `malloc`'d `EmeraldActorHeader`. `self`,
+ * everywhere else in this compiler (field access, `initialize`, an
+ * ordinary same-actor method call), is the address *past* that slot —
+ * `emerald_actor_enqueue`'s very first job is walking back one pointer
+ * width from `self` to recover the header. This sidesteps ever needing
+ * `crates/emerald-codegen` to know this struct's real C `sizeof` (which
+ * varies by platform/libc, e.g. `pthread_mutex_t`'s own size) — codegen
+ * only ever needs to know "one pointer width," a constant it already
+ * relies on everywhere.
+ *
+ * Safety argument (restated from the Decision log, load-bearing enough
+ * to repeat here next to the code it governs): an actor is in exactly
+ * one of three mutually exclusive states — idle (`scheduled == 0`,
+ * mailbox empty or about to be appended to), runnable-but-unclaimed
+ * (`scheduled == 1`, linked into the global queue, no worker executing
+ * it yet), or currently-executing (`scheduled == 1`, unlinked from the
+ * queue, exactly one worker inside its mailbox-drain loop). The
+ * idle -> runnable transition and the "did a message arrive while I was
+ * about to go idle" recheck both happen while holding that ONE actor's
+ * own `mailbox_mutex`, so no two workers can ever observe the same
+ * actor as claimable at once. This is why no lock guards an actor's own
+ * fields anywhere in generated code: at most one thread is ever inside
+ * a given actor's code, full stop. */
+
+#define EMERALD_MESSAGE_ARGV_MAX 16
+
+typedef struct EmeraldMessage {
+  void (*trampoline)(void *self, long long *argv);
+  long long argv[EMERALD_MESSAGE_ARGV_MAX];
+  struct EmeraldMessage *next;
+} EmeraldMessage;
+
+typedef struct EmeraldActorHeader {
+  /* The instance's own field region — `arena_base + sizeof(void*)` —
+   * cached here so a worker dequeuing this header already has the
+   * exact pointer every trampoline expects as its `self` argument. */
+  void *self;
+  pthread_mutex_t mailbox_mutex;
+  EmeraldMessage *mailbox_head;
+  EmeraldMessage *mailbox_tail;
+  /* 0 = idle (not linked into the runnable queue, no worker owns it);
+   * 1 = runnable-or-executing (see this section's own doc comment). */
+  int scheduled;
+  struct EmeraldActorHeader *next_runnable;
+} EmeraldActorHeader;
+
+/* Called once per `.spawn`, on the raw allocation, before `initialize`
+ * runs — mallocs the real header, stores this instance's field-region
+ * pointer on it, and writes the header pointer into the arena's own
+ * leading 8-byte slot (see this section's own doc comment). */
+void *emerald_actor_init_header(void *arena_base) {
+  EmeraldActorHeader *header = malloc(sizeof(EmeraldActorHeader));
+  __atomic_fetch_add(&emerald_bytes_outstanding_counter,
+                      (long long) sizeof(EmeraldActorHeader), __ATOMIC_RELAXED);
+  header->self = (char *) arena_base + sizeof(void *);
+  pthread_mutex_init(&header->mailbox_mutex, NULL);
+  header->mailbox_head = NULL;
+  header->mailbox_tail = NULL;
+  header->scheduled = 0;
+  header->next_runnable = NULL;
+  *(void **) arena_base = header;
+  return header;
+}
+
+static pthread_mutex_t emerald_runnable_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t emerald_runnable_cond = PTHREAD_COND_INITIALIZER;
+static EmeraldActorHeader *emerald_runnable_head = NULL;
+static EmeraldActorHeader *emerald_runnable_tail = NULL;
+/* Every message from the moment it's enqueued until its trampoline call
+ * returns — the sole condition `emerald_worker_pool_drain_and_join`
+ * waits on, so a caller never guesses via a fixed sleep whether every
+ * send has actually finished processing. */
+static long long emerald_outstanding_messages = 0;
+static int emerald_pool_shutdown = 0;
+static pthread_t *emerald_workers = NULL;
+static int emerald_worker_count = 0;
+static int emerald_pool_started = 0;
+
+/* Builds a message node, appends it to `self`'s own actor's mailbox,
+ * and — only on that actor's idle -> runnable transition — links it
+ * onto the shared runnable queue and wakes one worker. `argc` beyond
+ * `EMERALD_MESSAGE_ARGV_MAX` truncates (sema/codegen's own compile-time
+ * arity cap on a cross-actor call keeps this from ever firing in
+ * practice — see the plan's own Decision log). */
+void emerald_actor_enqueue(void *self, void (*trampoline)(void *, long long *),
+                            long long *argv, long long argc) {
+  EmeraldActorHeader *header = *(EmeraldActorHeader **) ((char *) self - sizeof(void *));
+
+  EmeraldMessage *msg = malloc(sizeof(EmeraldMessage));
+  msg->trampoline = trampoline;
+  long long n = argc < EMERALD_MESSAGE_ARGV_MAX ? argc : EMERALD_MESSAGE_ARGV_MAX;
+  for (long long i = 0; i < n; i++) {
+    msg->argv[i] = argv[i];
+  }
+  msg->next = NULL;
+
+  pthread_mutex_lock(&emerald_runnable_mutex);
+  emerald_outstanding_messages++;
+  pthread_mutex_unlock(&emerald_runnable_mutex);
+
+  int need_schedule = 0;
+  pthread_mutex_lock(&header->mailbox_mutex);
+  if (header->mailbox_tail == NULL) {
+    header->mailbox_head = msg;
+    header->mailbox_tail = msg;
+  } else {
+    header->mailbox_tail->next = msg;
+    header->mailbox_tail = msg;
+  }
+  if (!header->scheduled) {
+    header->scheduled = 1;
+    need_schedule = 1;
+  }
+  pthread_mutex_unlock(&header->mailbox_mutex);
+
+  if (need_schedule) {
+    pthread_mutex_lock(&emerald_runnable_mutex);
+    header->next_runnable = NULL;
+    if (emerald_runnable_tail == NULL) {
+      emerald_runnable_head = header;
+      emerald_runnable_tail = header;
+    } else {
+      emerald_runnable_tail->next_runnable = header;
+      emerald_runnable_tail = header;
+    }
+    pthread_cond_signal(&emerald_runnable_cond);
+    pthread_mutex_unlock(&emerald_runnable_mutex);
+  }
+}
+
+static void *emerald_worker_main(void *arg) {
+  (void) arg;
+  for (;;) {
+    pthread_mutex_lock(&emerald_runnable_mutex);
+    while (emerald_runnable_head == NULL && !emerald_pool_shutdown) {
+      pthread_cond_wait(&emerald_runnable_cond, &emerald_runnable_mutex);
+    }
+    if (emerald_runnable_head == NULL && emerald_pool_shutdown) {
+      pthread_mutex_unlock(&emerald_runnable_mutex);
+      break;
+    }
+    EmeraldActorHeader *header = emerald_runnable_head;
+    emerald_runnable_head = header->next_runnable;
+    if (emerald_runnable_head == NULL) {
+      emerald_runnable_tail = NULL;
+    }
+    header->next_runnable = NULL;
+    pthread_mutex_unlock(&emerald_runnable_mutex);
+
+    /* Drain every message this actor has right now, one at a time, to
+     * completion — real FIFO order, since both this dequeue and any
+     * concurrent `emerald_actor_enqueue`'s append serialize on the same
+     * `mailbox_mutex`. Only clear `scheduled` (going back to idle) once
+     * the mailbox is observed empty under that same lock — the
+     * invariant this section's own doc comment states. */
+    for (;;) {
+      pthread_mutex_lock(&header->mailbox_mutex);
+      EmeraldMessage *msg = header->mailbox_head;
+      if (msg == NULL) {
+        header->scheduled = 0;
+        pthread_mutex_unlock(&header->mailbox_mutex);
+        break;
+      }
+      header->mailbox_head = msg->next;
+      if (header->mailbox_head == NULL) {
+        header->mailbox_tail = NULL;
+      }
+      pthread_mutex_unlock(&header->mailbox_mutex);
+
+      msg->trampoline(header->self, msg->argv);
+      free(msg);
+
+      pthread_mutex_lock(&emerald_runnable_mutex);
+      emerald_outstanding_messages--;
+      if (emerald_outstanding_messages == 0) {
+        pthread_cond_broadcast(&emerald_runnable_cond);
+      }
+      pthread_mutex_unlock(&emerald_runnable_mutex);
+    }
+  }
+  return NULL;
+}
+
+/* Spawns `EMERALD_WORKERS` (when set and `> 0`) or
+ * `sysconf(_SC_NPROCESSORS_ONLN)` worker threads. A no-op if already
+ * started — generated `main` calls this exactly once, at its very
+ * start, but this stays idempotent rather than relying on that being
+ * the only caller forever. */
+void emerald_worker_pool_start(void) {
+  if (emerald_pool_started) {
+    return;
+  }
+  int count = 0;
+  const char *env = getenv("EMERALD_WORKERS");
+  if (env != NULL) {
+    long env_count = atol(env);
+    if (env_count > 0) {
+      count = (int) env_count;
+    }
+  }
+  if (count <= 0) {
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    count = nproc > 0 ? (int) nproc : 1;
+  }
+  emerald_worker_count = count;
+  emerald_workers = malloc(sizeof(pthread_t) * (size_t) count);
+  emerald_pool_shutdown = 0;
+  for (int i = 0; i < count; i++) {
+    pthread_create(&emerald_workers[i], NULL, emerald_worker_main, NULL);
+  }
+  emerald_pool_started = 1;
+}
+
+/* Generated `main`'s implicit barrier, emitted as the last thing before
+ * its own `ret` (see the plan's own Decision log for why this is
+ * compiler-inserted rather than a language-visible `await`): blocks
+ * until every message ever enqueued has finished running, then signals
+ * shutdown and joins every worker. Only `main`'s own generated code
+ * ever calls this, after every top-level statement (and therefore every
+ * send `main` will ever issue) has already run — see this file's own
+ * `EmeraldActorHeader` doc comment for why a send racing this call is
+ * not a scenario generated code can produce. */
+void emerald_worker_pool_drain_and_join(void) {
+  pthread_mutex_lock(&emerald_runnable_mutex);
+  while (emerald_outstanding_messages > 0) {
+    pthread_cond_wait(&emerald_runnable_cond, &emerald_runnable_mutex);
+  }
+  emerald_pool_shutdown = 1;
+  pthread_cond_broadcast(&emerald_runnable_cond);
+  pthread_mutex_unlock(&emerald_runnable_mutex);
+
+  for (int i = 0; i < emerald_worker_count; i++) {
+    pthread_join(emerald_workers[i], NULL);
+  }
+  free(emerald_workers);
+  emerald_workers = NULL;
+  emerald_worker_count = 0;
+  emerald_pool_started = 0;
+  emerald_pool_shutdown = 0;
+}
+
+/* Observability only (plan 55's `leaf-worked-concurrency-proof`'s own
+ * best-effort, disclosed-probabilistic evidence) — never consulted by
+ * any dispatch/safety logic above. */
+long long emerald_current_thread_id(void) {
+  return (long long) (intptr_t) pthread_self();
 }
