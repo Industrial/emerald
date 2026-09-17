@@ -36,9 +36,17 @@ for this session; neither is a permanent dependency of this repo.
   (Crystal's default/dev build is deliberately unoptimized — `--release` is
   the correct apples-to-apples point against the others' optimized output).
   **`emerald-cli` has no optimization-level flag at all** — still true today,
-  same gap the prior report noted. Every Emerald number below is therefore
-  whatever the LLVM backend emits with no flag to ask for more. Ruby has no
-  compile step; its row's "Compile" column is `n/a`, not a hidden zero.
+  same gap the prior report noted, but checked further this session and
+  clarified: there's no CLI switch to *choose* a level, but every benchmark
+  program below was still compiled with LLVM's full `default<O3>` pass
+  pipeline (`crates/emerald-codegen/src/lib.rs`, `module.run_passes
+  ("default<O3>", ...)`), which runs unconditionally except when debug info
+  is requested or the program uses `retry` — neither applies to any
+  benchmark here. So **"Emerald has no way to ask for more optimization" is
+  true; "these numbers are unoptimized" would be false** — the remaining gap
+  against C/Rust is real and is not explained by a missing `-O` flag. Ruby
+  has no compile step; its row's "Compile" column is `n/a`, not a hidden
+  zero.
 - **Machine**: AMD Ryzen 9 7950X (16C/32T), 61 GiB RAM, one machine, one
   session — see Limitations.
 - **Driver**: `benchmarks/run_benchmarks.py`, run inside one
@@ -88,9 +96,13 @@ A real, substantial, measured improvement on five of six benchmarks — but
 `sum`'s post-fix 4.20 ms is still well above C's 0.48 ms or Rust's 0.64 ms,
 and still above Crystal's 3.22 ms. **The remaining gap on `sum` and most
 other benchmarks is not explained by this session** — the worker-pool call
-was the one identified, fixable cause found, and it's now fixed; whatever
-produces the rest of the gap (LLVM optimization level, the always-linked
-runtime's static initializers, something else entirely) is a genuinely open
+was the one identified, fixable cause found, and it's now fixed. It is
+**not** LLVM optimization level (checked and ruled out — see the
+Methodology section's compile-flags note: every benchmark here compiles
+through LLVM's full `default<O3>` pass pipeline already). What does explain
+the rest of the gap — the always-linked runtime's static initializers,
+something in `main`'s generated prologue, page-in cost from the larger
+binary (see finding 2), or something else entirely — is a genuinely open
 question for whoever picks up the roadmap's "evidence" item next, not
 something to guess at here.
 
