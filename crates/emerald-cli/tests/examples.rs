@@ -78,3 +78,52 @@ fn modules_em_prints_expected_sequence() {
 fn interfaces_generics_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("interfaces_generics.em"), "750\n100\n");
 }
+
+#[test]
+fn strings_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("strings.em"),
+    "Hello, World! You are 30 years old.\nHello World\n  HELLO WORLD  \n  hello world  \n15\n6\n42\n3.5\n"
+  );
+}
+
+#[test]
+fn symbols_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("symbols.em"), "82\n100\n1\n0\n");
+}
+
+#[test]
+fn nullable_safe_nav_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("nullable_safe_nav.em"), "1\n0\n");
+}
+
+#[test]
+fn bitwise_and_assignment_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("bitwise_and_assignment.em"),
+    "3\n1\n1\n-1\n16\n16\n10\n2\n1\n"
+  );
+}
+
+#[test]
+fn ranges_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("ranges.em"), "15\n10\n");
+}
+
+#[test]
+fn class_inheritance_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("class_inheritance.em"), "5\n3\n103\n");
+}
+
+#[test]
+fn operator_overloading_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("operator_overloading.em"), "4\n6\n0\n1\n");
+}
+
+#[test]
+fn function_signatures_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("function_signatures.em"),
+    "1\n2\n3\n2\n60\n"
+  );
+}

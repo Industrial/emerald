@@ -70,6 +70,28 @@ fn a_file_where_every_test_passes_exits_0() {
 }
 
 #[test]
+fn examples_test_framework_em_matches_the_documented_transcript() {
+  // The durable, re-checkable version of examples/README.md's
+  // documented `emerald test examples/test_framework.em` transcript —
+  // this file is the only example that can't run through the ordinary
+  // `emerald <file>` path (`Item::Test` rejects it), so it gets its
+  // own verification here rather than `examples.rs`'s `compile_and_run`.
+  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("test")
+    .arg("examples/test_framework.em")
+    .current_dir(&root)
+    .output()
+    .unwrap();
+
+  assert_eq!(
+    String::from_utf8_lossy(&output.stdout),
+    "PASS: addition works\nexpected:\n3\nbut got:\n2\nFAIL: addition is broken on purpose: examples/test_framework.em:6\npassed:\n1\nfailed:\n1\n"
+  );
+  assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn a_type_error_is_rejected_before_ever_attempting_the_test_harness() {
   let dir = fresh_dir("type-error");
   let path = dir.join("bad_test.em");
