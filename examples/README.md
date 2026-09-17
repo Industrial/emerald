@@ -35,7 +35,7 @@ cargo run -p emerald-cli -- examples/<file>.em -o /tmp/out && /tmp/out
 | `generic_classes.em` | `class Stack[T]`, user-declared generic classes, monomorphized per instantiation (`Stack[Int64]` and `Stack[String]` in one program) | `30`, `20`, `second` — see the bug note below; a 4th expected line is silently dropped |
 | `c_ffi.em` | `unsafe extern "C" { fn ... }`, calling real libc (`llabs`, `strlen`, `strstr`), `CString`/`String.from_cstring` | `42`, `5`, `not found` — 3 lines; see the safe-navigation bug already noted below, which this example also hits |
 | `counter_actor.em` | `actor Counter`, fields, `.initialize`, ordinary methods on an actor — a shared library file, not run standalone (declares the class only, no top-level statements) | n/a — imported by `host.em`/`client.em` |
-| `host.em` / `client.em` | `Counter.spawn(0)`, `.register("counter1", 9000)`, `Counter.remote("127.0.0.1:9000", "counter1")` — distributed, location-transparent actors over real TCP, across two separate OS processes | **currently does not build** — see the bug note below |
+| `host.em` / `client.em` | `Counter.spawn(0)`, `.register("counter1", 9000)`, `Counter.remote("127.0.0.1:9000", "counter1")` — distributed, location-transparent actors over real TCP, across two separate OS processes | `3` (printed by the `host` process, after the `client` process's 3 real TCP `.increment` calls plus `.report`) — build with `--jobs 2` (see the bug note below: this genuinely didn't build earlier this same session, fixed via `WeakODR` linkage) |
 | `packages/` | The package manager: `emerald.toml`, a path dependency (`app` depends on `mathutils`), `require`. Build with `cd examples/packages/app && emerald build`, then run `./app` (or `emerald run`) — **not** `emerald <file> -o`, which doesn't resolve `[dependencies]` | `8` |
 | `parallel/` | Multi-file `require` splicing under the parallel/incremental compiler. Build with `emerald --jobs N examples/parallel/main.em -o out` — **not** a bare `emerald <file> -o`, which (per `crates/emerald-cli/src/main.rs`'s `run_legacy`) never splices `require`s at all without `--jobs` | `30` |
 
@@ -143,25 +143,29 @@ doesn't need to rediscover the constraint from scratch:
   Not yet root-caused (left as a genuine open finding rather than a
   guessed explanation); left in place rather than worked around, same
   reasoning as the `c_ffi.em` case above.
-- **`require`-splicing a file that declares an `actor` class produces a
+- **`require`-splicing a file that declares an `actor` class produced a
   linker failure under `--jobs N`, and produces no splice at all
   without `--jobs`** — found compiling `host.em`/`client.em`, which
-  `require counter_actor` (an `actor Counter` declaration). A bare
-  `emerald host.em -o out` fails typecheck (`unknown type 'Counter'`,
-  `undefined variable 'c'`) — the already-documented "no `--jobs`, no
-  splice" gap. `emerald --jobs 2 host.em -o out` fails to *link*:
+  `require counter_actor` (an `actor Counter` declaration). **Fixed,
+  same session, for the `--jobs` half.** A bare `emerald host.em -o out`
+  still fails typecheck (`unknown type 'Counter'`, `undefined variable
+  'c'`) — the "no `--jobs`, no splice" gap is unrelated and still real.
+  But `emerald --jobs 2 host.em -o out` used to fail to *link*:
   `multiple definition of 'Counter_report__trampoline'` and the same
   for `RemoteActorError_encode`/`_decode`, every `Counter_*_encode_args`/
   `_decode_args`, and `Counter__methods` — the requiring file's
   compilation unit and the required file's own compilation unit both
-  emit full, externally-linked definitions of the actor's wire-protocol
-  functions, so linking both objects into one binary collides. Ordinary
-  (non-actor) multi-file `require` doesn't hit this — `parallel/`'s
-  plain-function example links and runs fine under `--jobs`. As a
-  result, **the only examples exercising distributed, location-
-  transparent actors over real TCP do not currently build, via either
-  invocation path** — the scheduler/supervision runtime itself is
-  proven (see above), but this specific multi-process story is not.
+  emitted full, externally-linked definitions of the actor's wire-protocol
+  functions (and, found in the same pass, ordinary class/actor/module
+  method bodies too), so linking both objects into one binary collided.
+  Fixed via `WeakODR` linkage (`crates/emerald-codegen/src/lib.rs`'s
+  `declare_actor_trampolines`/`declare_wire_class_codecs`/`declare_actor_
+  wire_arg_codecs`/`build_actor_method_tables`/`weak_odr_class_shaped_
+  methods`), verified end-to-end as two real, separate OS processes:
+  `host` listens on `:9000`, `client` sends three real TCP `.increment`
+  calls plus `.report`, `host` prints `3`. Regression test:
+  `an_actor_shared_across_require_d_files_links_and_runs_correctly_under_jobs`
+  in `crates/emerald-driver/tests/parallel_jobs.rs`.
 
 None of this is a reason not to use these features — `.strip`,
 `.to_i`, splat params, keyword args, safe navigation, etc. all work

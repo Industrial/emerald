@@ -44,8 +44,9 @@ per-topic decisions and unchanged across all 65 plans since.
    linear-use message-safety check (plan 56), `one_for_one` supervision
    trees (plan 57), and location-transparent actors over real TCP with
    automatic consistent-hash cluster placement (plans 60, 65). Full detail
-   in `RUNTIME.md` §§2-3, including what's still unproven (the distributed
-   examples don't currently build — see `examples/README.md`).
+   in `RUNTIME.md` §§2-3, including one thing found broken and fixed this
+   session (the distributed examples failed to link — see
+   `examples/README.md`).
 
 No other language found in this session's landscape research combines
 both pillars — see the field-audit artifact from this session for the
@@ -59,11 +60,14 @@ sourced comparison against Crystal, Elixir, Gleam, Pony, and Akka.
 - Roughly 10-15% of standard Ruby's language-and-stdlib surface by a
   prior internal estimate (`history/2026-09-08T174011Z-plan-of-plans.md`),
   by design — the 36-47 batch's own stated ceiling, not a target of 100%.
-- Two rigorously-measured benchmark programs exist as of this session
-  (see `benchmarks/REPORT.md`); most of the concurrency/distribution
-  surface above is proven by unit/integration test, not by an end-to-end
-  user-facing example, and one specific gap (multi-process distributed
-  actors) is proven *not* to work yet, disclosed rather than hidden.
+- Six rigorously-measured benchmark programs exist as of this session,
+  10 runs each against C/C++/Rust/Crystal/Ruby (see `benchmarks/REPORT.md`)
+  — Emerald beats Ruby on all six, beats Crystal (its closest competitor)
+  on one and ties a second, and still trails Crystal on the other four.
+  Most of the concurrency/distribution surface above is proven by unit/
+  integration test; the one user-facing multi-process distributed-actor
+  example was found broken and fixed this same session (see `RUNTIME.md`
+  §3).
 
 ## Reading order for a new contributor
 

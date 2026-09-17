@@ -63,7 +63,12 @@ beyond routing allocation-heavy code through explicit regions or actors.
 Revisiting this (reference counting, a tracing collector, or a more
 aggressive escape-analysis/region-inference story) is open post-v1 work;
 inception §12 itself names all three as future options, deliberately
-undecided.
+undecided. `benchmarks/REPORT.md`'s `object_allocation` benchmark gives this
+a real number: 1,000,000 `emerald_alloc`-backed instances runs measurably
+slower than every other language in that report, including Crystal and
+Ruby's own garbage-collected allocation — the likely mechanism (never
+reusing freed slots forces the allocator to keep extending the heap) is a
+disclosed hypothesis there, not a proven root cause.
 
 ---
 
@@ -113,12 +118,13 @@ undecided.
    `EmeraldActorRef` shape, which is what "location-transparent" means
    concretely here: calling code doesn't need a different code path for
    local vs. remote.
-   **Caveat, found this session and not yet fixed as of this document:**
-   the only examples exercising this (`examples/host.em`/`client.em`) do
-   not currently build — see `examples/README.md`'s "Real bugs found"
-   section for the exact linker failure. The mechanism above is what the
-   runtime *implements*; it is not currently provable end-to-end through
-   the example programs.
+   **Found broken, then fixed, this same session:** the only examples
+   exercising this (`examples/host.em`/`client.em`) failed to link under
+   `--jobs` (multi-file `require`-splicing didn't scope actor-method
+   linkage correctly) — fixed via `WeakODR` linkage in `emerald-codegen`;
+   see `examples/README.md`'s "Real bugs found" section. Verified
+   end-to-end as two real OS processes: `host` listens, `client` sends
+   three real TCP `.increment` calls plus `.report`, `host` prints `3`.
 2. **`ActorName.locate(key, args...)`** (plan 65) adds automatic placement:
    `emerald_consistent_hash_owner` hashes a key against a ring of known
    peers (`emerald_fnv1a`, `EmeraldRingPoint`) to decide which node owns a

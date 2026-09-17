@@ -12393,14 +12393,26 @@ fn define_main<'ctx>(
   let entry = context.append_basic_block(main_fn, "entry");
   builder.position_at_end(entry);
 
+  // Bugfix (benchmark session, plan 65+): plan 55's Decision log assumed
+  // "no cost worth special-casing" for starting the pool unconditionally
+  // — measured, this session, to be false. `emerald_worker_pool_start`
+  // (`runtime/emerald_runtime.c`) spawns `nproc` real `pthread_create`
+  // threads (32 on the machine this was measured on) and `_drain_and_
+  // join` joins every one of them, even when the program declares zero
+  // actors; a trivial `sum` program's real run time went from ~0.5ms to
+  // ~6.4ms because of this pair of calls alone (root-caused via
+  // `EMERALD_WORKERS=1` isolating the cost — see `benchmarks/
+  // confirm_worker_pool.py`). Gated on whether this compilation unit's
+  // own merged `program` (post-`require`-splice, so `client.em`-style
+  // files that only reference an actor declared in a required file still
+  // count) contains any `Item::Actor` at all — every actor-declaring
+  // program still gets the exact previous unconditional behavior; a
+  // program with none now skips both calls entirely.
+  let program_declares_actors = program.items.iter().any(|i| matches!(i, Item::Actor(_)));
+
   // Plan 55's Decision log: a compiler-inserted implicit barrier, not a
   // language-visible `await`/join primitive — Emerald still has no
   // `async`/`await` keyword anywhere in its grammar after this plan.
-  // Started unconditionally (even for a program with no actors at
-  // all — no cost worth special-casing: an idle pool with zero
-  // messages ever enqueued drains and joins immediately) so every
-  // compiled program's `main` is symmetric, with no separate "does
-  // this program need a pool" analysis anywhere in codegen.
   //
   // `unset_current_debug_location` before this call, when debug info is
   // active (`compile_to_object_with_debug_info`, `emerald-cli`'s own
@@ -12411,12 +12423,14 @@ fn define_main<'ctx>(
   // in the same program), which LLVM's module verifier correctly
   // rejects as a `!dbg` attachment pointing at the wrong subprogram.
   // No-op (there is no location to unset) when debug info is off.
-  if gen_ctx.dibuilder.is_some() {
-    builder.unset_current_debug_location();
+  if program_declares_actors {
+    if gen_ctx.dibuilder.is_some() {
+      builder.unset_current_debug_location();
+    }
+    builder
+      .build_call(gen_ctx.actor_funcs.pool_start, &[], "poolstart")
+      .map_err(|e| e.to_string())?;
   }
-  builder
-    .build_call(gen_ctx.actor_funcs.pool_start, &[], "poolstart")
-    .map_err(|e| e.to_string())?;
 
   let top_stmts: Vec<Spanned<Stmt>> = program
     .items
@@ -12524,12 +12538,14 @@ fn define_main<'ctx>(
     &fn_ctx,
   )?;
   if !terminated {
-    if gen_ctx.dibuilder.is_some() {
-      builder.unset_current_debug_location();
+    if program_declares_actors {
+      if gen_ctx.dibuilder.is_some() {
+        builder.unset_current_debug_location();
+      }
+      builder
+        .build_call(gen_ctx.actor_funcs.pool_drain_and_join, &[], "pooldrain")
+        .map_err(|e| e.to_string())?;
     }
-    builder
-      .build_call(gen_ctx.actor_funcs.pool_drain_and_join, &[], "pooldrain")
-      .map_err(|e| e.to_string())?;
     let zero = context.i32_type().const_int(0, false);
     builder
       .build_return(Some(&zero))
