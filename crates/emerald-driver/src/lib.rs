@@ -241,8 +241,16 @@ fn build_link_args(
   output_path: &Path,
   extra_libs: &[String],
 ) -> Vec<std::ffi::OsString> {
+  // Bugfix (benchmark session): pairs with build.rs's `-ffunction-
+  // sections`/`-fdata-sections` on the runtime archive — `--gc-sections`
+  // is what actually asks the linker to drop the now-per-symbol sections
+  // it can prove nothing reachable from `main`/the user's program refers
+  // to (e.g. the actor/networking runtime, for a program with no actors).
+  // No effect without the build.rs flags; harmless if the linker finds
+  // nothing prunable.
   let mut args: Vec<std::ffi::OsString> = vec![
     "-no-pie".into(),
+    "-Wl,--gc-sections".into(),
     obj_path.as_os_str().to_os_string(),
     runtime_archive_path.as_os_str().to_os_string(),
   ];
@@ -780,6 +788,9 @@ mod tests {
 
   #[test]
   fn build_link_args_with_no_extra_libs_is_byte_for_byte_the_original_five_argument_list() {
+    // Bugfix (benchmark session): name kept for history, but this is now
+    // the six-argument list including `-Wl,--gc-sections` — see that
+    // flag's own doc comment on `build_link_args` for why.
     let obj = Path::new("/tmp/x.o");
     let archive = Path::new("/tmp/libemerald_runtime.a");
     let out = Path::new("/tmp/out");
@@ -788,6 +799,7 @@ mod tests {
       args,
       vec![
         std::ffi::OsString::from("-no-pie"),
+        std::ffi::OsString::from("-Wl,--gc-sections"),
         std::ffi::OsString::from("/tmp/x.o"),
         std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
         std::ffi::OsString::from("-o"),
@@ -806,6 +818,7 @@ mod tests {
       args,
       vec![
         std::ffi::OsString::from("-no-pie"),
+        std::ffi::OsString::from("-Wl,--gc-sections"),
         std::ffi::OsString::from("/tmp/x.o"),
         std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
         std::ffi::OsString::from("-lsqlite3"),

@@ -28,10 +28,24 @@ fn main() {
 
   println!("cargo:rerun-if-changed={}", runtime_src.display());
 
-  // `cc::Build::compile("emerald_runtime")` produces
-  // `{OUT_DIR}/libemerald_runtime.a` by its own documented convention.
+  // Bugfix (benchmark session): `emerald_runtime.c` is one translation
+  // unit compiled to one `.o` inside the archive — by default the
+  // linker can only pull in a static-archive member whole-or-nothing,
+  // so any single referenced symbol (even just `emerald_print_i64` for
+  // a bare `puts`) drags in every actor/networking/supervision function
+  // too, regardless of whether the compiled program uses them. Measured
+  // this session: every benchmark's Emerald binary landed in the same
+  // flat ~90 KB band no matter what the program actually did. `-ffunction-
+  // sections`/`-fdata-sections` here move every function/global into its
+  // own linker section instead of one per-file blob, so `--gc-sections`
+  // at the link step (`build_link_args`/`link_many`, `emerald-driver/
+  // src/lib.rs`/`src/parallel.rs`) can prune unreferenced ones — the
+  // standard fix for this exact "one translation unit forces monolithic
+  // linking" shape, not a novel technique.
   cc::Build::new()
     .file(&runtime_src)
+    .flag("-ffunction-sections")
+    .flag("-fdata-sections")
     .compile("emerald_runtime");
 
   let out_dir = std::env::var("OUT_DIR").expect("set by cargo");

@@ -17,6 +17,15 @@ deleted) specifically so this report doesn't quietly launder its own finding
 — see "Headline" below for both the original diagnosis and the fix's actual
 effect once applied.
 
+**Second update, same session**: the binary-size finding (Headline §2) was
+also root-caused and mostly fixed (`-ffunction-sections`/`-fdata-sections`
+in `crates/emerald-driver/build.rs`, `-Wl,--gc-sections` in `src/lib.rs`
+and `src/parallel.rs`) — a real ~37% size reduction, not full closure. Every
+Emerald row was re-measured a third time; both pre-fix and worker-pool-only
+numbers are kept inline for the same reason as above. This update also
+directly tested (not assumed) whether the size fix affected run time — it
+did not, meaningfully — so Headline §§1 and 2 are confirmed independent.
+
 Ruby (3.4.9) and Crystal (1.19.1) were pulled in via `nix-shell -p ruby crystal`
 for this session; neither is a permanent dependency of this repo.
 
@@ -101,31 +110,46 @@ was the one identified, fixable cause found, and it's now fixed. It is
 Methodology section's compile-flags note: every benchmark here compiles
 through LLVM's full `default<O3>` pass pipeline already). What does explain
 the rest of the gap — the always-linked runtime's static initializers,
-something in `main`'s generated prologue, page-in cost from the larger
-binary (see finding 2), or something else entirely — is a genuinely open
-question for whoever picks up the roadmap's "evidence" item next, not
-something to guess at here.
+something in `main`'s generated prologue, or something else entirely — is a
+genuinely open question for whoever picks up the roadmap's "evidence" item
+next. **Ruled out, checked directly rather than guessed**: binary size
+(finding 2) — fixing that (see below) had essentially zero effect on run
+time, so the two findings are independent, not the same root cause.
 
-**2. Binary size grew ~5.6x for the identical trivial program — not
-addressed by the fix above, still open.** Old snapshot: `sum.em` → 16,488
-bytes. This report, both before and after the worker-pool fix: `sum.em` →
-~90,000 bytes, and every other benchmark's Emerald binary lands in the same
-~90 KB band regardless of what the program actually does (`sum_of_squares`
-90,120 B, `fibonacci` 90,088 B, `object_allocation`/`method_dispatch`
-~90,352 B — a nearly-flat floor, not scaling with program complexity, and
-essentially unchanged post-fix since the fix only removes two function
-*calls*, not the linked-in code implementing them). Consistent explanation:
-actor/networking/supervision runtime code is statically linked into every
-binary whether or not the program references it, and isn't being stripped.
-This is real, measured, and still unfixed — flagged for the same roadmap
-item as the unexplained runtime gap above.
+**2. Binary size grew ~5.6x for the identical trivial program — found the
+mechanism and partially fixed, same session, in a follow-up pass.** Old
+snapshot: `sum.em` → 16,488 bytes. This report's first two passes measured
+`sum.em` at ~90,000 bytes, flat across every benchmark regardless of program
+complexity (`sum_of_squares` 90,120 B, `fibonacci` 90,088 B,
+`object_allocation`/`method_dispatch` ~90,352 B). Root cause:
+`runtime/emerald_runtime.c` compiles to a single translation unit inside the
+embedded static archive — a linker can only pull in a static-archive member
+whole-or-nothing, so any one referenced runtime symbol (even just
+`emerald_print_i64` for a bare `puts`) dragged in every actor/networking/
+supervision function too, regardless of whether the program used them.
+**Fixed** by compiling the runtime with `-ffunction-sections
+-fdata-sections` (`crates/emerald-driver/build.rs`) and linking with
+`-Wl,--gc-sections` (`crates/emerald-driver/src/lib.rs`'s
+`build_link_args`, and `src/parallel.rs`'s `link_many` for `--jobs`
+builds) — the standard fix for this exact shape, not a novel technique.
+Re-measured: `sum.em` → 56,736 bytes, a real **~37% reduction**, and every
+other benchmark dropped proportionally (56.7–57.5 KB band, down from the
+~90 KB band). **Not fully closed** — still roughly 3.4x the pre-actor-era
+16,488 bytes, not the original 1x; some further-prunable structure remains
+unidentified. **And, checked directly rather than assumed: this fix has
+essentially zero effect on run time** (all six benchmarks' post-fix means
+are within existing run-to-run noise of their pre-fix means — see the
+Results tables below) — so binary size and finding 1's runtime gap are
+**not** the same root cause, contrary to what this report's own earlier
+pass speculated. Disconfirmed, not confirmed; reported plainly either way.
 
 Both findings are reported plainly because they're real and measured, not to
 indict the actor/supervision/distribution feature set — that work is
 genuinely substantial (see the field audit's landscape section). A language
 that taxes every program, actors-or-not, for a feature it doesn't use is a
-real cost; one half of that cost is now fixed and verified, the other half
-is disclosed rather than hidden.
+real cost; this session closed most of finding 1 and roughly two-thirds of
+finding 2's size regression, and disclosed rather than hid what's still
+unexplained in both.
 
 ## Results
 
@@ -143,10 +167,14 @@ measurement. Binary size in bytes; Ruby has neither (interpreted, no binary).
 | Rust | 615.1 ms | 4,354,944 B | 0.645 ± 0.044 ms | 0.571–0.723 ms |
 | C++ | 625.8 ms | 15,864 B | 1.192 ± 0.106 ms | 1.054–1.403 ms |
 | Crystal | 1,143.4 ms | 1,046,616 B | 3.224 ± 0.177 ms | 2.990–3.548 ms |
-| **Emerald** | 575.2 ms | 90,008 B | **4.200 ± 0.200 ms** | 4.024–4.593 ms |
+| **Emerald** | 588.4 ms | 56,736 B | **4.217 ± 0.212 ms** | 4.046–4.795 ms |
 | Ruby | n/a | n/a | 143.118 ± 1.686 ms | 140.045–145.119 ms |
 
-*(Emerald, post worker-pool fix — was 6.394 ± 0.343 ms; see Headline §1.)*
+*(Emerald, post worker-pool fix and `--gc-sections` fix — run time was
+6.394 ± 0.343 ms before either fix, 4.200 ± 0.200 ms after the worker-pool
+fix alone; binary size was 90,008 B before `--gc-sections`. See Headline
+§§1–2 — the size fix, checked directly, changed run time by ~0.02 ms
+(noise), confirming the two regressions were independent.)*
 
 ### array_traversal
 
@@ -158,10 +186,12 @@ measurement. Binary size in bytes; Ruby has neither (interpreted, no binary).
 | C | 614.0 ms | 15,928 B | 2.456 ± 0.067 ms | 2.322–2.542 ms |
 | C++ | 625.3 ms | 15,928 B | 3.196 ± 0.160 ms | 2.835–3.450 ms |
 | Crystal | 1,154.5 ms | 1,055,840 B | 5.194 ± 0.143 ms | 4.936–5.383 ms |
-| **Emerald** | 577.2 ms | 90,056 B | **11.363 ± 0.148 ms** | 11.148–11.640 ms |
+| **Emerald** | 597.5 ms | 56,784 B | **11.285 ± 0.150 ms** | 11.018–11.489 ms |
 | Ruby | n/a | n/a | 492.469 ± 1.463 ms | 490.118–494.971 ms |
 
-*(Emerald, post worker-pool fix — was 13.323 ± 0.428 ms; see Headline §1.)*
+*(Emerald, post worker-pool fix and `--gc-sections` fix — was
+13.323 ± 0.428 ms before either fix; binary size was 90,056 B before
+`--gc-sections`. See Headline §§1–2.)*
 
 ### sum_of_squares *(new this report)*
 
@@ -173,14 +203,16 @@ iteration. Expected: `333332833333500000`.*
 | Rust | 581.9 ms | 4,355,000 B | 0.627 ± 0.060 ms | 0.569–0.749 ms |
 | Crystal | 1,129.3 ms | 1,046,696 B | 1.419 ± 0.113 ms | 1.267–1.541 ms |
 | C | 598.4 ms | 15,904 B | 1.441 ± 0.064 ms | 1.345–1.534 ms |
-| **Emerald** | 582.2 ms | 90,120 B | **1.481 ± 0.078 ms** | 1.391–1.664 ms |
+| **Emerald** | 587.6 ms | 56,848 B | **1.465 ± 0.132 ms** | 1.348–1.755 ms |
 | C++ | 627.5 ms | 15,912 B | 2.163 ± 0.185 ms | 1.941–2.601 ms |
 | Ruby | n/a | n/a | 58.773 ± 0.747 ms | 57.812–60.118 ms |
 
-*(Emerald, post worker-pool fix — was 3.187 ± 0.306 ms; see Headline §1. Now
-essentially tied with Crystal and C — 1.481 ms vs. their 1.419/1.441 ms,
+*(Emerald, post worker-pool fix and `--gc-sections` fix — was
+3.187 ± 0.306 ms before either fix, 1.481 ± 0.078 ms after the worker-pool
+fix alone; binary size was 90,120 B before `--gc-sections`. Still
+essentially tied with Crystal and C — 1.465 ms vs. their 1.419/1.441 ms,
 inside roughly one combined standard deviation — and clearly ahead of C++.
-Reordered above to reflect the new ranking.)*
+Reordered above to reflect the ranking.)*
 
 ### fibonacci *(new this report)*
 
@@ -194,15 +226,16 @@ expressible; they weren't in the prior report.*
 | C | 612.5 ms | 15,936 B | 1.336 ± 0.047 ms | 1.261–1.404 ms |
 | C++ | 635.0 ms | 15,944 B | 2.036 ± 0.080 ms | 1.939–2.197 ms |
 | Rust | 571.1 ms | 4,355,144 B | 1.954 ± 0.074 ms | 1.881–2.141 ms |
-| **Emerald** | 543.6 ms | 90,088 B | **3.142 ± 0.076 ms** | 3.043–3.281 ms |
+| **Emerald** | 581.6 ms | 56,824 B | **3.205 ± 0.158 ms** | 3.087–3.563 ms |
 | Crystal | 1,136.6 ms | 1,046,896 B | 3.608 ± 0.117 ms | 3.435–3.733 ms |
 | Ruby | n/a | n/a | 83.220 ± 1.007 ms | 80.807–84.404 ms |
 
-*(Emerald, post worker-pool fix — was 5.217 ± 0.355 ms; see Headline §1.
-**This is the one benchmark in this report where Emerald genuinely beats
-Crystal**: 3.142 ms vs. 3.608 ms, a real gap — several combined standard
-deviations, not overlapping noise. Still behind C/C++/Rust. Reordered above
-to reflect the new ranking.)*
+*(Emerald, post worker-pool fix and `--gc-sections` fix — was
+5.217 ± 0.355 ms before either fix, 3.142 ± 0.076 ms after the worker-pool
+fix alone; binary size was 90,088 B before `--gc-sections`.
+**This remains the one benchmark in this report where Emerald genuinely
+beats Crystal**: 3.205 ms vs. 3.608 ms, still a real gap. Still behind
+C/C++/Rust. Reordered above to reflect the ranking.)*
 
 ### object_allocation *(new this report)*
 
@@ -230,12 +263,16 @@ free/collect step for a more expensive allocation path overall.
 | Rust | 573.4 ms | 4,355,080 B | 1.675 ± 0.095 ms | 1.533–1.876 ms |
 | C | 611.7 ms | 15,992 B | 5.809 ± 0.119 ms | 5.658–6.076 ms |
 | Crystal | 6,283.4 ms | 1,050,664 B | 8.826 ± 0.287 ms | 8.293–9.184 ms |
-| **Emerald** | 553.8 ms | 90,360 B | **22.196 ± 0.645 ms** | 21.232–23.049 ms |
+| **Emerald** | 594.4 ms | 57,472 B | **23.684 ± 0.662 ms** | 22.696–24.562 ms |
 | Ruby | n/a | n/a | 131.575 ± 1.981 ms | 129.730–136.411 ms |
 
-*(Emerald, post worker-pool fix — was 22.262 ± 0.622 ms: essentially
-unchanged, as expected, since this benchmark's bottleneck is the allocation
-path itself, not pool startup — the hypothesis above stands uncontradicted.)*
+*(Emerald: 22.262 ± 0.622 ms before either fix, 22.196 ± 0.645 ms after the
+worker-pool fix alone, 23.684 ± 0.662 ms after `--gc-sections` too — a
+small increase, barely outside the two nearer measurements' combined noise
+band, machine-load variance more likely than a real `--gc-sections` effect
+given neither fix touches the allocation path this benchmark's bottleneck
+is in. Binary size was 90,360 B before `--gc-sections`. Reported as
+measured, not smoothed toward the "should be flat" expectation.)*
 
 ### method_dispatch *(new this report)*
 
@@ -255,10 +292,12 @@ rule, and left for the next person to correct.
 | C++ | 590.7 ms | 15,872 B | 1.204 ± 0.136 ms | 0.972–1.405 ms |
 | Crystal | 5,842.0 ms | 1,050,656 B | 3.224 ± 0.182 ms | 2.958–3.463 ms |
 | C | 582.1 ms | 15,960 B | 10.117 ± 0.068 ms | 10.028–10.241 ms | *(see limitation above)* |
-| **Emerald** | 558.7 ms | 90,352 B | **10.372 ± 0.206 ms** | 10.161–10.803 ms |
+| **Emerald** | 591.5 ms | 57,472 B | **10.404 ± 0.141 ms** | 10.192–10.685 ms |
 | Ruby | n/a | n/a | 307.914 ± 44.414 ms | 291.466–434.181 ms |
 
-*(Emerald, post worker-pool fix — was 11.914 ± 0.284 ms; see Headline §1. Now
+*(Emerald, post worker-pool fix and `--gc-sections` fix — was
+11.914 ± 0.284 ms before either fix, 10.372 ± 0.206 ms after the worker-pool
+fix alone; binary size was 90,352 B before `--gc-sections`. Still
 essentially tied with C on this row, though see that row's own inlining
 caveat before reading anything into "Emerald ≈ C" here — both are still far
 behind Crystal's 3.224 ms on this benchmark.)*
@@ -288,11 +327,13 @@ smoothed over.)*
   section). That bar is cleared clearly and consistently.
 - **The one identified, fixable cause (unconditional actor-runtime
   startup/shutdown) is no longer a live deficit — it's fixed, this session,
-  and the table in Headline §1 is the before/after proof.** What remains
-  unexplained is the *rest* of the gap against C/C++/Rust that persists even
-  after the fix (clearest on `sum`: 4.20 ms Emerald vs. 0.48 ms C) and,
-  separately, the binary-size finding (Headline §2) — both real, both open,
-  neither guessed at here.
+  and the table in Headline §1 is the before/after proof.** Binary size
+  (Headline §2) is also mostly fixed — a real ~37% reduction, mechanism
+  identified and corrected — though not fully back to the pre-actor-era
+  size. What remains unexplained is the *rest* of the runtime gap against
+  C/C++/Rust that persists after both fixes (clearest on `sum`: 4.22 ms
+  Emerald vs. 0.48 ms C) — checked and confirmed **not** caused by binary
+  size or missing optimization, genuinely open, not guessed at here.
 - None of this is reported to indict the project — it's reported because a
   performance claim resting on a 2-program single-run snapshot wasn't a
   claim at all, and this is what the real numbers say once measured

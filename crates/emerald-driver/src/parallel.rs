@@ -322,8 +322,14 @@ fn link_many(obj_paths: Vec<PathBuf>, output_path: PathBuf) -> Result<(), Driver
       "failed to extract the embedded runtime archive: {e}"
     )));
   }
+  // Bugfix (benchmark session): matches `build_link_args`'s own
+  // `-Wl,--gc-sections` (`emerald-driver/src/lib.rs`) — this is the
+  // `--jobs` build's separate `cc` invocation, so it needs the same flag
+  // or multi-file builds would keep linking the whole runtime archive
+  // in regardless of build.rs's per-function/per-data sections.
   let link_result = Command::new("cc")
     .arg("-no-pie")
+    .arg("-Wl,--gc-sections")
     .args(&obj_paths)
     .arg(&runtime_archive_path)
     .arg("-o")
