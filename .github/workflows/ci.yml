@@ -1,0 +1,46 @@
+name: CI
+# Mirrors devenv/moon's own pre-push pipeline (see README.md "Lifecycle" and
+# "Summary flow") so CI enforces exactly what pre-push already enforces
+# locally — no separate CI-only command list to drift out of sync.
+#
+# Not yet run against a live GitHub Actions runner (this repo currently has
+# no git remote) — written from the documented devenv/moon/nix pipeline and
+# from the cargo-level commands verified directly in this session
+# (`cargo build --workspace`, `cargo nextest run --workspace`,
+# `cargo clippy --workspace --all-targets`, all green as of this commit).
+# Treat the first real run on a pushed remote as the actual verification
+# this file has never had, and fix forward from there rather than assuming
+# it's correct because it looks right.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci-format:
+    name: Format (fail on change)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v16
+        with:
+          name: project-template
+          skipPush: true
+      - name: devenv shell -- moon run :ci-format
+        run: nix develop --command bash -c "devenv shell -- moon run :ci-format"
+  pipeline:
+    name: format, check, lint, build, test, audit, check-docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v16
+        with:
+          name: project-template
+          skipPush: true
+      - name: devenv shell -- moon run :format :check :lint :build :test :audit :check-docs
+        run: nix develop --command bash -c "devenv shell -- moon run :format :check :lint :build :test :audit :check-docs"

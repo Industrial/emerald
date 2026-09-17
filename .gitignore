@@ -17,6 +17,7 @@
 .direnv
 .direnv
 .moon/cache/
+.emerald/
 .drift/**/.backups/
 .drift/cache/
 .drift/call-graph/

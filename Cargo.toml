@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "CC-BY-SA-4.0"
+license = "MIT OR Apache-2.0"
 
 # Plan 27: cargo-dist 0.32.0 release config. `emerald-cli` is the only
 # binary this workspace ships today (`emerald-lsp`/`emerald-mcp` don't
