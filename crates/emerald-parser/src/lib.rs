@@ -19,9 +19,9 @@ mod grammar {
 mod interpolate;
 
 pub use ast::{
-  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
-  ExternBlock, ExternFn, Function, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause,
-  Spanned, Stmt, StringPart, TypeParam, expand_derives,
+  expand_derives, ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef,
+  EnumVariant, Expr, ExternBlock, ExternFn, Function, InterfaceDef, Item, ModuleDef, Param,
+  Program, RescueClause, Spanned, Stmt, StringPart, TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -3361,16 +3361,14 @@ mod tests {
     let Item::Class(c) = &program.items[0] else {
       panic!("expected a class");
     };
-    assert!(
-      c.methods
-        .iter()
-        .any(|m| m.name == "x" && m.params.is_empty())
-    );
-    assert!(
-      c.methods
-        .iter()
-        .any(|m| m.name == "y" && m.params.is_empty())
-    );
+    assert!(c
+      .methods
+      .iter()
+      .any(|m| m.name == "x" && m.params.is_empty()));
+    assert!(c
+      .methods
+      .iter()
+      .any(|m| m.name == "y" && m.params.is_empty()));
     let eq = c
       .methods
       .iter()

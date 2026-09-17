@@ -23,6 +23,7 @@ use lsp_types::request::{
   Completion, GotoDefinition, Request as LspRequest, SemanticTokensFullRequest,
 };
 use lsp_types::{
+  notification::{DidChangeTextDocument, DidOpenTextDocument, Notification, PublishDiagnostics},
   CompletionItem, CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
   DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams, GotoDefinitionParams,
   GotoDefinitionResponse, Location, OneOf, Position, PublishDiagnosticsParams, Range,
@@ -30,7 +31,6 @@ use lsp_types::{
   SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
   SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
   TextDocumentSyncKind,
-  notification::{DidChangeTextDocument, DidOpenTextDocument, Notification, PublishDiagnostics},
 };
 use std::collections::HashMap;
 
@@ -217,7 +217,11 @@ fn goto_definition(
 ) -> Option<GotoDefinitionResponse> {
   let word = word_at_position(text, position)?;
   let keyword = if let Some(info) = table.classes.get(&word) {
-    if info.is_module { "module" } else { "class" }
+    if info.is_module {
+      "module"
+    } else {
+      "class"
+    }
   } else if table.functions.contains_key(&word) {
     "def"
   } else {

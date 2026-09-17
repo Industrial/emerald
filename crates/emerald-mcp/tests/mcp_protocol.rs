@@ -4,9 +4,9 @@
 //! client transport, never calling this crate's tool handlers
 //! in-process.
 
-use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, object};
+use rmcp::model::{object, CallToolRequestParams};
 use rmcp::transport::TokioChildProcess;
+use rmcp::ServiceExt;
 
 async fn connect() -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
   let cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_emerald-mcp"));

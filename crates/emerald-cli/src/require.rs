@@ -7,7 +7,7 @@
 //! same "no second caller yet, so it stays here" precedent `main.rs`'s
 //! own doc comment already states for the rest of the pipeline.
 
-use emerald_driver::cache::{CacheKey, raw_hash};
+use emerald_driver::cache::{raw_hash, CacheKey};
 use emerald_parser::{Item, ParseError, Program};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

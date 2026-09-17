@@ -6929,7 +6929,11 @@ fn check_purity(
     }
   }
 
-  if diags.is_empty() { Ok(()) } else { Err(diags) }
+  if diags.is_empty() {
+    Ok(())
+  } else {
+    Err(diags)
+  }
 }
 
 fn collect_purity_edges(
@@ -8719,7 +8723,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     diags.extend(purity_diags);
   }
 
-  if diags.is_empty() { Ok(()) } else { Err(diags) }
+  if diags.is_empty() {
+    Ok(())
+  } else {
+    Err(diags)
+  }
 }
 
 /// Plan 41's Decision log: substitutes every `"Self"` in the interface's
@@ -8889,11 +8897,9 @@ mod tests {
     let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject 1-arg call to 2-arg add");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("missing required argument `b`"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("missing required argument `b`")));
   }
 
   #[test]
@@ -8901,11 +8907,9 @@ mod tests {
     let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(1, 2, 3)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a 3-arg call to a 2-arg add");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("expects 2 argument"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("expects 2 argument")));
   }
 
   #[test]
@@ -8913,11 +8917,9 @@ mod tests {
     let src = "puts undefined_fn(1)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject call to undefined function");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("undefined function `undefined_fn`"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("undefined function `undefined_fn`")));
   }
 
   const MILESTONE2: &str = "x: Int64 = 10\n\nif x > 5\n  puts x\nend\n";
@@ -8985,11 +8987,9 @@ mod tests {
     let src = "class Point\n  x: Float64\nend\n\np: Point = Point.new()\nputs p.missing\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a call to an undeclared method");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("has no method `missing`"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("has no method `missing`")));
   }
 
   #[test]
@@ -9039,11 +9039,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject writing a Float64 into an Array[Int64]");
-    assert!(
-      errs[0]
-        .message
-        .contains("type mismatch in array assignment")
-    );
+    assert!(errs[0]
+      .message
+      .contains("type mismatch in array assignment"));
   }
 
   #[test]
@@ -9068,11 +9066,9 @@ mod tests {
     let src = "add_x: Proc = ->(y: Int64) -> Int64 { y }\nputs add_x.call(5, 6)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject 2-arg call to a 1-param Proc");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("expects 1 argument"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("expects 1 argument")));
   }
 
   #[test]
@@ -9081,11 +9077,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject a Float64 argument to an Int64 param");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("Int64") && d.message.contains("Float64"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("Int64") && d.message.contains("Float64")));
   }
 
   #[test]
@@ -9109,11 +9103,9 @@ mod tests {
     let src = "raise 5\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject raising a non-class value");
-    assert!(
-      errs[0]
-        .message
-        .contains("`raise` requires a class instance")
-    );
+    assert!(errs[0]
+      .message
+      .contains("`raise` requires a class instance"));
   }
 
   #[test]
@@ -9145,11 +9137,9 @@ mod tests {
     let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.missing(1)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject an undeclared module method");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("has no method `missing`"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("has no method `missing`")));
   }
 
   #[test]
@@ -9158,11 +9148,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject a 2-arg call to a 1-param module method");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("expects 1 argument"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("expects 1 argument")));
   }
 
   #[test]
@@ -9854,11 +9842,9 @@ mod tests {
     let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nv3: Vector2 = v1 + v2\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Vector2 declares no `+` method");
-    assert!(
-      errs[0]
-        .message
-        .contains("class `Vector2` has no operator method `+`")
-    );
+    assert!(errs[0]
+      .message
+      .contains("class `Vector2` has no operator method `+`"));
   }
 
   #[test]
@@ -9874,11 +9860,9 @@ mod tests {
     let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nb: Boolean = v1 == v2\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Vector2 declares no `==` method");
-    assert!(
-      errs[0]
-        .message
-        .contains("class `Vector2` has no operator method `==`")
-    );
+    assert!(errs[0]
+      .message
+      .contains("class `Vector2` has no operator method `==`"));
   }
 
   #[test]
@@ -9911,11 +9895,9 @@ mod tests {
     let src = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64) -> Void\n    @data = [a]\n  end\n\n  def [](i: Int64) -> Int64\n    @data[i]\n  end\nend\n\nb: Bag = Bag.new(1)\nb[0] = 5\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Bag declares no `[]=` method");
-    assert!(
-      errs[0]
-        .message
-        .contains("class `Bag` has no operator method `[]=`")
-    );
+    assert!(errs[0]
+      .message
+      .contains("class `Bag` has no operator method `[]=`"));
   }
 
   // Plan 41 (interfaces and generics).
@@ -9998,11 +9980,9 @@ mod tests {
     let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\ndef bad[T: Comparable, U: Comparable](a: T, b: U) -> T\n  a\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("two type parameters are not supported");
-    assert!(
-      errs[0]
-        .message
-        .contains("multiple type parameters are not supported")
-    );
+    assert!(errs[0]
+      .message
+      .contains("multiple type parameters are not supported"));
   }
 
   #[test]
@@ -10010,11 +9990,9 @@ mod tests {
     let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Box\n  def pick[T: Comparable](a: T, b: T) -> T\n    a\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("generic methods are not supported");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("generic methods are not supported"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("generic methods are not supported")));
   }
 
   // Plan 43 (nullable types and safe navigation).
@@ -10572,11 +10550,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("Ok(1) with no enclosing expected-type position can't infer T/E");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.to_lowercase().contains("infer"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.to_lowercase().contains("infer")));
   }
 
   #[test]
@@ -10585,11 +10561,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("Result[Int64, String]? inside a Result[Int64, IoError] function — E mismatch");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.to_lowercase().contains("error type"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.to_lowercase().contains("error type")));
   }
 
   #[test]
@@ -10607,11 +10581,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("`?` nested inside a binary operator is not supported");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("let") || d.message.contains("assignment"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("let") || d.message.contains("assignment")));
   }
 
   #[test]
@@ -10627,11 +10599,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("`v` is bound only inside the Ok arm, not visible in the Err arm");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.to_lowercase().contains("undefined"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.to_lowercase().contains("undefined")));
   }
 
   #[test]
@@ -10699,11 +10669,9 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("cross-actor calls are asynchronous — a method can't return a value");
-    assert!(
-      errs
-        .iter()
-        .any(|d| d.message.contains("get") && d.message.contains("return type"))
-    );
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("get") && d.message.contains("return type")));
   }
 
   #[test]

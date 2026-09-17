@@ -11,13 +11,12 @@
 
 use emerald_driver::DriverError;
 use rmcp::{
-  ServerHandler, ServiceExt,
   handler::server::{
     router::tool::ToolRouter,
     wrapper::{Json, Parameters},
   },
   model::{ServerCapabilities, ServerInfo},
-  tool, tool_handler, tool_router,
+  tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

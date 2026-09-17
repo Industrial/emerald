@@ -13,8 +13,8 @@
 
 use crate::cache::{CacheReporter, QueryCache};
 use crate::require_graph::{
-  RequireGraph, build_require_graph, closure_hashes, closure_items, compute_levels,
-  own_function_names, unsupported_construct,
+  build_require_graph, closure_hashes, closure_items, compute_levels, own_function_names,
+  unsupported_construct, RequireGraph,
 };
 use crate::{DriverError, RUNTIME_ARCHIVE};
 use emerald_parser::Program;
@@ -115,15 +115,13 @@ fn parallel_parse_all(
 
   std::thread::scope(|scope| {
     for _ in 0..jobs {
-      scope.spawn(|| {
-        loop {
-          let path = { queue.lock().unwrap().pop_front() };
-          let Some(path) = path else { break };
-          let node = &graph.nodes[path];
-          let name = path.to_string_lossy().to_string();
-          if let Err(errs) = cache.parse_query(&name, &node.source, reporter) {
-            errors.lock().unwrap().push((path.clone(), errs));
-          }
+      scope.spawn(|| loop {
+        let path = { queue.lock().unwrap().pop_front() };
+        let Some(path) = path else { break };
+        let node = &graph.nodes[path];
+        let name = path.to_string_lossy().to_string();
+        if let Err(errs) = cache.parse_query(&name, &node.source, reporter) {
+          errors.lock().unwrap().push((path.clone(), errs));
         }
       });
     }
@@ -163,17 +161,15 @@ fn parallel_type_check_level(
 
   std::thread::scope(|scope| {
     for _ in 0..jobs {
-      scope.spawn(|| {
-        loop {
-          let path = { queue.lock().unwrap().pop_front() };
-          let Some(path) = path else { break };
-          let items = closure_items(graph, path);
-          let program = Program { items };
-          let key = cache.key_for_many(&closure_hashes(graph, path));
-          let label = path.to_string_lossy().to_string();
-          if let Err(diags) = cache.type_check_query(key, &program, &label, reporter) {
-            errors.lock().unwrap().push((path.clone(), diags));
-          }
+      scope.spawn(|| loop {
+        let path = { queue.lock().unwrap().pop_front() };
+        let Some(path) = path else { break };
+        let items = closure_items(graph, path);
+        let program = Program { items };
+        let key = cache.key_for_many(&closure_hashes(graph, path));
+        let label = path.to_string_lossy().to_string();
+        if let Err(diags) = cache.type_check_query(key, &program, &label, reporter) {
+          errors.lock().unwrap().push((path.clone(), diags));
         }
       });
     }
@@ -223,42 +219,40 @@ fn parallel_codegen_level(
 
   std::thread::scope(|scope| {
     for _ in 0..jobs {
-      scope.spawn(|| {
-        loop {
-          let path = { queue.lock().unwrap().pop_front() };
-          let Some(path) = path else { break };
-          let start = Instant::now();
-          let thread_id = format!("{:?}", std::thread::current().id());
+      scope.spawn(|| loop {
+        let path = { queue.lock().unwrap().pop_front() };
+        let Some(path) = path else { break };
+        let start = Instant::now();
+        let thread_id = format!("{:?}", std::thread::current().id());
 
-          if delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-          }
-
-          let items = closure_items(graph, path);
-          let program = Program { items };
-          let own_names = own_function_names(graph, path);
-          let is_entry = *path == graph.entry;
-          let obj_path = std::env::temp_dir().join(format!(
-            "emerald_par_{}_{}.o",
-            process::id(),
-            raw_label(path)
-          ));
-          let outcome =
-            emerald_codegen::compile_to_object_scoped(&program, &own_names, is_entry, &obj_path)
-              .map(|()| (path.clone(), obj_path));
-
-          if trace_enabled {
-            let end = Instant::now();
-            trace.lock().unwrap().push(TraceRecord {
-              file: path.clone(),
-              thread_id,
-              start_nanos: start.duration_since(level_start).as_nanos(),
-              end_nanos: end.duration_since(level_start).as_nanos(),
-            });
-          }
-
-          results.lock().unwrap().push(outcome);
+        if delay_ms > 0 {
+          std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
+
+        let items = closure_items(graph, path);
+        let program = Program { items };
+        let own_names = own_function_names(graph, path);
+        let is_entry = *path == graph.entry;
+        let obj_path = std::env::temp_dir().join(format!(
+          "emerald_par_{}_{}.o",
+          process::id(),
+          raw_label(path)
+        ));
+        let outcome =
+          emerald_codegen::compile_to_object_scoped(&program, &own_names, is_entry, &obj_path)
+            .map(|()| (path.clone(), obj_path));
+
+        if trace_enabled {
+          let end = Instant::now();
+          trace.lock().unwrap().push(TraceRecord {
+            file: path.clone(),
+            thread_id,
+            start_nanos: start.duration_since(level_start).as_nanos(),
+            end_nanos: end.duration_since(level_start).as_nanos(),
+          });
+        }
+
+        results.lock().unwrap().push(outcome);
       });
     }
   });

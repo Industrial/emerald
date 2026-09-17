@@ -384,12 +384,10 @@ mod tests {
 
     let resolved = resolve_dependencies(&app_dir, &manifest).unwrap();
     assert_eq!(resolved.len(), 1);
-    assert!(
-      resolved[0]
-        .root
-        .to_string_lossy()
-        .contains(".emerald/deps/mathutils-")
-    );
+    assert!(resolved[0]
+      .root
+      .to_string_lossy()
+      .contains(".emerald/deps/mathutils-"));
 
     let link_target = std::fs::read_link(app_dir.join("deps").join("mathutils")).unwrap();
     assert!(link_target.join("lib.em").exists());

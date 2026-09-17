@@ -20,8 +20,8 @@
 //! `compute_levels` (Kahn's algorithm) ever runs — a cycle is detected
 //! during graph construction itself, never during leveling.
 
+use crate::cache::{raw_hash, CacheKey};
 use crate::DriverError;
-use crate::cache::{CacheKey, raw_hash};
 use emerald_parser::{Function, Item};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

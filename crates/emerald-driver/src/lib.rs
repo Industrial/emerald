@@ -17,14 +17,14 @@
 //! entry points alone don't cover.
 
 use emerald_parser::{ParseError, Program};
-use id_effect::{Effect, run_blocking};
+use id_effect::{run_blocking, Effect};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 pub mod cache;
 pub mod parallel;
 pub mod require_graph;
-use cache::{CacheKey, CacheReporter, QueryCache, raw_hash};
+use cache::{raw_hash, CacheKey, CacheReporter, QueryCache};
 
 // Plan 21's Decision log: `emerald-lsp` keeps depending only on this
 // crate, never directly on `emerald-parser`/`emerald-sema` (the same

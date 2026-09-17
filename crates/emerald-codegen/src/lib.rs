@@ -24,11 +24,11 @@ use emerald_parser::{
   Function as AstFunction, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
   StringPart,
 };
-use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
+use inkwell::AddressSpace;
 // Plan 35: DWARF line-table debug info (v1 scope — see the plan's own
 // Decision log: line tables only, no variable/type DIEs).
 use inkwell::debug_info::{
