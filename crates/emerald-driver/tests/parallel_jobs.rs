@@ -85,6 +85,58 @@ fn single_file_program_still_compiles_and_runs_identically_under_compile_paralle
 }
 
 #[test]
+fn an_actor_shared_across_require_d_files_links_and_runs_correctly_under_jobs() {
+  // Regression: `examples/host.em`/`examples/client.em` (both `require
+  // counter_actor`, an `actor Counter`) failed to LINK under `--jobs`
+  // — every `.o` in the require-closure independently re-emits full
+  // definitions for a shared class/actor's methods AND its trampoline/
+  // wire-codec/method-table scaffolding (`own_function_names` only
+  // scoped plain `Item::Function`s, not classes/actors), so two `.o`s
+  // both defining `Counter_initialize`/`Counter_increment__trampoline`/
+  // etc. hit a real `multiple definition of ...` error from `cc`/`ld`.
+  // Fixed by giving all of those symbols `WeakODR` linkage (`emerald-
+  // codegen/src/lib.rs`'s `declare_actor_trampolines`/`declare_wire_
+  // class_codecs`/`declare_actor_wire_arg_codecs`/`build_actor_method_
+  // tables`/`weak_odr_class_shaped_methods`) so the linker dedups
+  // identical multi-TU definitions instead of rejecting them. This test
+  // proves the link succeeds AND the actor's own message-send/mailbox
+  // behavior is still correct across the file boundary — single-
+  // process, local `.spawn()`, not `.remote()`/sockets (that exact
+  // two-process-over-real-TCP shape was proven by hand, once, using
+  // this fix, via `examples/host.em` + `examples/client.em` — not
+  // automated here since it needs two real OS processes).
+  let dir = fresh_dir("actor-across-require");
+  std::fs::write(
+    dir.join("counter.em"),
+    "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def report -> Void\n    puts @count\n  end\nend\n",
+  )
+  .unwrap();
+  std::fs::write(
+    dir.join("main.em"),
+    "require counter\n\nc: Counter = Counter.spawn(0)\nc.increment\nc.increment\nc.increment\nc.report\n",
+  )
+  .unwrap();
+  let output = dir.join("main_out");
+  let cache = emerald_driver::cache::QueryCache::new(dir.join(".cache"));
+  emerald_driver::parallel::compile_parallel(
+    &dir.join("main.em"),
+    &output,
+    2,
+    &cache,
+    &emerald_driver::cache::SilentReporter,
+  )
+  .unwrap();
+  let run = Command::new(&output).output().unwrap();
+  assert!(
+    run.status.success(),
+    "actor-across-require binary exited non-zero: {}",
+    String::from_utf8_lossy(&run.stderr)
+  );
+  assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "3");
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn main_referencing_a_function_b_does_not_export_is_rejected_not_silently_permissive() {
   // leaf-parallel-parse-and-typecheck AC2: level-ordering isn't merely
   // fast, it's necessary — proves this leaf didn't accidentally make

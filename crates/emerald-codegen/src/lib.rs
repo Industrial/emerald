@@ -2999,10 +2999,34 @@ fn declare_actor_trampolines<'ctx>(
       let Some(&(method_fv, _)) = user_func_ids.get(&mangled) else {
         continue;
       };
+      // Bugfix (multi-file `--jobs` link): every compilation unit whose
+      // require-closure includes this actor's own `Item::Actor` re-runs
+      // this whole function and re-emits a byte-identical trampoline —
+      // `own_function_names` (require_graph.rs) only scopes plain
+      // `Item::Function`s, not classes/actors, so two `.o`s sharing an
+      // actor both define this symbol with the old `External` linkage,
+      // and `cc`/`ld` reject the duplicate definition. `WeakODR` (C++
+      // template-instantiation's own standard fix for the same "N TUs
+      // independently emit one deterministic, identical definition"
+      // shape) lets the linker keep exactly one and drop the rest
+      // instead of erroring — safe here because this function is a
+      // pure function of the actor's AST, so every TU's copy is
+      // guaranteed identical. Deliberately `WeakODR`, not the more
+      // obvious `LinkOnceODR`: this session's own first attempt used
+      // `LinkOnceODR` and broke `a_trampoline_called_directly_produces_
+      // the_same_result_as_the_method_itself` (a hand-written C harness
+      // that `extern`-links straight against this exact symbol) —
+      // `default<O3>` is entitled to `GlobalDCE` a `linkonce_odr`
+      // function that looks unreferenced *from inside this module*,
+      // which a single-file actor program with no in-module caller of
+      // its own trampoline genuinely is. `weak_odr` keeps the identical
+      // multi-TU-dedup behavior but is never eligible for that
+      // optimization-time removal, so the symbol always survives into
+      // the object file whether or not anything in this module calls it.
       let trampoline_fv = module.add_function(
         &format!("{mangled}__trampoline"),
         trampoline_ty,
-        Some(Linkage::External),
+        Some(Linkage::WeakODR),
       );
 
       let entry = context.append_basic_block(trampoline_fv, "entry");
@@ -3369,21 +3393,23 @@ fn declare_wire_class_codecs<'ctx>(
   let mut encode_fns = HashMap::new();
   let mut decode_fns = HashMap::new();
   for name in &wire_safe {
+    // Bugfix (multi-file `--jobs` link): same shape as the trampoline
+    // fix above — a wire-safe class (including a synthesized one like
+    // `RemoteActorError`, added fresh into every compilation unit that
+    // has any actor at all) gets its `_encode`/`_decode` re-emitted,
+    // byte-identical, in every `.o` whose require-closure defines it.
+    // `WeakODR` over `External` lets the linker dedup instead of
+    // rejecting the duplicate definition — `WeakODR`, not `LinkOnceODR`,
+    // per `declare_actor_trampolines`'s own fix above: a `linkonce_odr`
+    // definition unreferenced from inside its own module is eligible
+    // for `default<O3>`'s `GlobalDCE`, `weak_odr` isn't.
     encode_fns.insert(
       name.clone(),
-      module.add_function(
-        &format!("{name}_encode"),
-        encode_ty,
-        Some(Linkage::External),
-      ),
+      module.add_function(&format!("{name}_encode"), encode_ty, Some(Linkage::WeakODR)),
     );
     decode_fns.insert(
       name.clone(),
-      module.add_function(
-        &format!("{name}_decode"),
-        decode_ty,
-        Some(Linkage::External),
-      ),
+      module.add_function(&format!("{name}_decode"), decode_ty, Some(Linkage::WeakODR)),
     );
   }
 
@@ -3608,15 +3634,21 @@ fn declare_actor_wire_arg_codecs<'ctx>(
     for (tag, m) in a.methods.iter().enumerate() {
       let key = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
       method_tags.insert(key.clone(), tag as i32);
+      // Bugfix (multi-file `--jobs` link): same shape as
+      // `declare_actor_trampolines`'s own fix — `WeakODR` (not
+      // `LinkOnceODR`, see that function's own doc comment for why)
+      // so a wire arg codec pair re-emitted identically in every TU
+      // that shares this actor's definition dedups at link time
+      // instead of erroring as a duplicate symbol.
       let encode_fv = module.add_function(
         &format!("{key}_encode_args"),
         encode_ty,
-        Some(Linkage::External),
+        Some(Linkage::WeakODR),
       );
       let decode_fv = module.add_function(
         &format!("{key}_decode_args"),
         decode_ty,
-        Some(Linkage::External),
+        Some(Linkage::WeakODR),
       );
 
       builder.position_at_end(context.append_basic_block(encode_fv, "entry"));
@@ -3778,6 +3810,13 @@ fn build_actor_method_tables<'ctx>(
     let global = module.add_global(array_ty, None, &format!("{}__methods", a.name));
     global.set_initializer(&entry_ty.const_array(&entries));
     global.set_constant(true);
+    // Bugfix (multi-file `--jobs` link): same `WeakODR` treatment
+    // (not `LinkOnceODR` — see `declare_actor_trampolines`'s own doc
+    // comment) as this file's other actor-symbol sites above — this
+    // table is re-built byte-identical in every TU that shares the
+    // actor's definition (`add_global` defaults to `External` linkage
+    // with no explicit setting), so it needs the same dedup fix.
+    global.set_linkage(Linkage::WeakODR);
     tables.insert(a.name.clone(), global.as_pointer_value());
   }
   (tables, counts)
@@ -13665,6 +13704,74 @@ pub enum CodegenTarget {
   Wasm32Wasi,
 }
 
+/// Bugfix (multi-file `--jobs` link): a class/actor/module method body
+/// is always fully defined by `declare_user_functions` in every
+/// compilation unit whose require-closure includes it — unlike
+/// `Item::Function` (scoped by `own_names` at its own define site,
+/// inside `compile_to_object_impl`'s main `for item in &program.items`
+/// loop), no ownership check exists yet for these item kinds. Two
+/// `.o`s sharing a class/actor/module both then define the same
+/// mangled symbol at the declare step's `External` linkage, and the
+/// linker rejects it as a duplicate — reproduced this session via
+/// `examples/host.em` requiring `examples/counter_actor.em` under
+/// `--jobs`. `WeakODR` (this file's own established fix, already
+/// applied to the actor-scaffolding symbols in `declare_actor_
+/// trampolines`/`declare_wire_class_codecs`/`declare_actor_wire_arg_
+/// codecs`/`build_actor_method_tables`) lets the linker keep exactly
+/// one identical copy instead of erroring — safe because every
+/// compilation unit's copy is a pure function of the same source AST,
+/// so they're guaranteed identical. Deliberately `WeakODR`, not
+/// `LinkOnceODR`: see `declare_actor_trampolines`'s own doc comment —
+/// this session's first attempt used `LinkOnceODR` and broke
+/// `a_trampoline_called_directly_produces_the_same_result_as_the_
+/// method_itself` (a hand-written C harness `extern`-linking straight
+/// against a method compiled with no in-module caller of its own,
+/// which `default<O3>`'s `GlobalDCE` is entitled to strip when the
+/// symbol is `linkonce_odr`; `weak_odr` is never eligible for that).
+/// Also covers a monomorphized generic class instance's own methods
+/// (`generic_instances`, defined later via the identical
+/// `define_method` path) — a generic class shared across files hits
+/// the exact same duplicate-definition shape.
+fn weak_odr_class_shaped_methods<'ctx>(
+  program: &Program,
+  generic_instances: &HashMap<String, ClassDef>,
+  user_func_ids: &HashMap<String, (FunctionValue<'ctx>, ValKind)>,
+) {
+  for item in &program.items {
+    let mangled_names: Vec<String> = match item {
+      Item::Class(c) => c
+        .methods
+        .iter()
+        .map(|m| format!("{}_{}", c.name, mangled_operator_symbol(&m.name)))
+        .collect(),
+      Item::Actor(a) => a
+        .methods
+        .iter()
+        .map(|m| format!("{}_{}", a.name, mangled_operator_symbol(&m.name)))
+        .collect(),
+      Item::Module(m) => m
+        .methods
+        .iter()
+        .map(|f| format!("{}_{}", m.name, f.name))
+        .collect(),
+      _ => continue,
+    };
+    for name in mangled_names {
+      if let Some((fv, _)) = user_func_ids.get(&name) {
+        fv.set_linkage(Linkage::WeakODR);
+      }
+    }
+  }
+  for c in generic_instances.values() {
+    for m in &c.methods {
+      let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
+      if let Some((fv, _)) = user_func_ids.get(&mangled) {
+        fv.set_linkage(Linkage::WeakODR);
+      }
+    }
+  }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_to_object_impl(
   program: &Program,
@@ -14172,6 +14279,9 @@ fn compile_to_object_impl(
     &generic_instances,
     &comptime_only_fns,
   );
+  // Bugfix (multi-file `--jobs` link) — see `weak_odr_class_shaped_
+  // methods`'s own doc comment for why this is needed and safe.
+  weak_odr_class_shaped_methods(program, &generic_instances, &user_func_ids);
   let lambda_func_ids = declare_lambda_functions(&context, &module, program, &lambda_infos);
 
   // Plan 41's Decision log: one specialization cache entry per distinct
