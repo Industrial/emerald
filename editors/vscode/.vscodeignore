@@ -1,0 +1,7 @@
+.vscodeignore
+node_modules/**
+package-lock.json
+check-grammar.mjs
+check-manifest.mjs
+extension.js
+**/*.map

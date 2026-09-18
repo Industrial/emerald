@@ -15,7 +15,7 @@ use rmcp::{
     router::tool::ToolRouter,
     wrapper::{Json, Parameters},
   },
-  model::{ServerCapabilities, ServerInfo},
+  model::{ServerCapabilities, ServerConfig},
   tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
@@ -368,8 +368,15 @@ impl EmeraldServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for EmeraldServer {
-  fn get_info(&self) -> ServerInfo {
-    ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+  // Bugfix (first-ever `git push` this session, first-ever real
+  // Cargo.lock): rmcp's own upstream renamed this type from
+  // `ServerInfo` to `ServerConfig` (both a bare `pub type ... =
+  // InitializeResult` alias — same underlying type, same `::new`/
+  // `.with_instructions` API, pure rename) between when this file was
+  // written and this session's first-ever `cargo generate-lockfile`
+  // pinning what "rmcp = \"3.2\"" actually resolves to today.
+  fn get_info(&self) -> ServerConfig {
+    ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
       "Emerald compiler tools: check_source (parse+typecheck in memory), \
          compile_and_run (compile, link, and actually run source), and \
          list_examples (the real, working examples/*.em corpus).",

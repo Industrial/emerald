@@ -54,7 +54,8 @@
 /tmp/
 /data/
 /target/
-Cargo.lock
+result
+result-*
 Thumbs.db
 charts/
 config.json
@@ -69,3 +70,5 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+editors/vscode/dist/
+editors/vscode/*.vsix

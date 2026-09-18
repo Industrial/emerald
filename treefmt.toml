@@ -88,10 +88,17 @@ command = "beautysh"
 includes = ["*.sh", ".envrc"]
 priority = 3
 
+# Bugfix (first-ever `git push` this session): biome's own config
+# (biome.json) already ignores lockfiles like `package-lock.json` --
+# machine-generated, not meant to be reformatted -- but treefmt still
+# handed it to biome, and biome refusing the file (correctly, per its
+# own config) came back as a hard treefmt error rather than a skip.
+# Excluded here to match biome's own policy instead of fighting it.
 [formatter.javascript]
 command = "biome"
 options = ["format", "--write"]
 includes = ["*.{js,jsx,ts,tsx,json}"]
+excludes = ["**/package-lock.json"]
 priority = 4
 
 [formatter.yaml]

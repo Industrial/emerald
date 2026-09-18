@@ -88,10 +88,13 @@ command = "beautysh"
 includes = ["*.sh", ".envrc"]
 priority = 3
 
+# Bugfix (first-ever `git push` this session) -- see treefmt.toml's
+# identical comment on this same formatter block.
 [formatter.javascript]
 command = "biome"
 options = ["format", "--write"]
 includes = ["*.{js,jsx,ts,tsx,json}"]
+excludes = ["**/package-lock.json"]
 priority = 4
 
 [formatter.yaml]

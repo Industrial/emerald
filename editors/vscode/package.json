@@ -4,6 +4,12 @@
 	"description": "Syntax highlighting and live diagnostics for Emerald (.em) via emerald-lsp.",
 	"version": "0.1.0",
 	"publisher": "emerald-lang",
+	"license": "MIT OR Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Industrial/emerald.git",
+		"directory": "editors/vscode"
+	},
 	"engines": {
 		"vscode": "^1.80.0"
 	},
@@ -13,7 +19,7 @@
 	"activationEvents": [
 		"onLanguage:emerald"
 	],
-	"main": "./extension.js",
+	"main": "./dist/extension.js",
 	"contributes": {
 		"languages": [
 			{
@@ -46,7 +52,14 @@
 			}
 		}
 	},
+	"scripts": {
+		"build": "esbuild extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+		"vscode:prepublish": "npm run build"
+	},
 	"dependencies": {
 		"vscode-languageclient": "^9.0.0"
+	},
+	"devDependencies": {
+		"esbuild": "^0.28.0"
 	}
 }
