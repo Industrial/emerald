@@ -7,7 +7,16 @@
 
 pub mod ast;
 
-#[allow(clippy::all)]
+// Bugfix (first-ever `git push` this session — pre-push's `check-docs`
+// gate had never actually run before, no remote existed): `clippy::all`
+// doesn't cover `clippy::missing_docs_in_private_items` — it's a
+// `clippy::restriction` lint, deliberately excluded from `all` since
+// restriction lints are opt-in-only — so `moon.yml`'s `check-docs` task
+// (`-W clippy::missing_docs_in_private_items` promoted to deny by its
+// own `-D warnings`) flagged every one of LALRPOP's thousands of
+// generated, unavoidably-undocumented items in `grammar.rs`. Generated
+// code, not something to hand-document.
+#[allow(clippy::all, clippy::missing_docs_in_private_items, missing_docs)]
 mod grammar {
   lalrpop_util::lalrpop_mod!(pub grammar, "/grammar.rs");
 }
@@ -34,9 +43,12 @@ pub use ast::{
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 #[error("{message}")]
 pub struct ParseError {
+  /// Human-readable description of what went wrong.
   message: String,
+  /// The full source text, for `miette`'s snippet rendering.
   #[source_code]
   src: miette::NamedSource<String>,
+  /// Byte-offset span of the failure within `src`.
   #[label("here")]
   span: miette::SourceSpan,
 }
@@ -125,6 +137,10 @@ fn fill_contract_text(items: &mut [Item], source: &str) {
   }
 }
 
+/// Whole-program walk rewriting every `assert`/`assert_eq` call's
+/// synthesized location arguments (file `name`, line) in place, by
+/// byte-offset lookup into `source` — the counterpart to
+/// `fill_contract_text`'s narrower, `FuncDef`-only walk above.
 fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
   for item in items {
     match item {
@@ -151,12 +167,15 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
   }
 }
 
+/// `rewrite_assert_locations`'s per-statement-list recursion step.
 fn rewrite_stmts(stmts: &mut [Spanned<Stmt>], name: &str, source: &str) {
   for s in stmts {
     rewrite_stmt(s, name, source);
   }
 }
 
+/// `rewrite_assert_locations`'s per-statement recursion step — walks
+/// into every `Stmt` variant's own sub-expressions/sub-blocks.
 fn rewrite_stmt(stmt: &mut Spanned<Stmt>, name: &str, source: &str) {
   match &mut stmt.node {
     Stmt::Let { value, .. }
@@ -259,6 +278,10 @@ fn rewrite_stmt(stmt: &mut Spanned<Stmt>, name: &str, source: &str) {
   }
 }
 
+/// `rewrite_assert_locations`'s leaf recursion step — walks into every
+/// `Expr` variant's own sub-expressions, and is the one that actually
+/// rewrites an `assert`/`assert_eq` call's synthesized offset argument
+/// into a `"name:line"` string literal (see the `Expr::Call` arm).
 fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
   match &mut expr.node {
     Expr::Ident(_)
