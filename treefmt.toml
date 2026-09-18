@@ -105,8 +105,20 @@ options = ["format"]
 includes = ["*.toml"]
 priority = 6
 
+# Bugfix (first-ever `git push` this session): this hardcoded
+# `--edition 2024` overrode rustfmt.toml's own `edition` setting (rustfmt
+# CLI flags win over config-file settings) -- while every crate here is
+# actually `edition = "2021"` (Cargo.toml's workspace.package). Two
+# independent sources of truth for the same setting, disagreeing: `moon
+# run :format` (this treefmt config) formatted as 2024, then `moon run
+# :lint`'s `cargo fmt --all -- --check` (reads rustfmt.toml, no CLI
+# override) checked against 2021 -- guaranteed to fail every time, which
+# is exactly what happened the first time this pipeline ever actually
+# ran end-to-end (no git remote existed before this session, so pre-push
+# had never been exercised). Dropped the override; rustfmt.toml's own
+# `edition = "2021"` is now the one source of truth both `:format` and
+# `:lint` agree on.
 [formatter.rust]
 command = "rustfmt"
-options = ["--edition", "2024"]
 includes = ["*.rs"]
 priority = 7

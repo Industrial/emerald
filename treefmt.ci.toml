@@ -105,8 +105,11 @@ options = ["format"]
 includes = ["*.toml"]
 priority = 6
 
+# Bugfix (first-ever `git push` this session) -- see treefmt.toml's
+# identical comment on this same formatter block for the full story:
+# this override disagreed with rustfmt.toml's real edition (2021,
+# matching Cargo.toml), guaranteeing :format and :lint would fight.
 [formatter.rust]
 command = "rustfmt"
-options = ["--edition", "2024"]
 includes = ["*.rs"]
 priority = 7
