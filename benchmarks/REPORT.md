@@ -26,6 +26,16 @@ numbers are kept inline for the same reason as above. This update also
 directly tested (not assumed) whether the size fix affected run time — it
 did not, meaningfully — so Headline §§1 and 2 are confirmed independent.
 
+**Third update, same session**: chasing §1's remaining "unexplained" gap
+by disassembling the actual compiled binaries (`objdump -d`) turned up
+Headline §3 — the `sum` benchmark's C/C++/Rust rows were never measuring
+loop execution at all; all three fold the loop to a compile-time constant.
+Confirmed via the literal instruction, confirmed Crystal does *not* do
+this (genuinely executes the loop, like Emerald), confirmed
+`sum_of_squares`/`array_traversal` aren't affected either. No numbers
+changed — this is a correction to what the existing `sum` numbers actually
+mean, not a re-measurement.
+
 Ruby (3.4.9) and Crystal (1.19.1) were pulled in via `nix-shell -p ruby crystal`
 for this session; neither is a permanent dependency of this repo.
 
@@ -101,18 +111,27 @@ are preserved in `benchmarks/raw_results.json` under each benchmark's
 | object_allocation | 22.262 ms | 22.196 ms | ~0% (expected — see that section) |
 | method_dispatch | 11.914 ms | 10.372 ms | −13% |
 
-A real, substantial, measured improvement on five of six benchmarks — but
-`sum`'s post-fix 4.20 ms is still well above C's 0.48 ms or Rust's 0.64 ms,
-and still above Crystal's 3.22 ms. **The remaining gap on `sum` and most
+A real, substantial, measured improvement on five of six benchmarks. `sum`'s
+post-fix 4.20 ms vs. C's 0.48 ms/Rust's 0.64 ms turned out not to be a real
+computation-speed gap at all — see Headline §3: C/C++/Rust fold that
+specific loop into a compile-time constant, Emerald doesn't, so that
+particular comparison was never apples-to-apples. `sum` vs. Crystal's
+3.22 ms *is* apples-to-apples (both execute the loop for real), and remains
+a genuine, unexplained gap. **The remaining gap on `sum`-vs-Crystal and the
 other benchmarks is not explained by this session** — the worker-pool call
 was the one identified, fixable cause found, and it's now fixed. It is
 **not** LLVM optimization level (checked and ruled out — see the
 Methodology section's compile-flags note: every benchmark here compiles
-through LLVM's full `default<O3>` pass pipeline already). What does explain
-the rest of the gap — the always-linked runtime's static initializers,
-something in `main`'s generated prologue, or something else entirely — is a
-genuinely open question for whoever picks up the roadmap's "evidence" item
-next. **Ruled out, checked directly rather than guessed**: binary size
+through LLVM's full `default<O3>` pass pipeline already). It is **not**
+constant-folding blindness across the board either — confirmed via
+disassembly that only `sum` is affected, `sum_of_squares`/`array_traversal`
+both do genuine work in every language checked. What does explain the rest
+of the gap — the always-linked runtime's static initializers, something in
+`main`'s generated prologue, LLVM simply not matching C/Crystal's codegen
+quality on these specific instruction sequences, or something else
+entirely — is a genuinely open question for whoever picks up the roadmap's
+"evidence" item next. **Ruled out, checked directly rather than guessed**:
+binary size
 (finding 2) — fixing that (see below) had essentially zero effect on run
 time, so the two findings are independent, not the same root cause.
 
@@ -151,6 +170,40 @@ real cost; this session closed most of finding 1 and roughly two-thirds of
 finding 2's size regression, and disclosed rather than hid what's still
 unexplained in both.
 
+**3. The `sum` benchmark's C/C++/Rust rows were never measuring loop
+execution speed — found by disassembling the actual binaries, not
+guessed.** `sum.em`'s "unexplained" gap against C (Headline §1) sent this
+report looking at the generated machine code directly. `objdump -d` on the
+compiled `sum` binaries shows exactly why: C, C++, and Rust's optimizers
+all recognize `total = Σ i for i in [0, 10,000,000)` has no observable side
+effects and **replace the entire loop with its closed-form answer at
+compile time** — all three binaries contain the literal instruction
+`movabs $0x2d7987f0d4c0,%r?x` (0x2d7987f0d4c0 = 49999995000000, the exact
+expected answer) immediately before the `printf` call. **No loop runs at
+all.** Their `sum` row is measuring process-startup-plus-one-`printf` cost,
+not computation. Checked, not assumed: Crystal's compiled binary contains
+zero occurrences of that constant anywhere — confirmed via
+`objdump -d | grep -c`, it genuinely executes the loop, same as Emerald.
+`sum_of_squares.c`'s disassembly was also checked as a control: it contains
+a real `call <square>` inside a real compare-and-jump loop, not a folded
+constant — that benchmark's C/Rust/C++ rows above are measuring real
+execution, this specific problem is isolated to `sum`.
+
+**What this means for the `sum` row specifically**: Emerald's 4.2 ms vs.
+Crystal's 3.2 ms is a fair, apples-to-apples "who runs this loop faster"
+comparison — both execute it for real. Emerald's 4.2 ms vs. C's 0.48 ms,
+Rust's 0.64 ms, or C++'s 1.19 ms is **not** a fair comparison of computation
+speed — it's "genuine loop execution" against "recognized the loop was
+foldable and skipped it," which is a real compiler-sophistication gap
+(Emerald's LLVM pipeline doesn't perform this optimization; matching it is
+a real, identified, not-yet-attempted improvement — see the roadmap), but
+a categorically different claim than "C computes this faster than
+Emerald" would be. The other five benchmarks in this report were not
+individually re-verified this way, though `array_traversal.c`'s own
+disassembly (checked while investigating this) shows genuine SIMD
+(`movdqa`/`pxor`) array traversal, not folding — that row stands as a real
+comparison.
+
 ## Results
 
 All run times are CPU time (user+sys), milliseconds, mean ± stddev over 10
@@ -175,6 +228,12 @@ measurement. Binary size in bytes; Ruby has neither (interpreted, no binary).
 fix alone; binary size was 90,008 B before `--gc-sections`. See Headline
 §§1–2 — the size fix, checked directly, changed run time by ~0.02 ms
 (noise), confirming the two regressions were independent.)*
+
+**Read the C/C++/Rust rows above with Headline §3 in hand**: all three
+compile this entire loop away into a single precomputed constant — their
+numbers measure startup-plus-`printf`, not this computation. Only the
+Emerald/Crystal/Ruby rows are executing the loop for real; only they're a
+fair comparison for "how fast does this run."
 
 ### array_traversal
 
@@ -330,10 +389,16 @@ smoothed over.)*
   and the table in Headline §1 is the before/after proof.** Binary size
   (Headline §2) is also mostly fixed — a real ~37% reduction, mechanism
   identified and corrected — though not fully back to the pre-actor-era
-  size. What remains unexplained is the *rest* of the runtime gap against
-  C/C++/Rust that persists after both fixes (clearest on `sum`: 4.22 ms
-  Emerald vs. 0.48 ms C) — checked and confirmed **not** caused by binary
-  size or missing optimization, genuinely open, not guessed at here.
+  size.
+- **A third finding: `sum`'s comparison against C/C++/Rust was never
+  measuring computation speed at all (Headline §3).** All three fold that
+  specific loop to a compile-time constant; Emerald and Crystal both
+  genuinely execute it. The real, still-open question is the gap against
+  Crystal specifically (`sum`: 4.22 ms Emerald vs. 3.22 ms Crystal, both
+  doing real work) and the similar gaps on the other benchmarks — checked
+  and confirmed **not** caused by binary size, missing optimization, or
+  constant-folding blindness elsewhere in the suite. Genuinely open, not
+  guessed at here.
 - None of this is reported to indict the project — it's reported because a
   performance claim resting on a 2-program single-run snapshot wasn't a
   claim at all, and this is what the real numbers say once measured
