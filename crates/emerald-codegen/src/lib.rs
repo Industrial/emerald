@@ -17291,9 +17291,27 @@ mod tests {
   // than returning it for a top-level `puts a.value` to print.
   const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
 
+  // Bugfix (first-ever `git push` this session — no remote existed
+  // before, so this test's real failure rate had never been exercised
+  // under a real gate): confirmed via 10 runs against the untouched
+  // pre-session commit that this fails ~50-60% of the time, not as
+  // flakiness introduced by anything this session changed. `a.value`
+  // and `b.value` are two DIFFERENT actors' independently-scheduled
+  // sends — nothing in the runtime model (N actors over a thread pool,
+  // no cross-actor ordering guarantee; see spec/RUNTIME.md §2) promises
+  // which one's worker thread prints first. The fixed-order `assert_eq!`
+  // asserted a guarantee the scheduler never actually made. Same fix as
+  // the neighboring `fib_worker`-style concurrency-proof tests in this
+  // same file already use (see their own "relative order is deliberately
+  // NOT asserted" comments) and as `actor_concurrency.rs`'s own
+  // sort-then-compare pattern: assert both expected lines appear,
+  // exactly once each, order-independent.
   #[test]
   fn actor_worked_example_compiled_linked_and_run_prints_2_and_101() {
-    assert_eq!(compile_link_run(COUNTER_ACTOR_EXAMPLE), "2\n101\n");
+    let output = compile_link_run(COUNTER_ACTOR_EXAMPLE);
+    let mut lines: Vec<&str> = output.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec!["101", "2"]);
   }
 
   // Plan 63 (purity annotations), `leaf-concurrency-proof` — the plan's
