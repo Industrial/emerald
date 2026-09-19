@@ -425,7 +425,7 @@ const ENUMERABLE_BLOCK_METHODS: [&str; 8] = [
 /// codegen/src/lib.rs`'s `call_named_proc` doc comment for the full
 /// "why a NAMED Proc, not an inline block literal" rationale this
 /// rewrite exists to satisfy without changing either crate: it turns
-/// `nums.map { |x: Int64| x * 2 }` into the exact AST a hand-written
+/// `nums.map do |x: Int64| x * 2 end` into the exact AST a hand-written
 /// `__fresh: Proc = do |x: Int64| x * 2 end; nums.map(__fresh)` produces
 /// (plan 71's own `"Void"` return-type placeholder aside — see that
 /// hoisted `Stmt::Let`'s own construction below, which overwrites it
@@ -444,7 +444,7 @@ const ENUMERABLE_BLOCK_METHODS: [&str; 8] = [
 /// point out of its original, possibly-conditionally-executed scope.
 ///
 /// `.map`/`.reduce`/`.inject`'s own block has no declared return type
-/// at all (`{ |x: Int64| x * 2 }` — and, since plan 71 deleted the
+/// at all (`do |x: Int64| x * 2 end` — and, since plan 71 deleted the
 /// lambda literal's own `-> T` return-type slot outright, NO surface
 /// syntax in this language can spell a lambda's return type explicitly
 /// any more, block-attached or bare) — `infer_block_result_type` below is
@@ -2062,7 +2062,7 @@ mod tests {
 
   #[test]
   fn trailing_block_literal_desugars_to_an_extra_call_argument() {
-    let src = "repeat(3) { |i: Int64| puts i }\n";
+    let src = "repeat(3) do |i: Int64| puts i end\n";
     let program = parse(src).unwrap();
     assert_eq!(
       program.items[0],
@@ -2112,7 +2112,7 @@ mod tests {
 
   #[test]
   fn plan_34_worked_example_parses() {
-    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) do |i: Int64| puts i end\n";
     parse(src).expect("plan 34's worked example must parse cleanly");
   }
 
@@ -3860,7 +3860,7 @@ mod tests {
   #[test]
   fn a_block_attached_select_call_parses_as_a_lets_rhs() {
     let src =
-      "nums: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = nums.select { |x: Int64| x > 1 }\n";
+      "nums: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = nums.select do |x: Int64| x > 1 end\n";
     let program = parse(src).expect("should parse");
     // The block is hoisted to a fresh top-level `Proc` `Let` immediately
     // before the `evens` statement, so there are 4 top-level items, not
@@ -3902,7 +3902,7 @@ mod tests {
   #[test]
   fn a_block_attached_map_call_infers_its_blocks_return_type_from_the_body() {
     let src =
-      "nums: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = nums.map { |x: Int64| x * 2 }\n";
+      "nums: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = nums.map do |x: Int64| x * 2 end\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
       node: Stmt::Let { ty, value, .. },
@@ -3920,7 +3920,7 @@ mod tests {
 
   #[test]
   fn a_block_attached_reduce_call_parses_with_args_and_a_block_together() {
-    let src = "nums: Array[Int64] = [1, 2, 3]\ntotal: Int64 = nums.reduce(0) { |acc: Int64, x: Int64| acc + x }\n";
+    let src = "nums: Array[Int64] = [1, 2, 3]\ntotal: Int64 = nums.reduce(0) do |acc: Int64, x: Int64| acc + x end\n";
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 3);
     let Item::Stmt(Spanned {
@@ -3948,7 +3948,7 @@ mod tests {
 
   #[test]
   fn a_bare_no_parens_block_attached_call_parses_as_a_statement_too() {
-    let src = "nums: Array[Int64] = [1, 2, 3]\nnums.each { |x: Int64| puts x }\n";
+    let src = "nums: Array[Int64] = [1, 2, 3]\nnums.each do |x: Int64| puts x end\n";
     let program = parse(src).expect("should parse");
     // `nums`, the hoisted proc, the `.each` statement.
     assert_eq!(program.items.len(), 3);
@@ -3960,7 +3960,7 @@ mod tests {
     // small `Call`-arm table can look up, and it isn't one of the
     // arithmetic/comparison/literal/param shapes it covers either — a
     // real, disclosed inference-coverage boundary, not a crash.
-    let src = "nums: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = nums.map { |x: Int64| File.read(\"a\") }\n";
+    let src = "nums: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = nums.map do |x: Int64| File.read(\"a\") end\n";
     let err = parse(src).expect_err("should fail to infer the block's return type");
     assert!(!err.is_empty());
   }
@@ -3973,7 +3973,7 @@ mod tests {
     // `Expr::Lambda`, which still parses (this plan's grammar change is
     // receiver/context-agnostic) but is `emerald-sema`'s problem, not
     // this pass's.
-    let src = "nums: Array[Int64] = [1, 2, 3]\nif true do\n  evens: Array[Int64] = nums.select { |x: Int64| x > 1 }\nend\n";
+    let src = "nums: Array[Int64] = [1, 2, 3]\nif true do\n  evens: Array[Int64] = nums.select do |x: Int64| x > 1 end\nend\n";
     let program = parse(src).expect("should still parse");
     let Item::Stmt(Spanned {
       node: Stmt::If { then_branch, .. },
@@ -3988,5 +3988,131 @@ mod tests {
     assert!(
       matches!(&value.node, Expr::MethodCall(_, _, args) if matches!(args.last().map(|a| &a.node), Some(Expr::Lambda { .. })))
     );
+  }
+
+  // Plan 87 (do...end exclusive: braces removed as block syntax).
+
+  #[test]
+  fn plan_87_do_end_block_attaches_in_statement_position() {
+    let src = "nums: Array[Int64] = [1, 2, 3]\nnums.each do |x: Int64| puts x end\n";
+    let program =
+      parse(src).expect("a bare, no-parens do...end-attached call must parse as a statement");
+    // `nums`, the hoisted proc, the `.each` statement.
+    assert_eq!(program.items.len(), 3);
+  }
+
+  #[test]
+  fn plan_87_do_end_block_attaches_in_expression_position() {
+    let src =
+      "nums: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = nums.select do |x: Int64| x > 1 end\n";
+    let program = parse(src).expect("a do...end-attached call must parse as a Let's RHS");
+    assert_eq!(program.items.len(), 3);
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, value, .. },
+      ..
+    }) = &program.items[2]
+    else {
+      panic!("expected the `evens` Let, got {:?}", program.items[2]);
+    };
+    assert_eq!(name, "evens");
+    assert!(matches!(&value.node, Expr::MethodCall(_, method, _) if method == "select"));
+  }
+
+  #[test]
+  fn plan_87_chain_of_at_least_three_do_end_calls_binds_tight_and_chains() {
+    // Chain-local tight binding (this plan's Decision log): each
+    // `do...end` block binds to exactly the `.method` call it's written
+    // on, and the whole result is itself a legal receiver for the next
+    // `.method` in the chain — three links here, `.select`, `.map`,
+    // `.count`, none of them parenthesized.
+    let src = "nums: Array[Int64] = [1, 2, 3]\nresult: Int64 = nums.select do |x: Int64| x > 1 end.map do |x: Int64| x * 2 end.count do |x: Int64| x > 1 end\n";
+    let program = parse(src)
+      .expect("a do...end chain of three .method calls should parse, each block binding tight to its own call");
+    assert_eq!(program.items.len(), 3);
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, value, .. },
+      ..
+    }) = &program.items[2]
+    else {
+      panic!("expected the `result` Let, got {:?}", program.items[2]);
+    };
+    assert_eq!(name, "result");
+    // Outermost link (`.count`): this is the top-level statement's own
+    // direct value, so `hoist_enumerable_blocks` rewrites its trailing
+    // block into a fresh, named `Proc` `Ident` — see that pass's own
+    // Decision log for why only this outermost link qualifies.
+    let Expr::MethodCall(recv2, method2, args2) = &value.node else {
+      panic!(
+        "expected the outermost `.count` MethodCall, got {:?}",
+        value.node
+      );
+    };
+    assert_eq!(method2, "count");
+    assert!(
+      matches!(args2.last().map(|a| &a.node), Some(Expr::Ident(n)) if n.starts_with("__enum_blk_"))
+    );
+    // Middle link (`.map`): nested inside a receiver, so it keeps its
+    // own raw, un-hoisted `Expr::Lambda` block (out of that pass's
+    // deliberately narrow, top-level-only scope).
+    let Expr::MethodCall(recv1, method1, args1) = &recv2.node else {
+      panic!(
+        "expected the middle `.map` MethodCall, got {:?}",
+        recv2.node
+      );
+    };
+    assert_eq!(method1, "map");
+    assert!(matches!(
+      args1.last().map(|a| &a.node),
+      Some(Expr::Lambda { .. })
+    ));
+    // Innermost link (`.select`) on the bare `nums` receiver — the base
+    // case of `ChainCallExpr`'s own recursion.
+    let Expr::MethodCall(recv0, method0, args0) = &recv1.node else {
+      panic!(
+        "expected the innermost `.select` MethodCall, got {:?}",
+        recv1.node
+      );
+    };
+    assert_eq!(method0, "select");
+    assert_eq!(recv0.node, Expr::Ident("nums".to_string()));
+    assert!(matches!(
+      args0.last().map(|a| &a.node),
+      Some(Expr::Lambda { .. })
+    ));
+  }
+
+  #[test]
+  fn plan_87_bare_block_attached_call_as_a_while_condition_is_a_real_parse_error() {
+    // No parens around the block-attached `.select` call — this plan's
+    // own condition-position restriction (Decision log) makes this a
+    // genuine parse error (the grammar has no derivation for it at all,
+    // once `CondPrimaryExpr` excludes a bare `ChainCallExpr`), not a
+    // silent misparse and not a hang.
+    let src = "nums: Array[Int64] = [1, 2, 3]\nwhile nums.select do |x: Int64| x > 100 end.length > 0 do\n  puts 1\nend\n";
+    let err = parse(src)
+      .expect_err("an unparenthesized block-attached call must not be usable as a while condition");
+    assert!(!err.is_empty());
+  }
+
+  #[test]
+  fn plan_87_bare_block_attached_call_as_an_if_condition_is_a_real_parse_error() {
+    // Same restriction, `if` instead of `while` — both route through
+    // the identical `CondExpr` nonterminal, so this must fail exactly
+    // the same way.
+    let src = "nums: Array[Int64] = [1, 2, 3]\nif nums.select do |x: Int64| x > 100 end.length > 0 do\n  puts 1\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "an unparenthesized block-attached call must not be usable as an if condition"
+    );
+  }
+
+  #[test]
+  fn plan_87_parenthesized_block_attached_call_is_legal_as_a_while_condition() {
+    // The one legal escape hatch this plan adds: wrapping the block-
+    // attached call in explicit parens closes off the ambiguity (see
+    // `CondPrimaryExpr`'s own header comment) and lets the chain be
+    // extended by one more, final, non-block `.length` call.
+    let src = "nums: Array[Int64] = [1, 2, 3]\nwhile (nums.select do |x: Int64| x > 100 end).length > 0 do\n  puts 1\nend\n";
+    parse(src).expect("a parenthesized block-attached call must be legal as a while condition");
   }
 }

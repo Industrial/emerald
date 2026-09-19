@@ -110,8 +110,8 @@ summarized here for completeness against inception §19's question list:
    escape-analysis restrictions, and the answer is no — escape analysis is
    an optimization concern (§4 below), not a legality concern.
 3. **Block parameter types are inferred from the call site** where the
-   receiving method's signature statically pins them (e.g. `xs.each { |x|
-   ... }` infers `x: Int64` from `xs: Array[Int64]`); an explicit
+   receiving method's signature statically pins them (e.g. `xs.each do |x|
+   ... end` infers `x: Int64` from `xs: Array[Int64]`); an explicit
    annotation (`GRAMMAR.md` §9's example) is always legal and required
    when the call site can't determine the type unambiguously (e.g. inside
    a generic method body before its type parameter is resolved).

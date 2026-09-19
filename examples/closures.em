@@ -13,4 +13,4 @@ fn repeat(n: Int64, &blk): Void do
   end
 end
 
-repeat(3) { |i: Int64| puts i }
+repeat(3) do |i: Int64| puts i end

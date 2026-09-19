@@ -9672,7 +9672,7 @@ fn build_for_range<'a, 'ctx>(
   Ok(false)
 }
 
-/// `name(args) { |params| body }` where `name` declares `block_param`
+/// `name(args) do |params| ... end` where `name` declares `block_param`
 /// (plan 34's Decision log) — call-site specialization, not an ordinary
 /// call: this compiles a fresh copy of `callee`'s body inline, directly
 /// into the CALLER's current function, right here. There is no
@@ -16784,7 +16784,7 @@ mod tests {
 
   // Plan 34 (blocks and yield).
 
-  const BLOCKS_EXAMPLE: &str = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+  const BLOCKS_EXAMPLE: &str = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) do |i: Int64| puts i end\n";
 
   #[test]
   fn blocks_and_yield_example_linked_and_run() {
@@ -16802,7 +16802,7 @@ mod tests {
     // proof capture flows through this call-site-specialization path
     // (reusing the same `vars` map as the call site itself), not just
     // plan 10's original top-level-`Let` lambda path.
-    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nmultiplier: Int64 = 10\nrepeat(3) { |i: Int64| puts i * multiplier }\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nmultiplier: Int64 = 10\nrepeat(3) do |i: Int64| puts i * multiplier end\n";
     assert_eq!(compile_link_run(src), "0\n10\n20\n");
   }
 
@@ -18401,7 +18401,7 @@ int main(void) {
   // Plan 42 (enumerable stdlib).
 
   // The plan's own worked example, adapted to this compiler's real
-  // syntax: `arr.select() { |x: Int64| ... }` does not parse at all —
+  // syntax: `arr.select() do |x: Int64| ... end` does not parse at all —
   // `PrimaryExpr` (the nonterminal reachable from a `Let`'s RHS)
   // deliberately never gained plan 34's trailing-block-literal
   // attachment (a real, pre-existing LALR(1) conflict with `HashLit`,
@@ -18912,7 +18912,7 @@ int main(void) {
   /// byte-identical, fully-correct output every run — this plan's own
   /// regression-hardening insurance, the same posture plan 66/68
   /// already established for this test module.
-  const PLAN_70_ENUMERABLE_EXAMPLE: &str = "nums: Array[Int64] = [1, 2, 3, 4, 5]\n\ndoubled: Array[Int64] = nums.map { |x: Int64| x * 2 }\nevens: Array[Int64] = nums.select { |x: Int64| x % 2 == 0 }\ntotal: Int64 = nums.reduce(0) { |acc: Int64, x: Int64| acc + x }\nabove_two: Int64 = nums.count { |x: Int64| x > 2 }\ns: Int64 = nums.sum\nsorted: Array[Int64] = nums.sort\n\nnums.each_with_index { |x: Int64, i: Int64| puts i }\n\nputs doubled[4]\nputs evens.count\nputs total\nputs above_two\nputs s\nputs sorted[0]\n\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nh_values: Array[Int64] = h.map { |p: Pair[Int64, Int64]| p.value }\nh_total: Int64 = h.reduce(0) { |acc: Int64, p: Pair[Int64, Int64]| acc + p.value }\nh_big: Int64 = h.count { |p: Pair[Int64, Int64]| p.value > 15 }\n\nputs h_values[0]\nputs h_total\nputs h_big\nputs h.count\n";
+  const PLAN_70_ENUMERABLE_EXAMPLE: &str = "nums: Array[Int64] = [1, 2, 3, 4, 5]\n\ndoubled: Array[Int64] = nums.map do |x: Int64| x * 2 end\nevens: Array[Int64] = nums.select do |x: Int64| x % 2 == 0 end\ntotal: Int64 = nums.reduce(0) do |acc: Int64, x: Int64| acc + x end\nabove_two: Int64 = nums.count do |x: Int64| x > 2 end\ns: Int64 = nums.sum\nsorted: Array[Int64] = nums.sort\n\nnums.each_with_index do |x: Int64, i: Int64| puts i end\n\nputs doubled[4]\nputs evens.count\nputs total\nputs above_two\nputs s\nputs sorted[0]\n\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nh_values: Array[Int64] = h.map do |p: Pair[Int64, Int64]| p.value end\nh_total: Int64 = h.reduce(0) do |acc: Int64, p: Pair[Int64, Int64]| acc + p.value end\nh_big: Int64 = h.count do |p: Pair[Int64, Int64]| p.value > 15 end\n\nputs h_values[0]\nputs h_total\nputs h_big\nputs h.count\n";
 
   #[test]
   fn plan_70_enumerable_worked_example_linked_and_run_prints_deterministically() {

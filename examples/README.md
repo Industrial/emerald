@@ -112,10 +112,16 @@ What's still genuinely missing, checked the same way this session:
     integer range as their scrutinee, never an arbitrary expression, a
     pre-existing restriction this plan did not lift. `each_with_index`
     is still available in exactly the callback-block shape plan 42
-    already designed (`arr.each_with_index { |x, i| ... }`).
-  - **No chaining** — `arr.select { }.map { }` in one expression is
+    already designed (`arr.each_with_index do |x, i| ... end`, plan 87's
+    exclusive `do...end` spelling).
+  - ~~**No chaining** — `arr.select { }.map { }` in one expression is
     still unsupported (inherited, unchanged, from plan 42's own
-    original scope).
+    original scope).~~ — **Fixed (plan 87).** Braces are gone entirely
+    (block-attached calls are exclusively `do...end` now), and a
+    `do...end`-attached call binds tight enough, chain-locally, to be
+    used as the receiver of a further `.method` call: `arr.select do
+    |x| ... end.map do |x| ... end` now parses and chains through as
+    many links as written.
 
 **Take the "Not implemented" label in this section literally and
 narrowly** — it means "checked directly against source/build this

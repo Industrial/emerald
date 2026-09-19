@@ -174,7 +174,7 @@ end
 
 **Example (KEEP: block argument call):**
 ```ruby
-xs.each { |x: Int64| puts x }
+xs.each do |x: Int64| puts x end
 ```
 
 ---
@@ -224,7 +224,7 @@ end
 
 **Example (KEEP: typed block):**
 ```ruby
-total: Int64 = xs.reduce(0) { |acc: Int64, x: Int64| acc + x }
+total: Int64 = xs.reduce(0) do |acc: Int64, x: Int64| acc + x end
 ```
 
 ---

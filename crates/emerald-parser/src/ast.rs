@@ -966,7 +966,7 @@ pub enum Item {
   Require(String),
   /// `test "description" do ... end` (plan 47's Decision log) — a
   /// narrow, self-contained grammar addition (its own `"do" Stmt*
-  /// "end"` production, not plan 34's general `{ |params| body }`
+  /// "end"` production, not plan 34's general `do |params| ... end`
   /// block syntax, which explicitly declined a `do...end` form).
   /// `body` is compiled as its own synthesized zero-parameter,
   /// `Void`-returning function, wrapped in `begin ... rescue

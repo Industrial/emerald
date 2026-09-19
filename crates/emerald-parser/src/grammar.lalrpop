@@ -234,8 +234,15 @@ FuncDef: Function = {
 // to work with, not `source`, which LALRPOP's own generated parser entry
 // point has no parameter slot for).
 ContractClause: (bool, Contract) = {
-  "requires" <e:Expr> => (true, Contract { expr: e, text: String::new(), line: 0 }),
-  "ensures" <e:Expr> => (false, Contract { expr: e, text: String::new(), line: 0 }),
+  // Plan 87: `<e:CondExpr>`, not `<e:Expr>` — `requires`/`ensures` sit
+  // directly in front of `FuncDef`'s own mandatory `"do"` (via
+  // `<contracts:ContractClause*> "do"`), the identical "Expr immediately
+  // followed by a mandatory do" shape `if`/`while`/`match`'s own
+  // conditions have, and genuinely ambiguous for the exact same reason
+  // once a block-attached call can end in `do...end` — see `CondExpr`'s
+  // own header comment for the full argument.
+  "requires" <e:CondExpr> => (true, Contract { expr: e, text: String::new(), line: 0 }),
+  "ensures" <e:CondExpr> => (false, Contract { expr: e, text: String::new(), line: 0 }),
 };
 
 // `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
@@ -517,19 +524,19 @@ Stmt: Spanned<Stmt> = {
   // closes its own `"end"` before this `"do"` is ever reached) —
   // verified conflict-free against LALRPOP's own conflict report, not
   // just assumed (see this plan's own Decision log).
-  <l:@L> "if" <cond:Expr> "do" <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If { cond, then_branch, else_branch } },
-  <l:@L> "while" <cond:Expr> "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While { cond, body } },
+  <l:@L> "if" <cond:CondExpr> "do" <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If { cond, then_branch, else_branch } },
+  <l:@L> "while" <cond:CondExpr> "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While { cond, body } },
   // Plan 29: pure parse-time desugaring — no new AST shape, just the
   // condition wrapped in plan 18's `Expr::Not` (see the Decision log).
   // Reuses `ElseClause` as-is, so `unless ... else ... end` falls out
   // for free.
   // Plan 71: mandatory `"do"`, mirroring `if`/`while` above exactly.
-  <l:@L> "unless" <cond:Expr> "do" <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If {
+  <l:@L> "unless" <cond:CondExpr> "do" <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If {
     cond: Spanned { span: (l, r), node: Expr::Not(Box::new(cond)) },
     then_branch,
     else_branch,
   }},
-  <l:@L> "until" <cond:Expr> "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While {
+  <l:@L> "until" <cond:CondExpr> "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While {
     cond: Spanned { span: (l, r), node: Expr::Not(Box::new(cond)) },
     body,
   }},
@@ -630,7 +637,7 @@ Stmt: Spanned<Stmt> = {
   // used to, rather than adding a `CasePattern::Wildcard` variant —
   // keeps the AST's own shape untouched, so `emerald-codegen`'s existing
   // `else_body: Option<...>` handling needs zero changes.
-  <l:@L> "match" <scrutinee:Expr> "do" <arms:CaseArm+> <else_body:MatchWildcard?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::Case {
+  <l:@L> "match" <scrutinee:CondExpr> "do" <arms:CaseArm+> <else_body:MatchWildcard?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::Case {
     scrutinee,
     arms,
     else_body,
@@ -647,7 +654,7 @@ Stmt: Spanned<Stmt> = {
   // dedicated `Result[T, E]` destructuring form — `"Ok"`/`"Err"` stay
   // the disambiguating first token right after `match ... do`, exactly
   // as they did right after `case ... when` before.
-  <l:@L> "match" <scrutinee:Expr> "do" "Ok" "(" <ok_var:Ident> ")" "do" <ok_body:Stmt*> "end" "Err" "(" <err_var:Ident> ")" "do" <err_body:Stmt*> "end" "end" <r:@R> => Spanned { span: (l, r), node: Stmt::MatchResult {
+  <l:@L> "match" <scrutinee:CondExpr> "do" "Ok" "(" <ok_var:Ident> ")" "do" <ok_body:Stmt*> "end" "Err" "(" <err_var:Ident> ")" "do" <err_body:Stmt*> "end" "end" <r:@R> => Spanned { span: (l, r), node: Stmt::MatchResult {
     scrutinee,
     ok_var,
     ok_body,
@@ -910,7 +917,7 @@ CallMethodName: String = {
 // at more precisely than the whole call — `Spanned::synthetic` marks
 // that honestly rather than fabricating one.
 StmtPrimaryExpr: Spanned<Expr> = {
-  <l:@L> <name:Ident> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
+  <l:@L> <name:Ident> "(" <mut args:Args> ")" <blk:DoBlock?> <r:@R> => {
     if let Some(b) = blk { args.push(b); }
     Spanned { span: (l, r), node: Expr::Call(name, args) }
   },
@@ -943,27 +950,20 @@ StmtPrimaryExpr: Spanned<Expr> = {
   // it rather than inventing a second one — no FIRST-set overlap with
   // anything else here, since `"supervise"` alone disambiguates.
   <l:@L> "supervise" "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Supervise(body) },
-  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
-    if let Some(b) = blk { args.push(b); }
-    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
-  },
+  // Plan 87: `.method(args)`, no block — kept as its own, separate,
+  // fully mandatory-no-block alternative (previously folded into an
+  // optional `<blk:BlockLiteral?>` here, plan 70) — split out so the
+  // block-attached case below can be reused, as-is, from `ChainCallExpr`
+  // instead of duplicated inline (the same split `PrimaryExpr` already
+  // used, unchanged).
+  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
-  // Plan 70's Decision log: a trailing block literal attached directly
-  // to a bare (no-parens) `.method` call — `nums.select { |x: Int64| ...
-  // }`, with no `()` at all. Distinct from the `"(" Args ")" <blk:
-  // BlockLiteral?>` alternative above (which already covers `.method(
-  // args) { ... }`): this is the zero-explicit-argument shape, needed
-  // because every one of this plan's own worked-example calls
-  // (`.select`/`.map`/`.count`/`.each`/`.each_with_index`) attaches a
-  // block with no parens at all. No FIRST-set overlap with the bare,
-  // no-block alternative directly above: LALR(1) shifts into this
-  // production only when the very next token is `{`, otherwise reduces
-  // the bare alternative — the same one-token-of-lookahead disambiguation
-  // this file already relies on everywhere else a production has an
-  // optional trailing suffix.
-  <l:@L> <recv:Ident> "." <method:CallMethodName> <blk:BlockLiteral> <r:@R> => {
-    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![blk]) }
-  },
+  // Plan 87: `ChainCallExpr` covers both `.method(args) do...end` and
+  // the no-parens `.method do...end` shape, plus the chained-tight-
+  // binding extension (see `ChainCallExpr`'s own Decision-log comment)
+  // — reused verbatim here so a bare, top-level statement can also be
+  // (or start) a do...end chain, not only a `Let`'s RHS.
+  <e:ChainCallExpr> => e,
   // Plan 55's Decision log: `@field.method(args)` — this plan's own
   // `@peer.hit` cross-actor call shape. Mirrors the two `Ident`-headed
   // `MethodCall` alternatives immediately above exactly, `InstanceVarTok`
@@ -976,7 +976,7 @@ StmtPrimaryExpr: Spanned<Expr> = {
   // `@field.method(...)`, not `@field&.method(...)`/arbitrary nesting —
   // sema/codegen's own real scope for this plan is exactly this one
   // shape.
-  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral?> <r:@R> => {
+  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:DoBlock?> <r:@R> => {
     if let Some(b) = blk { args.push(b); }
     Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) }
   },
@@ -1008,35 +1008,67 @@ StmtPrimaryExpr: Spanned<Expr> = {
   <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
   <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
   <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
-  // Plan 34: `HashLit`'s bare `"{" HashPairs "}"` alternative is
-  // deliberately DROPPED from this Stmt-initial position (unlike
-  // `PrimaryExpr`, which keeps it) — a real, build-verified LALR(1)
-  // conflict, not a hypothetical one: with a trailing `BlockLiteral?`
-  // now attached to the two call productions above, `{` right after a
-  // completed call is genuinely ambiguous between "attach a block" and
-  // "reduce, a fresh bare hash-literal statement begins here," the same
-  // class of conflict plan 09 already hit and fixed for array literals
-  // at this exact position ("forbidding it as a *standalone* statement
-  // costs nothing real" — a bare hash-literal statement is equally
-  // side-effect-free and useless). `HashLit` remains fully available
-  // everywhere else (a `Let`'s RHS, a call argument) via the ordinary,
-  // non-`Stmt` `PrimaryExpr`.
+  // Plan 34/87: `HashLit`'s bare `"{" HashPairs "}"` alternative stays
+  // deliberately dropped from this Stmt-initial position — plan 34's
+  // own reason (a real LALR(1) conflict against a trailing `{`-
+  // delimited block literal) no longer applies now that blocks are
+  // spelled `do...end` (plan 87), but lifting this restriction isn't
+  // this plan's own scope (see plan 87's Decision log: "does not
+  // attempt to lift [plan 70's narrowings], only change the delimiter
+  // of what already exists") — a bare hash-literal statement remains
+  // just as useless a standalone statement as plan 09's own array-
+  // literal precedent, so the restriction is kept as-is regardless.
   <l:@L> <name:InstanceVarTok> <r:@R> => Spanned { span: (l, r), node: Expr::InstanceVar(name) },
   <l:@L> <name:Ident> <r:@R> => Spanned { span: (l, r), node: Expr::Ident(name) },
 };
 
-// Plan 34: `{ |params| body }` — a trailing block literal, desugared to
-// `Expr::Lambda` (reusing plan 10's node wholesale — see the Decision
-// log) and pushed as an extra, implicit trailing argument onto the
-// call it attaches to. Always `Void`-returning (no `-> Type>` — real
-// Ruby block syntax has none either, and this plan's blocks are never
-// value-producing).
-BlockLiteral: Spanned<Expr> = {
-  <l:@L> "{" "|" <params:Params> "|" <body:Stmt*> "}" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
+// Plan 87: `do |params| ... end` — the sole spelling for a trailing
+// block attached to a call now (plan 34's `{ |params| ... }` is
+// deleted outright — see this plan's own Decision log). Desugars to
+// the identical `Expr::Lambda` shape plan 34's own `BlockLiteral`
+// already built (reusing plan 10's node wholesale) — this is a
+// delimiter swap, not a semantic change. Always `Void`-returning, same
+// reasoning as before. Also reused directly by `PrimaryExpr`'s own
+// bare `do...end` lambda-literal expression below (identical output
+// shape) — exactly one production builds this AST node, not two.
+DoBlock: Spanned<Expr> = {
+  <l:@L> "do" "|" <params:Params> "|" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
     params,
     return_type: "Void".to_string(),
     body,
   }},
+};
+
+// Plan 87: a `.method`/`.method(args)` call with a `do...end` block
+// attached — tight, chain-local binding (this plan's Decision log): the
+// block binds to exactly the call it is written on, and the whole
+// result may itself be the receiver of a further `.method` call,
+// letting a `do...end`-attached chain extend through as many links as
+// written (`nums.select do ... end.map do ... end.each do ... end`,
+// unbounded via the two recursive alternatives below). Deliberately
+// narrower than Ruby's global "do...end is always loose" rule — chain-
+// local tightness applies only in this exact shape, not to `do...end`
+// everywhere in the grammar (`PrimaryExpr`'s own bare `do...end`
+// lambda-literal, reached via `DoBlock` directly, is untouched).
+// Receiver stays `Ident`-only at the base case (plan 70's own
+// narrowing, not lifted here) — the recursive case is the one,
+// deliberate extension this plan makes to that rule: a receiver may
+// also be a previous link in the same do...end chain.
+ChainCallExpr: Spanned<Expr> = {
+  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:DoBlock> <r:@R> => {
+    args.push(blk);
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
+  },
+  <l:@L> <recv:Ident> "." <method:CallMethodName> <blk:DoBlock> <r:@R> => {
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![blk]) }
+  },
+  <l:@L> <recv:ChainCallExpr> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:DoBlock> <r:@R> => {
+    args.push(blk);
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(recv), method, args) }
+  },
+  <l:@L> <recv:ChainCallExpr> "." <method:CallMethodName> <blk:DoBlock> <r:@R> => {
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(recv), method, vec![blk]) }
+  },
 };
 
 // Plan 25: `{k1 => v1, k2 => v2, ...}` — reuses `"=>"` (already a
@@ -1067,7 +1099,7 @@ ElseClause: Vec<Spanned<Stmt>> = {
   // as this nested `If`'s own `else_branch`. No new AST variant; see
   // the Decision log.
   // Plan 71: mandatory `"do"` here too, same reasoning as `if` itself.
-  <l:@L> "elsif" <cond:Expr> "do" <then_branch:Stmt*> <rest:ElseClause?> <r:@R> => vec![Spanned { span: (l, r), node: Stmt::If {
+  <l:@L> "elsif" <cond:CondExpr> "do" <then_branch:Stmt*> <rest:ElseClause?> <r:@R> => vec![Spanned { span: (l, r), node: Stmt::If {
     cond,
     then_branch,
     else_branch: rest,
@@ -1332,26 +1364,23 @@ PrimaryExpr: Spanned<Expr> = {
   <l:@L> "supervise" "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Supervise(body) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
-  // Plan 70's Decision log: unlike the rest of this production (see the
-  // long-standing comment on `BlockLiteral` below explaining why a
-  // trailing `<blk:BlockLiteral?>` was previously declined here), these
-  // two alternatives are real, new, and build-verified conflict-free —
-  // added specifically so a block-attached enumerable call
-  // (`nums.map { |x: Int64| x * 2 }`) can appear as a `Let`'s own RHS,
-  // not only as a bare top-level statement. `.method(args) { blk }`
-  // (needed by `.reduce(0) { |acc, x| ... }`) and the no-parens
-  // `.method { blk }` shape (needed by every other worked-example call)
-  // are both distinct, textually-disjoint productions from the two
-  // bare alternatives immediately above — LALR(1) picks between them on
-  // one token of lookahead (`(` vs `{` vs anything else) exactly the
-  // way `StmtPrimaryExpr`'s own mirror alternatives already do.
-  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral> <r:@R> => {
-    args.push(blk);
-    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
-  },
-  <l:@L> <recv:Ident> "." <method:CallMethodName> <blk:BlockLiteral> <r:@R> => {
-    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![blk]) }
-  },
+  // Plan 87: block-attached calls now go through `ChainCallExpr`
+  // (`do...end`, not `{ ... }`) — reused verbatim here (needed so
+  // `nums.map do |x: Int64| x * 2 end` can appear as a `Let`'s own RHS,
+  // not only as a bare top-level statement), plus its own chain-local
+  // tight-binding extension (see `ChainCallExpr`'s own Decision-log
+  // comment). The two alternatives immediately below let a completed
+  // chain be extended by one more, final, NON-block-attached
+  // `.method`/`.method(args)` call (`nums.select do |x| ... end.length`)
+  // — safe and unambiguous here (unlike `CondPrimaryExpr`'s identical-
+  // looking restriction) because ordinary `Expr`'s own FOLLOW set never
+  // contains a bare, mandatory `"do"` the way an `if`/`while`/`match`
+  // condition's does; see `CondPrimaryExpr` below for the position
+  // where that's no longer true and a real grammar-level restriction is
+  // needed instead.
+  <e:ChainCallExpr> => e,
+  <l:@L> <recv:ChainCallExpr> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(recv), method, args) },
+  <l:@L> <recv:ChainCallExpr> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(recv), method, vec![]) },
   // Plan 55's Decision log: see `StmtPrimaryExpr`'s own identical
   // `InstanceVarTok`-headed mirror alternative for the full rationale.
   <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) },
@@ -1372,11 +1401,17 @@ PrimaryExpr: Spanned<Expr> = {
   // assigned to, or a bare `Proc` annotation) — never by its own
   // literal syntax, which is why this alternative carries no return
   // type of its own at all. `return_type` is set to the same `"Void"`
-  // placeholder `BlockLiteral` below already uses for its own
-  // no-return-type block — `emerald-sema` does not yet infer a lambda's
-  // real return type from its binding's context (a real, disclosed gap
-  // this plan's own narrow scope leaves for a follow-on plan; see this
-  // plan's Decision log).
+  // placeholder `DoBlock` (plan 87 — formerly `BlockLiteral`) already
+  // uses for its own no-return-type block — `emerald-sema` does not yet
+  // infer a lambda's real return type from its binding's context (a
+  // real, disclosed gap this plan's own narrow scope leaves for a
+  // follow-on plan; see this plan's Decision log).
+  //
+  // Plan 87: this alternative now literally reuses `DoBlock` (the exact
+  // same nonterminal `ChainCallExpr`'s own block-attachment uses),
+  // rather than duplicating its production inline — the two contexts
+  // (a bare expression here, a call suffix there) don't collide, so
+  // sharing the rule costs nothing.
   //
   // Deliberately reachable only from `PrimaryExpr`, NOT from
   // `StmtPrimaryExpr` — this plan's own named risk (a bare `do...end`
@@ -1391,11 +1426,147 @@ PrimaryExpr: Spanned<Expr> = {
   // with zero shift/reduce or reduce/reduce conflicts reported, not
   // assumed safe from this reasoning alone — see this plan's own
   // Decision log for the full argument this comment summarizes.
-  <l:@L> "do" "|" <params:Params> "|" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
-    params,
-    return_type: "Void".to_string(),
-    body,
-  }},
+  <e:DoBlock> => e,
+  <l:@L> <f:FloatLit> <r:@R> => Spanned { span: (l, r), node: Expr::Float(f) },
+  <l:@L> <n:Num> <r:@R> => Spanned { span: (l, r), node: Expr::Int(n) },
+  <l:@L> <s:StringLitTok> <r:@R> =>? interpolate::parse_interpolated_string(&s)
+    .map(|node| Spanned { span: (l, r), node })
+    .map_err(|error| lalrpop_util::ParseError::User { error }),
+  <l:@L> <s:SymbolLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::SymbolLit(s) },
+  <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
+  <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
+  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
+  <l:@L> "{" <pairs:HashPairs> "}" <r:@R> => Spanned { span: (l, r), node: Expr::HashLit(pairs) },
+  <l:@L> <name:InstanceVarTok> <r:@R> => Spanned { span: (l, r), node: Expr::InstanceVar(name) },
+  <l:@L> <name:Ident> <r:@R> => Spanned { span: (l, r), node: Expr::Ident(name) },
+};
+
+// Plan 87: a parallel copy of the `Expr` precedence ladder (`OrExpr`
+// through `PrimaryExpr`), used ONLY by `if`/`while`/`unless`/`until`/
+// `elsif`/`match`'s own condition-or-scrutinee position and by
+// `ContractClause`'s `requires`/`ensures` (every place an `Expr` sits
+// directly in front of one of this grammar's mandatory `"do"` tokens).
+// Real, build-verified necessity, not caution: once a block-attached
+// call can end in `do...end` (`ChainCallExpr` above), `<cond:Expr> "do"`
+// is genuinely LALR(1)-ambiguous — on seeing `"do"` right after a
+// completed `recv.method` call, the parser cannot decide between
+// "reduce, `cond` is done, this `do` starts the if/while/match body"
+// and "shift, attach a block to this call instead" from one token of
+// lookahead, because BOTH are legal continuations reachable from the
+// identical parser state once `PrimaryExpr` itself admits `ChainCallExpr`
+// (Ruby's real answer to this exact fight is giving `{ }`/`do...end`
+// different binding precedence specifically so they never collide here;
+// that escape hatch doesn't exist once there is only one block
+// delimiter — see this plan's own Decision log). `CondPrimaryExpr`
+// below is `PrimaryExpr` with that one alternative removed — every
+// other alternative (including every non-block-attached call form) is
+// carried over unchanged — plus one new, deliberately narrow addition:
+// a PARENTHESIZED `ChainCallExpr` may still be used as a method-call
+// receiver (`(nums.select do |x| x > 100 end).length`), since by the
+// time `")"` closes, the following mandatory `"do"` can no longer be
+// ambiguous with anything inside the parens. This is a real grammar-
+// level restriction with its own consequence (a genuine parse error for
+// the disallowed bare form, not documentation or a silent misparse) —
+// every intermediate tier below is duplicated, not just the leftmost,
+// because (unlike the pre-existing `Stmt*` ladder split, which only
+// ever needs to restrict the FIRST token of a fresh statement) this
+// restriction has to hold on every path that can reach the LAST token
+// of `cond` before the mandatory `"do"`, and every one of this ladder's
+// tiers can be that last token via its own right-hand operand.
+CondExpr: Spanned<Expr> = {
+  CondOrExpr,
+};
+
+CondOrExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondOrExpr> "||" <rhs:CondAndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Or(Box::new(lhs), Box::new(rhs)) },
+  CondAndExpr,
+};
+
+CondAndExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondAndExpr> "&&" <rhs:CondCompareExpr> <r:@R> => Spanned { span: (l, r), node: Expr::And(Box::new(lhs), Box::new(rhs)) },
+  CondCompareExpr,
+};
+
+CondCompareExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondBitOrExpr> <op:CompareOp> <rhs:CondBitOrExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Compare(Box::new(lhs), op, Box::new(rhs)) },
+  CondBitOrExpr,
+};
+
+CondBitOrExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondBitOrExpr> "|" <rhs:CondBitAndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitOr(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:CondBitOrExpr> "^" <rhs:CondBitAndExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitXor(Box::new(lhs), Box::new(rhs)) },
+  CondBitAndExpr,
+};
+
+CondBitAndExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondBitAndExpr> "&" <rhs:CondShiftExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitAnd(Box::new(lhs), Box::new(rhs)) },
+  CondShiftExpr,
+};
+
+CondShiftExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondShiftExpr> "<<" <rhs:CondAddExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Shl(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:CondShiftExpr> ">>" <rhs:CondAddExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Shr(Box::new(lhs), Box::new(rhs)) },
+  CondAddExpr,
+};
+
+CondAddExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondAddExpr> "+" <rhs:CondMulExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Add(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:CondAddExpr> "-" <rhs:CondMulExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Sub(Box::new(lhs), Box::new(rhs)) },
+  CondMulExpr,
+};
+
+CondMulExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondMulExpr> "*" <rhs:CondUnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Mul(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:CondMulExpr> "/" <rhs:CondUnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Div(Box::new(lhs), Box::new(rhs)) },
+  <l:@L> <lhs:CondMulExpr> "%" <rhs:CondUnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Rem(Box::new(lhs), Box::new(rhs)) },
+  CondUnaryExpr,
+};
+
+CondUnaryExpr: Spanned<Expr> = {
+  <l:@L> "-" <e:CondUnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Neg(Box::new(e)) },
+  <l:@L> "!" <e:CondUnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Not(Box::new(e)) },
+  <l:@L> "~" <e:CondUnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::BitNot(Box::new(e)) },
+  <l:@L> "comptime" <e:CondUnaryExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Comptime(Box::new(e)) },
+  CondCallExpr,
+};
+
+CondCallExpr: Spanned<Expr> = {
+  <l:@L> <base:CondCallExpr> "[" <idx:Expr> "]" <r:@R> => Spanned { span: (l, r), node: Expr::Index(Box::new(base), Box::new(idx)) },
+  <l:@L> <base:CondCallExpr> "?" <r:@R> => Spanned { span: (l, r), node: Expr::Try(Box::new(base)) },
+  CondPrimaryExpr,
+};
+
+CondPrimaryExpr: Spanned<Expr> = {
+  <l:@L> <name:Ident> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Call(name, args) },
+  <l:@L> <name:Ident> "(" <kwargs:CallKwArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::CallKw(name, kwargs) },
+  <l:@L> <recv:Ident> "." "new" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::New(recv, args) },
+  <l:@L> <recv:Ident> "." "spawn" "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Spawn(recv, args) },
+  <l:@L> <class:Ident> "." "remote" "(" <addr:Expr> "," <name:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Remote { class, addr: Box::new(addr), name: Box::new(name) } },
+  <l:@L> <class:Ident> "." "locate" "(" <ka:LocateArgs> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Locate { class, key: Box::new(ka.0), args: ka.1 } },
+  <l:@L> "Array" "." "new" "(" <size:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayNew(Box::new(size)) },
+  <l:@L> "Ok" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Ok(Box::new(e)) },
+  <l:@L> "Err" "(" <e:Expr> ")" <r:@R> => Spanned { span: (l, r), node: Expr::Err(Box::new(e)) },
+  <l:@L> "supervise" "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Supervise(body) },
+  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
+  <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  // Plan 87: the ONE legal way to use a `do...end`-attached call inside
+  // a condition — parenthesized, so the mandatory `"do"` that follows
+  // `")"` can never be ambiguous with a further block attachment (see
+  // this tier's own header comment above). Deliberately narrow: only
+  // this one parenthesized-`ChainCallExpr`-as-receiver shape, not a
+  // general "`(Expr)` may be a method-call receiver" rule — plan 70's
+  // Ident-only receiver restriction is not lifted anywhere else by this
+  // addition.
+  <l:@L> "(" <recv:ChainCallExpr> ")" "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(recv), method, args) },
+  <l:@L> "(" <recv:ChainCallExpr> ")" "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(recv), method, vec![]) },
+  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) },
+  <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, vec![]) },
+  <l:@L> <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
+    Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
+  },
+  <l:@L> <recv:Ident> "&." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  <l:@L> "[" <elements:Args> "]" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayLit(elements) },
+  <e:DoBlock> => e,
   <l:@L> <f:FloatLit> <r:@R> => Spanned { span: (l, r), node: Expr::Float(f) },
   <l:@L> <n:Num> <r:@R> => Spanned { span: (l, r), node: Expr::Int(n) },
   <l:@L> <s:StringLitTok> <r:@R> =>? interpolate::parse_interpolated_string(&s)

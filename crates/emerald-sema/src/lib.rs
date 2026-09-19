@@ -1603,7 +1603,7 @@ fn check_enumerable_call(
 ) -> Result<Type, Diagnostic> {
   // `count` is the only method both Array and Hash support.
   //
-  // Plan 70 (enumerable stdlib completion): `.count { |x| ... }` — an
+  // Plan 70 (enumerable stdlib completion): `.count do |x| ... end` — an
   // optional predicate `Proc` (Boolean-returning), counting only the
   // elements/pairs it accepts, real new scope beyond plan 42's original
   // arity-0-only `.count` (a plain O(1) header read, unchanged and
@@ -1919,14 +1919,17 @@ fn check_enumerable_call(
 /// (superseding this function's own first-drafted, now-removed
 /// `check_enumerable_block`, which type-checked an INLINE block
 /// literal's body directly): plan 34's own trailing-`{ |params| ... }`
-/// block-literal syntax attaches ONLY to a bare, statement-initial
-/// call (`grammar.lalrpop`'s own `StmtPrimaryExpr` — verified this
-/// session; `PrimaryExpr`, the nonterminal actually reachable from a
-/// `Let`'s RHS or a nested call argument, deliberately does NOT gain a
-/// trailing block, a real, pre-existing LALR(1) conflict with `HashLit`
-/// the grammar's own comment documents) — so `evens: Array[Int64] =
-/// arr.select() { |x: Int64| ... }` **does not parse at all** in this
-/// compiler's real grammar. The only way to pass "a function value" to
+/// block-literal syntax (since plan 87, `do |params| ... end`) attaches
+/// ONLY to a bare, statement-initial call (`grammar.lalrpop`'s own
+/// `StmtPrimaryExpr` — verified this session; `PrimaryExpr`, the
+/// nonterminal actually reachable from a `Let`'s RHS or a nested call
+/// argument, deliberately did NOT gain a trailing block at the time this
+/// comment was first written, a real, pre-existing LALR(1) conflict
+/// with `HashLit` the grammar's own comment documented — plan 70 later
+/// lifted that restriction, and plan 87 changed the delimiter again) —
+/// so `evens: Array[Int64] = arr.select() { |x: Int64| ... }` **did not
+/// parse at all** in this compiler's grammar at the time. The only way
+/// to pass "a function value" to
 /// an ordinary call argument position here is plan 10's pre-existing
 /// mechanism: bind a lambda to a top-level `Proc`-typed `Let` first
 /// (`is_even: Proc = ->(x: Int64) -> Boolean { x % 2 == 0 }`), then
@@ -7995,7 +7998,7 @@ fn check_one_block_call_site(
     let span = args.last().map(|a| a.span).unwrap_or((0, 0));
     diags.push(Diagnostic::new(
       format!(
-        "`{name}` requires a trailing block (`{{ |params| ... }}`) — it declares a block parameter"
+        "`{name}` requires a trailing block (`do |params| ... end`) — it declares a block parameter"
       ),
       span,
     ));
@@ -9697,7 +9700,7 @@ mod tests {
 
   // Plan 34 (blocks and yield).
 
-  const BLOCKS_EXAMPLE: &str = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+  const BLOCKS_EXAMPLE: &str = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) do |i: Int64| puts i end\n";
 
   #[test]
   fn accepts_blocks_and_yield_example() {
@@ -9716,7 +9719,7 @@ mod tests {
 
   #[test]
   fn rejects_block_arity_mismatch_against_yield() {
-    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64, extra: Int64| puts i }\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) do |i: Int64, extra: Int64| puts i end\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("must reject a block whose arity doesn't match yield's call sites");
