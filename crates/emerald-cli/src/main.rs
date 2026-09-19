@@ -334,6 +334,68 @@ fn run_legacy(args: &[String]) {
     process::exit(1);
   });
 
+  // Plan 69: a bare `emerald <file>.em -o out` (no `--jobs`) used to
+  // hand `source` straight to `compile`/`compile_cached`/
+  // `compile_with_comptime_step_limit` without ever looking at its
+  // `require`s — `emerald_sema` treats a `require` item as a no-op
+  // (`ast.rs`'s own doc comment on `Item::Require`), so every symbol
+  // the required file was supposed to bring into scope (a class, an
+  // actor, a plain function) came back "unknown type"/"undefined
+  // variable"/"undefined function" at typecheck instead, even though
+  // `require.rs`'s own splicer (plan 23) has always spliced correctly
+  // once actually invoked — `cmd_build`'s `emerald build` path (which
+  // needs an `emerald.toml`) was the only caller ever reaching it.
+  // Detected by a cheap up-front parse (reusing `emerald_parser`
+  // directly, the same dependency `require.rs` already has) rather
+  // than a textual scan, so a `require` appearing only inside a
+  // string/comment can't false-positive; a parse failure here is left
+  // alone and falls through to the unchanged `compile`/`compile_cached`/
+  // `compile_with_comptime_step_limit` call below, which reports it
+  // with the exact same rich span-based rendering as always.
+  let requires_present = emerald_parser::parse_named(&source, source_path)
+    .map(|program| {
+      program
+        .items
+        .iter()
+        .any(|item| matches!(item, emerald_parser::Item::Require(_)))
+    })
+    .unwrap_or(false);
+
+  if requires_present {
+    let (program, hashes) = require::resolve_program_with_hashes(Path::new(source_path))
+      .unwrap_or_else(|e| {
+        report_error(CliError::Require(e));
+        process::exit(1);
+      });
+    // No single coherent source string exists for a `require`-spliced
+    // `Program` (`report_driver_error`'s own doc comment has the full
+    // reasoning, `cmd_build` already relies on it below in the same
+    // way) — `--comptime-step-limit` has no `_program`-taking
+    // counterpart to route through here, the same real, disclosed
+    // narrowing `--jobs`'s own early return above already accepts for
+    // that flag.
+    let result = if verbose_cache_requested(args) {
+      let cache = emerald_driver::cache::QueryCache::new(cache_root());
+      let reporter = emerald_driver::cache::VerboseReporter;
+      let key = cache.key_for_many(&hashes.iter().map(|(_, h)| *h).collect::<Vec<_>>());
+      emerald_driver::compile_program_cached(
+        program,
+        key,
+        source_path,
+        &output_path,
+        &cache,
+        &reporter,
+      )
+    } else {
+      emerald_driver::compile_program(program, &output_path)
+    };
+    if let Err(e) = result {
+      report_driver_error(e, None);
+      process::exit(1);
+    }
+    return;
+  }
+
   // Plan 48: `--verbose-cache` is strictly additive and opt-in — with
   // no such flag, this is the exact `emerald_driver::compile` call
   // every prior plan's test already proves, unchanged.

@@ -1602,11 +1602,43 @@ fn check_enumerable_call(
   span: (usize, usize),
 ) -> Result<Type, Diagnostic> {
   // `count` is the only method both Array and Hash support.
+  //
+  // Plan 70 (enumerable stdlib completion): `.count { |x| ... }` — an
+  // optional predicate `Proc` (Boolean-returning), counting only the
+  // elements/pairs it accepts, real new scope beyond plan 42's original
+  // arity-0-only `.count` (a plain O(1) header read, unchanged and
+  // still the fast path taken when no predicate is passed).
   if method == "count" {
-    if !args.is_empty() {
+    if args.is_empty() {
+      return Ok(Type::Int64);
+    }
+    let [proc_arg] = args else {
       return Err(Diagnostic::new(
-        format!("`.count` takes no arguments, found {}", args.len()),
+        format!(
+          "`.count` takes 0 or 1 arguments (an optional predicate Proc), found {}",
+          args.len()
+        ),
         span,
+      ));
+    };
+    let elem_ty = match recv_ty {
+      Type::Array(elem) => (**elem).clone(),
+      Type::Hash(k, v) => Type::Pair(k.clone(), v.clone()),
+      _ => unreachable!("caller already checked recv_ty is Array or Hash"),
+    };
+    let result_ty = check_enumerable_proc_arg(
+      proc_arg,
+      std::slice::from_ref(&elem_ty),
+      env,
+      sigs,
+      classes,
+      self_fields,
+      gctx,
+    )?;
+    if result_ty != Type::Boolean {
+      return Err(Diagnostic::new(
+        format!("`.count`'s predicate Proc must return Boolean, found {result_ty:?}"),
+        proc_arg.span,
       ));
     }
     return Ok(Type::Int64);
@@ -1629,6 +1661,107 @@ fn check_enumerable_call(
     };
     check_enumerable_proc_arg(proc_arg, &[elem_ty], env, sigs, classes, self_fields, gctx)?;
     return Ok(Type::Void);
+  }
+
+  // Plan 70 (enumerable stdlib completion): `map`/`reduce`/`inject`/
+  // `each_with_index` on `Hash[K,V]` — the "K,V-appropriate subset"
+  // this plan's own leaf describes, iterating `Pair[K,V]` elements
+  // exactly the way `.each`/`.count` above already do. `sum`/`sort`
+  // stay Array-only, deliberately not extended here: a `Pair` has no
+  // natural sum (nothing to add two pairs together into) or total
+  // order (`sort`'s own Decision log already narrows ordering to
+  // `Int64`/`Float64` for the SAME reason a real `Pair` ordering would
+  // need — a `Comparable`-dispatching fork this plan's Decision log
+  // declines to add). `select`/`filter` are ALSO deliberately left
+  // Array-only, for a real, different, and more fundamental reason
+  // found implementing this plan: their only sensible result type is
+  // `Array[Pair[K,V]]`, but `grammar.lalrpop`'s `TypeName` rule can
+  // only parse `Array[<a bare Ident>]` — a nested compound element
+  // type like `Pair[K,V]` inside `Array[...]` cannot be written in
+  // this language's concrete syntax at all (confirmed against the real
+  // parser: `x: Array[Pair[Int64, Int64]] = ...` is a real parse
+  // error, not a hypothetical one), so a `Let` could never even name
+  // the result — and no chaining is allowed either (this plan's own
+  // Decision log), so there is no other way to consume it. Every
+  // method kept in this list produces a directly nameable type
+  // (`Array[Elem]` for `map`, the accumulator's own type for
+  // `reduce`/`inject`, `Void` for `each_with_index`). Falls through to
+  // the existing Array-only rejection below for `select`/`filter`/
+  // `sum`/`sort` (and any future method), which already produces an
+  // accurate "is only supported on Array[T], found Hash(...)"
+  // diagnostic without needing a second copy of that message here.
+  if let Type::Hash(k_ty, v_ty) = recv_ty {
+    if matches!(method, "map" | "reduce" | "inject" | "each_with_index") {
+      let elem_ty = Type::Pair(k_ty.clone(), v_ty.clone());
+      return match method {
+        "map" => {
+          let [proc_arg] = args else {
+            return Err(Diagnostic::new(
+              format!(
+                "`.map` expects exactly 1 argument (a Proc), found {}",
+                args.len()
+              ),
+              span,
+            ));
+          };
+          let result_ty =
+            check_enumerable_proc_arg(proc_arg, &[elem_ty], env, sigs, classes, self_fields, gctx)?;
+          Ok(Type::Array(Box::new(result_ty)))
+        }
+        "reduce" | "inject" => {
+          let [initial, proc_arg] = args else {
+            return Err(Diagnostic::new(
+              format!(
+                "`.{method}` expects exactly 2 arguments (an initial value and a Proc), found {}",
+                args.len()
+              ),
+              span,
+            ));
+          };
+          let acc_ty = infer_expr_type(initial, env, sigs, classes, self_fields, gctx)?;
+          let result_ty = check_enumerable_proc_arg(
+            proc_arg,
+            &[acc_ty.clone(), elem_ty],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          if result_ty != acc_ty {
+            return Err(Diagnostic::new(
+              format!(
+                "`.{method}`'s Proc must return the same type as the initial value ({acc_ty:?}), found {result_ty:?}"
+              ),
+              proc_arg.span,
+            ));
+          }
+          Ok(acc_ty)
+        }
+        "each_with_index" => {
+          let [proc_arg] = args else {
+            return Err(Diagnostic::new(
+              format!(
+                "`.each_with_index` expects exactly 1 argument (a Proc), found {}",
+                args.len()
+              ),
+              span,
+            ));
+          };
+          check_enumerable_proc_arg(
+            proc_arg,
+            &[elem_ty, Type::Int64],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Void)
+        }
+        other => unreachable!("just matched method against a fixed set, found `{other}`"),
+      };
+    }
   }
 
   // Every remaining method (`map`/`select`/`filter`/`reduce`/`inject`/
@@ -11549,6 +11682,69 @@ end
       check_program(&program),
       Ok(()),
       "`check_purity` must be a strict no-op over a program that never writes the word `pure`"
+    );
+  }
+
+  // Plan 70 (enumerable stdlib completion): `map`/`reduce`/
+  // `each_with_index` on `Hash[K,V]`, and the new predicate form of
+  // `.count`.
+
+  #[test]
+  fn hash_map_over_pairs_type_checks_to_an_array_of_the_procs_own_return_type() {
+    let src = "double_value: Proc = ->(p: Pair[Int64, Int64]) -> Int64 { p.value * 2 }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nvalues: Array[Int64] = h.map(double_value)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn hash_reduce_over_pairs_folds_to_the_initial_values_own_type() {
+    let src = "sum_values: Proc = ->(acc: Int64, p: Pair[Int64, Int64]) -> Int64 { acc + p.value }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\ntotal: Int64 = h.reduce(0, sum_values)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn hash_each_with_index_accepts_a_pair_then_index_proc() {
+    let src = "visit: Proc = ->(p: Pair[Int64, Int64], i: Int64) -> Void { puts i }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.each_with_index(visit)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn hash_select_stays_array_only_since_array_of_pair_cannot_be_named() {
+    // Real, disclosed narrowing (`check_enumerable_call`'s own doc
+    // comment): `Array[Pair[K,V]]` — `.select`'s only sensible result
+    // type on a Hash — can never be written in this language's
+    // concrete syntax, so `.select`/`.filter` stay Array-only.
+    let src = "is_big: Proc = ->(p: Pair[Int64, Int64]) -> Boolean { p.value > 15 }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.select(is_big)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("`.select` on a Hash[K,V] receiver must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("is only supported on Array[T]")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn array_count_with_a_predicate_proc_type_checks_to_int64() {
+    let src = "is_big: Proc = ->(x: Int64) -> Boolean { x > 2 }\narr: Array[Int64] = [1, 2, 3, 4]\nn: Int64 = arr.count(is_big)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_a_count_predicate_that_does_not_return_boolean() {
+    let src = "not_bool: Proc = ->(x: Int64) -> Int64 { x }\narr: Array[Int64] = [1, 2, 3]\nn: Int64 = arr.count(not_bool)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`.count`'s predicate Proc must return Boolean");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("predicate Proc must return Boolean")),
+      "{errs:?}"
     );
   }
 }

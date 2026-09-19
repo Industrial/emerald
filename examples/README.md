@@ -32,12 +32,13 @@ cargo run -p emerald-cli -- examples/<file>.em -o /tmp/out && /tmp/out
 | `strings.em` | `"...#{expr}..."` interpolation, `String` intrinsics (`.strip`/`.upcase`/`.downcase`/`.length`/`.split_count`/`.to_i`/`.to_f`) | see test |
 | `nullable_safe_nav.em` | `T?` nullable types, `obj&.method` safe navigation, `||=` | `1`, `0` |
 | `test_framework.em` | `test "..." do ... end`, `assert_eq` — run via `emerald test examples/test_framework.em`, **not** the ordinary compile path (which rejects a `Program` containing a `test` block) | `PASS`/`FAIL`/pass-fail counts, exit 1 (one test is deliberately broken, matching the plan record's own worked example) |
-| `generic_classes.em` | `class Stack[T]`, user-declared generic classes, monomorphized per instantiation (`Stack[Int64]` and `Stack[String]` in one program) | `30`, `20`, `second` — see the bug note below; a 4th expected line is silently dropped |
-| `c_ffi.em` | `unsafe extern "C" { fn ... }`, calling real libc (`llabs`, `strlen`, `strstr`), `CString`/`String.from_cstring` | `42`, `5`, `not found` — 3 lines; see the safe-navigation bug already noted below, which this example also hits |
+| `generic_classes.em` | `class Stack[T]`, user-declared generic classes, monomorphized per instantiation (`Stack[Int64]` and `Stack[String]` in one program) | `30`, `20`, `second`, `first` — all 4 lines; the previously-noted "4th line silently dropped" bug was investigated and found not to be a compiler defect (see "Real bugs found") |
+| `c_ffi.em` | `unsafe extern "C" { fn ... }`, calling real libc (`llabs`, `strlen`, `strstr`), `CString`/`String.from_cstring` | `42`, `5`, `world`, `not found` — all 4 lines; the safe-navigation bug previously noted below was fixed (see "Real bugs found") |
 | `counter_actor.em` | `actor Counter`, fields, `.initialize`, ordinary methods on an actor — a shared library file, not run standalone (declares the class only, no top-level statements) | n/a — imported by `host.em`/`client.em` |
 | `host.em` / `client.em` | `Counter.spawn(0)`, `.register("counter1", 9000)`, `Counter.remote("127.0.0.1:9000", "counter1")` — distributed, location-transparent actors over real TCP, across two separate OS processes | `3` (printed by the `host` process, after the `client` process's 3 real TCP `.increment` calls plus `.report`) — build with `--jobs 2` (see the bug note below: this genuinely didn't build earlier this same session, fixed via `WeakODR` linkage) |
 | `packages/` | The package manager: `emerald.toml`, a path dependency (`app` depends on `mathutils`), `require`. Build with `cd examples/packages/app && emerald build`, then run `./app` (or `emerald run`) — **not** `emerald <file> -o`, which doesn't resolve `[dependencies]` | `8` |
-| `parallel/` | Multi-file `require` splicing under the parallel/incremental compiler. Build with `emerald --jobs N examples/parallel/main.em -o out` — **not** a bare `emerald <file> -o`, which (per `crates/emerald-cli/src/main.rs`'s `run_legacy`) never splices `require`s at all without `--jobs` | `30` |
+| `parallel/` | Multi-file `require` splicing under the parallel/incremental compiler. Build with `emerald --jobs N examples/parallel/main.em -o out` for genuine level-order parallel compilation of the require-DAG (plan 49) — a bare `emerald <file> -o` (no `--jobs`) also splices `require`s correctly as of the plan 69 fix (`crates/emerald-cli/src/main.rs`'s `run_legacy` now detects and resolves `Item::Require` before compiling), just single-threaded, not in parallel | `30` |
+| `enumerable.em` | `map`/`select`/`filter`/`reduce`/`inject`/`each_with_index`/`count`(arity-0 and predicate)/`sum`/`sort` on `Array[T]`; `map`/`reduce`/`each_with_index`/`count` on `Hash[K,V]`; the new block-attached-call syntax (`recv.method { \|params\| body }`) itself, on both a bare no-parens call and a call with explicit positional args | `0`,`1`,`2`,`3`,`4`,`10`,`2`,`15`,`3`,`15`,`1`,`10`,`60`,`2`,`3` |
 
 For anything not in this table, grep `crates/emerald-parser/src/ast.rs`'s
 `Expr`/`Stmt`/`Item` enums and `crates/emerald-cli/tests/examples.rs` —
@@ -73,11 +74,48 @@ What's still genuinely missing, checked the same way this session:
   worked example uses one; the lexer has no heredoc token at all today
   (grep `crates/emerald-parser` for `heredoc`/`<<~`: nothing). Only
   `"...#{expr}..."` interpolation from that same plan actually landed.
-- **The enumerable stdlib (`.map`/`.select`/`.sum`/`.reduce`/etc., plan
-  42)** — no `Iterable` interface, no monomorphized free functions,
-  anywhere in `emerald-sema`. A block literal attached to a method call
-  (`arr.select { |x| ... }`) doesn't even parse; block-attachment syntax
-  only works on a user `def` that declares `&blk`.
+- ~~**The enumerable stdlib (`.map`/`.select`/`.sum`/`.reduce`/etc.,
+  plan 42)** — no `Iterable` interface, no monomorphized free
+  functions, anywhere in `emerald-sema`. A block literal attached to a
+  method call (`arr.select { |x| ... }`) doesn't even parse;
+  block-attachment syntax only works on a user `def` that declares
+  `&blk`.~~ — **Mostly fixed (plan 70).** `grammar.lalrpop` now parses
+  a trailing block literal on any `Ident.method`/`.method(args)` call
+  in BOTH statement-initial and expression (a `Let`'s RHS) position,
+  and `emerald-parser`'s new `hoist_enumerable_blocks` pass turns it
+  into exactly the pre-existing named-`Proc` call shape plan 42's own
+  `check_enumerable_call`/`build_enumerable_call` already fully
+  implemented for `Array[T]` — that machinery, it turns out, was
+  already complete and working end-to-end; the ONLY missing piece was
+  this parse-time block-attachment syntax. `map`/`reduce`/
+  `each_with_index`/`count` (a real, new predicate form, not just the
+  original arity-0 header read) are now also implemented for
+  `Hash[K,V]`. Still genuinely not done, disclosed plainly rather than
+  glossed over:
+  - **No real `Iterable[T]` compiler-recognized interface** — these
+    ten methods remain a hard-coded per-type (`Array`/`Hash`) dispatch
+    arm in both `emerald-sema` and `emerald-codegen`, exactly as plan
+    42 originally shipped it and exactly as its own doc comment already
+    discloses (a real `Proc[T, U]` bracketed-annotation parsing
+    prerequisite this plan did not build either).
+  - **Block parameters need an explicit type** (`|x: Int64|`, not a
+    bare `|x|`) — this compiler has no call-site-driven type inference
+    for an unannotated parameter.
+  - **`Hash[K,V]`'s `.select`/`.filter` stay Array-only** — their only
+    sensible result type, `Array[Pair[K,V]]`, cannot be written in this
+    language's concrete syntax at all (`grammar.lalrpop`'s `TypeName`
+    rule only parses `Array[<a bare Ident>]`, never a nested compound
+    element type), confirmed against the real parser, not assumed.
+  - **No `for i, x in arr.each_with_index`-style iteration** — the
+    plan-of-plans' own worked-example sketch for this shape; `for`
+    loops in this compiler only ever accept a literal array or an
+    integer range as their scrutinee, never an arbitrary expression, a
+    pre-existing restriction this plan did not lift. `each_with_index`
+    is still available in exactly the callback-block shape plan 42
+    already designed (`arr.each_with_index { |x, i| ... }`).
+  - **No chaining** — `arr.select { }.map { }` in one expression is
+    still unsupported (inherited, unchanged, from plan 42's own
+    original scope).
 
 **Take the "Not implemented" label in this section literally and
 narrowly** — it means "checked directly against source/build this
@@ -97,52 +135,87 @@ tested against the current build. Every example in this directory is
 written to route around them; the workaround is noted so a future fix
 doesn't need to rediscover the constraint from scratch:
 
-- **`puts` cannot be called from inside a user-defined `def` function's
-  body** — only at a program's top level (`crates/emerald-codegen`'s
-  `build_stmt` special-cases a bare `puts` statement, but that
-  special-case isn't reachable from a function body's own compilation
-  path; the generic fallback then rejects `puts` as "not a compiled
-  user function"). Every function in every example here returns a
-  value and lets the caller `puts` it, which is why this wasn't
-  visible before.
-- **A top-level `String`-typed `Let` binding silently fails to print**
-  — `y: String = "hello"; puts y` compiles, runs, exits 0, and prints
-  nothing (no crash, no diagnostic). `puts` of a `String` *expression*
-  used directly (a literal, an interpolation, or a method call result)
-  works fine; only a stored-then-loaded `String` local breaks. Worked
-  around by always `puts`ing the expression directly.
-- **Multi-argument `String` intrinsics silently drop their `puts`
-  output** — `puts phrase.slice(1, 3)` compiles and runs but prints
-  nothing, while single-argument intrinsics (`.strip`, `.upcase`,
-  `.to_i`, ...) print correctly. `strings.em` doesn't use `.slice`.
-- **`Array[String]` indexing silently drops its `puts` output** —
-  `words: Array[String] = phrase.split(" "); puts words[0]` compiles,
-  runs, and prints nothing. `strings.em` doesn't index a `split()`
-  result.
+- ~~**`puts` cannot be called from inside a user-defined `def` function's
+  body**~~ — **Fixed; was never actually a codegen gap.** Plan 66's
+  root-cause investigation found this, and the four bullets below it,
+  do not reproduce against the current build at all: `build_puts` is
+  fully generic over `ValKind` regardless of the AST shape that
+  produced the `String` value, and every statement position (including
+  inside a `def` body) reaches the same `build_stmt` `puts`
+  special-case. The real defect was a nondeterministic runtime race —
+  the (since-removed) actor worker-pool thread spawn/join that used to
+  wrap every compiled program's `main` unconditionally, racing against
+  glibc's block-buffered stdout — incidentally fixed by `b0d8bc1`
+  ("perf(codegen): skip actor worker-pool startup/shutdown for programs
+  with no actors"), which predates this correction. Regression test:
+  `plan_66_puts_inside_a_def_body_prints_deterministically` (runs the
+  compiled binary 20x per test, asserting byte-identical output every
+  time — insurance against the *race* regressing, not just the output).
+- ~~**A top-level `String`-typed `Let` binding silently fails to
+  print**~~ — **Fixed; same race as above, not a codegen gap.**
+  `y: String = "hello"; puts y` prints correctly and deterministically
+  on the current build. Regression test:
+  `plan_66_a_stored_top_level_string_let_binding_prints_deterministically`.
+- ~~**Multi-argument `String` intrinsics silently drop their `puts`
+  output**~~ — **Fixed; same race as above, not a codegen gap.**
+  `puts phrase.slice(1, 3)` prints `ell` correctly and deterministically.
+  Regression test:
+  `plan_66_puts_of_a_multi_arg_string_intrinsic_result_prints_deterministically`.
+- ~~**`Array[String]` indexing silently drops its `puts` output**~~ —
+  **Fixed; same race as above, not a codegen gap.**
+  `words: Array[String] = phrase.split(" "); puts words[0]` prints
+  `hello` correctly and deterministically. Regression test:
+  `plan_66_puts_of_an_array_string_index_read_prints_deterministically`.
 - **`String == String` isn't implemented in codegen** — sema accepts
   it, then codegen rejects it with "comparison operands must both be
   Int64 or both Float64." `nullable_safe_nav.em` avoids comparing
-  narrowed `String` locals for equality.
-- **A `String?` value populated via safe navigation through a
+  narrowed `String` locals for equality. (Not this plan's scope — see
+  plan 67.)
+- ~~**A `String?` value populated via safe navigation through a
   function's return value, then read after an `||=`, silently drops
-  its `puts` output or fails at codegen** — the exact shape plan 43's
-  own worked example uses. `nullable_safe_nav.em`'s safe-navigation
-  demo instead compares the result to `nil` (which works, and is
-  already how `collections.em` exercises `String? == nil`) rather than
-  printing the unwrapped value. `c_ffi.em` hits this same bug directly
-  (its `found: String?` populated via `String.from_cstring(strstr(...))`
-  then `found ||= "not found"` then `puts found`) rather than routing
-  around it — left in place deliberately so this example doubles as a
-  live repro, which is why its verified output is 3 lines, not 4.
-- **A second consecutive `puts` of a generic method's return value on a
-  monomorphized instance can silently drop its output** — found writing
-  `generic_classes.em`. `ints.pop()` (a `Stack[Int64]`) prints correctly
-  twice; `strs.pop()` (a separately-monomorphized `Stack[String]`)
-  called the same way, back-to-back, prints only its first result, not
-  its second — 3 lines out of an expected 4, no crash, no diagnostic.
-  Not yet root-caused (left as a genuine open finding rather than a
-  guessed explanation); left in place rather than worked around, same
-  reasoning as the `c_ffi.em` case above.
+  its `puts` output or fails at codegen**~~ — **Fixed; same race as
+  above, not a codegen gap.** The exact shape plan 43's own worked
+  example uses, and the exact shape `c_ffi.em` hits directly (its
+  `found: String?` populated via `String.from_cstring(strstr(...))`
+  then `found ||= "not found"` then `puts found`), both print correctly
+  and deterministically on the current build — `c_ffi.em`'s verified
+  output is the full 4 lines (`42`, `5`, `world`, `not found`), not 3 as
+  previously noted here. Regression tests:
+  `plan_66_a_string_optional_via_safe_nav_and_coalesce_prints_deterministically`
+  and `plan_66_the_c_ffi_string_optional_safe_nav_shape_prints_deterministically`
+  (the latter runs the exact `c_ffi.em` FFI example 20x end-to-end).
+  `nullable_safe_nav.em`'s own safe-navigation demo still compares the
+  result to `nil` rather than printing the unwrapped value — that
+  choice predates this fix and is left as-is, not because printing it
+  would fail.
+- ~~**A second consecutive `puts` of a generic method's return value on
+  a monomorphized instance can silently drop its output**~~ —
+  **Investigated (plan 68) and not a compiler defect.** `strs.pop()`'s
+  second call (a `Stack[String]`, monomorphized separately from the
+  `Stack[Int64]` instance also in this program) prints correctly and
+  deterministically on the current build: 50 fresh compile-link-run
+  cycles of this exact program, each executed and its stdout captured
+  entirely in-process (`std::process::Command`, no external capture
+  tool in the loop), produced the correct 4 lines every single time —
+  see `plan_68_generic_stack_second_pop_on_a_monomorphized_string_instance_prints_deterministically`.
+  Disassembly of the compiled binary (`Stack$String_pop`,
+  `Stack$String_push`, `main`, `emerald_print_str`) is also textbook-
+  correct: two distinct `emerald_print_str` calls, fed the two real
+  return values of two real `Stack$String_pop` calls, the same shape as
+  the `Int64` instance's own two calls right above them. The original
+  one-off observation (and this plan's own prior "reproduced once in
+  roughly 250 runs" finding) is best explained by an output-capture
+  artifact in the tooling used to observe repeated runs, not a real
+  race in the compiled program: piping the identical freshly-linked
+  binary's repeated stdout through this environment's `ctx_shell` MCP
+  tool *without* its `raw: true` verbatim-capture escape reproduced a
+  3-line-instead-of-4 truncation matching the disclosed symptom at some
+  repeat counts and not others against the exact same binary and
+  command — a tool-side parameter with no causal path into the compiled
+  program's own execution. `raw: true` on that same tool, plain shell
+  redirection, and this file's own `compile_link_run`/
+  `compile_link_run_n_times` in-process capture all showed the correct
+  4 lines, every time, on every attempt.
 - **`require`-splicing a file that declares an `actor` class produced a
   linker failure under `--jobs N`, and produces no splice at all
   without `--jobs`** — found compiling `host.em`/`client.em`, which

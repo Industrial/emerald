@@ -6445,13 +6445,7 @@ fn build_enumerable_call<'ctx>(
   // plain O(1) header read either way (`build_array_lit`'s own `leaf-
   // array-length-header` doc comment; `build_hash_lit`'s already-
   // shipped count header).
-  if method == "count" {
-    if !args.is_empty() {
-      return Err(format!(
-        "codegen: internal error — `.count` takes no arguments, found {} (sema should have rejected this)",
-        args.len()
-      ));
-    }
+  if method == "count" && args.is_empty() {
     let (recv_val, _) = build_expr(
       context,
       builder,
@@ -6471,30 +6465,134 @@ fn build_enumerable_call<'ctx>(
     .get(recv_name)
     .and_then(|s| parse_hash_type(s))
   {
-    if method != "each" {
-      return Err(format!(
-        "codegen: internal error — `.{method}` is not supported on Hash[K, V] (sema should have rejected this)"
-      ));
-    }
-    let [proc_arg] = args else {
-      return Err(
-        "codegen: internal error — `.each` expects exactly 1 argument (sema should have rejected this)"
-          .to_string(),
-      );
+    // Plan 70 (enumerable stdlib completion): `map`/`select`/`filter`/
+    // `reduce`/`inject`/`each_with_index` on `Hash[K,V]` — mirrors
+    // `each` immediately below (already plan 42's own, unchanged), each
+    // one constructing its per-iteration `Pair[K,V]` value via the same
+    // `build_hash_pair_ptr` helper `build_hash_each` itself now also
+    // calls. `sum`/`sort` (and anything else) fall to the `other` arm's
+    // pre-existing rejection, unchanged — `emerald-sema`'s own
+    // `check_enumerable_call` never routes them here in the first place
+    // (Hash stays Array-only for those two).
+    return match method {
+      "each" => {
+        let [proc_arg] = args else {
+          return Err(
+            "codegen: internal error — `.each` expects exactly 1 argument (sema should have rejected this)"
+              .to_string(),
+          );
+        };
+        build_hash_each(
+          context,
+          builder,
+          func,
+          recv,
+          proc_arg,
+          k_kind,
+          v_kind,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )
+      }
+      "map" => {
+        let [proc_arg] = args else {
+          return Err(
+            "codegen: internal error — `.map` expects exactly 1 argument (sema should have rejected this)"
+              .to_string(),
+          );
+        };
+        build_hash_map(
+          context,
+          builder,
+          func,
+          recv,
+          proc_arg,
+          k_kind,
+          v_kind,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )
+      }
+      // Plan 70's own real, disclosed narrowing: `select`/`filter` are
+      // deliberately NOT extended to `Hash[K,V]` — see `emerald-sema`'s
+      // `check_enumerable_call` doc comment on why `Array[Pair[K,V]]`
+      // (the only sensible result type) can never even be named in
+      // this language's concrete syntax. Falls to the `other` arm
+      // below, matching sema's own rejection.
+      "reduce" | "inject" => {
+        let [initial, proc_arg] = args else {
+          return Err(format!(
+            "codegen: internal error — `.{method}` expects exactly 2 arguments (sema should have rejected this)"
+          ));
+        };
+        build_hash_reduce(
+          context,
+          builder,
+          func,
+          recv,
+          initial,
+          proc_arg,
+          k_kind,
+          v_kind,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )
+      }
+      "each_with_index" => {
+        let [proc_arg] = args else {
+          return Err(
+            "codegen: internal error — `.each_with_index` expects exactly 1 argument (sema should have rejected this)"
+              .to_string(),
+          );
+        };
+        build_hash_each_with_index(
+          context,
+          builder,
+          func,
+          recv,
+          proc_arg,
+          k_kind,
+          v_kind,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )
+      }
+      // Plan 70: `.count(proc_name)` — the predicate form (the arity-0
+      // O(1) header-read form is handled unconditionally above, before
+      // this Hash/Array split, and never reaches here).
+      "count" => {
+        let [proc_arg] = args else {
+          return Err(format!(
+            "codegen: internal error — `.count` takes 0 or 1 arguments, found {} (sema should have rejected this)",
+            args.len()
+          ));
+        };
+        build_hash_count_predicate(
+          context,
+          builder,
+          func,
+          recv,
+          proc_arg,
+          k_kind,
+          v_kind,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )
+      }
+      other => Err(format!(
+        "codegen: internal error — `.{other}` is not supported on Hash[K, V] (sema should have rejected this)"
+      )),
     };
-    return build_hash_each(
-      context,
-      builder,
-      func,
-      recv,
-      proc_arg,
-      k_kind,
-      v_kind,
-      vars,
-      local_classes,
-      local_array_elem_types,
-      ctx,
-    );
   }
 
   let elem_kind = local_array_elem_types
@@ -6628,6 +6726,29 @@ fn build_enumerable_call<'ctx>(
       local_array_elem_types,
       ctx,
     ),
+    // Plan 70: `.count(proc_name)` — the predicate form (the arity-0
+    // O(1) header-read form is handled unconditionally above, before
+    // this Hash/Array split, and never reaches here).
+    "count" => {
+      let [proc_arg] = args else {
+        return Err(format!(
+          "codegen: internal error — `.count` takes 0 or 1 arguments, found {} (sema should have rejected this)",
+          args.len()
+        ));
+      };
+      build_array_count_predicate(
+        context,
+        builder,
+        func,
+        recv,
+        proc_arg,
+        elem_kind,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )
+    }
     other => Err(format!(
       "codegen: internal error — unsupported enumerable method `.{other}` (sema should have rejected this)"
     )),
@@ -6735,66 +6856,363 @@ fn build_hash_each<'ctx>(
     .into_int_value();
 
   build_count_loop(context, builder, func, count_val, |builder, idx| {
-    let stride = i64_ty.const_int(16, false);
-    let pair_off = builder
-      .build_int_mul(idx, stride, "heachpairoff")
-      .map_err(|e| e.to_string())?;
-    let pair_byte_off = builder
-      .build_int_add(pair_off, i64_ty.const_int(8, false), "heachpairbyteoff")
-      .map_err(|e| e.to_string())?;
-    let key_src_ptr = unsafe {
-      builder
-        .build_in_bounds_gep(context.i8_type(), h_ptr, &[pair_byte_off], "heachkeysrc")
-        .map_err(|e| e.to_string())?
-    };
-    let key_val = builder
-      .build_load(
-        local_llvm_type(context, &k_kind),
-        key_src_ptr,
-        "heachkeyval",
-      )
-      .map_err(|e| e.to_string())?;
-    let value_byte_off = builder
-      .build_int_add(
-        pair_byte_off,
-        i64_ty.const_int(8, false),
-        "heachvaluebyteoff",
-      )
-      .map_err(|e| e.to_string())?;
-    let value_src_ptr = unsafe {
-      builder
-        .build_in_bounds_gep(context.i8_type(), h_ptr, &[value_byte_off], "heachvaluesrc")
-        .map_err(|e| e.to_string())?
-    };
-    let value_val = builder
-      .build_load(
-        local_llvm_type(context, &v_kind),
-        value_src_ptr,
-        "heachvalueval",
-      )
-      .map_err(|e| e.to_string())?;
-
-    let pair_alloc_call = builder
-      .build_call(
-        ctx.alloc,
-        &[i64_ty.const_int(16, false).into()],
-        "heachpair",
-      )
-      .map_err(|e| e.to_string())?;
-    let pair_ptr = call_result(pair_alloc_call)?.into_pointer_value();
-    builder
-      .build_store(pair_ptr, key_val)
-      .map_err(|e| e.to_string())?;
-    let pair_value_ptr = field_ptr(context, builder, pair_ptr, 8)?;
-    builder
-      .build_store(pair_value_ptr, value_val)
-      .map_err(|e| e.to_string())?;
-
+    let pair_ptr = build_hash_pair_ptr(context, builder, h_ptr, idx, &k_kind, &v_kind, ctx)?;
     call_named_proc(
       context,
       builder,
       proc_arg,
       &[pair_ptr.into()],
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    Ok(())
+  })?;
+
+  Ok((i64_ty.const_int(0, false).into(), ValKind::Void))
+}
+
+/// Plan 70 (enumerable stdlib completion): reads the `(key, value)`
+/// pair stored at `idx` in a `Hash[K,V]`'s own buffer and copies it
+/// into a freshly heap-allocated, real 16-byte `Pair` (`Type::Pair`'s
+/// own `[key: 8][value: 8]` layout) — factored out of `build_hash_each`
+/// (plan 42's own original implementation, which now calls this too),
+/// so every Hash enumerable method added by this plan (`map`/`select`/
+/// `filter`/`reduce`/`inject`/`each_with_index`) constructs its
+/// `Pair[K,V]` value identically, in one place.
+fn build_hash_pair_ptr<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  h_ptr: PointerValue<'ctx>,
+  idx: inkwell::values::IntValue<'ctx>,
+  k_kind: &ValKind,
+  v_kind: &ValKind,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+  let i64_ty = context.i64_type();
+  let stride = i64_ty.const_int(16, false);
+  let pair_off = builder
+    .build_int_mul(idx, stride, "hpairoff")
+    .map_err(|e| e.to_string())?;
+  let pair_byte_off = builder
+    .build_int_add(pair_off, i64_ty.const_int(8, false), "hpairbyteoff")
+    .map_err(|e| e.to_string())?;
+  let key_src_ptr = unsafe {
+    builder
+      .build_in_bounds_gep(context.i8_type(), h_ptr, &[pair_byte_off], "hkeysrc")
+      .map_err(|e| e.to_string())?
+  };
+  let key_val = builder
+    .build_load(local_llvm_type(context, k_kind), key_src_ptr, "hkeyval")
+    .map_err(|e| e.to_string())?;
+  let value_byte_off = builder
+    .build_int_add(pair_byte_off, i64_ty.const_int(8, false), "hvaluebyteoff")
+    .map_err(|e| e.to_string())?;
+  let value_src_ptr = unsafe {
+    builder
+      .build_in_bounds_gep(context.i8_type(), h_ptr, &[value_byte_off], "hvaluesrc")
+      .map_err(|e| e.to_string())?
+  };
+  let value_val = builder
+    .build_load(local_llvm_type(context, v_kind), value_src_ptr, "hvalueval")
+    .map_err(|e| e.to_string())?;
+
+  let pair_alloc_call = builder
+    .build_call(ctx.alloc, &[i64_ty.const_int(16, false).into()], "hpair")
+    .map_err(|e| e.to_string())?;
+  let pair_ptr = call_result(pair_alloc_call)?.into_pointer_value();
+  builder
+    .build_store(pair_ptr, key_val)
+    .map_err(|e| e.to_string())?;
+  let pair_value_ptr = field_ptr(context, builder, pair_ptr, 8)?;
+  builder
+    .build_store(pair_value_ptr, value_val)
+    .map_err(|e| e.to_string())?;
+  Ok(pair_ptr)
+}
+
+/// Plan 70 (enumerable stdlib completion): `h.map(proc_name)` — mirrors
+/// `build_array_map` exactly, except each source "element" is a
+/// freshly constructed `Pair[K,V]` (`build_hash_pair_ptr`) rather than
+/// a value loaded straight out of a flat element array.
+#[allow(clippy::too_many_arguments)]
+fn build_hash_map<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  recv: &Spanned<Expr>,
+  proc_arg: &Spanned<Expr>,
+  k_kind: ValKind,
+  v_kind: ValKind,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (recv_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let h_ptr = recv_val.into_pointer_value();
+  let i64_ty = context.i64_type();
+  let count_val = builder
+    .build_load(i64_ty, h_ptr, "hmapcount")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+
+  let elems_bytes = builder
+    .build_int_mul(count_val, i64_ty.const_int(8, false), "hmapoutelembytes")
+    .map_err(|e| e.to_string())?;
+  let out_bytes = builder
+    .build_int_add(elems_bytes, i64_ty.const_int(8, false), "hmapoutbytes")
+    .map_err(|e| e.to_string())?;
+  let out_call = builder
+    .build_call(ctx.alloc, &[out_bytes.into()], "hmapout")
+    .map_err(|e| e.to_string())?;
+  let out_ptr = call_result(out_call)?.into_pointer_value();
+  builder
+    .build_store(out_ptr, count_val)
+    .map_err(|e| e.to_string())?;
+  let out_elems_base = field_ptr(context, builder, out_ptr, 8)?;
+
+  build_count_loop(context, builder, func, count_val, |builder, idx| {
+    let pair_ptr = build_hash_pair_ptr(context, builder, h_ptr, idx, &k_kind, &v_kind, ctx)?;
+    let (result_val_opt, result_kind) = call_named_proc(
+      context,
+      builder,
+      proc_arg,
+      &[pair_ptr.into()],
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let result_val = result_val_opt.ok_or(
+      "codegen: internal error — `.map`'s Proc must not be Void (sema should have rejected this)",
+    )?;
+    let result_llvm_ty = local_llvm_type(context, &result_kind);
+    let dst_ptr = unsafe {
+      builder
+        .build_in_bounds_gep(result_llvm_ty, out_elems_base, &[idx], "hmapdst")
+        .map_err(|e| e.to_string())?
+    };
+    builder
+      .build_store(dst_ptr, result_val)
+      .map_err(|e| e.to_string())?;
+    Ok(())
+  })?;
+
+  Ok((out_ptr.into(), ValKind::Ptr))
+}
+
+/// Plan 70 (enumerable stdlib completion): `h.count(proc_name)` — the
+/// predicate form (the arity-0 O(1) header-read form never reaches
+/// this function; see `build_enumerable_call`'s own unconditional
+/// early return). A plain running counter, incremented once per pair
+/// the predicate accepts — no output buffer at all, unlike `.select`.
+#[allow(clippy::too_many_arguments)]
+fn build_hash_count_predicate<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  recv: &Spanned<Expr>,
+  proc_arg: &Spanned<Expr>,
+  k_kind: ValKind,
+  v_kind: ValKind,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (recv_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let h_ptr = recv_val.into_pointer_value();
+  let i64_ty = context.i64_type();
+  let count_val = builder
+    .build_load(i64_ty, h_ptr, "hcntcount")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+
+  let acc_alloca = builder
+    .build_alloca(i64_ty, "hcntacc")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(acc_alloca, i64_ty.const_int(0, false))
+    .map_err(|e| e.to_string())?;
+
+  build_count_loop(context, builder, func, count_val, |builder, idx| {
+    let pair_ptr = build_hash_pair_ptr(context, builder, h_ptr, idx, &k_kind, &v_kind, ctx)?;
+    let (pred_val_opt, _) = call_named_proc(
+      context,
+      builder,
+      proc_arg,
+      &[pair_ptr.into()],
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let pred_bool = pred_val_opt
+      .ok_or(
+        "codegen: internal error — `.count`'s predicate Proc must not be Void (sema should have rejected this)",
+      )?
+      .into_int_value();
+    let acc_cur = builder
+      .build_load(i64_ty, acc_alloca, "hcntacccur")
+      .map_err(|e| e.to_string())?
+      .into_int_value();
+    let incremented = builder
+      .build_int_add(acc_cur, i64_ty.const_int(1, false), "hcntinc")
+      .map_err(|e| e.to_string())?;
+    let new_acc = builder
+      .build_select(pred_bool, incremented, acc_cur, "hcntnewacc")
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_store(acc_alloca, new_acc)
+      .map_err(|e| e.to_string())?;
+    Ok(())
+  })?;
+
+  let final_val = builder
+    .build_load(i64_ty, acc_alloca, "hcntfinal")
+    .map_err(|e| e.to_string())?;
+  Ok((final_val, ValKind::Int64))
+}
+
+/// Plan 70 (enumerable stdlib completion): `h.reduce(initial, proc_name)`/
+/// `.inject(...)` — mirrors `build_array_reduce` exactly, folding over
+/// freshly constructed `Pair[K,V]` values (`build_hash_pair_ptr`).
+#[allow(clippy::too_many_arguments)]
+fn build_hash_reduce<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  recv: &Spanned<Expr>,
+  initial: &Spanned<Expr>,
+  proc_arg: &Spanned<Expr>,
+  k_kind: ValKind,
+  v_kind: ValKind,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (recv_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let h_ptr = recv_val.into_pointer_value();
+  let i64_ty = context.i64_type();
+  let count_val = builder
+    .build_load(i64_ty, h_ptr, "hreducecount")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+
+  let (initial_val, acc_kind) = build_expr(
+    context,
+    builder,
+    initial,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let acc_llvm_ty = local_llvm_type(context, &acc_kind);
+  let acc_alloca = builder
+    .build_alloca(acc_llvm_ty, "hreduceacc")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(acc_alloca, initial_val)
+    .map_err(|e| e.to_string())?;
+
+  build_count_loop(context, builder, func, count_val, |builder, idx| {
+    let acc_cur = builder
+      .build_load(acc_llvm_ty, acc_alloca, "hreduceacccur")
+      .map_err(|e| e.to_string())?;
+    let pair_ptr = build_hash_pair_ptr(context, builder, h_ptr, idx, &k_kind, &v_kind, ctx)?;
+    let (result_val_opt, _) = call_named_proc(
+      context,
+      builder,
+      proc_arg,
+      &[acc_cur, pair_ptr.into()],
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let result_val = result_val_opt.ok_or(
+      "codegen: internal error — `.reduce`'s Proc must not be Void (sema should have rejected this)",
+    )?;
+    builder
+      .build_store(acc_alloca, result_val)
+      .map_err(|e| e.to_string())?;
+    Ok(())
+  })?;
+
+  let final_val = builder
+    .build_load(acc_llvm_ty, acc_alloca, "hreducefinal")
+    .map_err(|e| e.to_string())?;
+  Ok((final_val, acc_kind))
+}
+
+/// Plan 70 (enumerable stdlib completion): `h.each_with_index(proc_name)`
+/// — mirrors `build_array_each_with_index` exactly, over freshly
+/// constructed `Pair[K,V]` values (`build_hash_pair_ptr`).
+#[allow(clippy::too_many_arguments)]
+fn build_hash_each_with_index<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  recv: &Spanned<Expr>,
+  proc_arg: &Spanned<Expr>,
+  k_kind: ValKind,
+  v_kind: ValKind,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (recv_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let h_ptr = recv_val.into_pointer_value();
+  let i64_ty = context.i64_type();
+  let count_val = builder
+    .build_load(i64_ty, h_ptr, "hewicount")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+
+  build_count_loop(context, builder, func, count_val, |builder, idx| {
+    let pair_ptr = build_hash_pair_ptr(context, builder, h_ptr, idx, &k_kind, &v_kind, ctx)?;
+    call_named_proc(
+      context,
+      builder,
+      proc_arg,
+      &[pair_ptr.into(), idx.into()],
       vars,
       local_classes,
       local_array_elem_types,
@@ -7021,6 +7439,96 @@ fn build_array_select<'ctx>(
     .map_err(|e| e.to_string())?;
 
   Ok((out_ptr.into(), ValKind::Ptr))
+}
+
+/// Plan 70 (enumerable stdlib completion): `arr.count(proc_name)` —
+/// the predicate form (the arity-0 O(1) header-read form never reaches
+/// this function; see `build_enumerable_call`'s own unconditional
+/// early return). A plain running counter, incremented once per
+/// element the predicate accepts — no output buffer at all, unlike
+/// `.select`.
+#[allow(clippy::too_many_arguments)]
+fn build_array_count_predicate<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  func: FunctionValue<'ctx>,
+  recv: &Spanned<Expr>,
+  proc_arg: &Spanned<Expr>,
+  elem_kind: ValKind,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (recv_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let arr_ptr = recv_val.into_pointer_value();
+  let i64_ty = context.i64_type();
+  let count_val = builder
+    .build_load(i64_ty, arr_ptr, "acntcount")
+    .map_err(|e| e.to_string())?
+    .into_int_value();
+  let elem_llvm_ty = local_llvm_type(context, &elem_kind);
+  let elems_base = field_ptr(context, builder, arr_ptr, 8)?;
+
+  let acc_alloca = builder
+    .build_alloca(i64_ty, "acntacc")
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(acc_alloca, i64_ty.const_int(0, false))
+    .map_err(|e| e.to_string())?;
+
+  build_count_loop(context, builder, func, count_val, |builder, idx| {
+    let src_ptr = unsafe {
+      builder
+        .build_in_bounds_gep(elem_llvm_ty, elems_base, &[idx], "acntsrc")
+        .map_err(|e| e.to_string())?
+    };
+    let src_val = builder
+      .build_load(elem_llvm_ty, src_ptr, "acntsrcval")
+      .map_err(|e| e.to_string())?;
+    let (pred_val_opt, _) = call_named_proc(
+      context,
+      builder,
+      proc_arg,
+      &[src_val],
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let pred_bool = pred_val_opt
+      .ok_or(
+        "codegen: internal error — `.count`'s predicate Proc must not be Void (sema should have rejected this)",
+      )?
+      .into_int_value();
+    let acc_cur = builder
+      .build_load(i64_ty, acc_alloca, "acntacccur")
+      .map_err(|e| e.to_string())?
+      .into_int_value();
+    let incremented = builder
+      .build_int_add(acc_cur, i64_ty.const_int(1, false), "acntinc")
+      .map_err(|e| e.to_string())?;
+    let new_acc = builder
+      .build_select(pred_bool, incremented, acc_cur, "acntnewacc")
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_store(acc_alloca, new_acc)
+      .map_err(|e| e.to_string())?;
+    Ok(())
+  })?;
+
+  let final_val = builder
+    .build_load(i64_ty, acc_alloca, "acntfinal")
+    .map_err(|e| e.to_string())?;
+  Ok((final_val, ValKind::Int64))
 }
 
 /// Plan 42 (enumerable stdlib): `arr.reduce(initial, proc_name)`/
@@ -15423,6 +15931,59 @@ mod tests {
     String::from_utf8_lossy(&output.stdout).into_owned()
   }
 
+  /// Plan 66's regression-hardening runner: compiles and links `src`
+  /// exactly once, then executes the resulting binary `n` times in a
+  /// row, asserting every single run produced byte-identical stdout.
+  /// Plan 66's own root-cause investigation found the original "puts
+  /// silently prints nothing" family wasn't a codegen defect at all —
+  /// it was a nondeterministic race between the (since-removed) actor
+  /// worker-pool thread spawn/join wrapping every compiled program's
+  /// `main` and glibc's block-buffered stdout, incidentally fixed by
+  /// `b0d8bc1` ("perf(codegen): skip actor worker-pool startup/shutdown
+  /// for programs with no actors"). A single `compile_link_run` call
+  /// proves correctness but not the *absence* of that race class; this
+  /// helper is the cheap insurance the investigation recommended so a
+  /// future change that reintroduces unconditional thread startup (or
+  /// extends it to more program shapes) fails loudly instead of
+  /// flaking quietly.
+  fn compile_link_run_n_times(src: &str, n: usize) -> Vec<String> {
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = std::env::temp_dir();
+    let unique = format!(
+      "{}_{:?}_repeat",
+      std::process::id(),
+      std::thread::current().id()
+    );
+    let obj_path = dir.join(format!("emerald_codegen_aot_{unique}.o"));
+    let bin_path = dir.join(format!("emerald_codegen_aot_bin_{unique}"));
+
+    compile_to_object(&program, &obj_path).expect("should compile to object file");
+
+    let status = Command::new("cc")
+      .arg("-no-pie")
+      .arg(&obj_path)
+      .arg(runtime_path())
+      .arg("-o")
+      .arg(&bin_path)
+      .status()
+      .expect("failed to invoke cc");
+    assert!(status.success(), "linking should succeed");
+
+    let mut runs = Vec::with_capacity(n);
+    for _ in 0..n {
+      let output = Command::new(&bin_path)
+        .output()
+        .expect("failed to run compiled binary");
+      assert!(output.status.success(), "compiled binary should exit 0");
+      runs.push(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&bin_path).ok();
+
+    runs
+  }
+
   /// Plan 45's own general-purpose runner — `compile_link_run` above
   /// covers every prior plan's own no-args/no-stdin/cwd-agnostic case
   /// unchanged; this one adds exactly the three axes `ARGV`/`gets`/
@@ -16573,6 +17134,30 @@ mod tests {
     // `(ValKind::Nil, ValKind::Nil)` codegen case, not the new
     // `Ptr`/`Str`-vs-`Nil` null-pointer-test case this plan adds.
     assert_eq!(compile_link_run(NIL_EXAMPLE), "1\n");
+  }
+
+  // Plan 67 (String equality codegen).
+
+  const STRING_EQUALITY_WORKED_EXAMPLE: &str = "a: String = \"hello\"\nb: String = \"hello\"\nc: String = \"world\"\n\nif a == b\n  puts 1\nelse\n  puts 0\nend\n\nif a == c\n  puts 1\nelse\n  puts 0\nend\n\nif a != c\n  puts 1\nelse\n  puts 0\nend\n\nd: String = \"hel\" + \"lo\"\nif a == d\n  puts 1\nelse\n  puts 0\nend\n";
+
+  #[test]
+  fn string_equality_worked_example_linked_and_run() {
+    // Plan 67's own regression proof: `String == String`/`!=` lower to
+    // a real `emerald_string_eq` content comparison (the `(ValKind::
+    // Str, ValKind::Str)` arm right next to `(ValKind::Symbol,
+    // ValKind::Symbol)`'s own, restricted the same way to `Eq`/`Ne`),
+    // never the catch-all `codegen: comparison operands must both be
+    // Int64 or both Float64` error this exact shape would hit without
+    // that arm. `d` is built by concatenation — a freshly
+    // `emerald_alloc`'d buffer with the same bytes as `a` but never the
+    // same pointer — so `a == d` only reads `1` here if the comparison
+    // is real byte-for-byte content equality, not a pointer-identity
+    // shortcut that would happen to pass every other case in this same
+    // test.
+    assert_eq!(
+      compile_link_run(STRING_EQUALITY_WORKED_EXAMPLE),
+      "1\n0\n1\n1\n"
+    );
   }
 
   // Plan 44 (symbols).
@@ -17765,6 +18350,67 @@ int main(void) {
     );
   }
 
+  // Plan 68 (generic-method repeated-print investigation).
+  //
+  // `examples/README.md` disclosed a "second consecutive `puts` of a
+  // generic method's return value on a monomorphized instance can
+  // silently drop its output" finding against this exact program: the
+  // `Stack[Int64]` instance's two `pop()` calls both printed correctly,
+  // but the *second* `pop()` on the separately-monomorphized
+  // `Stack[String]` instance's return value never reached stdout — 3
+  // lines instead of 4, no crash, no diagnostic — reproduced exactly
+  // once out of hundreds of direct binary executions by plan 68's own
+  // investigation.
+  //
+  // This plan's own re-investigation could not reproduce the symptom
+  // against any actual execution of the compiled binary — not once,
+  // across hundreds of direct runs of freshly-linked binaries — using
+  // every method available that reads a subprocess's stdout without
+  // going through this environment's `ctx_shell` MCP tool's output
+  // *compression* layer (plain shell redirection, `raw`-mode capture,
+  // and this exact `compile_link_run`/`compile_link_run_n_times`
+  // in-process `std::process::Command` capture, which this test uses).
+  // Directly comparable: piping the identical freshly-linked binary's
+  // repeated output through `ctx_shell` WITHOUT its `raw: true` escape
+  // reproduced a 3-line-instead-of-4 truncation matching the disclosed
+  // symptom deterministically at some repeat counts (e.g. 3 runs) and
+  // not at others (e.g. 5 runs) against the *same* binary and command —
+  // varying with a tool-side parameter (repeat count) that has no
+  // causal path into the compiled program's own execution, which rules
+  // out a real race in the compiled program. `raw: true` (verbatim,
+  // uncompressed capture) on that same tool, and every other capture
+  // method, always showed the correct 4 lines. The disassembled
+  // machine code (`Stack$String_pop`/`Stack$String_push`/`main`/
+  // `emerald_print_str`, `objdump -d`) is also textbook-correct: two
+  // real, distinct `emerald_print_str` calls in sequence, fed the two
+  // real return values of two real `Stack$String_pop` calls, matching
+  // Int64's identical-shape call sequence exactly.
+  //
+  // Conclusion: this was very likely never a compiler defect at all —
+  // the original one-off observation, and this plan's own prior
+  // "reproduced once in ~250 runs" finding, are best explained by this
+  // same class of output-capture artifact (present in at least one tool
+  // this environment's agents are directed to use for exactly this kind
+  // of loop) rather than a real, if rare, codegen/runtime race. This
+  // test is the regression-hardening insurance anyway: 50 fresh
+  // `compile_link_run` executions of a compiled-and-linked-once binary,
+  // asserting byte-identical, fully-4-line output every single time,
+  // captured entirely in-process (never through any external capture
+  // tool) so a real regression — in either direction — fails loudly.
+  const PLAN_68_REPEAT_COUNT: usize = 50;
+
+  #[test]
+  fn plan_68_generic_stack_second_pop_on_a_monomorphized_string_instance_prints_deterministically()
+  {
+    let runs = compile_link_run_n_times(GENERIC_CLASSES_EXAMPLE, PLAN_68_REPEAT_COUNT);
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(
+        out, "30\n20\nsecond\nfirst\n",
+        "run {i} produced unexpected output: {out:?}"
+      );
+    }
+  }
+
   // Plan 59 (C FFI).
 
   // The plan's own worked proof verbatim — three real libc functions,
@@ -18049,5 +18695,144 @@ int main(void) {
   fn requires_and_ensures_both_pass_when_the_contract_genuinely_holds() {
     let src = format!("{DIVIDE_SRC}\nputs divide(10, 2)\n");
     assert_eq!(compile_link_run(&src), "5\n");
+  }
+
+  // Plan 66 (puts / String value-flow codegen regression hardening).
+  //
+  // The investigation found none of `examples/README.md`'s five
+  // disclosed "puts silently prints nothing" symptoms reproduce against
+  // current codegen — `build_puts` (this file, `fn build_puts`) is
+  // already fully generic over `ValKind` regardless of the AST shape
+  // that produced the `String` value, and every statement position
+  // (including inside a `def` body, via `build_block`/`build_stmt`)
+  // reaches the same `puts` special-case. The real, now-fixed defect
+  // was a runtime race (see `compile_link_run_n_times`'s doc comment),
+  // not a codegen routing gap. These five tests pin down each
+  // previously-disclosed shape individually, each run 20 times, so a
+  // regression in either direction — a real codegen gap, or a
+  // reintroduced timing race — fails loudly instead of silently.
+
+  const PLAN_66_REPEAT_COUNT: usize = 20;
+
+  #[test]
+  fn plan_66_puts_inside_a_def_body_prints_deterministically() {
+    // Shape 1: `puts` as a non-trailing statement inside a user `def`
+    // body (not the top level).
+    let src = "def greet(name: String) -> String\n  puts \"hello from inside a def\"\n  name\nend\n\nputs greet(\"world\")\n";
+    let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(
+        out, "hello from inside a def\nworld\n",
+        "run {i} produced unexpected output: {out:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn plan_66_a_stored_top_level_string_let_binding_prints_deterministically() {
+    // Shape 2: `puts` of a local variable loaded back from a stored
+    // `String`-typed `Let`, not a literal/method-call expression used
+    // directly.
+    let src = "y: String = \"hello\"\nputs y\n";
+    let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(
+        out, "hello\n",
+        "run {i} produced unexpected output: {out:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn plan_66_puts_of_a_multi_arg_string_intrinsic_result_prints_deterministically() {
+    // Shape 3: `puts` of a multi-argument `String` intrinsic's return
+    // value (`.slice(1, 3)`), as opposed to a single-argument intrinsic.
+    let src = "phrase: String = \"hello world\"\nputs phrase.slice(1, 3)\n";
+    let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(out, "ell\n", "run {i} produced unexpected output: {out:?}");
+    }
+  }
+
+  #[test]
+  fn plan_66_puts_of_an_array_string_index_read_prints_deterministically() {
+    // Shape 4: `puts` of an `Array[String]` index read.
+    let src = "phrase: String = \"hello world\"\nwords: Array[String] = phrase.split(\" \")\nputs words[0]\n";
+    let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(
+        out, "hello\n",
+        "run {i} produced unexpected output: {out:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn plan_66_a_string_optional_via_safe_nav_and_coalesce_prints_deterministically() {
+    // Shape 5: `puts` of a `String?` populated via `||=` after starting
+    // `nil` — the exact shape `nullable_safe_nav.em` and `c_ffi.em` hit,
+    // mirrored here without the `unsafe extern "C"` dependency.
+    let src = "found: String? = nil\nfound ||= \"not found\"\nputs found\n";
+    let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(
+        out, "not found\n",
+        "run {i} produced unexpected output: {out:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn plan_66_the_c_ffi_string_optional_safe_nav_shape_prints_deterministically() {
+    // Same as shape 5 above, but through the exact `c_ffi.em` repro
+    // path (safe-nav result of a real C FFI call, not a literal `nil`),
+    // run repeatedly rather than once.
+    let runs = compile_link_run_n_times(FFI_EXAMPLE, PLAN_66_REPEAT_COUNT);
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(
+        out, "42\n5\nworld\nnot found\n",
+        "run {i} produced unexpected output: {out:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn plan_66_all_five_shapes_combined_in_one_program_print_in_order_every_run() {
+    // The plan's own combined proof program: all five previously-
+    // disclosed shapes in one binary, so a fix that only patches one
+    // call site rather than the shared mechanism would still be caught
+    // by the others. Note `greet` is only *called* (and so only prints
+    // its inner `puts`) at the final `puts greet("world")` line, so
+    // "hello from inside a def" is emitted last, not first — sequential
+    // execution order, not declaration order.
+    let src = "def greet(name: String) -> String\n  puts \"hello from inside a def\"\n  name\nend\n\ny: String = \"hello\"\nputs y\n\nphrase: String = \"hello world\"\nputs phrase.slice(1, 3)\n\nwords: Array[String] = phrase.split(\" \")\nputs words[0]\n\nfound: String? = nil\nfound ||= \"not found\"\nputs found\n\nputs greet(\"world\")\n";
+    let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
+    let expected = "hello\nell\nhello\nnot found\nhello from inside a def\nworld\n";
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(out, expected, "run {i} produced unexpected output: {out:?}");
+    }
+  }
+
+  /// Plan 70 (enumerable stdlib completion): the exact `examples/
+  /// enumerable.em` source (kept as a literal copy, not a file read,
+  /// matching every other worked-example test in this module) —
+  /// `map`/`select`/`reduce`/`count`(predicate)/`sum`/`sort`/
+  /// `each_with_index` on `Array[Int64]`, and `map`/`reduce`/
+  /// `count`(predicate)/`count`(arity-0) on `Hash[Int64,Int64]`, all
+  /// via this plan's new block-attached-call syntax (`recv.method {
+  /// |params| body }`) rather than plan 42's pre-existing named-`Proc`
+  /// workaround. Compiled and linked once, run 20 times, asserting
+  /// byte-identical, fully-correct output every run — this plan's own
+  /// regression-hardening insurance, the same posture plan 66/68
+  /// already established for this test module.
+  const PLAN_70_ENUMERABLE_EXAMPLE: &str = "nums: Array[Int64] = [1, 2, 3, 4, 5]\n\ndoubled: Array[Int64] = nums.map { |x: Int64| x * 2 }\nevens: Array[Int64] = nums.select { |x: Int64| x % 2 == 0 }\ntotal: Int64 = nums.reduce(0) { |acc: Int64, x: Int64| acc + x }\nabove_two: Int64 = nums.count { |x: Int64| x > 2 }\ns: Int64 = nums.sum\nsorted: Array[Int64] = nums.sort\n\nnums.each_with_index { |x: Int64, i: Int64| puts i }\n\nputs doubled[4]\nputs evens.count\nputs total\nputs above_two\nputs s\nputs sorted[0]\n\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nh_values: Array[Int64] = h.map { |p: Pair[Int64, Int64]| p.value }\nh_total: Int64 = h.reduce(0) { |acc: Int64, p: Pair[Int64, Int64]| acc + p.value }\nh_big: Int64 = h.count { |p: Pair[Int64, Int64]| p.value > 15 }\n\nputs h_values[0]\nputs h_total\nputs h_big\nputs h.count\n";
+
+  #[test]
+  fn plan_70_enumerable_worked_example_linked_and_run_prints_deterministically() {
+    let runs = compile_link_run_n_times(PLAN_70_ENUMERABLE_EXAMPLE, PLAN_66_REPEAT_COUNT);
+    let expected = "0\n1\n2\n3\n4\n10\n2\n15\n3\n15\n1\n10\n60\n2\n3\n";
+    for (i, out) in runs.iter().enumerate() {
+      assert_eq!(out, expected, "run {i} produced unexpected output: {out:?}");
+    }
   }
 }

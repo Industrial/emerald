@@ -127,3 +127,11 @@ fn function_signatures_em_prints_expected_sequence() {
     "1\n2\n3\n2\n60\n"
   );
 }
+
+#[test]
+fn enumerable_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("enumerable.em"),
+    "0\n1\n2\n3\n4\n10\n2\n15\n3\n15\n1\n10\n60\n2\n3\n"
+  );
+}

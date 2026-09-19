@@ -889,6 +889,22 @@ StmtPrimaryExpr: Spanned<Expr> = {
     Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  // Plan 70's Decision log: a trailing block literal attached directly
+  // to a bare (no-parens) `.method` call — `nums.select { |x: Int64| ...
+  // }`, with no `()` at all. Distinct from the `"(" Args ")" <blk:
+  // BlockLiteral?>` alternative above (which already covers `.method(
+  // args) { ... }`): this is the zero-explicit-argument shape, needed
+  // because every one of this plan's own worked-example calls
+  // (`.select`/`.map`/`.count`/`.each`/`.each_with_index`) attaches a
+  // block with no parens at all. No FIRST-set overlap with the bare,
+  // no-block alternative directly above: LALR(1) shifts into this
+  // production only when the very next token is `{`, otherwise reduces
+  // the bare alternative — the same one-token-of-lookahead disambiguation
+  // this file already relies on everywhere else a production has an
+  // optional trailing suffix.
+  <l:@L> <recv:Ident> "." <method:CallMethodName> <blk:BlockLiteral> <r:@R> => {
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![blk]) }
+  },
   // Plan 55's Decision log: `@field.method(args)` — this plan's own
   // `@peer.hit` cross-actor call shape. Mirrors the two `Ident`-headed
   // `MethodCall` alternatives immediately above exactly, `InstanceVarTok`
@@ -1235,6 +1251,26 @@ PrimaryExpr: Spanned<Expr> = {
   <l:@L> "supervise" "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Supervise(body) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) },
   <l:@L> <recv:Ident> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  // Plan 70's Decision log: unlike the rest of this production (see the
+  // long-standing comment on `BlockLiteral` below explaining why a
+  // trailing `<blk:BlockLiteral?>` was previously declined here), these
+  // two alternatives are real, new, and build-verified conflict-free —
+  // added specifically so a block-attached enumerable call
+  // (`nums.map { |x: Int64| x * 2 }`) can appear as a `Let`'s own RHS,
+  // not only as a bare top-level statement. `.method(args) { blk }`
+  // (needed by `.reduce(0) { |acc, x| ... }`) and the no-parens
+  // `.method { blk }` shape (needed by every other worked-example call)
+  // are both distinct, textually-disjoint productions from the two
+  // bare alternatives immediately above — LALR(1) picks between them on
+  // one token of lookahead (`(` vs `{` vs anything else) exactly the
+  // way `StmtPrimaryExpr`'s own mirror alternatives already do.
+  <l:@L> <recv:Ident> "." <method:CallMethodName> "(" <mut args:Args> ")" <blk:BlockLiteral> <r:@R> => {
+    args.push(blk);
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
+  },
+  <l:@L> <recv:Ident> "." <method:CallMethodName> <blk:BlockLiteral> <r:@R> => {
+    Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![blk]) }
+  },
   // Plan 55's Decision log: see `StmtPrimaryExpr`'s own identical
   // `InstanceVarTok`-headed mirror alternative for the full rationale.
   <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) },

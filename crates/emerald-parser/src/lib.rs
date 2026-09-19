@@ -396,6 +396,247 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
   }
 }
 
+/// Plan 70 (enumerable stdlib completion): the fixed set of `Array[T]`/
+/// `Hash[K,V]` intrinsic methods that ever take a trailing block-literal
+/// argument (`grammar.lalrpop`'s new block-attached-call productions,
+/// added by this same plan). Kept as its own list here rather than
+/// reused from `emerald-sema` (which this crate can't depend on without
+/// inverting the workspace's dependency graph) purely to scope
+/// `hoist_enumerable_blocks`'s rewrite to call sites that can actually
+/// use it — a block attached to any OTHER method still parses (any
+/// `.method { ... }` shape does, after this plan's grammar change) but
+/// is left completely alone here, falling through to `emerald-sema`'s
+/// own pre-existing "expected a Proc" diagnostic unchanged.
+const ENUMERABLE_BLOCK_METHODS: [&str; 8] = [
+  "each",
+  "map",
+  "select",
+  "filter",
+  "reduce",
+  "inject",
+  "each_with_index",
+  "count",
+];
+
+/// Plan 70's Decision log: bridges `grammar.lalrpop`'s new block-
+/// attached-call syntax onto the pre-existing (plan 42), already fully
+/// working named-`Proc` call convention every enumerable intrinsic in
+/// `emerald-sema`/`emerald-codegen` expects — see `crates/emerald-
+/// codegen/src/lib.rs`'s `call_named_proc` doc comment for the full
+/// "why a NAMED Proc, not an inline block literal" rationale this
+/// rewrite exists to satisfy without changing either crate: it turns
+/// `nums.map { |x: Int64| x * 2 }` into the exact AST a hand-written
+/// `__fresh: Proc = ->(x: Int64) -> Int64 { x * 2 }; nums.map(__fresh)`
+/// already produces, before sema ever runs.
+///
+/// Deliberately narrow, matching `collect_lambda_infos`' own real,
+/// pre-existing "top-level `Let` only" restriction on every `Proc`
+/// value in this language (block-attached or not): only a *top-level*
+/// `Item::Stmt`'s own, direct `Let`/`Expr`/`Assign`/`SetField` value is
+/// rewritten here — a block-attached enumerable call nested inside an
+/// `if`/`while`/`for`/`begin` body, inside a binary-operator operand,
+/// or inside any function/class/actor method body, is left alone
+/// entirely (falls through to sema's existing, correctly-worded
+/// rejection) rather than risk moving a captured free variable's read
+/// point out of its original, possibly-conditionally-executed scope.
+///
+/// `.map`/`.reduce`/`.inject`'s own block has no declared return type
+/// at all (`{ |x: Int64| x * 2 }`, unlike the full `->(...) -> T
+/// {...}` lambda-literal syntax) — `infer_block_result_type` below is
+/// a small, self-contained, syntax-only type inferencer (no `env`,
+/// only the block's own explicitly-typed params and this program's own
+/// top-level function return-type table) that computes it, since
+/// `emerald_sema::check_program` takes `&Program` and can never write
+/// an inferred type back into this immutable AST for codegen to see —
+/// the inference has to happen here, before codegen ever looks at the
+/// string. When it can't determine a type (an expression shape this
+/// small inferencer doesn't cover), this returns a real, disclosed
+/// parse error naming the exact call rather than silently guessing.
+fn hoist_enumerable_blocks(
+  program: &mut Program,
+  name: &str,
+  source: &str,
+) -> Result<(), ParseError> {
+  let top_level_fn_returns: std::collections::HashMap<String, String> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Function(f) => Some((f.name.clone(), f.return_type.clone())),
+      _ => None,
+    })
+    .collect();
+
+  let mut counter: usize = 0;
+  let old_items = std::mem::take(&mut program.items);
+  let mut new_items = Vec::with_capacity(old_items.len());
+  for item in old_items {
+    let Item::Stmt(mut stmt) = item else {
+      new_items.push(item);
+      continue;
+    };
+    let value = match &mut stmt.node {
+      Stmt::Let { value, .. }
+      | Stmt::Expr(value)
+      | Stmt::Assign { value, .. }
+      | Stmt::SetField { value, .. } => Some(value),
+      _ => None,
+    };
+    let mut hoisted: Option<Item> = None;
+    if let Some(value) = value {
+      if let Expr::MethodCall(_, method, args) = &mut value.node {
+        let method_name = method.clone();
+        let has_trailing_block = matches!(args.last().map(|a| &a.node), Some(Expr::Lambda { .. }));
+        if ENUMERABLE_BLOCK_METHODS.contains(&method_name.as_str()) && has_trailing_block {
+          let old = args
+            .pop()
+            .expect("checked Some above via has_trailing_block");
+          let Expr::Lambda { params, body, .. } = old.node else {
+            unreachable!("has_trailing_block already matched Expr::Lambda")
+          };
+          let return_type = match method_name.as_str() {
+            "select" | "filter" | "count" => "Boolean".to_string(),
+            "each" | "each_with_index" => "Void".to_string(),
+            "map" | "reduce" | "inject" => {
+              infer_block_result_type(&params, &body, &top_level_fn_returns).ok_or_else(|| {
+                hoist_error(
+                  name,
+                  source,
+                  old.span,
+                  format!(
+                    "can't infer this block's result type for `.{method_name}` — bind it to a \
+                     named `Proc` with an explicit return type instead (`name: Proc = \
+                     ->(...) -> ReturnType {{ ... }}`), then pass `name` in its place; this \
+                     plan's own block-return-type inference only covers literals, a bare \
+                     block-parameter reference, same-typed arithmetic/comparison/logical \
+                     operators, and a call to an already-declared top-level function"
+                  ),
+                )
+              })?
+            }
+            _ => unreachable!("ENUMERABLE_BLOCK_METHODS has no other member"),
+          };
+          let fresh = format!("__enum_blk_{counter}");
+          counter += 1;
+          args.push(Spanned {
+            span: old.span,
+            node: Expr::Ident(fresh.clone()),
+          });
+          hoisted = Some(Item::Stmt(Spanned {
+            span: old.span,
+            node: Stmt::Let {
+              name: fresh,
+              ty: "Proc".to_string(),
+              value: Spanned {
+                span: old.span,
+                node: Expr::Lambda {
+                  params,
+                  return_type,
+                  body,
+                },
+              },
+            },
+          }));
+        }
+      }
+    }
+    if let Some(hoisted) = hoisted {
+      new_items.push(hoisted);
+    }
+    new_items.push(Item::Stmt(stmt));
+  }
+  program.items = new_items;
+  Ok(())
+}
+
+/// `hoist_enumerable_blocks`'s own tiny error constructor — same shape
+/// as `to_parse_error`'s `ParseError`, just built from a byte-offset
+/// span this pass already has in hand rather than one recovered from a
+/// `lalrpop_util::ParseError`.
+fn hoist_error(name: &str, source: &str, span: (usize, usize), message: String) -> ParseError {
+  ParseError {
+    message,
+    src: miette::NamedSource::new(name, source.to_string()),
+    span: span.into(),
+  }
+}
+
+/// `hoist_enumerable_blocks`'s own return-type inferencer for a
+/// parameter-less-return-type block literal — see that function's own
+/// doc comment for the full rationale and real, disclosed coverage
+/// limit.
+fn infer_block_result_type(
+  params: &[Param],
+  body: &[Spanned<Stmt>],
+  top_level_fn_returns: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+  let param_types: std::collections::HashMap<&str, &str> = params
+    .iter()
+    .map(|p| (p.name.as_str(), p.ty.as_str()))
+    .collect();
+  let tail = match body.last().map(|s| &s.node) {
+    Some(Stmt::Expr(e)) => e,
+    Some(Stmt::Return(Some(e))) => e,
+    _ => return None,
+  };
+  infer_simple_expr_type(&tail.node, &param_types, top_level_fn_returns)
+}
+
+/// `infer_block_result_type`'s own recursive expression walk — see
+/// `hoist_enumerable_blocks`'s doc comment for exactly which shapes
+/// this intentionally-small inferencer covers and why anything else
+/// returns `None` rather than a guess.
+fn infer_simple_expr_type(
+  expr: &Expr,
+  param_types: &std::collections::HashMap<&str, &str>,
+  top_level_fn_returns: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+  match expr {
+    Expr::Int(_) => Some("Int64".to_string()),
+    Expr::Float(_) => Some("Float64".to_string()),
+    Expr::StringLit(_) | Expr::Interpolate(_) => Some("String".to_string()),
+    Expr::Bool(_) => Some("Boolean".to_string()),
+    Expr::Ident(n) => param_types.get(n.as_str()).map(|t| t.to_string()),
+    Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) | Expr::Rem(a, b) => {
+      let ta = infer_simple_expr_type(&a.node, param_types, top_level_fn_returns)?;
+      let tb = infer_simple_expr_type(&b.node, param_types, top_level_fn_returns)?;
+      (ta == tb).then_some(ta)
+    }
+    Expr::Neg(a) => infer_simple_expr_type(&a.node, param_types, top_level_fn_returns),
+    Expr::Compare(..) | Expr::And(..) | Expr::Or(..) | Expr::Not(_) => Some("Boolean".to_string()),
+    Expr::Call(fn_name, _) => top_level_fn_returns
+      .get(fn_name.as_str())
+      .map(|t| t.to_string()),
+    // `p.key`/`p.value` on a block param explicitly typed `Pair[K, V]`
+    // (`Hash[K,V]`'s own `.each`/`.map`/`.reduce`/`.each_with_index`
+    // block parameter shape) — the one `MethodCall` receiver+method
+    // combination this small inferencer covers, since `Pair[K, V]`'s
+    // own compound type-name string (`grammar.lalrpop`'s `TypeName`
+    // rule) already carries `K`/`V` in plain text, no real type
+    // resolution needed to read them back out.
+    Expr::MethodCall(recv, method, call_args)
+      if call_args.is_empty() && (method == "key" || method == "value") =>
+    {
+      let Expr::Ident(recv_name) = &recv.node else {
+        return None;
+      };
+      let (k, v) = parse_pair_type_parts(param_types.get(recv_name.as_str())?)?;
+      Some(if method == "key" { k } else { v })
+    }
+    _ => None,
+  }
+}
+
+/// Parses a `Pair[K, V]` compound type-name string (`grammar.lalrpop`'s
+/// own `"Pair" "[" <k:Ident> "," <v:Ident> "]" => format!("Pair[{k}, \
+/// {v}]")` production) back into its `(K, V)` parts — the exact inverse
+/// of that `format!`, kept in sync with it deliberately (both live in
+/// this one crate).
+fn parse_pair_type_parts(ty: &str) -> Option<(String, String)> {
+  let inner = ty.strip_prefix("Pair[")?.strip_suffix(']')?;
+  let (k, v) = inner.split_once(", ")?;
+  Some((k.to_string(), v.to_string()))
+}
+
 pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
   let mut recovered = Vec::new();
   let result = grammar::grammar::ProgramParser::new().parse(&mut recovered, src);
@@ -407,6 +648,7 @@ pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
     Ok(mut program) if errors.is_empty() => {
       rewrite_assert_locations(&mut program.items, name, src);
       fill_contract_text(&mut program.items, src);
+      hoist_enumerable_blocks(&mut program, name, src).map_err(|e| vec![e])?;
       Ok(program)
     }
     Ok(_) => {
@@ -3596,5 +3838,141 @@ mod tests {
   fn pure_used_as_an_ordinary_identifier_is_a_real_parse_error() {
     let src = "pure: Int64 = 1\n";
     assert!(parse(src).is_err());
+  }
+
+  // Plan 70 (enumerable stdlib completion): block-attached-call parsing
+  // + `hoist_enumerable_blocks`.
+
+  #[test]
+  fn a_block_attached_select_call_parses_as_a_lets_rhs() {
+    let src =
+      "nums: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = nums.select { |x: Int64| x > 1 }\n";
+    let program = parse(src).expect("should parse");
+    // The block is hoisted to a fresh top-level `Proc` `Let` immediately
+    // before the `evens` statement, so there are 4 top-level items, not
+    // 2: `nums`, the hoisted proc, `evens`, in that order.
+    assert_eq!(program.items.len(), 3);
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { name, ty, .. },
+      ..
+    }) = &program.items[1]
+    else {
+      panic!("expected the hoisted Proc Let, got {:?}", program.items[1]);
+    };
+    assert_eq!(name, "__enum_blk_0");
+    assert_eq!(ty, "Proc");
+    let Item::Stmt(Spanned {
+      node:
+        Stmt::Let {
+          name: evens_name,
+          value:
+            Spanned {
+              node: Expr::MethodCall(_, method, args),
+              ..
+            },
+          ..
+        },
+      ..
+    }) = &program.items[2]
+    else {
+      panic!("expected the `evens` Let, got {:?}", program.items[2]);
+    };
+    assert_eq!(evens_name, "evens");
+    assert_eq!(method, "select");
+    assert_eq!(
+      args,
+      &vec![Spanned::synthetic(Expr::Ident("__enum_blk_0".to_string()))]
+    );
+  }
+
+  #[test]
+  fn a_block_attached_map_call_infers_its_blocks_return_type_from_the_body() {
+    let src =
+      "nums: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = nums.map { |x: Int64| x * 2 }\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, value, .. },
+      ..
+    }) = &program.items[1]
+    else {
+      panic!("expected the hoisted Proc Let, got {:?}", program.items[1]);
+    };
+    assert_eq!(ty, "Proc");
+    let Expr::Lambda { return_type, .. } = &value.node else {
+      panic!("expected a Lambda value, got {:?}", value.node);
+    };
+    assert_eq!(return_type, "Int64");
+  }
+
+  #[test]
+  fn a_block_attached_reduce_call_parses_with_args_and_a_block_together() {
+    let src = "nums: Array[Int64] = [1, 2, 3]\ntotal: Int64 = nums.reduce(0) { |acc: Int64, x: Int64| acc + x }\n";
+    let program = parse(src).expect("should parse");
+    assert_eq!(program.items.len(), 3);
+    let Item::Stmt(Spanned {
+      node:
+        Stmt::Let {
+          value:
+            Spanned {
+              node: Expr::MethodCall(_, method, args),
+              ..
+            },
+          ..
+        },
+      ..
+    }) = &program.items[2]
+    else {
+      panic!("expected the `total` Let, got {:?}", program.items[2]);
+    };
+    assert_eq!(method, "reduce");
+    // `0` (the explicit initial-value arg) plus the hoisted Proc name —
+    // the block did not silently disappear, and the initial value's own
+    // position (before the block) is preserved.
+    assert_eq!(args.len(), 2);
+    assert_eq!(args[0], Spanned::synthetic(Expr::Int(0)));
+  }
+
+  #[test]
+  fn a_bare_no_parens_block_attached_call_parses_as_a_statement_too() {
+    let src = "nums: Array[Int64] = [1, 2, 3]\nnums.each { |x: Int64| puts x }\n";
+    let program = parse(src).expect("should parse");
+    // `nums`, the hoisted proc, the `.each` statement.
+    assert_eq!(program.items.len(), 3);
+  }
+
+  #[test]
+  fn a_block_whose_return_type_cannot_be_inferred_is_a_real_disclosed_parse_error() {
+    // `File.read` isn't a top-level function this inferencer's own
+    // small `Call`-arm table can look up, and it isn't one of the
+    // arithmetic/comparison/literal/param shapes it covers either — a
+    // real, disclosed inference-coverage boundary, not a crash.
+    let src = "nums: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = nums.map { |x: Int64| File.read(\"a\") }\n";
+    let err = parse(src).expect_err("should fail to infer the block's return type");
+    assert!(!err.is_empty());
+  }
+
+  #[test]
+  fn a_block_attached_call_inside_an_if_body_is_left_unhoisted_and_reports_semas_own_error() {
+    // Deliberately narrow scope (this plan's own Decision log): only a
+    // top-level statement's own, direct value is hoisted — nested
+    // inside an `if` body, the block is left as a raw, un-hoisted
+    // `Expr::Lambda`, which still parses (this plan's grammar change is
+    // receiver/context-agnostic) but is `emerald-sema`'s problem, not
+    // this pass's.
+    let src = "nums: Array[Int64] = [1, 2, 3]\nif true\n  evens: Array[Int64] = nums.select { |x: Int64| x > 1 }\nend\n";
+    let program = parse(src).expect("should still parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::If { then_branch, .. },
+      ..
+    }) = &program.items[1]
+    else {
+      panic!("expected the `if`, got {:?}", program.items[1]);
+    };
+    let Stmt::Let { value, .. } = &then_branch[0].node else {
+      panic!("expected a Let");
+    };
+    assert!(
+      matches!(&value.node, Expr::MethodCall(_, _, args) if matches!(args.last().map(|a| &a.node), Some(Expr::Lambda { .. })))
+    );
   }
 }
