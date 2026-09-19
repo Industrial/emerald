@@ -27,6 +27,21 @@ feature boundaries.
 - Surgical edits only — touch what the task requires.
 - Bump the relevant version when behavior changes.
 
+## Known tooling gotchas
+
+- **`ctx_shell` without `raw: true` can silently truncate trailing lines
+  of looped/repeated subprocess output.** Confirmed via direct A/B
+  testing across independently-built binaries (2026-09-19): identical
+  command, identical binary, `raw: true` → correct output every time;
+  default (compressed) output → trailing lines missing, correlated with
+  loop repeat count, not with anything the subprocess actually printed.
+  This already produced one false compiler-bug report (history's plan
+  68 — a "generic method repeated-print bug" that was never real).
+  **When verifying N-times/loop-based regression checks (the pattern
+  this project's own tests use to catch races — see plans 66/68), pass
+  `raw: true`, or verify via `cargo nextest`/`cargo test` directly,
+  which capture stdout in-process and are immune to this.**
+
 ## See also
 
 - `.maestro/MAESTRO.md` — read order, lane policy, daily commands
