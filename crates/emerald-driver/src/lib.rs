@@ -689,7 +689,7 @@ mod tests {
   use super::*;
 
   const HELLO_SRC: &str =
-    "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
 
   #[test]
   fn check_accepts_hello_em_in_memory_with_no_filesystem_write() {
@@ -704,7 +704,7 @@ mod tests {
 
   #[test]
   fn check_rejects_a_parse_error() {
-    let source = "def add(a: Int64\n";
+    let source = "fn add(a: Int64\n";
     assert!(matches!(
       check(source, "bad.em"),
       Err(DriverError::Parse(_))
@@ -730,7 +730,7 @@ mod tests {
   // call actually reaches every real compile path.
   #[test]
   fn derive_comparable_worked_example_prints_true_then_false() {
-    let src = "class Point derive Comparable\n  x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np1: Point = Point.new(1, 2)\np2: Point = Point.new(1, 2)\np3: Point = Point.new(1, 2)\np4: Point = Point.new(3, 4)\nif p1 == p2\n  puts \"true\"\nelse\n  puts \"false\"\nend\nif p3 == p4\n  puts \"true\"\nelse\n  puts \"false\"\nend\n";
+    let src = "class Point derive Comparable\n  x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\np1: Point = Point.new(1, 2)\np2: Point = Point.new(1, 2)\np3: Point = Point.new(1, 2)\np4: Point = Point.new(3, 4)\nif p1 == p2 do\n  puts \"true\"\nelse\n  puts \"false\"\nend\nif p3 == p4 do\n  puts \"true\"\nelse\n  puts \"false\"\nend\n";
     let dir = std::env::temp_dir().join(format!(
       "emerald-driver-derive-comparable-test-{}",
       process::id()
@@ -770,14 +770,14 @@ mod tests {
 
   #[test]
   fn symbols_returns_a_table_for_classes_em() {
-    let src = "class Counter\n  value: Int64\n\n  def initialize(start: Int64) -> Void\n    @value = start\n  end\nend\n";
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\nend\n";
     let table = symbols(src, "classes.em").expect("should collect symbols");
     assert!(table.classes.contains_key("Counter"));
   }
 
   #[test]
   fn symbols_rejects_an_unparseable_buffer() {
-    let source = "def add(a: Int64\n";
+    let source = "fn add(a: Int64\n";
     assert!(matches!(
       symbols(source, "bad.em"),
       Err(DriverError::Parse(_))

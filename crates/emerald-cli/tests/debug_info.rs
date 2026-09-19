@@ -18,7 +18,7 @@ use std::process::Command;
 /// log names, byte-for-byte, so the breakpoint target line this test
 /// computes always matches the real compiled line.
 const WORKED_EXAMPLE: &str =
-  "def add(a: Int64, b: Int64) -> Int64\n  sum: Int64 = a + b\n  sum\nend\n\nputs add(20, 22)\n";
+  "fn add(a: Int64, b: Int64): Int64 do\n  sum: Int64 = a + b\n  sum\nend\n\nputs add(20, 22)\n";
 
 #[test]
 #[ignore]

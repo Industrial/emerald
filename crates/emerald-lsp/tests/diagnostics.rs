@@ -129,7 +129,7 @@ fn a_sema_type_mismatch_publishes_a_diagnostic_at_the_real_b_position() {
   did_open(
     &client,
     "file:///bad_types.em",
-    "def add(a: Int64, b: String) -> Int64\n  a + b\nend\n",
+    "fn add(a: Int64, b: String): Int64 do\n  a + b\nend\n",
   );
   let published = recv_diagnostics(&client);
 

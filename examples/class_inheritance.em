@@ -1,11 +1,11 @@
 class Animal
   read age: Int64
 
-  def initialize(age: Int64) -> Void
+  fn initialize(age: Int64): Void do
     @age = age
   end
 
-  def describe -> Int64
+  fn describe: Int64 do
     @age
   end
 end
@@ -13,12 +13,12 @@ end
 class Dog < Animal
   breed_code: Int64
 
-  def initialize(age: Int64, breed_code: Int64) -> Void
+  fn initialize(age: Int64, breed_code: Int64): Void do
     @age = age
     @breed_code = breed_code
   end
 
-  def describe -> Int64
+  fn describe: Int64 do
     @age + @breed_code
   end
 end

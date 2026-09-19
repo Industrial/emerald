@@ -10,8 +10,12 @@ use logos::Logos;
 #[derive(Logos, Debug, Clone, PartialEq, Eq)]
 #[logos(skip r"[ \t\r\n]+")]
 pub enum Token<'src> {
-  #[token("def")]
-  Def,
+  // Plan 71: `def` is deleted outright (no coexistence period) — `fn`
+  // is the one reserved keyword for a function-shaped declaration now,
+  // matching plan 59's `extern fn` spelling that this plan generalizes
+  // to every function-shaped construct in the language.
+  #[token("fn")]
+  Fn,
   #[token("end")]
   End,
 
@@ -32,8 +36,10 @@ pub enum Token<'src> {
   Comma,
   #[token(":")]
   Colon,
-  #[token("->")]
-  Arrow,
+  // Plan 71: `->` is removed entirely — every return-type position
+  // (a function/method/interface signature) now uses `Colon` instead,
+  // and the lambda literal's own leading `->` introducer is deleted
+  // too (a lambda is a bare `do |params: T| ... end` block).
   #[token("+")]
   Plus,
 
@@ -58,7 +64,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, usize> {
 mod tests {
   use super::*;
 
-  const HELLO_EM: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+  const HELLO_EM: &str = "fn add(a: Int64, b: Int64): Int64\n  a + b\nend\n\nputs add(20, 22)\n";
 
   #[test]
   fn tokenizes_hello_em() {
@@ -66,7 +72,7 @@ mod tests {
     assert_eq!(
       tokens,
       vec![
-        Token::Def,
+        Token::Fn,
         Token::Ident("add"),
         Token::LParen,
         Token::Ident("a"),
@@ -77,7 +83,7 @@ mod tests {
         Token::Colon,
         Token::Ident("Int64"),
         Token::RParen,
-        Token::Arrow,
+        Token::Colon,
         Token::Ident("Int64"),
         Token::Ident("a"),
         Token::Plus,

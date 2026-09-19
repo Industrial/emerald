@@ -199,7 +199,13 @@ ActorDef: ActorDef = {
 // `ensures` in sema regardless (see the Decision log for why the
 // grammar-level fence is simpler here).
 FuncDef: Function = {
-  <is_pure:"pure"?> <comptime:"comptime"?> "def" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <contracts:ContractClause*> <body:Stmt*> "end" => {
+  // Plan 71: `"fn"` replaces `"def"` outright (no coexistence period —
+  // `def foo` is a real parse error from here on), and the return type
+  // moves from a trailing `"->" TypeName` to a trailing `":" TypeName`,
+  // matching plan 59's `extern fn` spelling exactly. A mandatory `"do"`
+  // now separates the signature from `body` — the same disambiguating
+  // role `"do"` plays on `if`/`while` below.
+  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeName> <contracts:ContractClause*> "do" <body:Stmt*> "end" => {
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     for (is_requires, c) in contracts {
@@ -239,7 +245,10 @@ ContractClause: (bool, Contract) = {
 // existing `Params`/`Param` rule for the method's parameter list, the
 // same reuse `ClassField` already makes for class fields.
 InterfaceDef: InterfaceDef = {
-  "interface" <name:Ident> "def" <method_name:Ident> "(" <params:Params> ")" "->" <return_type:TypeName> "end" => {
+  // Plan 71: `"fn"`/`":"` replace `"def"`/`"->"` here too — no `"do"`
+  // added, since an interface method has no body at all (this
+  // production ends directly at `"end"`, nothing to disambiguate).
+  "interface" <name:Ident> "fn" <method_name:Ident> "(" <params:Params> ")" ":" <return_type:TypeName> "end" => {
     InterfaceDef { name, method_name, params, return_type }
   }
 };
@@ -363,7 +372,9 @@ MethodDef: Function = {
   // `type_params` found while registering a class method with a real
   // "generic methods are not supported" diagnostic, never a panic and
   // never a silent accept.
-  <is_pure:"pure"?> <comptime:"comptime"?> "def" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> "->" <return_type:TypeName> <body:Stmt*> "end" => Function {
+  // Plan 71: `"fn"`/`":"`/mandatory `"do"` replace `"def"`/`"->"` here
+  // exactly the same way `FuncDef` above changes.
+  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeName> "do" <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
@@ -474,19 +485,51 @@ CallKwArgs: Vec<(String, Spanned<Expr>)> = {
 // `Expr::Add`/etc.) reuses this same outer `(l, r)` span — there's no
 // real source text for just the synthesized node to point at instead.
 Stmt: Spanned<Stmt> = {
+  // Plan 71's Decision log (leaf-mandatory-explicit-local-types): this
+  // production already required `name: Type = expr` before this plan —
+  // there is no bare, untyped `Stmt::Let` shape anywhere in this
+  // grammar to begin with (an untyped `p = Point.new(...)` parses as
+  // `Stmt::Assign` below instead, never as a fresh `Let`). Investigated
+  // this session and confirmed, not assumed: `emerald-sema`'s own
+  // `Stmt::Assign`/`Stmt::MultiAssign` handling (`check_stmt`/
+  // `check_multi_assign`) already requires every assignment target to
+  // already be present in `env`, raising a real "undefined variable"
+  // diagnostic otherwise (see `rejects_reassignment_of_an_undeclared_
+  // local`/`rejects_multiple_assignment_undefined_target`, both
+  // pre-existing) — so a bare `Stmt::Assign` can never silently
+  // introduce a fresh, untyped local either. No grammar or sema change
+  // was needed for this leaf; the invariant plan 71 asks for was
+  // already fully enforced. This also directly answers this plan's own
+  // open multiple-assignment question: `a, b = b, a` (`Stmt::MultiAssign`
+  // below) gets NO carve-out — `check_multi_assign` already requires
+  // every one of `names` to already be a pre-declared, typed local,
+  // the identical rule plain `Stmt::Assign` enforces, with zero special
+  // casing for the multi-target form.
   <l:@L> <name:Ident> ":" <ty:TypeName> "=" <value:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Let { name, ty, value } },
-  <l:@L> "if" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If { cond, then_branch, else_branch } },
-  <l:@L> "while" <cond:Expr> <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While { cond, body } },
+  // Plan 71: `"do"` is now mandatory right after `cond` — a bare `if
+  // cond` `... end` with no `"do"` is a real parse error, not an
+  // accepted alternate form (Sable design brief §44/§50: `do...end` is
+  // the one executable-block construct across every language feature).
+  // No ambiguity from this addition: `cond` is parsed via the ordinary
+  // `Expr`, which has no production that can itself consume a bare
+  // `"do"` as a continuation (the only `Expr`-reachable production
+  // starting with `"do"` is the lambda literal below, which fully
+  // closes its own `"end"` before this `"do"` is ever reached) —
+  // verified conflict-free against LALRPOP's own conflict report, not
+  // just assumed (see this plan's own Decision log).
+  <l:@L> "if" <cond:Expr> "do" <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If { cond, then_branch, else_branch } },
+  <l:@L> "while" <cond:Expr> "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While { cond, body } },
   // Plan 29: pure parse-time desugaring — no new AST shape, just the
   // condition wrapped in plan 18's `Expr::Not` (see the Decision log).
   // Reuses `ElseClause` as-is, so `unless ... else ... end` falls out
   // for free.
-  <l:@L> "unless" <cond:Expr> <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If {
+  // Plan 71: mandatory `"do"`, mirroring `if`/`while` above exactly.
+  <l:@L> "unless" <cond:Expr> "do" <then_branch:Stmt*> <else_branch:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::If {
     cond: Spanned { span: (l, r), node: Expr::Not(Box::new(cond)) },
     then_branch,
     else_branch,
   }},
-  <l:@L> "until" <cond:Expr> <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While {
+  <l:@L> "until" <cond:Expr> "do" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::While {
     cond: Spanned { span: (l, r), node: Expr::Not(Box::new(cond)) },
     body,
   }},
@@ -575,7 +618,19 @@ Stmt: Spanned<Stmt> = {
   // `CaseArm`'s own trailing `Stmt*` unambiguously stops at the next
   // `"when"`/`"else"`/`"end"`, the same way `"rescue"` already
   // terminates `begin`'s body above.
-  <l:@L> "case" <scrutinee:Expr> <arms:CaseArm+> <else_body:ElseClause?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::Case {
+  // Plan 71: `case`/`when` becomes `match`/`do` — `scrutinee` is
+  // followed by a mandatory `"do"`, each arm supplies its own trailing
+  // `"do" ... "end"` (see `CaseArm` below, `"when"` is gone entirely),
+  // and the default arm spells `_ do ... end` (`MatchWildcard` below)
+  // instead of reusing `ElseClause` (which still serves `if`/`unless`'s
+  // own `else`/`elsif` unchanged, but is no longer reachable from here
+  // — an `elsif` after a match arm was never meaningful and is now a
+  // real parse error instead of a silently-accepted no-op). Deliberately
+  // feeds the exact same `else_body` field `case`/`when`'s own `else`
+  // used to, rather than adding a `CasePattern::Wildcard` variant —
+  // keeps the AST's own shape untouched, so `emerald-codegen`'s existing
+  // `else_body: Option<...>` handling needs zero changes.
+  <l:@L> "match" <scrutinee:Expr> "do" <arms:CaseArm+> <else_body:MatchWildcard?> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::Case {
     scrutinee,
     arms,
     else_body,
@@ -588,7 +643,11 @@ Stmt: Spanned<Stmt> = {
   // (`CaseValues`) and `Ident` (plan 52's `Variant` pattern), so there
   // is no FIRST-set overlap to resolve). Both arms mandatory, fixed
   // order, no `else`.
-  <l:@L> "case" <scrutinee:Expr> "when" "Ok" "(" <ok_var:Ident> ")" <ok_body:Stmt*> "when" "Err" "(" <err_var:Ident> ")" <err_body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Stmt::MatchResult {
+  // Plan 71: same `case`/`when` → `match`/`do` cutover, applied to this
+  // dedicated `Result[T, E]` destructuring form — `"Ok"`/`"Err"` stay
+  // the disambiguating first token right after `match ... do`, exactly
+  // as they did right after `case ... when` before.
+  <l:@L> "match" <scrutinee:Expr> "do" "Ok" "(" <ok_var:Ident> ")" "do" <ok_body:Stmt*> "end" "Err" "(" <err_var:Ident> ")" "do" <err_body:Stmt*> "end" "end" <r:@R> => Spanned { span: (l, r), node: Stmt::MatchResult {
     scrutinee,
     ok_var,
     ok_body,
@@ -1007,7 +1066,8 @@ ElseClause: Vec<Spanned<Stmt>> = {
   // rest of the chain (another `elsif`, a trailing `else`, or nothing)
   // as this nested `If`'s own `else_branch`. No new AST variant; see
   // the Decision log.
-  <l:@L> "elsif" <cond:Expr> <then_branch:Stmt*> <rest:ElseClause?> <r:@R> => vec![Spanned { span: (l, r), node: Stmt::If {
+  // Plan 71: mandatory `"do"` here too, same reasoning as `if` itself.
+  <l:@L> "elsif" <cond:Expr> "do" <then_branch:Stmt*> <rest:ElseClause?> <r:@R> => vec![Spanned { span: (l, r), node: Stmt::If {
     cond,
     then_branch,
     else_branch: rest,
@@ -1039,10 +1099,31 @@ CaseValues: Vec<Spanned<Expr>> = {
 // from the pre-existing `CaseValues` alternative by the very first
 // token after `"when"` (`Num` vs. `Ident`) — no FIRST-set overlap.
 CaseArm: CaseArm = {
-  "when" <values:CaseValues> <body:Stmt*> => (CasePattern::Values(values), body),
-  "when" <name:Ident> "(" <bindings:BindingNames> ")" <body:Stmt*> => {
+  // Plan 71: `"when"` is gone — each arm's own leading token (`Num`
+  // for `CaseValues`, `Ident` for `Variant`) still disambiguates the
+  // two alternatives with no FIRST-set overlap, exactly as it did right
+  // after `"when"` before; each arm now closes its own `"do" ... "end"`
+  // instead of running until the next `"when"`/`"else"`/`"end"`.
+  <values:CaseValues> "do" <body:Stmt*> "end" => (CasePattern::Values(values), body),
+  <name:Ident> "(" <bindings:BindingNames> ")" "do" <body:Stmt*> "end" => {
     (CasePattern::Variant { name, bindings }, body)
   },
+};
+
+// Plan 71's Decision log: `match`'s own default arm spells `_ do ...
+// end` — Sable's own wildcard convention, replacing whatever spelling
+// `case`/`when`'s own default arm (a trailing bare `else`) used before.
+// `"_"` is a genuinely new reserved literal token here: LALRPOP's
+// tokenizer prioritizes an explicit literal over the generic `Ident`
+// regex at an equal-length match, the same "reserve a new keyword"
+// idiom this file already uses for `new`/`read`/`do`/etc., so a real,
+// user-declared variable or class named `_` cannot shadow this arm.
+// A dedicated nonterminal (not folded into `CaseArm` itself) so the
+// resulting `Vec<Stmt>` can feed `Stmt::Case.else_body` directly — no
+// `CasePattern::Wildcard` variant needed, keeping the AST's own shape
+// (and `emerald-codegen`'s existing handling of it) untouched.
+MatchWildcard: Vec<Spanned<Stmt>> = {
+  "_" "do" <body:Stmt*> "end" => body,
 };
 
 // Left-recursive, trailing-comma list of plain `Ident`s — a pattern
@@ -1282,17 +1363,37 @@ PrimaryExpr: Spanned<Expr> = {
   },
   <l:@L> <recv:Ident> "&." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   <l:@L> "[" <elements:Args> "]" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayLit(elements) },
-  // `->(params) -> ReturnType { body }` — plan 10's lambda literal.
-  // `"->"` doesn't start any other `PrimaryExpr` alternative, so this
-  // can't collide with the FuncDef-return-arrow usage of `"->"` or
-  // anything else. `{`/`}` are no longer this grammar's only brace use
-  // (plan 25's `HashPairs` below is the other) — this production's `{`
-  // only ever appears after `"->" "(" ... ")" "->" TypeName` is already
-  // consumed, never as `PrimaryExpr`'s own first token, so it's in a
-  // disjoint parser state from `HashPairs`' leading `"{"`.
-  <l:@L> "->" "(" <params:Params> ")" "->" <return_type:TypeName> "{" <body:Stmt*> "}" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
+  // Plan 71: plan 10's `->(params) -> ReturnType { body }` lambda
+  // literal is deleted outright, not arrow-shortened — Sable has no
+  // separate lambda syntax at all (design brief §10/§11). A function
+  // value is a bare `do |params: T| ... end` block used directly as an
+  // ordinary expression, typed entirely by its surrounding context
+  // (e.g. the `fn(Int64, Int64): Int64` annotation on the binding it's
+  // assigned to, or a bare `Proc` annotation) — never by its own
+  // literal syntax, which is why this alternative carries no return
+  // type of its own at all. `return_type` is set to the same `"Void"`
+  // placeholder `BlockLiteral` below already uses for its own
+  // no-return-type block — `emerald-sema` does not yet infer a lambda's
+  // real return type from its binding's context (a real, disclosed gap
+  // this plan's own narrow scope leaves for a follow-on plan; see this
+  // plan's Decision log).
+  //
+  // Deliberately reachable only from `PrimaryExpr`, NOT from
+  // `StmtPrimaryExpr` — this plan's own named risk (a bare `do...end`
+  // block used as an expression colliding with `if`/`while`'s own
+  // mandatory `"do"`, or with `match`'s own `"do"`) is resolved
+  // primarily by this exact restriction, mirroring the established
+  // precedent immediately above `StmtPrimaryExpr` itself (a bare array/
+  // hash literal is likewise excluded from Stmt-initial position, for
+  // the identical reason: something useless as a standalone statement
+  // costs nothing real to forbid there, and forbidding it sidesteps a
+  // real ambiguity). Verified conflict-free by an actual LALRPOP build
+  // with zero shift/reduce or reduce/reduce conflicts reported, not
+  // assumed safe from this reasoning alone — see this plan's own
+  // Decision log for the full argument this comment summarizes.
+  <l:@L> "do" "|" <params:Params> "|" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
     params,
-    return_type,
+    return_type: "Void".to_string(),
     body,
   }},
   <l:@L> <f:FloatLit> <r:@R> => Spanned { span: (l, r), node: Expr::Float(f) },

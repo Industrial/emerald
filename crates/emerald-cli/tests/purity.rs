@@ -52,13 +52,13 @@ fn detected_core_count() -> usize {
 /// own illustrative bare `if ... else ... end` shorthand (a real,
 /// disclosed adaptation around an unrelated, pre-existing codegen gap,
 /// documented there in full).
-const FIB_WORKER_EXAMPLE: &str = "pure def fib(n: Int64) -> Int64\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nactor Worker\n  def run(n: Int64) -> Void\n    puts fib(n)\n  end\nend\n\nw1: Worker = Worker.spawn()\nw2: Worker = Worker.spawn()\nw1.run(30)\nw2.run(31)\n";
+const FIB_WORKER_EXAMPLE: &str = "pure fn fib(n: Int64): Int64 do\n  if n < 2 do\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nactor Worker\n  fn run(n: Int64): Void do\n    puts fib(n)\n  end\nend\n\nw1: Worker = Worker.spawn()\nw2: Worker = Worker.spawn()\nw1.run(30)\nw2.run(31)\n";
 
 /// AC3's own baseline unit: a single `Worker`, a single `run(31)` send —
 /// `fib(31)` is the larger of the two calls the concurrent example
 /// makes, so this is "the single larger call's own time" the plan's own
 /// wording names.
-const SINGLE_FIB31_EXAMPLE: &str = "pure def fib(n: Int64) -> Int64\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nactor Worker\n  def run(n: Int64) -> Void\n    puts fib(n)\n  end\nend\n\nw1: Worker = Worker.spawn()\nw1.run(31)\n";
+const SINGLE_FIB31_EXAMPLE: &str = "pure fn fib(n: Int64): Int64 do\n  if n < 2 do\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nactor Worker\n  fn run(n: Int64): Void do\n    puts fib(n)\n  end\nend\n\nw1: Worker = Worker.spawn()\nw1.run(31)\n";
 
 fn assert_expected_fib_outputs(output: &Output) {
   assert!(
@@ -156,7 +156,7 @@ fn a_pure_function_performing_io_is_rejected_by_the_real_cli() {
 
   std::fs::write(
     &src_path,
-    "pure def bad(x: Int64) -> Int64\n  puts x\n  return x\nend\n\nputs bad(5)\n",
+    "pure fn bad(x: Int64): Int64 do\n  puts x\n  return x\nend\n\nputs bad(5)\n",
   )
   .unwrap();
 
@@ -193,7 +193,7 @@ fn a_pure_function_sending_to_an_actor_is_rejected_by_the_real_cli() {
 
   std::fs::write(
     &src_path,
-    "actor Worker\n  def run(n: Int64) -> Void\n    puts n\n  end\nend\n\npure def bad2(w: Worker) -> Void\n  w.run(5)\nend\n\nw: Worker = Worker.spawn()\nbad2(w)\n",
+    "actor Worker\n  fn run(n: Int64): Void do\n    puts n\n  end\nend\n\npure fn bad2(w: Worker): Void do\n  w.run(5)\nend\n\nw: Worker = Worker.spawn()\nbad2(w)\n",
   )
   .unwrap();
 

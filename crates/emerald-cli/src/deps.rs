@@ -331,7 +331,7 @@ mod tests {
       assert!(status.success(), "git {args:?} failed");
     };
     run(&["init", "-q", "-b", "main"]);
-    std::fs::write(dir.join("lib.em"), "def five() -> Int64\n  5\nend\n").unwrap();
+    std::fs::write(dir.join("lib.em"), "fn five(): Int64 do\n  5\nend\n").unwrap();
     run(&["add", "."]);
     run(&["commit", "-q", "-m", "initial"]);
     dir.to_string_lossy().into_owned()
@@ -342,7 +342,7 @@ mod tests {
     let root = fresh_dir("path");
     let lib_dir = root.join("mathutils");
     std::fs::create_dir_all(&lib_dir).unwrap();
-    std::fs::write(lib_dir.join("lib.em"), "def add() -> Int64\n  8\nend\n").unwrap();
+    std::fs::write(lib_dir.join("lib.em"), "fn add(): Int64 do\n  8\nend\n").unwrap();
 
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();

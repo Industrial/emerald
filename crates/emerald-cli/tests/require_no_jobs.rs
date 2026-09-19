@@ -63,7 +63,7 @@ fn compile_and_run(dir: &std::path::Path, entry: &str) -> (bool, String, String)
 #[test]
 fn a_bare_no_jobs_require_of_a_plain_function_splices_and_runs() {
   let dir = fresh_dir("plain-function");
-  std::fs::write(dir.join("helper.em"), "def helper() -> Int64\n  5\nend\n").unwrap();
+  std::fs::write(dir.join("helper.em"), "fn helper(): Int64 do\n  5\nend\n").unwrap();
   std::fs::write(dir.join("main.em"), "require helper\nputs helper() + 1\n").unwrap();
 
   let (ok, stdout, stderr) = compile_and_run(&dir, "main.em");
@@ -97,7 +97,7 @@ fn a_bare_no_jobs_require_of_an_actor_declaring_file_splices_links_and_runs() {
   let dir = fresh_dir("actor");
   std::fs::write(
     dir.join("counter_actor.em"),
-    "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def report -> Void\n    puts @count\n  end\nend\n",
+    "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn report: Void do\n    puts @count\n  end\nend\n",
   )
   .unwrap();
   std::fs::write(
@@ -122,7 +122,7 @@ fn a_bare_no_jobs_actor_require_no_longer_reports_unknown_type_or_undefined_vari
   let dir = fresh_dir("actor-diagnostics");
   std::fs::write(
     dir.join("counter_actor.em"),
-    "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def report -> Void\n    puts @count\n  end\nend\n",
+    "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn report: Void do\n    puts @count\n  end\nend\n",
   )
   .unwrap();
   std::fs::write(

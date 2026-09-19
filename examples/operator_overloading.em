@@ -2,16 +2,16 @@ class Vector2
   read x: Float64
   read y: Float64
 
-  def initialize(x: Float64, y: Float64) -> Void
+  fn initialize(x: Float64, y: Float64): Void do
     @x = x
     @y = y
   end
 
-  def +(other: Vector2) -> Vector2
+  fn +(other: Vector2): Vector2 do
     Vector2.new(@x + other.x, @y + other.y)
   end
 
-  def ==(other: Vector2) -> Boolean
+  fn ==(other: Vector2): Boolean do
     @x == other.x && @y == other.y
   end
 end
@@ -21,12 +21,12 @@ v2: Vector2 = Vector2.new(3.0, 4.0)
 v3: Vector2 = v1 + v2
 puts v3.x
 puts v3.y
-if v1 == v2
+if v1 == v2 do
   puts 1
 else
   puts 0
 end
-if v1 == v1
+if v1 == v1 do
   puts 1
 else
   puts 0

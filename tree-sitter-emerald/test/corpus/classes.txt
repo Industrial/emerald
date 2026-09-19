@@ -5,15 +5,15 @@ classes.em — fields, initialize, instance vars, .new, method calls
 class Counter
   value: Int64
 
-  def initialize(start: Int64) -> Void
+  fn initialize(start: Int64): Void do
     @value = start
   end
 
-  def value -> Int64
+  fn value: Int64 do
     @value
   end
 
-  def add(n: Int64) -> Int64
+  fn add(n: Int64): Int64 do
     @value + n
   end
 end
@@ -26,12 +26,12 @@ class Point
   x: Float64
   y: Float64
 
-  def initialize(x: Float64, y: Float64) -> Void
+  fn initialize(x: Float64, y: Float64): Void do
     @x = x
     @y = y
   end
 
-  def sum -> Float64
+  fn sum: Float64 do
     @x + @y
   end
 end

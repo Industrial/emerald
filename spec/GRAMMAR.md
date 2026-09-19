@@ -123,7 +123,7 @@ name: String? = user&.name
 
 **Example (KEEP: `if` as a typed expression):**
 ```ruby
-label: String = if x > 5
+label: String = if x > 5 do
   "big"
 else
   "small"
@@ -136,7 +136,7 @@ end
 
 | Ruby grammar area | Status | Emerald form / reason |
 |---|---|---|
-| `def name(params) ... end` | MODIFY | Every parameter requires a type annotation; the method requires an explicit return-type annotation (`-> T`). This is inception §6's headline example. |
+| `fn name(params): T do ... end` | MODIFY | Every parameter requires a type annotation; the method requires an explicit return-type annotation, a trailing `: T` (superseded from `-> T` by the Sable-alignment grammar cutover, `history/2026-09-19T110000Z-plan-71-grammar-unification-fn-and-do-end.md`). This is inception §6's headline example, in its current spelling. |
 | Default parameter values (`def f(x = 1)`) | KEEP | Default expression's type must match the parameter's declared type. |
 | Keyword parameters (`def f(x:, y: 1)`) | KEEP | Same annotation requirement as positional parameters; see `SEMANTICS.md` §3 (Methods) for whether they're retained project-wide. |
 | Splat parameters (`def f(*xs)`) | UNDECIDED | Requires deciding `xs`'s static element type and arity checking — tracked in `SEMANTICS.md` §3; not required for inception §17's first three milestones. |
@@ -151,7 +151,7 @@ end
 
 **Example (MODIFY: typed method definition, inception §6's own example):**
 ```ruby
-def add(a: Int64, b: Int64) -> Int64
+fn add(a: Int64, b: Int64): Int64 do
   a + b
 end
 ```
@@ -202,7 +202,7 @@ class Point
   x: Float64
   y: Float64
 
-  def initialize(x: Float64, y: Float64) -> Void
+  fn initialize(x: Float64, y: Float64): Void do
     @x = x
     @y = y
   end
@@ -216,7 +216,7 @@ end
 | Ruby grammar area | Status | Emerald form / reason |
 |---|---|---|
 | `{ |x| ... }` / `do |x| ... end` block literal | KEEP, scope-limited | Kept "if they can be represented cleanly" per inception §5; block parameter types must be statically inferable from the call site. |
-| `->(x) { ... }` lambda literal | KEEP, scope-limited | Same scoping condition as blocks. |
+| `->(x) -> T { ... }` lambda literal | SUPERSEDED | Deleted outright by the Sable-alignment grammar cutover (plan 71) — a lambda is now a bare `do |x: T| ... end` block used directly as an expression, typed by context, with no arrow anywhere; see `history/2026-09-19T110000Z-plan-71-grammar-unification-fn-and-do-end.md`. |
 | `Proc.new { ... }` | REMOVE | Redundant with lambda literal syntax once procs are statically typed; one closure literal form is simpler (inception §22 rule 3/10). |
 | `proc { ... }` | REMOVE | Same reasoning as `Proc.new`. |
 | Block-local variables (`{ |x; y| ... }`) | KEEP | No new semantics beyond ordinary scoping. |
@@ -312,5 +312,6 @@ methods, not separate syntax):
 
 - Every `UNDECIDED` row above is answered, deferred, or locked in
   [`SEMANTICS.md`](./SEMANTICS.md).
-- Type-annotation syntax (`x: T`, `-> T`) is defined precisely in
-  [`TYPE_SYSTEM.md`](./TYPE_SYSTEM.md).
+- Type-annotation syntax (`x: T`, a function's trailing `: T` return type —
+  `-> T` before the Sable-alignment grammar cutover, see plan 71) is defined
+  precisely in [`TYPE_SYSTEM.md`](./TYPE_SYSTEM.md).

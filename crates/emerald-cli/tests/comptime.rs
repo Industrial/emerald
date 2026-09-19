@@ -7,7 +7,7 @@
 
 use std::process::Command;
 
-const SPIN_SRC: &str = "comptime def spin(n: Int64) -> Int64\n  i: Int64 = 0\n  while true\n    i = i + 1\n  end\n  return i\nend\n\nX: Int64 = comptime spin(1)\nputs X\n";
+const SPIN_SRC: &str = "comptime fn spin(n: Int64): Int64 do\n  i: Int64 = 0\n  while true do\n    i = i + 1\n  end\n  return i\nend\n\nX: Int64 = comptime spin(1)\nputs X\n";
 
 #[test]
 fn comptime_step_limit_flag_fails_compilation_with_the_step_ceiling_diagnostic() {
@@ -56,7 +56,7 @@ fn comptime_factorial_worked_example_compiles_and_runs_via_the_real_cli() {
 
   std::fs::write(
     &src_path,
-    "comptime def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\nputs FACT10\n",
+    "comptime fn factorial(n: Int64): Int64 do\n  if n <= 1 do\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\nputs FACT10\n",
   )
   .unwrap();
 

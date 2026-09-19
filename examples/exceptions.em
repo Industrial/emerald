@@ -1,17 +1,17 @@
 class MyError
   code: Int64
 
-  def initialize(code: Int64) -> Void
+  fn initialize(code: Int64): Void do
     @code = code
   end
 
-  def code -> Int64
+  fn code: Int64 do
     @code
   end
 end
 
-def risky(x: Int64) -> Int64
-  if x > 100
+fn risky(x: Int64): Int64 do
+  if x > 100 do
     raise MyError.new(99)
   end
   return x
@@ -32,12 +32,12 @@ end
 attempts: Int64 = 0
 begin
   attempts: Int64 = attempts + 1
-  if attempts < 2
+  if attempts < 2 do
     raise MyError.new(1)
   end
   puts attempts
 rescue MyError => e
-  if attempts < 2
+  if attempts < 2 do
     retry
   end
   puts 999

@@ -91,7 +91,7 @@ async fn check_source_reports_a_real_line_and_column_for_a_sema_type_mismatch() 
   let result = call(
     &client,
     "check_source",
-    serde_json::json!({ "source": "def add(a: Int64, b: String) -> Int64\n  a + b\nend\n" }),
+    serde_json::json!({ "source": "fn add(a: Int64, b: String): Int64 do\n  a + b\nend\n" }),
   )
   .await;
   let diagnostics = result["diagnostics"].as_array().expect("diagnostics array");

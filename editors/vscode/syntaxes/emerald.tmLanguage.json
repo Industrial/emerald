@@ -61,14 +61,15 @@
 			"match": "@[A-Za-z_][A-Za-z0-9_]*"
 		},
 		"keywords": {
+			"comment": "Plan 71: 'def' -> 'fn'; 'case'/'when' are deleted outright in favor of 'match', with every arm (including the '_' wildcard default) now closed by its own 'do' ... 'end' — 'do' also becomes mandatory after if/unless/while/until/elsif's own condition, and introduces the bare do|params| ... end lambda literal (plan 10's arrow-lambda is gone).",
 			"patterns": [
 				{
 					"name": "keyword.control.emerald",
-					"match": "\\b(if|else|elsif|unless|while|until|for|in|return|break|next|begin|rescue|ensure|retry|case|when|yield)\\b"
+					"match": "\\b(if|else|elsif|unless|while|until|for|in|return|break|next|begin|rescue|ensure|retry|match|do|yield)\\b"
 				},
 				{
 					"name": "keyword.other.emerald",
-					"match": "\\b(class|module|def|end|interface|implements|require|read|new|puts|raise)\\b"
+					"match": "\\b(class|module|fn|end|interface|implements|require|read|new|puts|raise)\\b"
 				}
 			]
 		},
@@ -100,9 +101,9 @@
 			"match": "[(){}\\[\\]]"
 		},
 		"operators": {
-			"comment": "Every literal operator/punctuation terminal in grammar.lalrpop, longest first so e.g. '<=>' wins over '<=' wins over '<'.",
+			"comment": "Every literal operator/punctuation terminal in grammar.lalrpop, longest first so e.g. '<=>' wins over '<=' wins over '<'. Plan 71: '->' is deleted from the grammar outright (every return-type position now uses ':') and is not matched here any more.",
 			"name": "keyword.operator.emerald",
-			"match": "(\\.\\.\\.|<=>|\\|\\|=|&&=|==|!=|>=|<=|&\\.|->|=>|\\+=|-=|\\*=|/=|%=|\\|\\||&&|<<|>>|\\.\\.|\\+|-|\\*|/|%|=|>|<|!|~|&|\\||\\^|\\?|\\.|,|:)"
+			"match": "(\\.\\.\\.|<=>|\\|\\|=|&&=|==|!=|>=|<=|&\\.|=>|\\+=|-=|\\*=|/=|%=|\\|\\||&&|<<|>>|\\.\\.|\\+|-|\\*|/|%|=|>|<|!|~|&|\\||\\^|\\?|\\.|,|:)"
 		},
 		"identifiers": {
 			"name": "variable.other.emerald",

@@ -41,7 +41,7 @@ fn rejects_type_mismatch_with_nonzero_exit_and_stderr_diagnostic() {
   let src_path = dir.join(format!("emerald_bad_{}.em", std::process::id()));
   std::fs::write(
     &src_path,
-    "def add(a: Int64, b: String) -> Int64\n  a + b\nend\n",
+    "fn add(a: Int64, b: String): Int64 do\n  a + b\nend\n",
   )
   .unwrap();
   let output_path = dir.join(format!("emerald_bad_out_{}", std::process::id()));
@@ -81,7 +81,7 @@ fn sema_type_mismatch_renders_a_miette_source_snippet_with_a_caret_at_b() {
   let src_path = dir.join(format!("emerald_sema_span_{}.em", std::process::id()));
   std::fs::write(
     &src_path,
-    "def add(a: Int64, b: String) -> Int64\n  a + b\nend\n",
+    "fn add(a: Int64, b: String): Int64 do\n  a + b\nend\n",
   )
   .unwrap();
   let output_path = dir.join(format!("emerald_sema_span_out_{}", std::process::id()));

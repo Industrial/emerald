@@ -18,7 +18,7 @@ fn emit_escape_report_prints_the_real_stack_and_heap_counts() {
   // by returning directly (heap), for a real 1-stack/1-heap program.
   std::fs::write(
     &src_path,
-    "class Point\n  x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\ndef distance_squared(x: Int64, y: Int64) -> Int64\n  p: Point = Point.new(x, y)\n  x * x + y * y\nend\n\ndef make_point(x: Int64, y: Int64) -> Point\n  p: Point = Point.new(x, y)\n  p\nend\n\nputs distance_squared(3, 4)\nq: Point = make_point(1, 2)\n",
+    "class Point\n  x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\nfn distance_squared(x: Int64, y: Int64): Int64 do\n  p: Point = Point.new(x, y)\n  x * x + y * y\nend\n\nfn make_point(x: Int64, y: Int64): Point do\n  p: Point = Point.new(x, y)\n  p\nend\n\nputs distance_squared(3, 4)\nq: Point = make_point(1, 2)\n",
   )
   .unwrap();
 

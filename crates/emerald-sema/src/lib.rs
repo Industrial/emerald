@@ -3418,9 +3418,27 @@ fn infer_hash_lit_type(
 /// scope's locals plus the lambda's own params, no `@field` access (`None`
 /// self_fields; plan 10's Decision log restricts lambdas to top-level
 /// `Let`s, where there's no enclosing method anyway).
+///
+/// Plan 71's Decision log: after the grammar unification, a lambda
+/// literal's surface syntax (`do |params: T| ... end`) no longer states
+/// a return type at all — `return_type` here is always the `"Void"`
+/// placeholder the parser fills in (see `Expr::Lambda`'s own doc
+/// comment), never a real user-written annotation. Unlike an ordinary
+/// function/method (whose `return_type` is mandatory, real, surface
+/// syntax and is *checked against*), a lambda's return type is instead
+/// *inferred* from its own body — the type of the body's trailing
+/// implicit-return expression (or of an explicit `return <expr>` in
+/// that same trailing position), falling back to `Void` for an empty
+/// body or one that doesn't end in either shape. This closes the
+/// disclosed gap plan 71 itself left open: every one of this crate's
+/// existing Proc-consuming call sites (`.select`/`.map`/`.reduce`/
+/// `.count`/generic-function binding/etc.) reads the real signature
+/// back out of `env` (see `check_stmt`'s own `Proc`-typed `Let` case),
+/// so a bogus `Void` here previously broke every one of them, not just
+/// a body/return-type mismatch on the lambda itself.
 fn infer_lambda_type(
   params: &[Param],
-  return_type: &str,
+  _return_type: &str,
   body: &[Spanned<Stmt>],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
@@ -3434,7 +3452,18 @@ fn infer_lambda_type(
     param_types.push(t.clone());
     lambda_env.insert(p.name.clone(), t);
   }
-  let declared_return = resolve_type(return_type, classes)?;
+  let inferred_return = match body.last() {
+    None => Type::Void,
+    Some(Spanned {
+      node: Stmt::Expr(e),
+      ..
+    })
+    | Some(Spanned {
+      node: Stmt::Return(Some(e)),
+      ..
+    }) => infer_expr_type(e, &lambda_env, sigs, classes, None, gctx)?,
+    Some(_) => Type::Void,
+  };
   // Plan 34: `yields_allowed = false` — a lambda/block literal's own
   // body is never itself a `yield`-legal context (only a function/
   // method that declares `block_param` is), whether this is plan 10's
@@ -3446,7 +3475,7 @@ fn infer_lambda_type(
     sigs,
     classes,
     None,
-    &declared_return,
+    &inferred_return,
     false,
     false,
     false,
@@ -3458,11 +3487,11 @@ fn infer_lambda_type(
     sigs,
     classes,
     None,
-    &declared_return,
+    &inferred_return,
     "<lambda>",
     gctx,
   )?;
-  Ok(Type::Proc(param_types, Box::new(declared_return)))
+  Ok(Type::Proc(param_types, Box::new(inferred_return)))
 }
 
 /// All elements of an array literal must share one type, and — since
@@ -8990,7 +9019,7 @@ fn check_generic_function_body(
 mod tests {
   use super::*;
 
-  const HELLO_EM: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+  const HELLO_EM: &str = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
 
   #[test]
   fn accepts_hello_em() {
@@ -9000,7 +9029,7 @@ mod tests {
 
   #[test]
   fn rejects_inception_25e_mismatch_with_useful_diagnostic() {
-    let src = "def add(a: Int64, b: String) -> Int64\n  a + b\nend";
+    let src = "fn add(a: Int64, b: String): Int64 do\n  a + b\nend";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject Int64 + String");
     assert_eq!(errs.len(), 1);
@@ -9014,7 +9043,7 @@ mod tests {
 
   #[test]
   fn rejects_undefined_variable_without_panicking() {
-    let src = "def add(a: Int64) -> Int64\n  a + b\nend";
+    let src = "fn add(a: Int64): Int64 do\n  a + b\nend";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject undefined `b`");
     assert!(errs[0].message.contains("undefined variable `b`"));
@@ -9027,7 +9056,7 @@ mod tests {
     // argument(s)" — a real, plan-required diagnostic improvement (AC4:
     // "a compile-time arity diagnostic naming the missing required
     // parameter").
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject 1-arg call to 2-arg add");
     assert!(errs
@@ -9037,7 +9066,7 @@ mod tests {
 
   #[test]
   fn rejects_too_many_arguments_to_a_non_splat_function() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(1, 2, 3)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(1, 2, 3)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a 3-arg call to a 2-arg add");
     assert!(errs
@@ -9055,7 +9084,7 @@ mod tests {
       .any(|d| d.message.contains("undefined function `undefined_fn`")));
   }
 
-  const MILESTONE2: &str = "x: Int64 = 10\n\nif x > 5\n  puts x\nend\n";
+  const MILESTONE2: &str = "x: Int64 = 10\n\nif x > 5 do\n  puts x\nend\n";
 
   #[test]
   fn accepts_inception_milestone2_example() {
@@ -9065,7 +9094,7 @@ mod tests {
 
   #[test]
   fn rejects_non_boolean_if_condition() {
-    let src = "x: Int64 = 10\n\nif x\n  puts x\nend\n";
+    let src = "x: Int64 = 10\n\nif x do\n  puts x\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject non-Boolean if condition");
     assert!(errs[0].message.contains("must be Boolean"));
@@ -9081,12 +9110,12 @@ mod tests {
 
   #[test]
   fn accepts_while_loop_with_break() {
-    let src = "x: Int64 = 0\n\nwhile x < 3\n  x: Int64 = x + 1\n  break\nend\n";
+    let src = "x: Int64 = 0\n\nwhile x < 3 do\n  x: Int64 = x + 1\n  break\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
-  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn sum: Float64 do\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
 
   #[test]
   fn accepts_inception_point_example() {
@@ -9097,7 +9126,7 @@ mod tests {
   #[test]
   fn rejects_field_assignment_type_mismatch() {
     let src =
-      "class Point\n  x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = 1\n  end\nend\n";
+      "class Point\n  x: Float64\n\n  fn initialize(x: Float64): Void do\n    @x = 1\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject Int64 assigned to a Float64 field");
     let msg = &errs[0].message;
@@ -9186,7 +9215,7 @@ mod tests {
   }
 
   const LAMBDA_EXAMPLE: &str =
-    "x: Int64 = 10\nadd_x: Proc = ->(y: Int64) -> Int64 { y + x }\nputs add_x.call(5)\n";
+    "x: Int64 = 10\nadd_x: Proc = do |y: Int64| y + x end\nputs add_x.call(5)\n";
 
   #[test]
   fn accepts_lambda_capture_and_call() {
@@ -9196,7 +9225,7 @@ mod tests {
 
   #[test]
   fn rejects_call_arity_mismatch() {
-    let src = "add_x: Proc = ->(y: Int64) -> Int64 { y }\nputs add_x.call(5, 6)\n";
+    let src = "add_x: Proc = do |y: Int64| y end\nputs add_x.call(5, 6)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject 2-arg call to a 1-param Proc");
     assert!(errs
@@ -9206,7 +9235,7 @@ mod tests {
 
   #[test]
   fn rejects_call_argument_type_mismatch() {
-    let src = "add_x: Proc = ->(y: Int64) -> Int64 { y }\nputs add_x.call(1.5)\n";
+    let src = "add_x: Proc = do |y: Int64| y end\nputs add_x.call(1.5)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject a Float64 argument to an Int64 param");
@@ -9223,7 +9252,7 @@ mod tests {
     assert!(errs[0].message.contains("non-Proc type"));
   }
 
-  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
+  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
 
   #[test]
   fn accepts_raise_and_rescue() {
@@ -9249,7 +9278,7 @@ mod tests {
     assert!(errs[0].message.contains("must name a class"));
   }
 
-  const MODULE_EXAMPLE: &str = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
+  const MODULE_EXAMPLE: &str = "module MathUtils\n  fn double(x: Int64): Int64 do\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
 
   #[test]
   fn accepts_module_namespaced_call() {
@@ -9259,7 +9288,7 @@ mod tests {
 
   #[test]
   fn rejects_instantiating_a_module() {
-    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.new()\n";
+    let src = "module MathUtils\n  fn double(x: Int64): Int64 do\n    x + x\n  end\nend\n\nputs MathUtils.new()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject `.new` on a module");
     assert!(errs[0].message.contains("cannot `.new` module"));
@@ -9267,7 +9296,7 @@ mod tests {
 
   #[test]
   fn rejects_undeclared_module_method() {
-    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.missing(1)\n";
+    let src = "module MathUtils\n  fn double(x: Int64): Int64 do\n    x + x\n  end\nend\n\nputs MathUtils.missing(1)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject an undeclared module method");
     assert!(errs
@@ -9277,7 +9306,7 @@ mod tests {
 
   #[test]
   fn rejects_module_call_arity_mismatch() {
-    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(1, 2)\n";
+    let src = "module MathUtils\n  fn double(x: Int64): Int64 do\n    x + x\n  end\nend\n\nputs MathUtils.double(1, 2)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject a 2-arg call to a 1-param module method");
@@ -9288,7 +9317,7 @@ mod tests {
 
   #[test]
   fn rejects_module_used_as_a_type_annotation() {
-    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nx: MathUtils = 5\n";
+    let src = "module MathUtils\n  fn double(x: Int64): Int64 do\n    x + x\n  end\nend\n\nx: MathUtils = 5\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a module used as a type annotation");
     assert!(errs[0].message.contains("unknown type"));
@@ -9296,8 +9325,8 @@ mod tests {
 
   // Plan 18 (arithmetic & logical operators).
 
-  const ARITHMETIC_EXAMPLE: &str = "def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
-  const SHORT_CIRCUIT_EXAMPLE: &str = "def noisy(n: Int64) -> Boolean\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1)\n  puts 100\nend\nif x > -10 && noisy(3)\n  puts 300\nend\nif x < 0 || noisy(2)\n  puts 200\nend\nif x > 0 || noisy(4)\n  puts 400\nend\n";
+  const ARITHMETIC_EXAMPLE: &str = "fn factorial(n: Int64): Int64 do\n  if n <= 1 do\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
+  const SHORT_CIRCUIT_EXAMPLE: &str = "fn noisy(n: Int64): Boolean do\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1) do\n  puts 100\nend\nif x > -10 && noisy(3) do\n  puts 300\nend\nif x < 0 || noisy(2) do\n  puts 200\nend\nif x > 0 || noisy(4) do\n  puts 400\nend\n";
 
   #[test]
   fn accepts_arithmetic_example() {
@@ -9333,7 +9362,7 @@ mod tests {
     // real, disclosed gap outside plan 18's scope) — `5 && 3 > 1`
     // still exercises the intended shape since `&&` binds looser than
     // comparison, so the right operand is `3 > 1` either way.
-    let src = "if 5 && 3 > 1\n  puts 1\nend\n";
+    let src = "if 5 && 3 > 1 do\n  puts 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject `5 && ...`");
     assert!(errs[0].message.contains("Boolean"));
@@ -9379,14 +9408,14 @@ mod tests {
 
   #[test]
   fn accepts_string_equality_compare() {
-    let src = "if \"abc\" == \"abc\"\n  puts 1\nend\n";
+    let src = "if \"abc\" == \"abc\" do\n  puts 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   // Plan 20 (comments and case/when).
 
-  const CASE_EXAMPLE: &str = "n: Int64 = 2\nlabel: Int64 = 0\ncase n\nwhen 1\n  label: Int64 = 10\nwhen 2, 3\n  label: Int64 = 20\nelse\n  label: Int64 = 99\nend\nputs label\n";
+  const CASE_EXAMPLE: &str = "n: Int64 = 2\nlabel: Int64 = 0\nmatch n do\n  1 do  label: Int64 = 10\n  end\n  2, 3 do  label: Int64 = 20\n  end\n  _ do  label: Int64 = 99\n  end\nend\nputs label\n";
 
   #[test]
   fn accepts_case_when_example() {
@@ -9396,7 +9425,7 @@ mod tests {
 
   #[test]
   fn rejects_float64_case_scrutinee() {
-    let src = "n: Float64 = 1.0\ncase n\nwhen 1\n  puts 1\nend\n";
+    let src = "n: Float64 = 1.0\nmatch n do\n  1 do  puts 1\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a Float64 scrutinee");
     assert!(errs[0].message.contains("Int64"));
@@ -9406,14 +9435,14 @@ mod tests {
 
   #[test]
   fn accepts_bool_literal_example() {
-    let src = "def check(flag: Boolean) -> Int64\n  if flag\n    return 1\n  end\n  return 0\nend\n\nputs check(true)\nputs check(false)\n";
+    let src = "fn check(flag: Boolean): Int64 do\n  if flag do\n    return 1\n  end\n  return 0\nend\n\nputs check(true)\nputs check(false)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn accepts_nil_literal_example() {
-    let src = "def check_nil(x: Nil) -> Int64\n  if x == nil\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
+    let src = "fn check_nil(x: Nil): Int64 do\n  if x == nil do\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -9468,7 +9497,7 @@ mod tests {
 
   // Plan 28 (bitwise operators).
 
-  const BITWISE_EXAMPLE: &str = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\ndef has_flag(flags: Int64, flag: Int64) -> Boolean\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ)\n  puts 1\nend\nif has_flag(perms, EXEC)\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
+  const BITWISE_EXAMPLE: &str = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\nfn has_flag(flags: Int64, flag: Int64): Boolean do\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ) do\n  puts 1\nend\nif has_flag(perms, EXEC) do\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
 
   #[test]
   fn accepts_bitwise_example() {
@@ -9531,7 +9560,7 @@ mod tests {
 
   #[test]
   fn accepts_break_and_next_inside_for_in() {
-    let src = "for x in [1, 2, 3]\n  if x == 2\n    next\n  end\n  if x == 3\n    break\n  end\n  puts x\nend\n";
+    let src = "for x in [1, 2, 3]\n  if x == 2 do\n    next\n  end\n  if x == 3 do\n    break\n  end\n  puts x\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -9564,7 +9593,7 @@ mod tests {
   #[test]
   fn accepts_compound_plus_assign_accumulator() {
     let src =
-      "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n";
+      "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5 do\n  total += i\n  i += 1\nend\nputs total\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -9603,7 +9632,7 @@ mod tests {
 
   // Plan 32 (class inheritance).
 
-  const INHERITANCE_EXAMPLE: &str = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\n\n  def describe -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\n\n  def describe -> Int64\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
+  const INHERITANCE_EXAMPLE: &str = "class Animal\n  age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn age: Int64 do\n    @age\n  end\n\n  fn describe: Int64 do\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  fn initialize(age: Int64, breed_code: Int64): Void do\n    @age = age\n    @breed_code = breed_code\n  end\n\n  fn describe: Int64 do\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
 
   #[test]
   fn accepts_inheritance_example() {
@@ -9630,7 +9659,7 @@ mod tests {
 
   #[test]
   fn rejects_override_with_mismatched_signature() {
-    let src = "class Animal\n  def speak(volume: Int64) -> Int64\n    volume\n  end\nend\n\nclass Dog < Animal\n  def speak(volume: Float64) -> Int64\n    1\n  end\nend\n";
+    let src = "class Animal\n  fn speak(volume: Int64): Int64 do\n    volume\n  end\nend\n\nclass Dog < Animal\n  fn speak(volume: Float64): Int64 do\n    1\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject an override with a mismatched signature");
@@ -9647,7 +9676,7 @@ mod tests {
 
   // Plan 33 (field-access sugar).
 
-  const READ_FIELD_EXAMPLE: &str = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
+  const READ_FIELD_EXAMPLE: &str = "class Point\n  read x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
 
   #[test]
   fn accepts_read_field_accessed_from_outside() {
@@ -9660,7 +9689,7 @@ mod tests {
     // Opt-in per field, not blanket exposure: `y` has no `read` marker,
     // so `p.y` must be rejected with the same "no such method"
     // diagnostic plan 08 already produces for any undeclared method.
-    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.y\n";
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.y\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject `p.y` — `y` has no `read` marker");
     assert!(errs[0].message.contains('y'));
@@ -9668,7 +9697,7 @@ mod tests {
 
   // Plan 34 (blocks and yield).
 
-  const BLOCKS_EXAMPLE: &str = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+  const BLOCKS_EXAMPLE: &str = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
 
   #[test]
   fn accepts_blocks_and_yield_example() {
@@ -9678,7 +9707,7 @@ mod tests {
 
   #[test]
   fn rejects_call_to_block_param_function_with_no_trailing_block() {
-    let src = "def repeat(n: Int64, &blk) -> Void\n  yield n\nend\n\nrepeat(3)\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  yield n\nend\n\nrepeat(3)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject calling a &blk function with no block");
@@ -9687,7 +9716,7 @@ mod tests {
 
   #[test]
   fn rejects_block_arity_mismatch_against_yield() {
-    let src = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64, extra: Int64| puts i }\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64, extra: Int64| puts i }\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("must reject a block whose arity doesn't match yield's call sites");
@@ -9696,7 +9725,7 @@ mod tests {
 
   #[test]
   fn rejects_yield_outside_a_block_param_function() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  yield 5\n  a + b\nend\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  yield 5\n  a + b\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("must reject `yield` in a function with no block parameter");
@@ -9768,14 +9797,14 @@ mod tests {
   #[test]
   fn accepts_break_and_next_inside_a_range_for_in() {
     let src =
-      "for i in 1..5\n  if i == 3\n    break\n  end\n  if i == 2\n    next\n  end\n  puts i\nend\n";
+      "for i in 1..5\n  if i == 3 do\n    break\n  end\n  if i == 2 do\n    next\n  end\n  puts i\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   // Plan 38 (full exception model).
 
-  const FULL_EXCEPTION_EXAMPLE: &str = "class NotFoundError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\nclass TimeoutError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise TimeoutError.new(7)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
+  const FULL_EXCEPTION_EXAMPLE: &str = "class NotFoundError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nclass TimeoutError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise TimeoutError.new(7)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
 
   #[test]
   fn accepts_the_full_worked_example_two_typed_rescues_and_ensure() {
@@ -9831,21 +9860,21 @@ mod tests {
 
   #[test]
   fn accepts_call_omitting_a_defaulted_trailing_argument() {
-    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5)\n";
+    let src = "fn inc(n: Int64, step: Int64 = 1): Int64 do\n  n + step\nend\n\nputs inc(5)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn accepts_call_overriding_a_default_with_an_explicit_argument() {
-    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5, 10)\n";
+    let src = "fn inc(n: Int64, step: Int64 = 1): Int64 do\n  n + step\nend\n\nputs inc(5, 10)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn rejects_call_omitting_a_required_no_default_argument() {
-    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc()\n";
+    let src = "fn inc(n: Int64, step: Int64 = 1): Int64 do\n  n + step\nend\n\nputs inc()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`n` has no default — must be required");
     assert!(errs[0].message.contains("missing required argument `n`"));
@@ -9853,14 +9882,14 @@ mod tests {
 
   #[test]
   fn rejects_default_parameter_on_a_method() {
-    let src = "class Foo\n  def m(x: Int64 = 0) -> Int64\n    x\n  end\nend\n";
+    let src = "class Foo\n  fn m(x: Int64 = 0): Int64 do\n    x\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("default parameter values are not supported on methods yet");
     assert!(errs[0].message.contains("not supported on methods"));
   }
 
-  const GREET_EXAMPLE: &str = "def greet(name: String, times: Int64 = 1) -> Void\n  i: Int64 = 0\n  while i < times\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
+  const GREET_EXAMPLE: &str = "fn greet(name: String, times: Int64 = 1): Void do\n  i: Int64 = 0\n  while i < times do\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
 
   #[test]
   fn accepts_the_greet_worked_example_keyword_calls_and_defaults() {
@@ -9870,7 +9899,7 @@ mod tests {
 
   #[test]
   fn rejects_misspelled_keyword_argument() {
-    let src = "def greet(name: String) -> Void\n  puts name\nend\n\ngreet(nam: \"hi\")\n";
+    let src = "fn greet(name: String): Void do\n  puts name\nend\n\ngreet(nam: \"hi\")\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`nam` is not a declared parameter of greet");
     assert!(errs[0].message.contains("unrecognized keyword `nam`"));
@@ -9883,7 +9912,7 @@ mod tests {
     // supplies the defaulted keyword while omitting the required one,
     // to genuinely exercise `Expr::CallKw`'s own missing-keyword path.
     let src =
-      "def greet(name: String, times: Int64 = 1) -> Void\n  puts name\nend\n\ngreet(times: 5)\n";
+      "fn greet(name: String, times: Int64 = 1): Void do\n  puts name\nend\n\ngreet(times: 5)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`name` has no default — must be required");
     assert!(errs[0].message.contains("missing required keyword `name`"));
@@ -9892,13 +9921,13 @@ mod tests {
   #[test]
   fn rejects_duplicate_keyword_argument() {
     let src =
-      "def greet(name: String) -> Void\n  puts name\nend\n\ngreet(name: \"hi\", name: \"yo\")\n";
+      "fn greet(name: String): Void do\n  puts name\nend\n\ngreet(name: \"hi\", name: \"yo\")\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a duplicate keyword");
     assert!(errs[0].message.contains("duplicate keyword `name`"));
   }
 
-  const SUM_ALL_EXAMPLE: &str = "def sum_all(*xs: Int64) -> Int64\n  total: Int64 = 0\n  i: Int64 = 0\n  while i < 4\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
+  const SUM_ALL_EXAMPLE: &str = "fn sum_all(*xs: Int64): Int64 do\n  total: Int64 = 0\n  i: Int64 = 0\n  while i < 4 do\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
 
   #[test]
   fn accepts_splat_call_type_checking_trailing_arguments() {
@@ -9908,14 +9937,14 @@ mod tests {
 
   #[test]
   fn accepts_splat_call_with_zero_trailing_arguments() {
-    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all()\n";
+    let src = "fn sum_all(*xs: Int64): Int64 do\n  0\nend\n\nputs sum_all()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn rejects_splat_call_with_a_mismatched_trailing_argument_type() {
-    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all(1, \"x\")\n";
+    let src = "fn sum_all(*xs: Int64): Int64 do\n  0\nend\n\nputs sum_all(1, \"x\")\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("a String trailing argument must not match Int64");
@@ -9924,14 +9953,14 @@ mod tests {
 
   #[test]
   fn rejects_splat_parameter_on_a_method() {
-    let src = "class Foo\n  def m(*xs: Int64) -> Int64\n    0\n  end\nend\n";
+    let src = "class Foo\n  fn m(*xs: Int64): Int64 do\n    0\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("splat parameters are not supported on methods yet");
     assert!(errs[0].message.contains("not supported on methods"));
   }
 
-  const DIVMOD_EXAMPLE: &str = "def divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
+  const DIVMOD_EXAMPLE: &str = "fn divmod(a: Int64, b: Int64): (Int64, Int64) do\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
 
   #[test]
   fn accepts_the_divmod_worked_example_tuple_return() {
@@ -9953,7 +9982,7 @@ mod tests {
   #[test]
   fn rejects_tuple_return_type_on_a_method() {
     let src =
-      "class Foo\n  def m(a: Int64, b: Int64) -> (Int64, Int64)\n    return a, b\n  end\nend\n";
+      "class Foo\n  fn m(a: Int64, b: Int64): (Int64, Int64) do\n    return a, b\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("tuple return types are not supported on methods yet");
@@ -9962,7 +9991,7 @@ mod tests {
 
   // Plan 40 (operator overloading).
 
-  const VECTOR2_EXAMPLE: &str = "class Vector2\n  read x: Float64\n  read y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x, @y + other.y)\n  end\n\n  def ==(other: Vector2) -> Boolean\n    @x == other.x && @y == other.y\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0, 2.0)\nv2: Vector2 = Vector2.new(3.0, 4.0)\nv3: Vector2 = v1 + v2\nputs v3.x\nputs v3.y\nif v1 == v2\n  puts 1\nelse\n  puts 0\nend\nif v1 == v1\n  puts 1\nelse\n  puts 0\nend\n";
+  const VECTOR2_EXAMPLE: &str = "class Vector2\n  read x: Float64\n  read y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn +(other: Vector2): Vector2 do\n    Vector2.new(@x + other.x, @y + other.y)\n  end\n\n  fn ==(other: Vector2): Boolean do\n    @x == other.x && @y == other.y\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0, 2.0)\nv2: Vector2 = Vector2.new(3.0, 4.0)\nv3: Vector2 = v1 + v2\nputs v3.x\nputs v3.y\nif v1 == v2 do\n  puts 1\nelse\n  puts 0\nend\nif v1 == v1 do\n  puts 1\nelse\n  puts 0\nend\n";
 
   #[test]
   fn accepts_the_vector2_worked_example() {
@@ -9972,7 +10001,7 @@ mod tests {
 
   #[test]
   fn rejects_plus_on_a_class_with_no_plus_method() {
-    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nv3: Vector2 = v1 + v2\n";
+    let src = "class Vector2\n  read x: Float64\n\n  fn initialize(x: Float64): Void do\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nv3: Vector2 = v1 + v2\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Vector2 declares no `+` method");
     assert!(errs[0]
@@ -9982,7 +10011,7 @@ mod tests {
 
   #[test]
   fn rejects_operator_call_with_a_mismatched_argument_type() {
-    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x)\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = v1 + 5\n";
+    let src = "class Vector2\n  read x: Float64\n\n  fn initialize(x: Float64): Void do\n    @x = x\n  end\n\n  fn +(other: Vector2): Vector2 do\n    Vector2.new(@x + other.x)\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = v1 + 5\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`+` expects a Vector2, not an Int64");
     assert!(errs[0].message.contains("argument 1 to `+`"));
@@ -9990,7 +10019,7 @@ mod tests {
 
   #[test]
   fn rejects_eq_on_a_class_with_no_eq_method() {
-    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nb: Boolean = v1 == v2\n";
+    let src = "class Vector2\n  read x: Float64\n\n  fn initialize(x: Float64): Void do\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nb: Boolean = v1 == v2\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Vector2 declares no `==` method");
     assert!(errs[0]
@@ -10000,14 +10029,14 @@ mod tests {
 
   #[test]
   fn rejects_ordering_comparison_on_a_class() {
-    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nb: Boolean = v1 < v2\n";
+    let src = "class Vector2\n  read x: Float64\n\n  fn initialize(x: Float64): Void do\n    @x = x\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nb: Boolean = v1 < v2\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("ordering comparisons on a class are not supported without `<=>`");
     assert!(errs[0].message.contains("ordering comparison"));
   }
 
-  const BAG_EXAMPLE: &str = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64, b: Int64, c: Int64) -> Void\n    @data = [a, b, c]\n  end\n\n  def [](i: Int64) -> Int64\n    @data[i]\n  end\n\n  def []=(i: Int64, v: Int64) -> Void\n    @data[i] = v\n  end\nend\n\nb: Bag = Bag.new(10, 20, 30)\nputs b[0] + b[1] + b[2]\nb[1] = 99\nputs b[1]\n";
+  const BAG_EXAMPLE: &str = "class Bag\n  data: Array[Int64]\n\n  fn initialize(a: Int64, b: Int64, c: Int64): Void do\n    @data = [a, b, c]\n  end\n\n  fn [](i: Int64): Int64 do\n    @data[i]\n  end\n\n  fn []=(i: Int64, v: Int64): Void do\n    @data[i] = v\n  end\nend\n\nb: Bag = Bag.new(10, 20, 30)\nputs b[0] + b[1] + b[2]\nb[1] = 99\nputs b[1]\n";
 
   #[test]
   fn accepts_the_bag_index_operator_example_read_and_write() {
@@ -10017,7 +10046,7 @@ mod tests {
 
   #[test]
   fn rejects_index_operator_with_a_mismatched_index_type() {
-    let src = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64) -> Void\n    @data = [a]\n  end\n\n  def [](i: Int64) -> Int64\n    @data[i]\n  end\nend\n\nb: Bag = Bag.new(1)\nx: Int64 = b[\"nope\"]\n";
+    let src = "class Bag\n  data: Array[Int64]\n\n  fn initialize(a: Int64): Void do\n    @data = [a]\n  end\n\n  fn [](i: Int64): Int64 do\n    @data[i]\n  end\nend\n\nb: Bag = Bag.new(1)\nx: Int64 = b[\"nope\"]\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`[]` expects an Int64 index, not a String");
     assert!(errs[0].message.contains("argument 1 to `[]`"));
@@ -10025,7 +10054,7 @@ mod tests {
 
   #[test]
   fn rejects_index_write_on_a_class_with_no_index_set_method() {
-    let src = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64) -> Void\n    @data = [a]\n  end\n\n  def [](i: Int64) -> Int64\n    @data[i]\n  end\nend\n\nb: Bag = Bag.new(1)\nb[0] = 5\n";
+    let src = "class Bag\n  data: Array[Int64]\n\n  fn initialize(a: Int64): Void do\n    @data = [a]\n  end\n\n  fn [](i: Int64): Int64 do\n    @data[i]\n  end\nend\n\nb: Bag = Bag.new(1)\nb[0] = 5\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Bag declares no `[]=` method");
     assert!(errs[0]
@@ -10035,7 +10064,7 @@ mod tests {
 
   // Plan 41 (interfaces and generics).
 
-  const COMPARABLE_MAX_EXAMPLE: &str = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
+  const COMPARABLE_MAX_EXAMPLE: &str = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\n\n  fn compare_to(other: Money): Int64 do\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  fn initialize(meters: Int64): Void do\n    @meters = meters\n  end\n\n  fn compare_to(other: Distance): Int64 do\n    @meters - other.meters\n  end\nend\n\nfn max[T: Comparable](a: T, b: T): T do\n  if a.compare_to(b) >= 0 do\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
 
   #[test]
   fn accepts_the_comparable_max_worked_example() {
@@ -10045,7 +10074,7 @@ mod tests {
 
   #[test]
   fn rejects_implements_with_no_matching_method_defined() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\nend\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Money never defines compare_to");
     assert!(errs[0].message.contains("Money"));
@@ -10055,7 +10084,7 @@ mod tests {
 
   #[test]
   fn rejects_implements_with_a_mismatched_method_signature() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Boolean\n    true\n  end\nend\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\n\n  fn compare_to(other: Money): Boolean do\n    true\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("compare_to returns the wrong type");
     assert!(errs[0].message.contains("does not match interface"));
@@ -10063,7 +10092,7 @@ mod tests {
 
   #[test]
   fn rejects_implements_naming_an_undefined_interface() {
-    let src = "class Money implements NotAnInterface\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\nend\n";
+    let src = "class Money implements NotAnInterface\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("NotAnInterface is never declared");
     assert!(errs[0].message.contains("NotAnInterface"));
@@ -10080,21 +10109,21 @@ mod tests {
     // `Self`-typed method (typed at the ancestor's own name) would
     // conflict with that leaf substitution on a completely separate
     // axis this AC isn't testing.
-    let src = "interface Describable\n  def describe(label: String) -> Int64\nend\n\nclass Animal\n  read age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def describe(label: String) -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal implements Describable\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\nend\n";
+    let src = "interface Describable\n  fn describe(label: String): Int64\nend\n\nclass Animal\n  read age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn describe(label: String): Int64 do\n    @age\n  end\nend\n\nclass Dog < Animal implements Describable\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn generic_function_body_type_checks_once_against_the_bound_interface() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\ndef describe[T: Comparable](a: T, b: T) -> Int64\n  a.compare_to(b)\nend\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nfn describe[T: Comparable](a: T, b: T): Int64 do\n  a.compare_to(b)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn rejects_a_generic_call_with_inconsistent_type_parameter_arguments() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nd1: Distance = Distance.new(100)\nboom: Money = max(m1, d1)\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\n\n  fn compare_to(other: Money): Int64 do\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  fn initialize(meters: Int64): Void do\n    @meters = meters\n  end\n\n  fn compare_to(other: Distance): Int64 do\n    @meters - other.meters\n  end\nend\n\nfn max[T: Comparable](a: T, b: T): T do\n  if a.compare_to(b) >= 0 do\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nd1: Distance = Distance.new(100)\nboom: Money = max(m1, d1)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`T` resolves to both Money and Distance");
     assert!(errs[0].message.contains("inconsistently"));
@@ -10102,7 +10131,7 @@ mod tests {
 
   #[test]
   fn rejects_a_generic_call_whose_concrete_type_does_not_implement_the_bound() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Widget\n  read id: Int64\n\n  def initialize(id: Int64) -> Void\n    @id = id\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nw1: Widget = Widget.new(1)\nw2: Widget = Widget.new(2)\nboom: Widget = max(w1, w2)\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Widget\n  read id: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n  end\nend\n\nfn max[T: Comparable](a: T, b: T): T do\n  if a.compare_to(b) >= 0 do\n    return a\n  end\n  return b\nend\n\nw1: Widget = Widget.new(1)\nw2: Widget = Widget.new(2)\nboom: Widget = max(w1, w2)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Widget does not implement Comparable");
     assert!(errs[0].message.contains("does not implement"));
@@ -10110,7 +10139,7 @@ mod tests {
 
   #[test]
   fn rejects_multiple_type_parameters_at_registration_time() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\ndef bad[T: Comparable, U: Comparable](a: T, b: U) -> T\n  a\nend\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nfn bad[T: Comparable, U: Comparable](a: T, b: U): T do\n  a\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("two type parameters are not supported");
     assert!(errs[0]
@@ -10120,7 +10149,7 @@ mod tests {
 
   #[test]
   fn rejects_generic_methods_on_a_class() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Box\n  def pick[T: Comparable](a: T, b: T) -> T\n    a\n  end\nend\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Box\n  fn pick[T: Comparable](a: T, b: T): T do\n    a\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("generic methods are not supported");
     assert!(errs
@@ -10130,9 +10159,9 @@ mod tests {
 
   // Plan 43 (nullable types and safe navigation).
 
-  const GREETER_PREFIX: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\n";
+  const GREETER_PREFIX: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\n";
 
-  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
 
   #[test]
   fn accepts_the_nullable_worked_example() {
@@ -10165,7 +10194,7 @@ mod tests {
   #[test]
   fn rejects_a_direct_method_call_on_a_nullable_receiver() {
     let src = format!(
-      "{GREETER_PREFIX}def greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  return g.shout\nend\n"
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  return g.shout\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     let errs = check_program(&program).expect_err("g is nullable, .shout is unguarded");
@@ -10175,7 +10204,7 @@ mod tests {
   #[test]
   fn nullable_vs_nil_comparison_type_checks_to_boolean() {
     let src = format!(
-      "{GREETER_PREFIX}def is_missing(id: Int64) -> Boolean\n  g: Greeter? = find_greeter(id)\n  return g == nil\nend\n"
+      "{GREETER_PREFIX}fn is_missing(id: Int64): Boolean do\n  g: Greeter? = find_greeter(id)\n  return g == nil\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
@@ -10184,7 +10213,7 @@ mod tests {
   #[test]
   fn safe_call_on_a_nullable_class_receiver_type_checks_to_the_wrapped_return_type() {
     let src = format!(
-      "{GREETER_PREFIX}def greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
@@ -10192,7 +10221,7 @@ mod tests {
 
   #[test]
   fn rejects_safe_call_on_a_non_nullable_receiver() {
-    let src = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef greet -> String?\n  g: Greeter = Greeter.new(\"ada\")\n  return g&.shout\nend\n";
+    let src = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn greet: String? do\n  g: Greeter = Greeter.new(\"ada\")\n  return g&.shout\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("g is never nil, & . is illegal");
     assert!(errs[0].message.contains("nullable"));
@@ -10200,7 +10229,7 @@ mod tests {
 
   #[test]
   fn rejects_safe_call_on_a_method_returning_a_value_type() {
-    let src = "class Greeter\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def years -> Int64\n    @age\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  return nil\nend\n\ndef ages(id: Int64) -> Int64\n  g: Greeter? = find_greeter(id)\n  x: Int64? = g&.years\n  return 0\nend\n";
+    let src = "class Greeter\n  age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn years: Int64 do\n    @age\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  return nil\nend\n\nfn ages(id: Int64): Int64 do\n  g: Greeter? = find_greeter(id)\n  x: Int64? = g&.years\n  return 0\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Int64 is not pointer-representable");
     assert!(errs.iter().any(|d| d.message.contains("Int64")));
@@ -10209,13 +10238,13 @@ mod tests {
   #[test]
   fn or_assign_narrows_the_tracked_type_so_a_later_return_type_checks() {
     let src = format!(
-      "{GREETER_PREFIX}def greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
-  const UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef upgrade(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
+  const UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn upgrade(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
 
   #[test]
   fn accepts_the_and_assign_upgrade_worked_example() {
@@ -10258,14 +10287,14 @@ mod tests {
 
   #[test]
   fn symbol_equality_and_inequality_both_type_check_to_boolean() {
-    let src = "if :foo == :foo\n  puts 1\nelse\n  puts 0\nend\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+    let src = "if :foo == :foo do\n  puts 1\nelse\n  puts 0\nend\nif :foo == :bar do\n  puts 1\nelse\n  puts 0\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn rejects_symbol_compared_against_string() {
-    let src = "if :foo == \"foo\"\n  puts 1\nend\n";
+    let src = "if :foo == \"foo\" do\n  puts 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Symbol is not String");
     assert!(errs[0].message.contains("Symbol"));
@@ -10288,7 +10317,7 @@ mod tests {
 
   #[test]
   fn accepts_the_symbols_worked_example() {
-    let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+    let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo do\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar do\n  puts 1\nelse\n  puts 0\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -10375,7 +10404,7 @@ mod tests {
 
   #[test]
   fn accepts_the_plan_45_worked_example() {
-    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
+    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n do\n  puts words[i]\n  i += 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -10421,7 +10450,7 @@ mod tests {
 
   #[test]
   fn collect_symbols_on_hello_em_finds_add() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let table = collect_symbols(&program);
     let add = table
@@ -10434,7 +10463,7 @@ mod tests {
 
   #[test]
   fn collect_symbols_on_classes_em_finds_both_classes_and_their_methods() {
-    let src = "class Counter\n  value: Int64\n\n  def initialize(start: Int64) -> Void\n    @value = start\n  end\n\n  def value -> Int64\n    @value\n  end\n\n  def add(n: Int64) -> Int64\n    @value + n\n  end\nend\n\nclass Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n";
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn add(n: Int64): Int64 do\n    @value + n\n  end\nend\n\nclass Point\n  x: Float64\n  y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn sum: Float64 do\n    @x + @y\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let table = collect_symbols(&program);
 
@@ -10461,7 +10490,7 @@ mod tests {
   #[test]
   fn collect_symbols_omits_only_the_class_with_an_unresolvable_field_type() {
     // AC3: the degrade is per-declaration, not all-or-nothing.
-    let src = "class Bad\n  x: NoSuchType\nend\n\nclass Good\n  y: Int64\nend\n\ndef ok() -> Int64\n  1\nend\n";
+    let src = "class Bad\n  x: NoSuchType\nend\n\nclass Good\n  y: Int64\nend\n\nfn ok(): Int64 do\n  1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let table = collect_symbols(&program);
     assert!(!table.classes.contains_key("Bad"));
@@ -10476,7 +10505,7 @@ mod tests {
     // AC1: the exact concrete-proof program from this plan's own
     // Decision log — proves the span actually threads from the parser
     // through sema (not just that the AST carries one internally).
-    let src = "def add(a: Int64, b: String) -> Int64\n  a + b\nend";
+    let src = "fn add(a: Int64, b: String): Int64 do\n  a + b\nend";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject Int64 + String");
     assert_eq!(errs.len(), 1);
@@ -10491,7 +10520,7 @@ mod tests {
   #[test]
   fn arity_mismatch_diagnostic_span_covers_the_whole_call_expression() {
     // AC2: `add(20)`'s own span — not just `add` and not just `20`.
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject 1-arg call to 2-arg add");
     let d = errs
@@ -10514,7 +10543,7 @@ mod tests {
 
   // Plan 52 (algebraic data types and exhaustive pattern matching).
 
-  const SHAPE_ENUM_WORKED_EXAMPLE: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase square\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase rect\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n";
+  const SHAPE_ENUM_WORKED_EXAMPLE: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch square do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch rect do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n";
 
   #[test]
   fn accepts_the_shape_worked_example() {
@@ -10524,7 +10553,7 @@ mod tests {
 
   #[test]
   fn rejects_a_case_missing_a_variant_naming_it_specifically() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = s\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a non-exhaustive case");
     assert!(
@@ -10541,7 +10570,7 @@ mod tests {
 
   #[test]
   fn rejects_an_unknown_variant_pattern() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = s\nwhen Rectangle(w, h)\n  area = w\nwhen Triangle(a, b, c)\n  area = a\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w, h) do  area = w\n  end\n  Triangle(a, b, c) do  area = a\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Triangle is not a variant of Shape");
     assert!(
@@ -10552,7 +10581,7 @@ mod tests {
 
   #[test]
   fn rejects_a_duplicate_variant_arm() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Circle(r2)\n  area = r2\nwhen Square(s)\n  area = s\nwhen Rectangle(w, h)\n  area = w\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Circle(r2) do  area = r2\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w, h) do  area = w\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Circle matched twice");
     assert!(
@@ -10563,7 +10592,7 @@ mod tests {
 
   #[test]
   fn rejects_an_arity_mismatched_pattern() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\narea: Float64 = 0.0\ncase rect\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = s\nwhen Rectangle(w)\n  area = w\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\narea: Float64 = 0.0\nmatch rect do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w) do  area = w\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Rectangle needs two bindings, not one");
     assert!(
@@ -10582,7 +10611,7 @@ mod tests {
 
   #[test]
   fn rejects_a_pattern_binding_referenced_outside_its_own_arm() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = r\nwhen Square(s)\n  area = r\nwhen Rectangle(w, h)\n  area = w\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = r\n  end\n  Rectangle(w, h) do  area = w\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("`r` is Circle's own binding, not visible inside the Square arm");
@@ -10596,7 +10625,7 @@ mod tests {
 
   #[test]
   fn rejects_a_pattern_binding_referenced_after_the_case_ends() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\ncase circle\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts s\nwhen Rectangle(w, h)\n  puts w\nend\nputs r\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nmatch circle do\n  Circle(r) do  puts r\n  end\n  Square(s) do  puts s\n  end\n  Rectangle(w, h) do  puts w\n  end\nend\nputs r\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`r` does not survive past its own arm");
     assert!(
@@ -10618,7 +10647,7 @@ mod tests {
   #[test]
   fn rejects_a_variant_name_colliding_with_an_existing_function() {
     let src =
-      "def Circle(x: Int64) -> Int64\n  x\nend\n\nenum Shape = Circle(Float64) | Square(Float64)\n";
+      "fn Circle(x: Int64): Int64 do\n  x\nend\n\nenum Shape = Circle(Float64) | Square(Float64)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("variant Circle collides with the function Circle");
@@ -10627,7 +10656,7 @@ mod tests {
 
   #[test]
   fn rejects_variant_pattern_over_an_int64_scrutinee() {
-    let src = "n: Int64 = 1\ncase n\nwhen Circle(r)\n  puts r\nend\n";
+    let src = "n: Int64 = 1\nmatch n do\n  Circle(r) do  puts r\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Int64 scrutinee can't use a variant pattern");
     assert!(!errs.is_empty());
@@ -10635,7 +10664,7 @@ mod tests {
 
   #[test]
   fn rejects_value_pattern_over_an_enum_scrutinee() {
-    let src = "enum Shape = Circle(Float64)\n\ncircle: Shape = Circle(2.0)\ncase circle\nwhen 1\n  puts 1\nend\n";
+    let src = "enum Shape = Circle(Float64)\n\ncircle: Shape = Circle(2.0)\nmatch circle do\n  1 do  puts 1\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("enum scrutinee can't use a value pattern");
     assert!(!errs.is_empty());
@@ -10653,7 +10682,7 @@ mod tests {
     );
   }
 
-  const RESULT_WORKED_EXAMPLE: &str = "def parse_int(s: String) -> Result[Int64, String]\n  if is_valid_int(s)\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"21\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+  const RESULT_WORKED_EXAMPLE: &str = "fn parse_int(s: String): Result[Int64, String] do\n  if is_valid_int(s) do\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\nfn try_parse(s: String): Result[Int64, String] do\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"21\")\nmatch result do\n  Ok(v) do  puts v\n  end\n  Err(e) do  puts e\n  end\nend\n";
 
   #[test]
   fn accepts_the_result_worked_example() {
@@ -10663,7 +10692,7 @@ mod tests {
 
   #[test]
   fn rejects_ok_with_the_wrong_t() {
-    let src = "def f -> Result[Int64, String]\n  return Ok(\"wrong\")\nend\n";
+    let src = "fn f: Result[Int64, String] do\n  return Ok(\"wrong\")\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Ok(\"wrong\") does not match declared T=Int64");
     assert!(errs.iter().any(|d| d.message.contains("Ok")));
@@ -10671,7 +10700,7 @@ mod tests {
 
   #[test]
   fn rejects_err_with_the_wrong_e() {
-    let src = "def f -> Result[Int64, String]\n  return Err(42)\nend\n";
+    let src = "fn f: Result[Int64, String] do\n  return Err(42)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Err(42) does not match declared E=String");
     assert!(errs.iter().any(|d| d.message.contains("Err")));
@@ -10679,7 +10708,7 @@ mod tests {
 
   #[test]
   fn rejects_ok_used_as_a_bare_call_argument() {
-    let src = "def f(x: Int64) -> Int64\n  x\nend\n\nputs f(Ok(1))\n";
+    let src = "fn f(x: Int64): Int64 do\n  x\nend\n\nputs f(Ok(1))\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("Ok(1) with no enclosing expected-type position can't infer T/E");
@@ -10690,7 +10719,7 @@ mod tests {
 
   #[test]
   fn rejects_try_whose_e_does_not_match_the_enclosing_return_type() {
-    let src = "class IoError\nend\n\ndef parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\ndef try_parse(s: String) -> Result[Int64, IoError]\n  n: Int64 = parse_int(s)?\n  return Ok(IoError.new())\nend\n";
+    let src = "class IoError\nend\n\nfn parse_int(s: String): Result[Int64, String] do\n  return Err(\"bad\")\nend\n\nfn try_parse(s: String): Result[Int64, IoError] do\n  n: Int64 = parse_int(s)?\n  return Ok(IoError.new())\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("Result[Int64, String]? inside a Result[Int64, IoError] function — E mismatch");
@@ -10701,7 +10730,7 @@ mod tests {
 
   #[test]
   fn rejects_try_outside_a_result_returning_function() {
-    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\nn: Int64 = parse_int(\"x\")?\n";
+    let src = "fn parse_int(s: String): Result[Int64, String] do\n  return Err(\"bad\")\nend\n\nn: Int64 = parse_int(\"x\")?\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("`?` at the top level has no Result-typed return_type");
@@ -10710,7 +10739,7 @@ mod tests {
 
   #[test]
   fn rejects_try_used_outside_a_let_or_assign_value() {
-    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  return Ok(1 + parse_int(s)?)\nend\n";
+    let src = "fn parse_int(s: String): Result[Int64, String] do\n  return Err(\"bad\")\nend\n\nfn try_parse(s: String): Result[Int64, String] do\n  return Ok(1 + parse_int(s)?)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("`?` nested inside a binary operator is not supported");
@@ -10721,14 +10750,14 @@ mod tests {
 
   #[test]
   fn accepts_ok_err_match_form_with_correctly_typed_bindings() {
-    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\nresult: Result[Int64, String] = parse_int(\"x\")\ncase result\nwhen Ok(v)\n  n: Int64 = v\n  puts n\nwhen Err(e)\n  s: String = e\n  puts s\nend\n";
+    let src = "fn parse_int(s: String): Result[Int64, String] do\n  return Err(\"bad\")\nend\n\nresult: Result[Int64, String] = parse_int(\"x\")\nmatch result do\n  Ok(v) do  n: Int64 = v\n  puts n\n  end\n  Err(e) do  s: String = e\n  puts s\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn rejects_ok_binding_referenced_in_the_err_arm() {
-    let src = "def parse_int(s: String) -> Result[Int64, String]\n  return Err(\"bad\")\nend\n\nresult: Result[Int64, String] = parse_int(\"x\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts v\nend\n";
+    let src = "fn parse_int(s: String): Result[Int64, String] do\n  return Err(\"bad\")\nend\n\nresult: Result[Int64, String] = parse_int(\"x\")\nmatch result do\n  Ok(v) do  puts v\n  end\n  Err(e) do  puts v\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("`v` is bound only inside the Ok arm, not visible in the Err arm");
@@ -10739,7 +10768,8 @@ mod tests {
 
   #[test]
   fn rejects_match_result_over_a_non_result_scrutinee() {
-    let src = "n: Int64 = 1\ncase n\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    let src =
+      "n: Int64 = 1\nmatch n do\n  Ok(v) do  puts v\n  end\n  Err(e) do  puts e\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("an Int64 scrutinee is not Result[T, E]-typed");
     assert!(!errs.is_empty());
@@ -10752,7 +10782,7 @@ mod tests {
   // method other than `initialize` may no longer declare a return
   // type — `value` now prints `@count` itself (`puts @count`) rather
   // than returning it for a top-level `puts a.value` to print.
-  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn value: Void do\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
 
   #[test]
   fn accepts_the_actor_worked_example() {
@@ -10762,7 +10792,7 @@ mod tests {
 
   #[test]
   fn rejects_new_called_on_an_actor() {
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.new(0)\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\nend\n\nc: Counter = Counter.new(0)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("actors are constructed with `.spawn`, not `.new`");
@@ -10780,7 +10810,7 @@ mod tests {
 
   #[test]
   fn rejects_spawn_with_wrong_arity() {
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(0, 1)\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(0, 1)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`initialize` takes exactly one argument");
     assert!(!errs.is_empty());
@@ -10788,7 +10818,7 @@ mod tests {
 
   #[test]
   fn rejects_spawn_with_wrong_argument_type() {
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(\"x\")\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(\"x\")\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`initialize` expects Int64, not String");
     assert!(!errs.is_empty());
@@ -10798,7 +10828,7 @@ mod tests {
 
   #[test]
   fn rejects_a_non_initialize_actor_method_declaring_a_return_type() {
-    let src = "actor Counter\n  count: Int64\n\n  def get -> Int64\n    @count\n  end\nend\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn get: Int64 do\n    @count\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("cross-actor calls are asynchronous — a method can't return a value");
@@ -10814,11 +10844,11 @@ mod tests {
     // own "no return type" default) or a real value type — unlike
     // every other actor method, which is unconditionally rejected for
     // declaring anything but `Void`.
-    let void_src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(0)\n";
+    let void_src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\nend\n\nc: Counter = Counter.spawn(0)\n";
     let program = emerald_parser::parse(void_src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
 
-    let value_src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Int64\n    @count = start\n    start\n  end\nend\n";
+    let value_src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Int64 do\n    @count = start\n    start\n  end\nend\n";
     let program = emerald_parser::parse(value_src).expect("should parse");
     assert_eq!(
       check_program(&program),
@@ -10830,7 +10860,7 @@ mod tests {
 
   #[test]
   fn accepts_every_non_initialize_method_declaring_no_return_type() {
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def bump -> Void\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.spawn(0)\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn bump: Void do\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.spawn(0)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -10843,7 +10873,7 @@ mod tests {
   /// `LogMessage`-typed param) backs the reference-type ones.
   fn message_safety_program(run_body: &str) -> String {
     format!(
-      "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\n\n  def text -> String\n    @text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n    puts msg.text\n  end\n\n  def ping(n: Int64) -> Void\n  end\nend\n\ndef run -> Void\n{run_body}end\n\nrun()\n"
+      "class LogMessage\n  text: String\n\n  fn initialize(text: String): Void do\n    @text = text\n  end\n\n  fn text: String do\n    @text\n  end\nend\n\nactor Logger\n  fn log(msg: LogMessage): Void do\n    puts msg.text\n  end\n\n  fn ping(n: Int64): Void do\n  end\nend\n\nfn run: Void do\n{run_body}end\n\nrun()\n"
     )
   }
 
@@ -10877,7 +10907,7 @@ mod tests {
   fn accepts_a_send_in_one_branch_and_a_read_only_in_the_other() {
     // The two branches are mutually exclusive — nothing races.
     let src = message_safety_program(
-      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  flag: Boolean = true\n  if flag\n    logger.log(msg)\n  else\n    puts msg.text\n  end\n",
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  flag: Boolean = true\n  if flag do\n    logger.log(msg)\n  else\n    puts msg.text\n  end\n",
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
@@ -10889,7 +10919,7 @@ mod tests {
     // whole `if` is the UNION of what every branch did, even though
     // only one branch could actually have executed on any given run.
     let src = message_safety_program(
-      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  flag: Boolean = true\n  if flag\n    logger.log(msg)\n  end\n  puts msg.text\n",
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  flag: Boolean = true\n  if flag do\n    logger.log(msg)\n  end\n  puts msg.text\n",
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     let errs = check_program(&program)
@@ -10903,7 +10933,7 @@ mod tests {
     // a loop body — a send anywhere in the body is checked against
     // every other use anywhere else in that SAME body.
     let src = message_safety_program(
-      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3\n    logger.log(msg)\n    puts msg.text\n    i = i + 1\n  end\n",
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3 do\n    logger.log(msg)\n    puts msg.text\n    i = i + 1\n  end\n",
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     let errs = check_program(&program)
@@ -10914,7 +10944,7 @@ mod tests {
   #[test]
   fn rejects_a_read_after_a_loop_whose_body_sent() {
     let src = message_safety_program(
-      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3\n    logger.log(msg)\n    i = i + 1\n  end\n  puts msg.text\n",
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3 do\n    logger.log(msg)\n    i = i + 1\n  end\n  puts msg.text\n",
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     let errs = check_program(&program).expect_err(
@@ -10947,7 +10977,7 @@ mod tests {
 
   #[test]
   fn rejects_a_field_read_passed_directly_as_a_message_argument() {
-    let src = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\n\n  def text -> String\n    @text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n    puts msg.text\n  end\nend\n\nclass Holder\n  msg: LogMessage\n\n  def initialize(msg: LogMessage) -> Void\n    @msg = msg\n  end\n\n  def send_it(logger: Logger) -> Void\n    logger.log(@msg)\n  end\nend\n";
+    let src = "class LogMessage\n  text: String\n\n  fn initialize(text: String): Void do\n    @text = text\n  end\n\n  fn text: String do\n    @text\n  end\nend\n\nactor Logger\n  fn log(msg: LogMessage): Void do\n    puts msg.text\n  end\nend\n\nclass Holder\n  msg: LogMessage\n\n  fn initialize(msg: LogMessage): Void do\n    @msg = msg\n  end\n\n  fn send_it(logger: Logger): Void do\n    logger.log(@msg)\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("`@msg` can alias a binding that outlives the send — rejected outright");
@@ -10956,7 +10986,7 @@ mod tests {
 
   #[test]
   fn rejects_an_index_read_passed_directly_as_a_message_argument() {
-    let src = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n  end\nend\n\ndef run -> Void\n  logger: Logger = Logger.spawn()\n  msgs: Array[LogMessage] = Array.new(1)\n  msgs[0] = LogMessage.new(\"x\")\n  logger.log(msgs[0])\nend\n\nrun()\n";
+    let src = "class LogMessage\n  text: String\n\n  fn initialize(text: String): Void do\n    @text = text\n  end\nend\n\nactor Logger\n  fn log(msg: LogMessage): Void do\n  end\nend\n\nfn run: Void do\n  logger: Logger = Logger.spawn()\n  msgs: Array[LogMessage] = Array.new(1)\n  msgs[0] = LogMessage.new(\"x\")\n  logger.log(msgs[0])\nend\n\nrun()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("`arr[i]` can alias a binding that outlives the send — rejected outright");
@@ -10965,7 +10995,7 @@ mod tests {
 
   #[test]
   fn rejects_a_nested_call_result_passed_directly_as_a_message_argument() {
-    let src = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\nend\n\ndef build -> LogMessage\n  LogMessage.new(\"built\")\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n  end\nend\n\ndef run -> Void\n  logger: Logger = Logger.spawn()\n  logger.log(build())\nend\n\nrun()\n";
+    let src = "class LogMessage\n  text: String\n\n  fn initialize(text: String): Void do\n    @text = text\n  end\nend\n\nfn build: LogMessage do\n  LogMessage.new(\"built\")\nend\n\nactor Logger\n  fn log(msg: LogMessage): Void do\n  end\nend\n\nfn run: Void do\n  logger: Logger = Logger.spawn()\n  logger.log(build())\nend\n\nrun()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err(
       "a nested call's return value can't be proven unaliased by this compiler — rejected outright",
@@ -10980,7 +11010,7 @@ mod tests {
     // check available: plan 54/55's own worked examples, unaffected by
     // this plan's new rule (neither sends a reference-typed local more
     // than once).
-    let counter = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
+    let counter = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn value: Void do\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
     let program = emerald_parser::parse(counter).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -10994,7 +11024,7 @@ mod tests {
   /// statements after the block itself (e.g. a `.child(...)` query).
   fn supervisor_program(after_supervise: &str) -> String {
     format!(
-      "actor Worker\n  count: Int64\n\n  def initialize(seed: Int64) -> Void\n    @count = seed\n  end\nend\n\nactor Logger\n  prefix: String\n\n  def initialize(prefix: String) -> Void\n    @prefix = prefix\n  end\nend\n\nsup: Supervisor = supervise do\n{after_supervise}"
+      "actor Worker\n  count: Int64\n\n  fn initialize(seed: Int64): Void do\n    @count = seed\n  end\nend\n\nactor Logger\n  prefix: String\n\n  fn initialize(prefix: String): Void do\n    @prefix = prefix\n  end\nend\n\nsup: Supervisor = supervise do\n{after_supervise}"
     )
   }
 
@@ -11059,7 +11089,7 @@ mod tests {
 
   #[test]
   fn accepts_the_enumerable_worked_example() {
-    let src = "is_even: Proc = ->(x: Int64) -> Boolean { x % 2 == 0 }\ndoubler: Proc = ->(x: Int64) -> Int64 { x * 2 }\n\narr: Array[Int64] = [1, 2, 3, 4, 5, 6]\nevens: Array[Int64] = arr.select(is_even)\ndoubled: Array[Int64] = evens.map(doubler)\ntotal: Int64 = doubled.sum()\n";
+    let src = "is_even: Proc = do |x: Int64| x % 2 == 0 end\ndoubler: Proc = do |x: Int64| x * 2 end\n\narr: Array[Int64] = [1, 2, 3, 4, 5, 6]\nevens: Array[Int64] = arr.select(is_even)\ndoubled: Array[Int64] = evens.map(doubler)\ntotal: Int64 = doubled.sum()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -11075,7 +11105,7 @@ mod tests {
     // same fix `.value`/`.sum` needed after an earlier, name-guarded
     // version broke `examples/classes.em`'s own real `Counter`/`Point`
     // methods.
-    let src = "printer: Proc = ->(x: Int64) -> Void { puts x }\nn: Int64 = 5\nn.each(printer)\n";
+    let src = "printer: Proc = do |x: Int64| puts x end\nn: Int64 = 5\nn.each(printer)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("`.each` on a non-Array/Hash receiver must be rejected");
@@ -11097,7 +11127,7 @@ mod tests {
 
   #[test]
   fn rejects_a_select_proc_that_does_not_return_boolean() {
-    let src = "not_bool: Proc = ->(x: Int64) -> Int64 { x }\narr: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = arr.select(not_bool)\n";
+    let src = "not_bool: Proc = do |x: Int64| x end\narr: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = arr.select(not_bool)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`.select`'s Proc must return Boolean");
     assert!(
@@ -11110,7 +11140,7 @@ mod tests {
 
   #[test]
   fn rejects_a_proc_argument_with_the_wrong_arity() {
-    let src = "no_args: Proc = ->() -> Boolean { true }\narr: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = arr.select(no_args)\n";
+    let src = "no_args: Proc = do | | true end\narr: Array[Int64] = [1, 2, 3]\nevens: Array[Int64] = arr.select(no_args)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("a Proc with the wrong parameter arity must be rejected");
@@ -11122,7 +11152,7 @@ mod tests {
 
   #[test]
   fn hash_each_proc_parameter_resolves_to_a_real_pair_type() {
-    let src = "printer: Proc = ->(p: Pair[Int64, Int64]) -> Void { puts p.key\n  puts p.value }\nh: Hash[Int64, Int64] = {1 => 10}\nh.each(printer)\n";
+    let src = "printer: Proc = do |p: Pair[Int64, Int64]| puts p.key\n  puts p.value end\nh: Hash[Int64, Int64] = {1 => 10}\nh.each(printer)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -11143,18 +11173,7 @@ mod tests {
     assert_eq!(check_program(&program), Ok(()));
   }
 
-  const COMPARABLE_MONEY_SRC: &str = "\
-interface Comparable
-  def compare_to(other: Self) -> Int64
-end
-
-class Money implements Comparable
-  amount: Int64
-  def compare_to(other: Money) -> Int64
-    @amount
-  end
-end
-";
+  const COMPARABLE_MONEY_SRC: &str = "\ninterface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  amount: Int64\n  fn compare_to(other: Money): Int64 do\n    @amount\n  end\nend\n";
 
   #[test]
   fn a_bounded_generic_class_instantiated_with_a_conforming_class_typechecks() {
@@ -11167,7 +11186,7 @@ end
 
   #[test]
   fn a_bounded_generic_class_instantiated_with_a_non_conforming_class_is_rejected() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Plain\n  x: Int64\nend\n\nclass Box[T: Comparable]\n  value: T\nend\n\nb: Box[Plain] = Box.new()\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Plain\n  x: Int64\nend\n\nclass Box[T: Comparable]\n  value: T\nend\n\nb: Box[Plain] = Box.new()\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("`Plain` doesn't implement `Comparable` — must be rejected");
@@ -11183,7 +11202,7 @@ end
   fn calling_a_method_on_an_unbounded_type_parameter_is_rejected_in_the_template_itself() {
     // Never instantiated anywhere — proves the template body checks once,
     // as a template, not lazily deferred to a call site that never comes.
-    let src = "class Box[T]\n  def show(x: T) -> Void\n    x.compare_to(x)\n  end\nend\n";
+    let src = "class Box[T]\n  fn show(x: T): Void do\n    x.compare_to(x)\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("a method call on an unbounded type parameter must be rejected");
@@ -11373,7 +11392,7 @@ end
 
   #[test]
   fn an_array_message_argument_is_rejected_as_not_wire_safe() {
-    let src = "actor Logger\n  def log(items: Array[Int64]) -> Void\n  end\nend\n\ndef main() -> Void\n  l: Logger = Logger.spawn()\n  arr: Array[Int64] = [1, 2, 3]\n  l.log(arr)\nend\n";
+    let src = "actor Logger\n  fn log(items: Array[Int64]): Void do\n  end\nend\n\nfn main(): Void do\n  l: Logger = Logger.spawn()\n  arr: Array[Int64] = [1, 2, 3]\n  l.log(arr)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Array[_] is not wire-safe");
     assert!(
@@ -11384,7 +11403,7 @@ end
 
   #[test]
   fn a_proc_message_argument_is_rejected_as_not_wire_safe() {
-    let src = "actor Logger\n  def run(f: Proc) -> Void\n  end\nend\n\ndef main() -> Void\n  l: Logger = Logger.spawn()\n  cb: Proc = ->() -> Void { }\n  l.run(cb)\nend\n";
+    let src = "actor Logger\n  fn run(f: Proc): Void do\n  end\nend\n\nfn main(): Void do\n  l: Logger = Logger.spawn()\n  cb: Proc = do | |  end\n  l.run(cb)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Proc is not wire-safe");
     assert!(
@@ -11395,7 +11414,7 @@ end
 
   #[test]
   fn a_second_actor_reference_message_argument_is_rejected_as_not_wire_safe() {
-    let src = "actor Pinger\n  def notify(other: Pinger) -> Void\n  end\nend\n\ndef main() -> Void\n  a: Pinger = Pinger.spawn()\n  b: Pinger = Pinger.spawn()\n  a.notify(b)\nend\n";
+    let src = "actor Pinger\n  fn notify(other: Pinger): Void do\n  end\nend\n\nfn main(): Void do\n  a: Pinger = Pinger.spawn()\n  b: Pinger = Pinger.spawn()\n  a.notify(b)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("sending an actor reference is not wire-safe");
     assert!(
@@ -11406,7 +11425,7 @@ end
 
   #[test]
   fn plan_56_liveness_still_fires_unchanged_on_an_actor_send() {
-    let src = "actor Receiver\n  def take(p: Payload) -> Void\n  end\nend\n\nclass Payload\n  data: String\nend\n\ndef main() -> Void\n  r: Receiver = Receiver.spawn()\n  p: Payload = Payload.new()\n  r.take(p)\n  r.take(p)\nend\n";
+    let src = "actor Receiver\n  fn take(p: Payload): Void do\n  end\nend\n\nclass Payload\n  data: String\nend\n\nfn main(): Void do\n  r: Receiver = Receiver.spawn()\n  p: Payload = Payload.new()\n  r.take(p)\n  r.take(p)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("reusing `p` after it was sent must be rejected");
     assert!(
@@ -11419,7 +11438,7 @@ end
 
   // Plan 62 (design-by-contract).
 
-  const DIVIDE_SRC: &str = "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b\nend\n";
+  const DIVIDE_SRC: &str = "fn divide(a: Int64, b: Int64): Int64\n  requires b != 0\n  ensures result * b <= a do\n  return a / b\nend\n";
 
   #[test]
   fn divide_worked_example_type_checks_ok() {
@@ -11430,7 +11449,7 @@ end
 
   #[test]
   fn a_non_boolean_requires_clause_is_rejected_naming_the_clause_and_type() {
-    let src = "def bad(a: Int64) -> Int64\n  requires a\n  return a\nend\n";
+    let src = "fn bad(a: Int64): Int64\n  requires a do\n  return a\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("a non-Boolean requires must be rejected");
     assert!(
@@ -11443,7 +11462,7 @@ end
 
   #[test]
   fn an_ensures_clause_referencing_an_undeclared_identifier_is_rejected() {
-    let src = "def bad2(a: Int64) -> Int64\n  ensures unknown_name\n  return a\nend\n";
+    let src = "fn bad2(a: Int64): Int64\n  ensures unknown_name do\n  return a\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("an undeclared identifier must be rejected");
     assert!(
@@ -11454,7 +11473,7 @@ end
 
   #[test]
   fn ensures_result_resolves_to_the_declared_return_type() {
-    let src = "def ok(a: Int64) -> Int64\n  ensures result >= 0\n  return a\nend\n";
+    let src = "fn ok(a: Int64): Int64\n  ensures result >= 0 do\n  return a\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -11496,7 +11515,7 @@ end
 
   #[test]
   fn requires_on_a_generic_function_is_rejected() {
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\ndef identity[T: Comparable](x: T) -> T\n  requires true\n  return x\nend\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nfn identity[T: Comparable](x: T): T\n  requires true do\n  return x\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("contracts on a generic function must be rejected");
@@ -11548,7 +11567,7 @@ end
 
   #[test]
   fn a_clause_with_one_literal_and_one_non_literal_argument_is_skipped_entirely() {
-    let src = "def f(a: Int64, b: Int64) -> Int64\n  requires a + b > 0\n  return a + b\nend\n\ny: Int64 = 10\nputs f(5, y)\n";
+    let src = "fn f(a: Int64, b: Int64): Int64\n  requires a + b > 0 do\n  return a + b\nend\n\ny: Int64 = 10\nputs f(5, y)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(
       check_program(&program),
@@ -11561,7 +11580,7 @@ end
 
   #[test]
   fn a_self_recursive_pure_function_is_accepted() {
-    let src = "pure def fib(n: Int64) -> Int64\n  if n < 2\n    n\n  else\n    fib(n - 1) + fib(n - 2)\n  end\nend\n";
+    let src = "pure fn fib(n: Int64): Int64 do\n  if n < 2 do\n    n\n  else\n    fib(n - 1) + fib(n - 2)\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(
       check_program(&program),
@@ -11572,7 +11591,7 @@ end
 
   #[test]
   fn genuine_mutual_recursion_both_pure_claimed_is_accepted_together() {
-    let src = "pure def is_even(n: Int64) -> Boolean\n  if n == 0\n    true\n  else\n    is_odd(n - 1)\n  end\nend\n\npure def is_odd(n: Int64) -> Boolean\n  if n == 0\n    false\n  else\n    is_even(n - 1)\n  end\nend\n";
+    let src = "pure fn is_even(n: Int64): Boolean do\n  if n == 0 do\n    true\n  else\n    is_odd(n - 1)\n  end\nend\n\npure fn is_odd(n: Int64): Boolean do\n  if n == 0 do\n    false\n  else\n    is_even(n - 1)\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(
       check_program(&program),
@@ -11583,7 +11602,7 @@ end
 
   #[test]
   fn a_mutual_recursion_pair_where_one_member_calls_puts_is_rejected_as_a_whole_component() {
-    let src = "pure def is_even(n: Int64) -> Boolean\n  if n == 0\n    true\n  else\n    is_odd(n - 1)\n  end\nend\n\npure def is_odd(n: Int64) -> Boolean\n  puts n\n  if n == 0\n    false\n  else\n    is_even(n - 1)\n  end\nend\n";
+    let src = "pure fn is_even(n: Int64): Boolean do\n  if n == 0 do\n    true\n  else\n    is_odd(n - 1)\n  end\nend\n\npure fn is_odd(n: Int64): Boolean do\n  puts n\n  if n == 0 do\n    false\n  else\n    is_even(n - 1)\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("a component with one I/O-performing member must be rejected");
@@ -11600,7 +11619,7 @@ end
 
   #[test]
   fn a_pure_function_calling_puts_is_rejected_naming_puts() {
-    let src = "pure def bad(x: Int64) -> Int64\n  puts x\n  return x\nend\n";
+    let src = "pure fn bad(x: Int64): Int64 do\n  puts x\n  return x\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("a `pure` function performing I/O must be rejected");
@@ -11614,7 +11633,7 @@ end
 
   #[test]
   fn a_pure_function_sending_to_an_actor_is_rejected_naming_the_send() {
-    let src = "actor Worker\n  def run(n: Int64) -> Void\n    puts n\n  end\nend\n\npure def bad2(w: Worker) -> Void\n  w.run(5)\nend\n";
+    let src = "actor Worker\n  fn run(n: Int64): Void do\n    puts n\n  end\nend\n\npure fn bad2(w: Worker): Void do\n  w.run(5)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("a `pure` function sending a message must be rejected");
@@ -11629,7 +11648,7 @@ end
   #[test]
   fn a_pure_function_setting_a_field_is_rejected() {
     let src =
-      "class Counter\n  n: Int64\n\n  pure def bump() -> Void\n    @n = @n + 1\n  end\nend\n";
+      "class Counter\n  n: Int64\n\n  pure fn bump(): Void do\n    @n = @n + 1\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("a `pure` method mutating a field must be rejected");
@@ -11641,7 +11660,7 @@ end
 
   #[test]
   fn a_pure_function_setting_an_index_is_rejected() {
-    let src = "pure def bad(arr: Array[Int64]) -> Void\n  arr[0] = 1\nend\n";
+    let src = "pure fn bad(arr: Array[Int64]): Void do\n  arr[0] = 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("a `pure` function mutating an index must be rejected");
@@ -11653,7 +11672,7 @@ end
 
   #[test]
   fn a_pure_function_calling_an_ordinary_function_is_rejected_naming_the_callee() {
-    let src = "def helper(x: Int64) -> Int64\n  return x + 1\nend\n\npure def bad(x: Int64) -> Int64\n  return helper(x)\nend\n";
+    let src = "fn helper(x: Int64): Int64 do\n  return x + 1\nend\n\npure fn bad(x: Int64): Int64 do\n  return helper(x)\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("a `pure` function calling a non-`pure` function must be rejected");
@@ -11665,7 +11684,7 @@ end
 
   #[test]
   fn pure_declared_on_an_actor_method_is_rejected_at_registration() {
-    let src = "actor Worker\n  pure def run(n: Int64) -> Void\n    puts n\n  end\nend\n";
+    let src = "actor Worker\n  pure fn run(n: Int64): Void do\n    puts n\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`pure` on an actor method must be rejected");
     assert!(
@@ -11676,7 +11695,7 @@ end
 
   #[test]
   fn an_ordinary_program_using_pure_nowhere_typechecks_identically() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  return a + b\nend\n\nputs add(2, 3)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  return a + b\nend\n\nputs add(2, 3)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(
       check_program(&program),
@@ -11691,21 +11710,21 @@ end
 
   #[test]
   fn hash_map_over_pairs_type_checks_to_an_array_of_the_procs_own_return_type() {
-    let src = "double_value: Proc = ->(p: Pair[Int64, Int64]) -> Int64 { p.value * 2 }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nvalues: Array[Int64] = h.map(double_value)\n";
+    let src = "double_value: Proc = do |p: Pair[Int64, Int64]| p.value * 2 end\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nvalues: Array[Int64] = h.map(double_value)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn hash_reduce_over_pairs_folds_to_the_initial_values_own_type() {
-    let src = "sum_values: Proc = ->(acc: Int64, p: Pair[Int64, Int64]) -> Int64 { acc + p.value }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\ntotal: Int64 = h.reduce(0, sum_values)\n";
+    let src = "sum_values: Proc = do |acc: Int64, p: Pair[Int64, Int64]| acc + p.value end\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\ntotal: Int64 = h.reduce(0, sum_values)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn hash_each_with_index_accepts_a_pair_then_index_proc() {
-    let src = "visit: Proc = ->(p: Pair[Int64, Int64], i: Int64) -> Void { puts i }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.each_with_index(visit)\n";
+    let src = "visit: Proc = do |p: Pair[Int64, Int64], i: Int64| puts i end\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.each_with_index(visit)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -11716,7 +11735,7 @@ end
     // comment): `Array[Pair[K,V]]` — `.select`'s only sensible result
     // type on a Hash — can never be written in this language's
     // concrete syntax, so `.select`/`.filter` stay Array-only.
-    let src = "is_big: Proc = ->(p: Pair[Int64, Int64]) -> Boolean { p.value > 15 }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.select(is_big)\n";
+    let src = "is_big: Proc = do |p: Pair[Int64, Int64]| p.value > 15 end\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.select(is_big)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("`.select` on a Hash[K,V] receiver must be rejected");
@@ -11730,14 +11749,14 @@ end
 
   #[test]
   fn array_count_with_a_predicate_proc_type_checks_to_int64() {
-    let src = "is_big: Proc = ->(x: Int64) -> Boolean { x > 2 }\narr: Array[Int64] = [1, 2, 3, 4]\nn: Int64 = arr.count(is_big)\n";
+    let src = "is_big: Proc = do |x: Int64| x > 2 end\narr: Array[Int64] = [1, 2, 3, 4]\nn: Int64 = arr.count(is_big)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn rejects_a_count_predicate_that_does_not_return_boolean() {
-    let src = "not_bool: Proc = ->(x: Int64) -> Int64 { x }\narr: Array[Int64] = [1, 2, 3]\nn: Int64 = arr.count(not_bool)\n";
+    let src = "not_bool: Proc = do |x: Int64| x end\narr: Array[Int64] = [1, 2, 3]\nn: Int64 = arr.count(not_bool)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("`.count`'s predicate Proc must return Boolean");
     assert!(

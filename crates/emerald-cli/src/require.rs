@@ -131,7 +131,7 @@ mod tests {
   #[test]
   fn splices_a_single_required_file_in_place() {
     let dir = fresh_dir("single");
-    std::fs::write(dir.join("helper.em"), "def helper() -> Int64\n  5\nend\n").unwrap();
+    std::fs::write(dir.join("helper.em"), "fn helper(): Int64 do\n  5\nend\n").unwrap();
     std::fs::write(dir.join("main.em"), "require helper\nputs helper()\n").unwrap();
     let program = resolve_program(&dir.join("main.em")).unwrap();
     assert!(!program.items.iter().any(|i| matches!(i, Item::Require(_))));
@@ -142,10 +142,10 @@ mod tests {
   #[test]
   fn requiring_the_same_file_twice_contributes_it_once() {
     let dir = fresh_dir("dedup");
-    std::fs::write(dir.join("a.em"), "def a() -> Int64\n  1\nend\n").unwrap();
+    std::fs::write(dir.join("a.em"), "fn a(): Int64 do\n  1\nend\n").unwrap();
     std::fs::write(
       dir.join("b.em"),
-      "require a\ndef b() -> Int64\n  a()\nend\n",
+      "require a\nfn b(): Int64 do\n  a()\nend\n",
     )
     .unwrap();
     std::fs::write(dir.join("main.em"), "require a\nrequire b\nputs b()\n").unwrap();
@@ -178,8 +178,8 @@ mod tests {
 
   fn diamond_dir(tag: &str) -> PathBuf {
     let dir = fresh_dir(tag);
-    std::fs::write(dir.join("utils.em"), "def util() -> Int64\n  4\nend\n").unwrap();
-    std::fs::write(dir.join("helpers.em"), "def helper() -> Int64\n  10\nend\n").unwrap();
+    std::fs::write(dir.join("utils.em"), "fn util(): Int64 do\n  4\nend\n").unwrap();
+    std::fs::write(dir.join("helpers.em"), "fn helper(): Int64 do\n  10\nend\n").unwrap();
     std::fs::write(
       dir.join("main.em"),
       "require helpers\nrequire utils\nputs helper() + util()\n",
@@ -214,7 +214,7 @@ mod tests {
     let dir = diamond_dir("hashes-selective");
     let (_p1, hashes1) = resolve_program_with_hashes(&dir.join("main.em")).unwrap();
 
-    std::fs::write(dir.join("helpers.em"), "def helper() -> Int64\n  99\nend\n").unwrap();
+    std::fs::write(dir.join("helpers.em"), "fn helper(): Int64 do\n  99\nend\n").unwrap();
     let (_p2, hashes2) = resolve_program_with_hashes(&dir.join("main.em")).unwrap();
 
     let by_name = |hashes: &[(PathBuf, CacheKey)], name: &str| {
@@ -259,7 +259,7 @@ mod tests {
     let utils_only_key_before =
       cache.key_for_many(&uhashes1.iter().map(|(_, h)| *h).collect::<Vec<_>>());
 
-    std::fs::write(dir.join("helpers.em"), "def helper() -> Int64\n  99\nend\n").unwrap();
+    std::fs::write(dir.join("helpers.em"), "fn helper(): Int64 do\n  99\nend\n").unwrap();
 
     let (_p2, hashes2) = resolve_program_with_hashes(&dir.join("main.em")).unwrap();
     let main_key_after = cache.key_for_many(&hashes2.iter().map(|(_, h)| *h).collect::<Vec<_>>());

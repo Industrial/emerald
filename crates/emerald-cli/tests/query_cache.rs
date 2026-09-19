@@ -131,7 +131,7 @@ fn write_package(dir: &Path, name: &str) {
     format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"main.em\"\n"),
   )
   .unwrap();
-  std::fs::write(dir.join("helper.em"), "def helper() -> Int64\n  5\nend\n").unwrap();
+  std::fs::write(dir.join("helper.em"), "fn helper(): Int64 do\n  5\nend\n").unwrap();
   std::fs::write(dir.join("main.em"), "require helper\nputs helper() + 1\n").unwrap();
 }
 

@@ -61,7 +61,7 @@ fn run_with_workers(bin: &Path, workers: u32) -> Output {
 /// kept separate from `emerald-codegen`'s own `PINGPONG_EXAMPLE` (which
 /// asserts an exact, thread-id-free 9-line output) — this crate's own
 /// copy adds the thread-id column that test doesn't need.
-const PINGPONG_EXAMPLE: &str = "actor PingPong\n  name: String\n  limit: Int64\n  count: Int64\n  peer: PingPong\n\n  def initialize(name: String, limit: Int64) -> Void\n    @name = name\n    @limit = limit\n    @count = 0\n  end\n\n  def set_peer(other: PingPong) -> Void\n    @peer = other\n  end\n\n  def hit -> Void\n    @count = @count + 1\n    puts \"#{@name} #{@count} #{current_thread_id()}\"\n    if @count < @limit\n      @peer.hit\n    end\n  end\nend\n\na: PingPong = PingPong.spawn(\"A\", 5)\nb: PingPong = PingPong.spawn(\"B\", 5)\na.set_peer(b)\nb.set_peer(a)\na.hit\n";
+const PINGPONG_EXAMPLE: &str = "actor PingPong\n  name: String\n  limit: Int64\n  count: Int64\n  peer: PingPong\n\n  fn initialize(name: String, limit: Int64): Void do\n    @name = name\n    @limit = limit\n    @count = 0\n  end\n\n  fn set_peer(other: PingPong): Void do\n    @peer = other\n  end\n\n  fn hit: Void do\n    @count = @count + 1\n    puts \"#{@name} #{@count} #{current_thread_id()}\"\n    if @count < @limit do\n      @peer.hit\n    end\n  end\nend\n\na: PingPong = PingPong.spawn(\"A\", 5)\nb: PingPong = PingPong.spawn(\"B\", 5)\na.set_peer(b)\nb.set_peer(a)\na.hit\n";
 
 #[test]
 fn pingpong_ordering_holds_across_20_repetitions_under_a_forced_multi_worker_pool() {
@@ -131,7 +131,7 @@ fn pingpong_ordering_holds_across_20_repetitions_under_a_forced_multi_worker_poo
 /// This plan's own `Spinner` worked example.
 fn spinner_example(iterations: u64) -> String {
   format!(
-    "actor Spinner\n  id: Int64\n  total: Int64\n\n  def initialize(id: Int64) -> Void\n    @id = id\n    @total = 0\n  end\n\n  def spin(iterations: Int64) -> Void\n    i: Int64 = 0\n    while i < iterations\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns2: Spinner = Spinner.spawn(2)\ns1.spin({iterations})\ns2.spin({iterations})\n"
+    "actor Spinner\n  id: Int64\n  total: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n    @total = 0\n  end\n\n  fn spin(iterations: Int64): Void do\n    i: Int64 = 0\n    while i < iterations do\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns2: Spinner = Spinner.spawn(2)\ns1.spin({iterations})\ns2.spin({iterations})\n"
   )
 }
 
@@ -139,7 +139,7 @@ fn spinner_example(iterations: u64) -> String {
 /// "a single `spin(200000000)` call's own measured time."
 fn single_spin_example(iterations: u64) -> String {
   format!(
-    "actor Spinner\n  id: Int64\n  total: Int64\n\n  def initialize(id: Int64) -> Void\n    @id = id\n    @total = 0\n  end\n\n  def spin(iterations: Int64) -> Void\n    i: Int64 = 0\n    while i < iterations\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns1.spin({iterations})\n"
+    "actor Spinner\n  id: Int64\n  total: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n    @total = 0\n  end\n\n  fn spin(iterations: Int64): Void do\n    i: Int64 = 0\n    while i < iterations do\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns1.spin({iterations})\n"
   )
 }
 

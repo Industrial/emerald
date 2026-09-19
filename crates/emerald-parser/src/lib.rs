@@ -426,8 +426,11 @@ const ENUMERABLE_BLOCK_METHODS: [&str; 8] = [
 /// "why a NAMED Proc, not an inline block literal" rationale this
 /// rewrite exists to satisfy without changing either crate: it turns
 /// `nums.map { |x: Int64| x * 2 }` into the exact AST a hand-written
-/// `__fresh: Proc = ->(x: Int64) -> Int64 { x * 2 }; nums.map(__fresh)`
-/// already produces, before sema ever runs.
+/// `__fresh: Proc = do |x: Int64| x * 2 end; nums.map(__fresh)` produces
+/// (plan 71's own `"Void"` return-type placeholder aside — see that
+/// hoisted `Stmt::Let`'s own construction below, which overwrites it
+/// with the real, inferred type before codegen ever sees it), before
+/// sema ever runs.
 ///
 /// Deliberately narrow, matching `collect_lambda_infos`' own real,
 /// pre-existing "top-level `Let` only" restriction on every `Proc`
@@ -441,8 +444,10 @@ const ENUMERABLE_BLOCK_METHODS: [&str; 8] = [
 /// point out of its original, possibly-conditionally-executed scope.
 ///
 /// `.map`/`.reduce`/`.inject`'s own block has no declared return type
-/// at all (`{ |x: Int64| x * 2 }`, unlike the full `->(...) -> T
-/// {...}` lambda-literal syntax) — `infer_block_result_type` below is
+/// at all (`{ |x: Int64| x * 2 }` — and, since plan 71 deleted the
+/// lambda literal's own `-> T` return-type slot outright, NO surface
+/// syntax in this language can spell a lambda's return type explicitly
+/// any more, block-attached or bare) — `infer_block_result_type` below is
 /// a small, self-contained, syntax-only type inferencer (no `env`,
 /// only the block's own explicitly-typed params and this program's own
 /// top-level function return-type table) that computes it, since
@@ -503,12 +508,14 @@ fn hoist_enumerable_blocks(
                   source,
                   old.span,
                   format!(
-                    "can't infer this block's result type for `.{method_name}` — bind it to a \
-                     named `Proc` with an explicit return type instead (`name: Proc = \
-                     ->(...) -> ReturnType {{ ... }}`), then pass `name` in its place; this \
-                     plan's own block-return-type inference only covers literals, a bare \
+                    "can't infer this block's result type for `.{method_name}` — as of plan \
+                     71, no surface syntax in this language can state a lambda's return type \
+                     explicitly any more (the old `->(...) -> ReturnType {{ ... }}` lambda \
+                     literal is gone), so there is currently no rewrite that works around this; \
+                     this plan's own block-return-type inference only covers literals, a bare \
                      block-parameter reference, same-typed arithmetic/comparison/logical \
-                     operators, and a call to an already-declared top-level function"
+                     operators, and a call to an already-declared top-level function — restate \
+                     the block using only those shapes"
                   ),
                 )
               })?
@@ -678,7 +685,7 @@ mod tests {
     Spanned::synthetic(node)
   }
 
-  const FUNC_ONLY: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend";
+  const FUNC_ONLY: &str = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend";
 
   #[test]
   fn parses_add_function() {
@@ -715,7 +722,7 @@ mod tests {
 
   #[test]
   fn missing_end_errors() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b";
     // Plan 26: `errs.len()` is 1 here — a syntax error inside a
     // function body (not at a top-level `Item` boundary) still
     // hard-stops the whole parse, unchanged by top-level recovery.
@@ -742,7 +749,7 @@ mod tests {
     assert!(!format!("{report:?}").is_empty());
   }
 
-  const HELLO_EM: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+  const HELLO_EM: &str = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
 
   #[test]
   fn parses_hello_em_end_to_end() {
@@ -779,7 +786,7 @@ mod tests {
     );
   }
 
-  const MILESTONE2: &str = "x: Int64 = 10\n\nif x > 5\n  puts x\nend\n";
+  const MILESTONE2: &str = "x: Int64 = 10\n\nif x > 5 do\n  puts x\nend\n";
 
   #[test]
   fn parses_inception_milestone2_end_to_end() {
@@ -834,7 +841,7 @@ mod tests {
 
   #[test]
   fn parses_while_break_next() {
-    let src = "while x < 3\n  next\n  break\nend\n";
+    let src = "while x < 3 do\n  next\n  break\nend\n";
     let program = parse(src).expect("while/break/next should parse");
     let Item::Stmt(Spanned {
       node: Stmt::While { body, .. },
@@ -848,7 +855,7 @@ mod tests {
 
   #[test]
   fn parses_if_else() {
-    let src = "if x > 5\n  puts x\nelse\n  puts x\nend\n";
+    let src = "if x > 5 do\n  puts x\nelse\n  puts x\nend\n";
     let program = parse(src).expect("if/else should parse");
     let Item::Stmt(Spanned {
       node: Stmt::If { else_branch, .. },
@@ -862,7 +869,7 @@ mod tests {
 
   #[test]
   fn parses_return_with_value() {
-    let src = "def f(a: Int64) -> Int64\n  return a\nend";
+    let src = "fn f(a: Int64): Int64 do\n  return a\nend";
     let program = parse(src).expect("return should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function, got {:?}", program.items[0]);
@@ -873,7 +880,7 @@ mod tests {
     );
   }
 
-  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn sum: Float64 do\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
 
   #[test]
   fn parses_inception_point_example_end_to_end() {
@@ -1053,7 +1060,7 @@ mod tests {
   }
 
   const LAMBDA_EXAMPLE: &str =
-    "x: Int64 = 10\nadd_x: Proc = ->(y: Int64) -> Int64 { y + x }\nputs add_x.call(5)\n";
+    "x: Int64 = 10\nadd_x: Proc = do |y: Int64| y + x end\nputs add_x.call(5)\n";
 
   #[test]
   fn parses_lambda_capture_and_call() {
@@ -1080,7 +1087,11 @@ mod tests {
           ty: "Int64".into(),
           default: None
         }],
-        return_type: "Int64".into(),
+        // Plan 71: the bare `do |params| ... end` lambda literal carries
+        // no return-type syntax of its own any more (typed by context
+        // instead) — the grammar's own placeholder for this position is
+        // `"Void"`, the same placeholder `BlockLiteral` already uses.
+        return_type: "Void".into(),
         body: vec![s(Stmt::Expr(s(Expr::Add(
           Box::new(s(Expr::Ident("y".into()))),
           Box::new(s(Expr::Ident("x".into())))
@@ -1151,7 +1162,7 @@ mod tests {
     );
   }
 
-  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
+  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
 
   #[test]
   fn parses_begin_rescue() {
@@ -1260,7 +1271,7 @@ mod tests {
 
   #[test]
   fn default_param_value_parses_into_param_default() {
-    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n";
+    let src = "fn inc(n: Int64, step: Int64 = 1): Int64 do\n  n + step\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function");
@@ -1271,7 +1282,7 @@ mod tests {
 
   #[test]
   fn default_referencing_another_parameter_is_a_parse_error() {
-    let src = "def bad(n: Int64, step: Int64 = n) -> Int64\n  n + step\nend\n";
+    let src = "fn bad(n: Int64, step: Int64 = n): Int64 do\n  n + step\nend\n";
     assert!(
       parse(src).is_err(),
       "DefaultLit admits only literal tokens, never an Expr::Ident"
@@ -1280,7 +1291,7 @@ mod tests {
 
   #[test]
   fn splat_param_parses_into_function_splat_param() {
-    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n";
+    let src = "fn sum_all(*xs: Int64): Int64 do\n  0\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function");
@@ -1293,7 +1304,7 @@ mod tests {
 
   #[test]
   fn ordinary_param_then_splat_param_parses() {
-    let src = "def f(a: Int64, *xs: Int64) -> Int64\n  0\nend\n";
+    let src = "fn f(a: Int64, *xs: Int64): Int64 do\n  0\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function");
@@ -1331,7 +1342,7 @@ mod tests {
 
   #[test]
   fn return_tuple_parses_into_a_tuple_lit() {
-    let src = "def divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n";
+    let src = "fn divmod(a: Int64, b: Int64): (Int64, Int64) do\n  return a / b, a % b\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function");
@@ -1377,7 +1388,7 @@ mod tests {
 
   #[test]
   fn plus_operator_method_parses_to_a_function_named_plus() {
-    let src = "class Vector2\n  def +(other: Vector2) -> Vector2\n    self\n  end\nend\n";
+    let src = "class Vector2\n  fn +(other: Vector2): Vector2 do\n    self\n  end\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Class(c) = &program.items[0] else {
       panic!("expected a class");
@@ -1407,32 +1418,32 @@ mod tests {
   #[test]
   fn all_eight_operator_tokens_parse_as_method_names() {
     assert_eq!(
-      operator_method_name("class C\n  def -(o: C) -> C\n    self\n  end\nend\n"),
+      operator_method_name("class C\n  fn -(o: C): C do\n    self\n  end\nend\n"),
       "-"
     );
     assert_eq!(
-      operator_method_name("class C\n  def *(o: C) -> C\n    self\n  end\nend\n"),
+      operator_method_name("class C\n  fn *(o: C): C do\n    self\n  end\nend\n"),
       "*"
     );
     assert_eq!(
-      operator_method_name("class C\n  def /(o: C) -> C\n    self\n  end\nend\n"),
+      operator_method_name("class C\n  fn /(o: C): C do\n    self\n  end\nend\n"),
       "/"
     );
     assert_eq!(
-      operator_method_name("class C\n  def ==(o: C) -> Boolean\n    true\nend\nend\n"),
+      operator_method_name("class C\n  fn ==(o: C): Boolean do\n    true\nend\nend\n"),
       "=="
     );
     assert_eq!(
-      operator_method_name("class C\n  def <=>(o: C) -> Int64\n    0\n  end\nend\n"),
+      operator_method_name("class C\n  fn <=>(o: C): Int64 do\n    0\n  end\nend\n"),
       "<=>"
     );
     assert_eq!(
-      operator_method_name("class C\n  def [](i: Int64) -> Float64\n    1.0\n  end\nend\n"),
+      operator_method_name("class C\n  fn [](i: Int64): Float64 do\n    1.0\n  end\nend\n"),
       "[]"
     );
     assert_eq!(
       operator_method_name(
-        "class C\n  def []=(i: Int64, v: Float64) -> Void\n    puts 1\n  end\nend\n"
+        "class C\n  fn []=(i: Int64, v: Float64): Void do\n    puts 1\n  end\nend\n"
       ),
       "[]="
     );
@@ -1440,14 +1451,14 @@ mod tests {
 
   #[test]
   fn top_level_operator_named_def_is_a_parse_error() {
-    let src = "def +(a: Int64, b: Int64) -> Int64\n  a + b\nend\n";
+    let src = "fn +(a: Int64, b: Int64): Int64 do\n  a + b\nend\n";
     assert!(
       parse(src).is_err(),
       "operator-named methods stay class-body-only"
     );
   }
 
-  const MODULE_EXAMPLE: &str = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
+  const MODULE_EXAMPLE: &str = "module MathUtils\n  fn double(x: Int64): Int64 do\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
 
   #[test]
   fn parses_module_and_namespaced_call() {
@@ -1612,7 +1623,7 @@ mod tests {
     );
   }
 
-  const ARITHMETIC_EXAMPLE: &str = "def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
+  const ARITHMETIC_EXAMPLE: &str = "fn factorial(n: Int64): Int64 do\n  if n <= 1 do\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
 
   #[test]
   fn parses_arithmetic_example() {
@@ -1651,7 +1662,7 @@ mod tests {
     );
   }
 
-  const SHORT_CIRCUIT_EXAMPLE: &str = "def noisy(n: Int64) -> Boolean\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1)\n  puts 100\nend\nif x > -10 && noisy(3)\n  puts 300\nend\nif x < 0 || noisy(2)\n  puts 200\nend\nif x > 0 || noisy(4)\n  puts 400\nend\n";
+  const SHORT_CIRCUIT_EXAMPLE: &str = "fn noisy(n: Int64): Boolean do\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1) do\n  puts 100\nend\nif x > -10 && noisy(3) do\n  puts 300\nend\nif x < 0 || noisy(2) do\n  puts 200\nend\nif x > 0 || noisy(4) do\n  puts 400\nend\n";
 
   #[test]
   fn parses_short_circuit_example() {
@@ -1784,7 +1795,9 @@ mod tests {
     assert_eq!(args[0], Expr::StringLit("a#b".to_string()));
   }
 
-  const CASE_EXAMPLE: &str = "# classify an integer by a fixed set of buckets\nn: Int64 = 2\nlabel: Int64 = 0\ncase n\nwhen 1\n  label: Int64 = 10\nwhen 2, 3\n  label: Int64 = 20\nelse\n  label: Int64 = 99\nend\nputs label\n";
+  // Plan 71: `case`/`when`/`else` becomes `match`/`do`/`_` — each arm
+  // (including the wildcard) closes its own `do ... end`.
+  const CASE_EXAMPLE: &str = "# classify an integer by a fixed set of buckets\nn: Int64 = 2\nlabel: Int64 = 0\nmatch n do\n  1 do\n    label: Int64 = 10\n  end\n  2, 3 do\n    label: Int64 = 20\n  end\n  _ do\n    label: Int64 = 99\n  end\nend\nputs label\n";
 
   #[test]
   fn parses_case_when_example() {
@@ -1919,7 +1932,7 @@ mod tests {
 
   #[test]
   fn case_with_no_else_parses() {
-    let src = "case n\nwhen 1\n  puts 1\nend\n";
+    let src = "match n do\n  1 do\n    puts 1\n  end\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
       node: Stmt::Case { else_body, .. },
@@ -2002,7 +2015,7 @@ mod tests {
 
   #[test]
   fn plan_31_worked_example_parses() {
-    let src = "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n\na: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+    let src = "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5 do\n  total += i\n  i += 1\nend\nputs total\n\na: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
     parse(src).expect("plan 31's worked example must parse cleanly");
   }
 
@@ -2010,7 +2023,7 @@ mod tests {
 
   #[test]
   fn block_param_marker_parses_separately_from_params() {
-    let src = "def repeat(n: Int64, &blk) -> Void\n  yield n\nend\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  yield n\nend\n";
     let program = parse(src).unwrap();
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function");
@@ -2028,7 +2041,7 @@ mod tests {
 
   #[test]
   fn zero_arg_block_param_parses() {
-    let src = "def once(&blk) -> Void\n  yield 1\nend\n";
+    let src = "fn once(&blk): Void do\n  yield 1\nend\n";
     let program = parse(src).unwrap();
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function");
@@ -2039,7 +2052,7 @@ mod tests {
 
   #[test]
   fn function_with_no_block_param_is_none() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n";
     let program = parse(src).unwrap();
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function");
@@ -2099,7 +2112,7 @@ mod tests {
 
   #[test]
   fn plan_34_worked_example_parses() {
-    let src = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
     parse(src).expect("plan 34's worked example must parse cleanly");
   }
 
@@ -2168,7 +2181,7 @@ mod tests {
 
   #[test]
   fn require_inside_a_function_body_is_a_parse_error() {
-    let src = "def f -> Void\n  require helpers\nend\n";
+    let src = "fn f: Void do\n  require helpers\nend\n";
     assert!(
       parse(src).is_err(),
       "`require` must be rejected inside a function body"
@@ -2179,7 +2192,7 @@ mod tests {
 
   #[test]
   fn read_field_synthesizes_a_zero_arg_accessor() {
-    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n";
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n";
     let program = parse(src).unwrap();
     let Item::Class(c) = &program.items[0] else {
       panic!("expected a ClassDef");
@@ -2219,7 +2232,7 @@ mod tests {
 
   #[test]
   fn plan_33_worked_example_parses() {
-    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
     parse(src).expect("plan 33's worked example must parse cleanly");
   }
 
@@ -2247,7 +2260,7 @@ mod tests {
 
   #[test]
   fn plan_32_worked_example_parses() {
-    let src = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\n\n  def describe -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\n\n  def describe -> Int64\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
+    let src = "class Animal\n  age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn age: Int64 do\n    @age\n  end\n\n  fn describe: Int64 do\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  fn initialize(age: Int64, breed_code: Int64): Void do\n    @age = age\n    @breed_code = breed_code\n  end\n\n  fn describe: Int64 do\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
     parse(src).expect("plan 32's worked example must parse cleanly");
   }
 
@@ -2341,7 +2354,7 @@ mod tests {
 
   #[test]
   fn elsif_chain_desugars_to_nested_if_in_else_branch() {
-    let src = "if a\n  1\nelsif b\n  2\nelsif c\n  3\nelse\n  4\nend\n";
+    let src = "if a do\n  1\nelsif b do\n  2\nelsif c do\n  3\nelse\n  4\nend\n";
     let program = parse(src).unwrap();
     let Item::Stmt(Spanned {
       node: Stmt::If {
@@ -2398,7 +2411,7 @@ mod tests {
 
   #[test]
   fn unless_desugars_to_if_not() {
-    let src = "unless x > 0\n  return 0\nend\n";
+    let src = "unless x > 0 do\n  return 0\nend\n";
     let program = parse(src).unwrap();
     let Item::Stmt(Spanned {
       node: Stmt::If {
@@ -2425,7 +2438,7 @@ mod tests {
 
   #[test]
   fn until_desugars_to_while_not() {
-    let src = "until i >= 3\n  puts i\nend\n";
+    let src = "until i >= 3 do\n  puts i\nend\n";
     let program = parse(src).unwrap();
     let Item::Stmt(Spanned {
       node: Stmt::While { cond, body },
@@ -2453,10 +2466,10 @@ mod tests {
 
   #[test]
   fn plan_29_worked_examples_parse() {
-    let example_a = "def grade(score: Int64) -> Int64\n  if score >= 90\n    return 4\n  elsif score >= 80\n    return 3\n  elsif score >= 70\n    return 2\n  else\n    return 1\n  end\nend\n\nputs grade(95)\nputs grade(85)\nputs grade(72)\nputs grade(50)\n";
+    let example_a = "fn grade(score: Int64): Int64 do\n  if score >= 90 do\n    return 4\n  elsif score >= 80 do\n    return 3\n  elsif score >= 70 do\n    return 2\n  else\n    return 1\n  end\nend\n\nputs grade(95)\nputs grade(85)\nputs grade(72)\nputs grade(50)\n";
     parse(example_a).expect("plan 29 example A must parse cleanly");
 
-    let example_b = "def describe(x: Int64) -> Int64\n  unless x > 0\n    return 0\n  end\n  return 1\nend\n\nputs describe(-5)\nputs describe(5)\n\ni: Int64 = 0\nuntil i >= 3\n  puts i\n  i: Int64 = i + 1\nend\n";
+    let example_b = "fn describe(x: Int64): Int64 do\n  unless x > 0 do\n    return 0\n  end\n  return 1\nend\n\nputs describe(-5)\nputs describe(5)\n\ni: Int64 = 0\nuntil i >= 3 do\n  puts i\n  i: Int64 = i + 1\nend\n";
     parse(example_b).expect("plan 29 example B must parse cleanly");
   }
 
@@ -2563,7 +2576,7 @@ mod tests {
 
   #[test]
   fn plan_28_worked_example_parses() {
-    let src = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\ndef has_flag(flags: Int64, flag: Int64) -> Boolean\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ)\n  puts 1\nend\nif has_flag(perms, EXEC)\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
+    let src = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\nfn has_flag(flags: Int64, flag: Int64): Boolean do\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ) do\n  puts 1\nend\nif has_flag(perms, EXEC) do\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
     parse(src).expect("plan 28's worked example must parse cleanly");
   }
 
@@ -2590,7 +2603,7 @@ mod tests {
     // Regression guard for the plan 26 acceptance criteria: a source with
     // exactly one malformed construct inside an otherwise well-formed
     // function body must still report exactly one error, not more.
-    let errs = parse("def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nx: Int64 = +\n")
+    let errs = parse("fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nx: Int64 = +\n")
       .expect_err("the second statement is malformed");
     assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
   }
@@ -2622,7 +2635,7 @@ mod tests {
 
   // Plan 41 (interfaces and generics).
 
-  const INTERFACES_GENERICS_EXAMPLE: &str = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
+  const INTERFACES_GENERICS_EXAMPLE: &str = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\n\n  fn compare_to(other: Money): Int64 do\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  fn initialize(meters: Int64): Void do\n    @meters = meters\n  end\n\n  fn compare_to(other: Distance): Int64 do\n    @meters - other.meters\n  end\nend\n\nfn max[T: Comparable](a: T, b: T): T do\n  if a.compare_to(b) >= 0 do\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
 
   #[test]
   fn worked_example_parses_end_to_end_into_the_expected_ast_shapes() {
@@ -2705,7 +2718,7 @@ mod tests {
     );
   }
 
-  const STACK_GENERIC_EXAMPLE: &str = "class Stack[T]\n  items: Array[T]\n  count: Int64\n\n  def initialize -> Void\n    @items = Array.new(8)\n    @count = 0\n  end\n\n  def push(x: T) -> Void\n    @items[@count] = x\n    @count = @count + 1\n  end\n\n  def pop -> T\n    @count = @count - 1\n    @items[@count]\n  end\n\n  def peek -> T\n    @items[@count - 1]\n  end\nend\n\ns1: Stack[Int64] = Stack.new()\ns1.push(10)\ns1.push(20)\ns1.push(30)\nputs s1.pop\nputs s1.peek\n\ns2: Stack[String] = Stack.new()\ns2.push(\"first\")\ns2.push(\"second\")\nputs s2.pop\nputs s2.peek\n";
+  const STACK_GENERIC_EXAMPLE: &str = "class Stack[T]\n  items: Array[T]\n  count: Int64\n\n  fn initialize: Void do\n    @items = Array.new(8)\n    @count = 0\n  end\n\n  fn push(x: T): Void do\n    @items[@count] = x\n    @count = @count + 1\n  end\n\n  fn pop: T do\n    @count = @count - 1\n    @items[@count]\n  end\n\n  fn peek: T do\n    @items[@count - 1]\n  end\nend\n\ns1: Stack[Int64] = Stack.new()\ns1.push(10)\ns1.push(20)\ns1.push(30)\nputs s1.pop\nputs s1.peek\n\ns2: Stack[String] = Stack.new()\ns2.push(\"first\")\ns2.push(\"second\")\nputs s2.pop\nputs s2.peek\n";
 
   #[test]
   fn stack_generic_worked_example_parses_end_to_end() {
@@ -2774,7 +2787,7 @@ mod tests {
   fn multiple_type_parameters_parse_the_grammar_does_not_restrict_the_count() {
     // Plan 41's Decision log: the grammar's `TypeParamList` is a general
     // comma list — the single-type-parameter restriction is sema's job.
-    let src = "def bad[T: Comparable, U: Comparable](a: T, b: U) -> T\n  a\nend\n";
+    let src = "fn bad[T: Comparable, U: Comparable](a: T, b: U): T do\n  a\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function, got {:?}", program.items[0]);
@@ -2789,14 +2802,14 @@ mod tests {
     // The grammar structurally admits exactly one method — a second
     // `def` before the outer `end` cannot reduce as this same
     // production, so this is a real parse error.
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\n  def other_method(x: Int64) -> Int64\nend\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\n  fn other_method(x: Int64): Int64\nend\n";
     let errs = parse(src).unwrap_err();
     assert!(!errs.is_empty());
   }
 
   #[test]
-  fn interface_missing_the_inner_arrow_return_type_is_a_parse_error_not_a_panic() {
-    let src = "interface Comparable\n  def compare_to(other: Self)\nend\n";
+  fn interface_missing_the_inner_return_type_is_a_parse_error_not_a_panic() {
+    let src = "interface Comparable\n  fn compare_to(other: Self)\nend\n";
     let errs = parse(src).unwrap_err();
     assert!(!errs.is_empty());
   }
@@ -2918,7 +2931,7 @@ mod tests {
 
   #[test]
   fn nullable_worked_example_parses_end_to_end() {
-    let src = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+    let src = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 5);
   }
@@ -2985,7 +2998,7 @@ mod tests {
 
   #[test]
   fn symbols_worked_example_parses_end_to_end() {
-    let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+    let src = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo do\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar do\n  puts 1\nelse\n  puts 0\nend\n";
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 6);
   }
@@ -3016,7 +3029,7 @@ mod tests {
 
   #[test]
   fn plan_45_worked_example_parses_end_to_end() {
-    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
+    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n do\n  puts words[i]\n  i += 1\nend\n";
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 10);
   }
@@ -3038,7 +3051,7 @@ mod tests {
   #[test]
   fn assert_call_rewrites_its_trailing_offset_into_a_file_line_string() {
     // `assert(...)` is on line 2 (1-based) of this named source.
-    let src = "def f() -> Void\n  assert(true)\nend\n";
+    let src = "fn f(): Void do\n  assert(true)\nend\n";
     let program = parse_named(src, "t.em").expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function item");
@@ -3079,7 +3092,7 @@ mod tests {
   fn assert_inside_a_nested_block_still_gets_its_own_correct_line() {
     // The rewrite pass must recurse into `if`/`while`/etc. bodies, not
     // just top-level statements — this asserts on line 3.
-    let src = "x: Int64 = 1\nif x == 1\n  assert(x == 1)\nend\n";
+    let src = "x: Int64 = 1\nif x == 1 do\n  assert(x == 1)\nend\n";
     let program = parse_named(src, "nested.em").expect("should parse");
     let Item::Stmt(Spanned {
       node: Stmt::If { then_branch, .. },
@@ -3119,7 +3132,7 @@ mod tests {
     // the *second* `b` in the source — the one actually used in `a +
     // b`, not the first `b` (the `b: String` parameter declaration) and
     // not some placeholder/whole-document span.
-    let src = "def add(a: Int64, b: String) -> Int64\n  a + b\nend";
+    let src = "fn add(a: Int64, b: String): Int64 do\n  a + b\nend";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function item, got {:?}", program.items[0]);
@@ -3144,7 +3157,7 @@ mod tests {
 
   #[test]
   fn spans_are_non_degenerate_for_both_multi_and_single_character_tokens() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a Function item, got {:?}", program.items[0]);
@@ -3230,7 +3243,7 @@ mod tests {
 
   #[test]
   fn case_over_variant_patterns_parses_arms_with_bindings_in_source_order() {
-    let src = "case circle\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts s\nwhen Rectangle(w, h)\n  puts w\nend\n";
+    let src = "match circle do\n  Circle(r) do\n    puts r\n  end\n  Square(s) do\n    puts s\n  end\n  Rectangle(w, h) do\n    puts w\n  end\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
       node: Stmt::Case { arms, .. },
@@ -3281,7 +3294,7 @@ mod tests {
 
   #[test]
   fn plan_52_worked_example_parses_end_to_end() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\n\ncase circle\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts s\nwhen Rectangle(w, h)\n  puts w\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\n\nmatch circle do\n  Circle(r) do\n    puts r\n  end\n  Square(s) do\n    puts s\n  end\n  Rectangle(w, h) do\n    puts w\n  end\nend\n";
     let program = parse(src).expect("worked example should parse");
     assert!(matches!(program.items[0], Item::Enum(_)));
     assert!(matches!(program.items[1], Item::Stmt(_)));
@@ -3338,7 +3351,8 @@ mod tests {
 
   #[test]
   fn ok_err_match_form_parses_to_stmt_match_result() {
-    let src = "case result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    let src =
+      "match result do\n  Ok(v) do\n    puts v\n  end\n  Err(e) do\n    puts e\n  end\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
       node:
@@ -3370,7 +3384,7 @@ mod tests {
   // method other than `initialize` may no longer declare a return
   // type — `value` now prints `@count` itself (`puts @count`) rather
   // than returning it for a top-level `puts a.value` to print.
-  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn value: Void do\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
 
   #[test]
   fn actor_worked_example_parses_into_expected_shapes() {
@@ -3433,7 +3447,7 @@ mod tests {
 
   #[test]
   fn plan_53_worked_example_parses_end_to_end() {
-    let src = "def parse_int(s: String) -> Result[Int64, String]\n  if is_valid_int(s)\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"21\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    let src = "fn parse_int(s: String): Result[Int64, String] do\n  if is_valid_int(s) do\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\nfn try_parse(s: String): Result[Int64, String] do\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"21\")\nmatch result do\n  Ok(v) do\n    puts v\n  end\n  Err(e) do\n    puts e\n  end\nend\n";
     let program = parse(src).expect("worked example should parse");
     assert!(matches!(program.items[0], Item::Function(_)));
     assert!(matches!(program.items[1], Item::Function(_)));
@@ -3512,7 +3526,7 @@ mod tests {
 
   #[test]
   fn comptime_prefixed_def_parses_with_is_comptime_true() {
-    let src = "comptime def fact(n: Int64) -> Int64\n  n\nend\n";
+    let src = "comptime fn fact(n: Int64): Int64 do\n  n\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function, got {:?}", program.items[0]);
@@ -3522,7 +3536,7 @@ mod tests {
 
   #[test]
   fn an_ordinary_def_has_is_comptime_false() {
-    let src = "def fact(n: Int64) -> Int64\n  n\nend\n";
+    let src = "fn fact(n: Int64): Int64 do\n  n\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function, got {:?}", program.items[0]);
@@ -3681,7 +3695,7 @@ mod tests {
 
   #[test]
   fn expand_derives_rejects_a_class_that_already_hand_writes_eq() {
-    let src = "class Point derive Comparable\n  x: Int64\n  def ==(other: Point) -> Boolean\n    true\n  end\nend\n";
+    let src = "class Point derive Comparable\n  x: Int64\n  fn ==(other: Point): Boolean do\n    true\n  end\nend\n";
     let mut program = parse(src).expect("should parse");
     let err = crate::expand_derives(&mut program).expect_err("should reject");
     assert!(err.contains("Point"));
@@ -3745,7 +3759,7 @@ mod tests {
 
   #[test]
   fn requires_and_ensures_clauses_parse_with_the_expected_ast_shape_and_text() {
-    let src = "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b\nend\n";
+    let src = "fn divide(a: Int64, b: Int64): Int64\n  requires b != 0\n  ensures result * b <= a\n  do\n  return a / b\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function");
@@ -3766,7 +3780,7 @@ mod tests {
 
   #[test]
   fn a_function_with_no_contracts_parses_with_both_lists_empty() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  return a + b\nend\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  return a + b\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function");
@@ -3789,13 +3803,13 @@ mod tests {
 
   #[test]
   fn a_requires_clause_on_a_class_method_is_a_real_parse_error_not_a_sema_diagnostic() {
-    let src = "class Point\n  x: Int64\n\n  def get_x() -> Int64\n    requires true\n    return @x\n  end\nend\n";
+    let src = "class Point\n  x: Int64\n\n  fn get_x(): Int64 do\n    requires true\n    return @x\n  end\nend\n";
     assert!(parse(src).is_err());
   }
 
   #[test]
   fn pure_def_parses_with_is_pure_true() {
-    let src = "pure def square(x: Int64) -> Int64\n  return x * x\nend\n";
+    let src = "pure fn square(x: Int64): Int64 do\n  return x * x\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function");
@@ -3805,7 +3819,7 @@ mod tests {
 
   #[test]
   fn an_ordinary_def_parses_with_is_pure_false() {
-    let src = "def square(x: Int64) -> Int64\n  return x * x\nend\n";
+    let src = "fn square(x: Int64): Int64 do\n  return x * x\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function");
@@ -3815,7 +3829,7 @@ mod tests {
 
   #[test]
   fn pure_def_parses_identically_inside_a_class_body() {
-    let src = "class Point\n  x: Int64\n\n  pure def get_x() -> Int64\n    return @x\n  end\nend\n";
+    let src = "class Point\n  x: Int64\n\n  pure fn get_x(): Int64 do\n    return @x\n  end\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Class(c) = &program.items[0] else {
       panic!("expected a class");
@@ -3825,7 +3839,7 @@ mod tests {
 
   #[test]
   fn pure_and_comptime_compose_on_the_same_function() {
-    let src = "pure comptime def square(x: Int64) -> Int64\n  return x * x\nend\n";
+    let src = "pure comptime fn square(x: Int64): Int64 do\n  return x * x\nend\n";
     let program = parse(src).expect("should parse");
     let Item::Function(f) = &program.items[0] else {
       panic!("expected a function");
@@ -3959,7 +3973,7 @@ mod tests {
     // `Expr::Lambda`, which still parses (this plan's grammar change is
     // receiver/context-agnostic) but is `emerald-sema`'s problem, not
     // this pass's.
-    let src = "nums: Array[Int64] = [1, 2, 3]\nif true\n  evens: Array[Int64] = nums.select { |x: Int64| x > 1 }\nend\n";
+    let src = "nums: Array[Int64] = [1, 2, 3]\nif true do\n  evens: Array[Int64] = nums.select { |x: Int64| x > 1 }\nend\n";
     let program = parse(src).expect("should still parse");
     let Item::Stmt(Spanned {
       node: Stmt::If { then_branch, .. },

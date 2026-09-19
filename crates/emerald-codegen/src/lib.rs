@@ -12794,7 +12794,7 @@ fn define_lambda<'ctx>(
   builder: &Builder<'ctx>,
   name: &str,
   params: &[Param],
-  return_type: &str,
+  ret_kind: ValKind,
   body: &[Spanned<Stmt>],
   info: &LambdaInfo,
   fv: FunctionValue<'ctx>,
@@ -12872,7 +12872,6 @@ fn define_lambda<'ctx>(
   collect_lets(body, &mut decls);
   prealloc_lets(context, builder, &decls, &mut vars)?;
 
-  let ret_kind = value_kind_for_type(return_type);
   build_function_body(
     context,
     builder,
@@ -13958,12 +13957,108 @@ fn declare_user_functions<'ctx>(
   user_func_ids
 }
 
+/// Plan 71 follow-up (this session's own real, disclosed gap, mirroring
+/// `emerald-sema`'s `infer_lambda_type`'s own doc comment): after the
+/// grammar unification, a lambda literal's surface syntax (`do |params: T|
+/// ... end`) never states a return type at all — `Expr::Lambda.return_type`
+/// is always the `"Void"` placeholder the parser fills in, never a real
+/// user-written annotation, unlike the old `->(params) -> Type { body }`
+/// literal this replaced. `declare_lambda_functions` used to trust that
+/// field directly for a top-level `Proc`-typed `Let`'s own LLVM function
+/// signature — sound when it was real surface syntax, silently wrong now
+/// that it's a constant placeholder (every `.select`/`.map`/`.reduce`/
+/// `.count` call against a non-Void-returning Proc hit this crate's own
+/// "Proc must not be Void (sema should have rejected this)" internal-error
+/// guards, since `ret_kind` was always `ValKind::Void` regardless of the
+/// lambda's real body). This is a narrow, `ValKind`-level mirror of sema's
+/// `Type`-level inference — precise enough to be right for any program that
+/// has already passed sema's own equivalent, real check, not a general type
+/// checker.
+fn infer_lambda_ret_kind(
+  params: &[Param],
+  body: &[Spanned<Stmt>],
+  top_level_types: &HashMap<String, String>,
+  user_fn_return_types: &HashMap<String, String>,
+) -> ValKind {
+  let mut env: HashMap<&str, ValKind> = HashMap::new();
+  for (name, ty) in top_level_types {
+    env.insert(name.as_str(), value_kind_for_type(ty));
+  }
+  for p in params {
+    env.insert(p.name.as_str(), value_kind_for_type(&p.ty));
+  }
+  match body.last() {
+    Some(Spanned {
+      node: Stmt::Expr(e),
+      ..
+    })
+    | Some(Spanned {
+      node: Stmt::Return(Some(e)),
+      ..
+    }) => infer_expr_val_kind(e, &env, user_fn_return_types),
+    _ => ValKind::Void,
+  }
+}
+
+fn infer_expr_val_kind(
+  expr: &Spanned<Expr>,
+  env: &HashMap<&str, ValKind>,
+  user_fn_return_types: &HashMap<String, String>,
+) -> ValKind {
+  match &expr.node {
+    Expr::Ident(name) => env.get(name.as_str()).cloned().unwrap_or(ValKind::Int64),
+    Expr::Int(_) => ValKind::Int64,
+    Expr::Float(_) => ValKind::Float64,
+    Expr::Bool(_) => ValKind::Bool,
+    Expr::StringLit(_) | Expr::Interpolate(_) => ValKind::Str,
+    Expr::SymbolLit(_) => ValKind::Symbol,
+    Expr::Nil => ValKind::Nil,
+    Expr::Not(_) | Expr::And(_, _) | Expr::Or(_, _) | Expr::Compare(_, _, _) => ValKind::Bool,
+    Expr::Add(l, _)
+    | Expr::Sub(l, _)
+    | Expr::Mul(l, _)
+    | Expr::Div(l, _)
+    | Expr::Rem(l, _)
+    | Expr::Neg(l) => infer_expr_val_kind(l, env, user_fn_return_types),
+    Expr::BitAnd(_, _)
+    | Expr::BitOr(_, _)
+    | Expr::BitXor(_, _)
+    | Expr::BitNot(_)
+    | Expr::Shl(_, _)
+    | Expr::Shr(_, _) => ValKind::Int64,
+    Expr::Call(name, _) if name == "puts" => ValKind::Void,
+    Expr::Call(name, _) => user_fn_return_types
+      .get(name)
+      .map(|t| value_kind_for_type(t))
+      .unwrap_or(ValKind::Void),
+    Expr::MethodCall(_, method, _) if method == "key" || method == "value" => ValKind::Int64,
+    _ => ValKind::Ptr,
+  }
+}
+
 fn declare_lambda_functions<'ctx>(
   context: &'ctx Context,
   module: &Module<'ctx>,
   program: &Program,
   lambda_infos: &HashMap<String, LambdaInfo>,
 ) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
+  let mut top_level_types: HashMap<String, String> = HashMap::new();
+  let mut user_fn_return_types: HashMap<String, String> = HashMap::new();
+  for item in &program.items {
+    match item {
+      Item::Stmt(Spanned {
+        node: Stmt::Let { name, ty, .. },
+        ..
+      }) => {
+        top_level_types.insert(name.clone(), ty.clone());
+      }
+      Item::Function(f) => {
+        user_fn_return_types.insert(f.name.clone(), f.return_type.clone());
+      }
+      _ => {}
+    }
+  }
+
   let mut lambda_func_ids = HashMap::new();
   for item in &program.items {
     let Item::Stmt(Spanned {
@@ -13973,12 +14068,7 @@ fn declare_lambda_functions<'ctx>(
           ty,
           value:
             Spanned {
-              node:
-                Expr::Lambda {
-                  params,
-                  return_type,
-                  ..
-                },
+              node: Expr::Lambda { params, body, .. },
               ..
             },
         },
@@ -13990,7 +14080,7 @@ fn declare_lambda_functions<'ctx>(
     if ty != "Proc" || !lambda_infos.contains_key(name) {
       continue;
     }
-    let ret_kind = value_kind_for_type(return_type);
+    let ret_kind = infer_lambda_ret_kind(params, body, &top_level_types, &user_fn_return_types);
     let mut kinds = vec![ValKind::Ptr]; // env
     kinds.extend(param_kinds(params));
     let fn_ty = make_fn_type(context, &kinds, &ret_kind);
@@ -15081,27 +15171,24 @@ fn compile_to_object_impl(
             ty,
             value:
               Spanned {
-                node:
-                  Expr::Lambda {
-                    params,
-                    return_type,
-                    body,
-                  },
+                node: Expr::Lambda { params, body, .. },
                 ..
               },
           },
         ..
       }) if ty == "Proc" => {
-        if let (Some(info), Some(&(fv, _))) = (lambda_infos.get(name), lambda_func_ids.get(name)) {
+        if let (Some(info), Some((fv, ret_kind))) =
+          (lambda_infos.get(name), lambda_func_ids.get(name))
+        {
           define_lambda(
             &context,
             &builder,
             name,
             params,
-            return_type,
+            ret_kind.clone(),
             body,
             info,
-            fv,
+            *fv,
             &gen_ctx,
           )?;
         }
@@ -16068,7 +16155,7 @@ mod tests {
 
   #[test]
   fn compiles_hello_em_to_an_object_file() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
     let program = emerald_parser::parse(src).expect("should parse");
 
     let dir = std::env::temp_dir();
@@ -16088,36 +16175,36 @@ mod tests {
 
   #[test]
   fn hello_em_linked_and_run_prints_42() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
 
   #[test]
   fn inception_milestone2_linked_and_run_prints_10() {
-    let src = "x: Int64 = 10\n\nif x > 5\n  puts x\nend\n";
+    let src = "x: Int64 = 10\n\nif x > 5 do\n  puts x\nend\n";
     assert_eq!(compile_link_run(src), "10\n");
   }
 
   #[test]
   fn while_loop_sums_1_to_3_and_prints_6() {
-    let src = "total: Int64 = 0\ni: Int64 = 1\nwhile i < 4\n  total: Int64 = total + i\n  i: Int64 = i + 1\nend\nputs total\n";
+    let src = "total: Int64 = 0\ni: Int64 = 1\nwhile i < 4 do\n  total: Int64 = total + i\n  i: Int64 = i + 1\nend\nputs total\n";
     assert_eq!(compile_link_run(src), "6\n");
   }
 
   #[test]
   fn break_exits_loop_early() {
-    let src = "total: Int64 = 0\ni: Int64 = 1\nwhile i < 4\n  if i == 2\n    break\n  end\n  total: Int64 = total + i\n  i: Int64 = i + 1\nend\nputs total\n";
+    let src = "total: Int64 = 0\ni: Int64 = 1\nwhile i < 4 do\n  if i == 2 do\n    break\n  end\n  total: Int64 = total + i\n  i: Int64 = i + 1\nend\nputs total\n";
     assert_eq!(compile_link_run(src), "1\n");
   }
 
-  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+  const POINT_EXAMPLE: &str = "class Point\n  x: Float64\n  y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn sum: Float64 do\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
 
   #[test]
   fn inception_point_example_linked_and_run_prints_5() {
     assert_eq!(compile_link_run(POINT_EXAMPLE), "5\n");
   }
 
-  const ARRAY_EXAMPLE: &str = "arr: Array[Int64] = [10, 20, 30]\nsum: Int64 = 0\ni: Int64 = 0\nwhile i < 3\n  sum: Int64 = sum + arr[i]\n  i: Int64 = i + 1\nend\narr[1] = 99\nputs sum\nputs arr[1]\n";
+  const ARRAY_EXAMPLE: &str = "arr: Array[Int64] = [10, 20, 30]\nsum: Int64 = 0\ni: Int64 = 0\nwhile i < 3 do\n  sum: Int64 = sum + arr[i]\n  i: Int64 = i + 1\nend\narr[1] = 99\nputs sum\nputs arr[1]\n";
 
   #[test]
   fn plan_09_collections_example_linked_and_run() {
@@ -16139,17 +16226,17 @@ mod tests {
 
   #[test]
   fn lambda_capture_and_call_linked_and_run() {
-    let src = "x: Int64 = 10\nadd_x: Proc = ->(y: Int64) -> Int64 { y + x }\nputs add_x.call(5)\n";
+    let src = "x: Int64 = 10\nadd_x: Proc = do |y: Int64| y + x end\nputs add_x.call(5)\n";
     assert_eq!(compile_link_run(src), "15\n");
   }
 
   #[test]
   fn lambda_with_no_captures_linked_and_run() {
-    let src = "add_one: Proc = ->(y: Int64) -> Int64 { y + 1 }\nputs add_one.call(41)\n";
+    let src = "add_one: Proc = do |y: Int64| y + 1 end\nputs add_one.call(41)\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
 
-  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
+  const EXCEPTION_EXAMPLE: &str = "class MyError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise MyError.new(99)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue MyError => e\n  puts e.code\nend\n";
 
   #[test]
   fn plan_11_exceptions_example_linked_and_run() {
@@ -16158,13 +16245,13 @@ mod tests {
 
   #[test]
   fn no_exception_raised_skips_rescue_entirely() {
-    let src = "def risky(x: Int64) -> Int64\n  if x > 100\n    raise MyError.new(99)\n  end\n  return x\nend\n\nclass MyError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nbegin\n  puts risky(5)\nrescue MyError => e\n  puts 0\nend\n";
+    let src = "fn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise MyError.new(99)\n  end\n  return x\nend\n\nclass MyError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nbegin\n  puts risky(5)\nrescue MyError => e\n  puts 0\nend\n";
     assert_eq!(compile_link_run(src), "5\n");
   }
 
   #[test]
   fn plan_12_module_example_linked_and_run() {
-    let src = "module MathUtils\n  def double(x: Int64) -> Int64\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
+    let src = "module MathUtils\n  fn double(x: Int64): Int64 do\n    x + x\n  end\nend\n\nputs MathUtils.double(21)\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
 
@@ -16236,7 +16323,7 @@ mod tests {
   // through, not just that it type-checks.
   #[test]
   fn plan65_capturing_a_local_sends_result_and_matching_ok_prints_the_ok_arm() {
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.spawn(0)\nresult: Result[Void, SendError] = c.increment\ncase result\nwhen Ok(v)\n  puts \"ok\"\nwhen Err(e)\n  puts \"err\"\nend\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.spawn(0)\nresult: Result[Void, SendError] = c.increment\nmatch result do\nOk(v) do\n  puts \"ok\"\nend\nErr(e) do\n  puts \"err\"\nend\nend\n";
     assert_eq!(compile_link_run(src), "ok\n");
   }
 
@@ -16247,7 +16334,7 @@ mod tests {
   // own allocation path.
   #[test]
   fn plan65_locate_with_no_peers_configured_activates_locally_like_spawn() {
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\nc: Counter = Counter.locate(\"shard-1\", 0)\nc.increment\nc.increment\nc.value\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn value: Void do\n    puts @count\n  end\nend\n\nc: Counter = Counter.locate(\"shard-1\", 0)\nc.increment\nc.increment\nc.value\n";
     assert_eq!(compile_link_run(src), "2\n");
   }
 
@@ -16256,7 +16343,7 @@ mod tests {
   // resets `@count` back to its original `initialize` argument.
   #[test]
   fn plan65_a_second_locate_call_for_the_same_key_returns_the_cached_instance() {
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\nc1: Counter = Counter.locate(\"shard-1\", 0)\nc1.increment\nc2: Counter = Counter.locate(\"shard-1\", 999)\nc2.increment\nc2.value\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn value: Void do\n    puts @count\n  end\nend\n\nc1: Counter = Counter.locate(\"shard-1\", 0)\nc1.increment\nc2: Counter = Counter.locate(\"shard-1\", 999)\nc2.increment\nc2.value\n";
     assert_eq!(
       compile_link_run(src),
       "2\n",
@@ -16276,14 +16363,14 @@ mod tests {
 
   // Plan 18 (arithmetic & logical operators).
 
-  const ARITHMETIC_EXAMPLE: &str = "def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
+  const ARITHMETIC_EXAMPLE: &str = "fn factorial(n: Int64): Int64 do\n  if n <= 1 do\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nputs factorial(5)\nputs 17 / 5\nputs 17 % 5\nputs -3 + 10\n";
 
   #[test]
   fn arithmetic_example_linked_and_run() {
     assert_eq!(compile_link_run(ARITHMETIC_EXAMPLE), "120\n3\n2\n7\n");
   }
 
-  const SHORT_CIRCUIT_EXAMPLE: &str = "def noisy(n: Int64) -> Boolean\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1)\n  puts 100\nend\nif x > -10 && noisy(3)\n  puts 300\nend\nif x < 0 || noisy(2)\n  puts 200\nend\nif x > 0 || noisy(4)\n  puts 400\nend\n";
+  const SHORT_CIRCUIT_EXAMPLE: &str = "fn noisy(n: Int64): Boolean do\n  puts n\n  return n > 0\nend\n\nx: Int64 = -5\nif x > 0 && noisy(1) do\n  puts 100\nend\nif x > -10 && noisy(3) do\n  puts 300\nend\nif x < 0 || noisy(2) do\n  puts 200\nend\nif x > 0 || noisy(4) do\n  puts 400\nend\n";
 
   #[test]
   fn short_circuit_example_linked_and_run() {
@@ -16312,7 +16399,7 @@ mod tests {
     // total of exactly 210000000, then subtract that same literal back
     // out — genuinely 0 only once the loop has actually run, not
     // something the optimizer can fold away.
-    let src = "arr: Array[Int64] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]\ntotal: Int64 = 0\nrep: Int64 = 0\nwhile rep < 1000000\n  i: Int64 = 0\n  while i < 20\n    total: Int64 = total + arr[i]\n    i: Int64 = i + 1\n  end\n  rep: Int64 = rep + 1\nend\nzero: Int64 = total - 210000000\nputs 10 / zero\n";
+    let src = "arr: Array[Int64] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]\ntotal: Int64 = 0\nrep: Int64 = 0\nwhile rep < 1000000 do\n  i: Int64 = 0\n  while i < 20 do\n    total: Int64 = total + arr[i]\n    i: Int64 = i + 1\n  end\n  rep: Int64 = rep + 1\nend\nzero: Int64 = total - 210000000\nputs 10 / zero\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = std::env::temp_dir();
     let unique = format!(
@@ -16369,7 +16456,7 @@ mod tests {
 
   // Plan 19 (string literals).
 
-  const STRING_EXAMPLE: &str = "s: String = \"hello\"\nputs s\na: String = \"foo\" + \"bar\"\nputs a\nif \"abc\" == \"abc\"\n  puts \"equal\"\nend\nputs \"line1\\nline2\"\nputs \"a\\\"b\"\n";
+  const STRING_EXAMPLE: &str = "s: String = \"hello\"\nputs s\na: String = \"foo\" + \"bar\"\nputs a\nif \"abc\" == \"abc\" do\n  puts \"equal\"\nend\nputs \"line1\\nline2\"\nputs \"a\\\"b\"\n";
 
   #[test]
   fn string_example_linked_and_run() {
@@ -16409,7 +16496,7 @@ mod tests {
 
   fn case_example(n: i64) -> String {
     format!(
-      "# classify an integer by a fixed set of buckets\nn: Int64 = {n}\nlabel: Int64 = 0\ncase n\nwhen 1\n  label: Int64 = 10\nwhen 2, 3\n  label: Int64 = 20\nelse\n  label: Int64 = 99\nend\nputs label\n"
+      "# classify an integer by a fixed set of buckets\nn: Int64 = {n}\nlabel: Int64 = 0\nmatch n do\n1 do\n  label: Int64 = 10\nend\n2, 3 do\n  label: Int64 = 20\nend\n_ do\n  label: Int64 = 99\nend\nend\nputs label\n"
     )
   }
 
@@ -16434,20 +16521,20 @@ mod tests {
   #[test]
   fn case_with_no_else_and_no_match_falls_through_harmlessly() {
     // AC3: no diagnostic, no crash — matches `if` with no `else`.
-    let src = "n: Int64 = 7\ncase n\nwhen 1\n  puts 1\nend\nputs 42\n";
+    let src = "n: Int64 = 7\nmatch n do\n1 do\n  puts 1\nend\nend\nputs 42\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
 
   // Plan 25 (stdlib expansion).
 
-  const BOOL_EXAMPLE: &str = "def check(flag: Boolean) -> Int64\n  if flag\n    return 1\n  end\n  return 0\nend\n\nputs check(true)\nputs check(false)\n";
+  const BOOL_EXAMPLE: &str = "fn check(flag: Boolean): Int64 do\n  if flag do\n    return 1\n  end\n  return 0\nend\n\nputs check(true)\nputs check(false)\n";
 
   #[test]
   fn bool_literal_example_linked_and_run() {
     assert_eq!(compile_link_run(BOOL_EXAMPLE), "1\n0\n");
   }
 
-  const NIL_EXAMPLE: &str = "def check_nil(x: Nil) -> Int64\n  if x == nil\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
+  const NIL_EXAMPLE: &str = "fn check_nil(x: Nil): Int64 do\n  if x == nil do\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
 
   #[test]
   fn nil_literal_example_linked_and_run() {
@@ -16500,7 +16587,7 @@ mod tests {
     );
   }
 
-  const ARRAY_NEW_EXAMPLE: &str = "arr: Array[Int64] = Array.new(5)\nputs arr[0]\ni: Int64 = 0\nwhile i < 5\n  arr[i] = i\n  i: Int64 = i + 1\nend\nputs arr[3]\n";
+  const ARRAY_NEW_EXAMPLE: &str = "arr: Array[Int64] = Array.new(5)\nputs arr[0]\ni: Int64 = 0\nwhile i < 5 do\n  arr[i] = i\n  i: Int64 = i + 1\nend\nputs arr[3]\n";
 
   #[test]
   fn array_new_zero_filled_and_writable_linked_and_run() {
@@ -16516,7 +16603,7 @@ mod tests {
 
   // Plan 28 (bitwise operators).
 
-  const BITWISE_EXAMPLE: &str = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\ndef has_flag(flags: Int64, flag: Int64) -> Boolean\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ)\n  puts 1\nend\nif has_flag(perms, EXEC)\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
+  const BITWISE_EXAMPLE: &str = "READ: Int64 = 1\nWRITE: Int64 = 2\nEXEC: Int64 = 4\n\nfn has_flag(flags: Int64, flag: Int64): Boolean do\n  return flags & flag == flag\nend\n\nperms: Int64 = READ | WRITE\nputs perms\nif has_flag(perms, READ) do\n  puts 1\nend\nif has_flag(perms, EXEC) do\n  puts 0\nend\nputs perms ^ WRITE\nputs ~0\nputs 1 << 4\nputs 256 >> 4\n";
 
   #[test]
   fn bitwise_example_linked_and_run() {
@@ -16554,14 +16641,14 @@ mod tests {
   // parse-time desugarings into existing Stmt::If/Stmt::While shapes —
   // no codegen source changes, real compiled-and-run proof only.
 
-  const ELSIF_EXAMPLE: &str = "def grade(score: Int64) -> Int64\n  if score >= 90\n    return 4\n  elsif score >= 80\n    return 3\n  elsif score >= 70\n    return 2\n  else\n    return 1\n  end\nend\n\nputs grade(95)\nputs grade(85)\nputs grade(72)\nputs grade(50)\n";
+  const ELSIF_EXAMPLE: &str = "fn grade(score: Int64): Int64 do\n  if score >= 90 do\n    return 4\n  elsif score >= 80 do\n    return 3\n  elsif score >= 70 do\n    return 2\n  else\n    return 1\n  end\nend\n\nputs grade(95)\nputs grade(85)\nputs grade(72)\nputs grade(50)\n";
 
   #[test]
   fn elsif_example_linked_and_run() {
     assert_eq!(compile_link_run(ELSIF_EXAMPLE), "4\n3\n2\n1\n");
   }
 
-  const UNLESS_UNTIL_EXAMPLE: &str = "def describe(x: Int64) -> Int64\n  unless x > 0\n    return 0\n  end\n  return 1\nend\n\nputs describe(-5)\nputs describe(5)\n\ni: Int64 = 0\nuntil i >= 3\n  puts i\n  i: Int64 = i + 1\nend\n";
+  const UNLESS_UNTIL_EXAMPLE: &str = "fn describe(x: Int64): Int64 do\n  unless x > 0 do\n    return 0\n  end\n  return 1\nend\n\nputs describe(-5)\nputs describe(5)\n\ni: Int64 = 0\nuntil i >= 3 do\n  puts i\n  i: Int64 = i + 1\nend\n";
 
   #[test]
   fn unless_until_example_linked_and_run() {
@@ -16578,13 +16665,13 @@ mod tests {
 
   #[test]
   fn for_in_break_stops_after_the_second_element() {
-    let src = "for x in [10, 20, 30, 40]\n  if x == 30\n    break\n  end\n  puts x\nend\n";
+    let src = "for x in [10, 20, 30, 40]\n  if x == 30 do\n    break\n  end\n  puts x\nend\n";
     assert_eq!(compile_link_run(src), "10\n20\n");
   }
 
   #[test]
   fn for_in_next_skips_one_element() {
-    let src = "for x in [10, 20, 30]\n  if x == 20\n    next\n  end\n  puts x\nend\n";
+    let src = "for x in [10, 20, 30]\n  if x == 20 do\n    next\n  end\n  puts x\nend\n";
     assert_eq!(compile_link_run(src), "10\n30\n");
   }
 
@@ -16630,7 +16717,7 @@ mod tests {
   }
 
   const COMPOUND_ASSIGN_EXAMPLE: &str =
-    "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n";
+    "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5 do\n  total += i\n  i += 1\nend\nputs total\n";
 
   #[test]
   fn compound_plus_assign_accumulator_linked_and_run() {
@@ -16658,13 +16745,13 @@ mod tests {
 
   #[test]
   fn plan_31_worked_example_linked_and_run() {
-    let src = "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5\n  total += i\n  i += 1\nend\nputs total\n\na: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+    let src = "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5 do\n  total += i\n  i += 1\nend\nputs total\n\na: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
     assert_eq!(compile_link_run(src), "10\n2\n1\n");
   }
 
   // Plan 32 (class inheritance).
 
-  const INHERITANCE_EXAMPLE: &str = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\n\n  def describe -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\n\n  def describe -> Int64\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
+  const INHERITANCE_EXAMPLE: &str = "class Animal\n  age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn age: Int64 do\n    @age\n  end\n\n  fn describe: Int64 do\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  fn initialize(age: Int64, breed_code: Int64): Void do\n    @age = age\n    @breed_code = breed_code\n  end\n\n  fn describe: Int64 do\n    @age + @breed_code\n  end\nend\n\na: Animal = Animal.new(5)\nd: Dog = Dog.new(3, 100)\nputs a.describe\nputs d.age\nputs d.describe\n";
 
   #[test]
   fn inheritance_example_linked_and_run() {
@@ -16680,7 +16767,7 @@ mod tests {
   fn class_with_no_superclass_still_compiles_and_runs_unchanged() {
     // Regression: an ordinary, non-inheriting class must behave exactly
     // as before this plan.
-    let src = "class Counter\n  n: Int64\n\n  def initialize(n: Int64) -> Void\n    @n = n\n  end\n\n  def value -> Int64\n    @n\n  end\nend\n\nc: Counter = Counter.new(7)\nputs c.value\n";
+    let src = "class Counter\n  n: Int64\n\n  fn initialize(n: Int64): Void do\n    @n = n\n  end\n\n  fn value: Int64 do\n    @n\n  end\nend\n\nc: Counter = Counter.new(7)\nputs c.value\n";
     assert_eq!(compile_link_run(src), "7\n");
   }
 
@@ -16691,13 +16778,13 @@ mod tests {
     // Real executed proof `p.x` dispatches through the synthesized
     // zero-arg accessor exactly like a hand-written method — no codegen
     // source changes needed for this plan at all.
-    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
+    let src = "class Point\n  read x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(3, 4)\nputs p.x\n";
     assert_eq!(compile_link_run(src), "3\n");
   }
 
   // Plan 34 (blocks and yield).
 
-  const BLOCKS_EXAMPLE: &str = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
+  const BLOCKS_EXAMPLE: &str = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nrepeat(3) { |i: Int64| puts i }\n";
 
   #[test]
   fn blocks_and_yield_example_linked_and_run() {
@@ -16715,7 +16802,7 @@ mod tests {
     // proof capture flows through this call-site-specialization path
     // (reusing the same `vars` map as the call site itself), not just
     // plan 10's original top-level-`Let` lambda path.
-    let src = "def repeat(n: Int64, &blk) -> Void\n  i: Int64 = 0\n  while i < n\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nmultiplier: Int64 = 10\nrepeat(3) { |i: Int64| puts i * multiplier }\n";
+    let src = "fn repeat(n: Int64, &blk): Void do\n  i: Int64 = 0\n  while i < n do\n    yield i\n    i: Int64 = i + 1\n  end\nend\n\nmultiplier: Int64 = 10\nrepeat(3) { |i: Int64| puts i * multiplier }\n";
     assert_eq!(compile_link_run(src), "0\n10\n20\n");
   }
 
@@ -16801,13 +16888,13 @@ mod tests {
 
   #[test]
   fn break_inside_a_range_for_in_stops_iteration_early() {
-    let src = "for i in 1..5\n  if i == 3\n    break\n  end\n  puts i\nend\n";
+    let src = "for i in 1..5\n  if i == 3 do\n    break\n  end\n  puts i\nend\n";
     assert_eq!(compile_link_run(src), "1\n2\n");
   }
 
   #[test]
   fn next_inside_a_range_for_in_skips_one_element() {
-    let src = "for i in 1..5\n  if i == 3\n    next\n  end\n  puts i\nend\n";
+    let src = "for i in 1..5\n  if i == 3 do\n    next\n  end\n  puts i\nend\n";
     assert_eq!(compile_link_run(src), "1\n2\n4\n5\n");
   }
 
@@ -16825,7 +16912,7 @@ mod tests {
 
   // Plan 38 (full exception model).
 
-  const FULL_EXCEPTION_WORKED_EXAMPLE: &str = "class NotFoundError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\nclass TimeoutError\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise TimeoutError.new(7)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
+  const FULL_EXCEPTION_WORKED_EXAMPLE: &str = "class NotFoundError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nclass TimeoutError\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise TimeoutError.new(7)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue NotFoundError => e\n  puts e.code\nrescue TimeoutError => e2\n  puts e2.code\nensure\n  puts \"cleanup\"\nend\n";
 
   #[test]
   fn full_exception_worked_example_linked_and_run() {
@@ -16840,7 +16927,7 @@ mod tests {
 
   #[test]
   fn ensure_runs_on_the_non_exceptional_path() {
-    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nbegin\n  puts 1\nrescue Foo => f\n  puts 0\nensure\n  puts 2\nend\n";
+    let src = "class Foo\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nbegin\n  puts 1\nrescue Foo => f\n  puts 0\nensure\n  puts 2\nend\n";
     assert_eq!(compile_link_run(src), "1\n2\n");
   }
 
@@ -16850,31 +16937,31 @@ mod tests {
     // the outer one — proving `ensure` fires on the mismatch-exhausted
     // path, in the correct order (inner's `ensure` before the outer
     // clause's own output).
-    let src = "class WrongType\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nclass RightType\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\n\n  def code -> Int64\n    @code\n  end\nend\n\nbegin\n  begin\n    raise RightType.new(5)\n  rescue WrongType => w\n    puts 0\n  ensure\n    puts \"inner\"\n  end\nrescue RightType => r\n  puts r.code\nensure\n  puts \"outer\"\nend\n";
+    let src = "class WrongType\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nclass RightType\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\n\n  fn code: Int64 do\n    @code\n  end\nend\n\nbegin\n  begin\n    raise RightType.new(5)\n  rescue WrongType => w\n    puts 0\n  ensure\n    puts \"inner\"\n  end\nrescue RightType => r\n  puts r.code\nensure\n  puts \"outer\"\nend\n";
     assert_eq!(compile_link_run(src), "inner\n5\nouter\n");
   }
 
   #[test]
   fn return_inside_a_matched_rescue_still_runs_ensure_first() {
-    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise Foo.new(1)\n  end\n  return x\nend\n\ndef f(x: Int64) -> Int64\n  begin\n    puts risky(x)\n  rescue Foo => e\n    return 9\n  ensure\n    puts \"cleanup\"\n  end\n  return 0\nend\n\nputs f(999)\n";
+    let src = "class Foo\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise Foo.new(1)\n  end\n  return x\nend\n\nfn f(x: Int64): Int64 do\n  begin\n    puts risky(x)\n  rescue Foo => e\n    return 9\n  ensure\n    puts \"cleanup\"\n  end\n  return 0\nend\n\nputs f(999)\n";
     assert_eq!(compile_link_run(src), "cleanup\n9\n");
   }
 
   #[test]
   fn subtype_aware_rescue_catches_a_raised_subclass_reusing_the_animal_dog_hierarchy() {
-    let src = "class Animal\n  age: Int64\n\n  def initialize(age: Int64) -> Void\n    @age = age\n  end\n\n  def age -> Int64\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  def initialize(age: Int64, breed_code: Int64) -> Void\n    @age = age\n    @breed_code = breed_code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise Dog.new(7, 1)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue Animal => a\n  puts a.age\nend\n";
+    let src = "class Animal\n  age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn age: Int64 do\n    @age\n  end\nend\n\nclass Dog < Animal\n  breed_code: Int64\n\n  fn initialize(age: Int64, breed_code: Int64): Void do\n    @age = age\n    @breed_code = breed_code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise Dog.new(7, 1)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue Animal => a\n  puts a.age\nend\n";
     assert_eq!(compile_link_run(src), "7\n");
   }
 
   #[test]
   fn bare_rescue_after_a_typed_mismatch_still_catches_unconditionally() {
-    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nclass Bar\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\ndef risky(x: Int64) -> Int64\n  if x > 100\n    raise Foo.new(1)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue Bar => b\n  puts 0\nrescue => e\n  puts 1\nend\n";
+    let src = "class Foo\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nclass Bar\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nfn risky(x: Int64): Int64 do\n  if x > 100 do\n    raise Foo.new(1)\n  end\n  return x\nend\n\nbegin\n  puts risky(999)\nrescue Bar => b\n  puts 0\nrescue => e\n  puts 1\nend\n";
     assert_eq!(compile_link_run(src), "1\n");
   }
 
   #[test]
   fn retry_re_attempts_the_begin_until_it_succeeds() {
-    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nattempts: Int64 = 0\n\nbegin\n  attempts = attempts + 1\n  if attempts < 3\n    raise Foo.new(1)\n  end\nrescue Foo => e\n  retry\nend\nputs attempts\n";
+    let src = "class Foo\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nattempts: Int64 = 0\n\nbegin\n  attempts = attempts + 1\n  if attempts < 3 do\n    raise Foo.new(1)\n  end\nrescue Foo => e\n  retry\nend\nputs attempts\n";
     assert_eq!(compile_link_run(src), "3\n");
   }
 
@@ -16882,7 +16969,7 @@ mod tests {
   fn retry_does_not_re_trigger_the_enclosing_ensure_per_attempt() {
     // `ensure` must print exactly once (after the third, successful
     // attempt), not once per attempt.
-    let src = "class Foo\n  code: Int64\n\n  def initialize(code: Int64) -> Void\n    @code = code\n  end\nend\n\nattempts: Int64 = 0\n\nbegin\n  attempts = attempts + 1\n  if attempts < 3\n    raise Foo.new(1)\n  end\nrescue Foo => e\n  retry\nensure\n  puts \"cleanup\"\nend\nputs attempts\n";
+    let src = "class Foo\n  code: Int64\n\n  fn initialize(code: Int64): Void do\n    @code = code\n  end\nend\n\nattempts: Int64 = 0\n\nbegin\n  attempts = attempts + 1\n  if attempts < 3 do\n    raise Foo.new(1)\n  end\nrescue Foo => e\n  retry\nensure\n  puts \"cleanup\"\nend\nputs attempts\n";
     assert_eq!(compile_link_run(src), "cleanup\n3\n");
   }
 
@@ -16904,17 +16991,17 @@ mod tests {
 
   #[test]
   fn default_param_omitted_uses_the_default_value() {
-    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5)\n";
+    let src = "fn inc(n: Int64, step: Int64 = 1): Int64 do\n  n + step\nend\n\nputs inc(5)\n";
     assert_eq!(compile_link_run(src), "6\n");
   }
 
   #[test]
   fn default_param_overridden_by_explicit_argument() {
-    let src = "def inc(n: Int64, step: Int64 = 1) -> Int64\n  n + step\nend\n\nputs inc(5, 10)\n";
+    let src = "fn inc(n: Int64, step: Int64 = 1): Int64 do\n  n + step\nend\n\nputs inc(5, 10)\n";
     assert_eq!(compile_link_run(src), "15\n");
   }
 
-  const GREET_EXAMPLE: &str = "def greet(name: String, times: Int64 = 1) -> Void\n  i: Int64 = 0\n  while i < times\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
+  const GREET_EXAMPLE: &str = "fn greet(name: String, times: Int64 = 1): Void do\n  i: Int64 = 0\n  while i < times do\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
 
   #[test]
   fn greet_worked_example_keyword_calls_and_defaults_linked_and_run() {
@@ -16926,11 +17013,11 @@ mod tests {
 
   #[test]
   fn positional_call_still_compiles_and_runs_unchanged() {
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
 
-  const SUM_ALL_EXAMPLE: &str = "def sum_all(*xs: Int64) -> Int64\n  total: Int64 = 0\n  i: Int64 = 0\n  while i < 4\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
+  const SUM_ALL_EXAMPLE: &str = "fn sum_all(*xs: Int64): Int64 do\n  total: Int64 = 0\n  i: Int64 = 0\n  while i < 4 do\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
 
   #[test]
   fn splat_param_sums_a_packed_trailing_argument_list() {
@@ -16939,11 +17026,11 @@ mod tests {
 
   #[test]
   fn splat_param_with_zero_trailing_arguments_is_a_zero_length_capture() {
-    let src = "def sum_all(*xs: Int64) -> Int64\n  0\nend\n\nputs sum_all()\n";
+    let src = "fn sum_all(*xs: Int64): Int64 do\n  0\nend\n\nputs sum_all()\n";
     assert_eq!(compile_link_run(src), "0\n");
   }
 
-  const DIVMOD_EXAMPLE: &str = "def divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
+  const DIVMOD_EXAMPLE: &str = "fn divmod(a: Int64, b: Int64): (Int64, Int64) do\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
 
   #[test]
   fn divmod_worked_example_tuple_return_linked_and_run() {
@@ -16959,7 +17046,7 @@ mod tests {
     // The plan's own single combined program exercising all four
     // leaves at once: keyword args + defaults (`greet`), then a tuple
     // return unpacked via multi-assign (`divmod`).
-    let src = "def greet(name: String, times: Int64 = 1) -> Void\n  i: Int64 = 0\n  while i < times\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n\ndef divmod(a: Int64, b: Int64) -> (Int64, Int64)\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
+    let src = "fn greet(name: String, times: Int64 = 1): Void do\n  i: Int64 = 0\n  while i < times do\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n\nfn divmod(a: Int64, b: Int64): (Int64, Int64) do\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
     assert_eq!(compile_link_run(src), "yo\nhi\nhi\n3\n2\n");
   }
 
@@ -16976,7 +17063,7 @@ mod tests {
 
   // Plan 40 (operator overloading).
 
-  const VECTOR2_EXAMPLE: &str = "class Vector2\n  read x: Float64\n  read y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x, @y + other.y)\n  end\n\n  def ==(other: Vector2) -> Boolean\n    @x == other.x && @y == other.y\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0, 2.0)\nv2: Vector2 = Vector2.new(3.0, 4.0)\nv3: Vector2 = v1 + v2\nputs v3.x\nputs v3.y\nif v1 == v2\n  puts 1\nelse\n  puts 0\nend\nif v1 == v1\n  puts 1\nelse\n  puts 0\nend\n";
+  const VECTOR2_EXAMPLE: &str = "class Vector2\n  read x: Float64\n  read y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn +(other: Vector2): Vector2 do\n    Vector2.new(@x + other.x, @y + other.y)\n  end\n\n  fn ==(other: Vector2): Boolean do\n    @x == other.x && @y == other.y\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0, 2.0)\nv2: Vector2 = Vector2.new(3.0, 4.0)\nv3: Vector2 = v1 + v2\nputs v3.x\nputs v3.y\nif v1 == v2 do\n  puts 1\nelse\n  puts 0\nend\nif v1 == v1 do\n  puts 1\nelse\n  puts 0\nend\n";
 
   #[test]
   fn vector2_worked_example_linked_and_run() {
@@ -16994,7 +17081,7 @@ mod tests {
   // — `@data` itself isn't an `Expr::Ident`, so each method rebinds the
   // field into a local first, matching this compiler's existing
   // instance-var-to-local pattern used throughout the test suite.
-  const BAG_EXAMPLE: &str = "class Bag\n  data: Array[Int64]\n\n  def initialize(a: Int64, b: Int64, c: Int64) -> Void\n    @data = [a, b, c]\n  end\n\n  def [](i: Int64) -> Int64\n    d: Array[Int64] = @data\n    d[i]\n  end\n\n  def []=(i: Int64, v: Int64) -> Void\n    d: Array[Int64] = @data\n    d[i] = v\n  end\nend\n\nb: Bag = Bag.new(10, 20, 30)\nputs b[0] + b[1] + b[2]\nb[1] = 99\nputs b[1]\n";
+  const BAG_EXAMPLE: &str = "class Bag\n  data: Array[Int64]\n\n  fn initialize(a: Int64, b: Int64, c: Int64): Void do\n    @data = [a, b, c]\n  end\n\n  fn [](i: Int64): Int64 do\n    d: Array[Int64] = @data\n    d[i]\n  end\n\n  fn []=(i: Int64, v: Int64): Void do\n    d: Array[Int64] = @data\n    d[i] = v\n  end\nend\n\nb: Bag = Bag.new(10, 20, 30)\nputs b[0] + b[1] + b[2]\nb[1] = 99\nputs b[1]\n";
 
   #[test]
   fn bag_index_operator_example_read_then_write_then_read_back() {
@@ -17013,7 +17100,7 @@ mod tests {
     // panic. The grammar has no generic parenthesized-expression
     // grouping (only `Array.new(...)` uses parens), so this is written
     // without explicit parens.
-    let src = "class Vector2\n  read x: Float64\n\n  def initialize(x: Float64) -> Void\n    @x = x\n  end\n\n  def +(other: Vector2) -> Vector2\n    Vector2.new(@x + other.x)\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nv3: Vector2 = Vector2.new(3.0)\nv4: Vector2 = v1 + v2 + v3\n";
+    let src = "class Vector2\n  read x: Float64\n\n  fn initialize(x: Float64): Void do\n    @x = x\n  end\n\n  fn +(other: Vector2): Vector2 do\n    Vector2.new(@x + other.x)\n  end\nend\n\nv1: Vector2 = Vector2.new(1.0)\nv2: Vector2 = Vector2.new(2.0)\nv3: Vector2 = Vector2.new(3.0)\nv4: Vector2 = v1 + v2 + v3\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let out = std::env::temp_dir().join("emerald_codegen_chained_operator_should_not_exist.o");
     assert!(compile_to_object(&program, &out).is_err());
@@ -17026,7 +17113,7 @@ mod tests {
 
   // Plan 41 (interfaces and generics).
 
-  const INTERFACES_GENERICS_EXAMPLE: &str = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  def initialize(meters: Int64) -> Void\n    @meters = meters\n  end\n\n  def compare_to(other: Distance) -> Int64\n    @meters - other.meters\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
+  const INTERFACES_GENERICS_EXAMPLE: &str = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\n\n  fn compare_to(other: Money): Int64 do\n    @cents - other.cents\n  end\nend\n\nclass Distance implements Comparable\n  read meters: Int64\n\n  fn initialize(meters: Int64): Void do\n    @meters = meters\n  end\n\n  fn compare_to(other: Distance): Int64 do\n    @meters - other.meters\n  end\nend\n\nfn max[T: Comparable](a: T, b: T): T do\n  if a.compare_to(b) >= 0 do\n    return a\n  end\n  return b\nend\n\nm1: Money = Money.new(500)\nm2: Money = Money.new(750)\nwinner_money: Money = max(m1, m2)\nputs winner_money.cents\n\nd1: Distance = Distance.new(100)\nd2: Distance = Distance.new(42)\nwinner_distance: Distance = max(d1, d2)\nputs winner_distance.meters\n";
 
   #[test]
   fn interfaces_generics_worked_example_linked_and_run() {
@@ -17082,7 +17169,7 @@ mod tests {
     // can resolve a concrete type from (both arguments are themselves
     // call results) — defensively returns a descriptive `Err`, not a
     // panic, same AC standard as every prior codegen plan.
-    let src = "interface Comparable\n  def compare_to(other: Self) -> Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  def initialize(cents: Int64) -> Void\n    @cents = cents\n  end\n\n  def compare_to(other: Money) -> Int64\n    @cents - other.cents\n  end\nend\n\ndef max[T: Comparable](a: T, b: T) -> T\n  if a.compare_to(b) >= 0\n    return a\n  end\n  return b\nend\n\ndef make_money(cents: Int64) -> Money\n  Money.new(cents)\nend\n\nboom: Money = max(make_money(500), make_money(750))\n";
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Money implements Comparable\n  read cents: Int64\n\n  fn initialize(cents: Int64): Void do\n    @cents = cents\n  end\n\n  fn compare_to(other: Money): Int64 do\n    @cents - other.cents\n  end\nend\n\nfn max[T: Comparable](a: T, b: T): T do\n  if a.compare_to(b) >= 0 do\n    return a\n  end\n  return b\nend\n\nfn make_money(cents: Int64): Money do\n  Money.new(cents)\nend\n\nboom: Money = max(make_money(500), make_money(750))\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let out =
       std::env::temp_dir().join("emerald_codegen_unresolvable_generic_call_should_not_exist.o");
@@ -17091,7 +17178,7 @@ mod tests {
 
   // Plan 43 (nullable types and safe navigation).
 
-  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef greet(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
 
   #[test]
   fn nullable_worked_example_linked_and_run() {
@@ -17110,7 +17197,7 @@ mod tests {
     );
   }
 
-  const AND_ASSIGN_UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  def initialize(name: String) -> Void\n    @name = name\n  end\n\n  def shout -> String\n    @name + \"!\"\n  end\nend\n\ndef find_greeter(id: Int64) -> Greeter?\n  if id == 1\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\ndef upgrade(id: Int64) -> String\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
+  const AND_ASSIGN_UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn upgrade(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
 
   #[test]
   fn and_assign_upgrade_worked_example_linked_and_run() {
@@ -17138,7 +17225,7 @@ mod tests {
 
   // Plan 67 (String equality codegen).
 
-  const STRING_EQUALITY_WORKED_EXAMPLE: &str = "a: String = \"hello\"\nb: String = \"hello\"\nc: String = \"world\"\n\nif a == b\n  puts 1\nelse\n  puts 0\nend\n\nif a == c\n  puts 1\nelse\n  puts 0\nend\n\nif a != c\n  puts 1\nelse\n  puts 0\nend\n\nd: String = \"hel\" + \"lo\"\nif a == d\n  puts 1\nelse\n  puts 0\nend\n";
+  const STRING_EQUALITY_WORKED_EXAMPLE: &str = "a: String = \"hello\"\nb: String = \"hello\"\nc: String = \"world\"\n\nif a == b do\n  puts 1\nelse\n  puts 0\nend\n\nif a == c do\n  puts 1\nelse\n  puts 0\nend\n\nif a != c do\n  puts 1\nelse\n  puts 0\nend\n\nd: String = \"hel\" + \"lo\"\nif a == d do\n  puts 1\nelse\n  puts 0\nend\n";
 
   #[test]
   fn string_equality_worked_example_linked_and_run() {
@@ -17162,7 +17249,7 @@ mod tests {
 
   // Plan 44 (symbols).
 
-  const SYMBOLS_WORKED_EXAMPLE: &str = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar\n  puts 1\nelse\n  puts 0\nend\n";
+  const SYMBOLS_WORKED_EXAMPLE: &str = "scores: Hash[Symbol, Int64] = {:alice => 90, :bob => 82, :carol => 95}\nputs scores[:bob]\nscores[:bob] = 100\nputs scores[:bob]\n\nif :foo == :foo do\n  puts 1\nelse\n  puts 0\nend\n\nif :foo == :bar do\n  puts 1\nelse\n  puts 0\nend\n";
 
   #[test]
   fn symbols_worked_example_linked_and_run() {
@@ -17179,7 +17266,7 @@ mod tests {
     // disclosed choice from plan 19's deliberate *non*-dedup of String
     // literals) — one `:dup` inside a function body, one at top level;
     // `==` between them must be true.
-    let src = "def make_dup -> Symbol\n  :dup\nend\n\nif make_dup() == :dup\n  puts 1\nelse\n  puts 0\nend\n";
+    let src = "fn make_dup: Symbol do\n  :dup\nend\n\nif make_dup() == :dup do\n  puts 1\nelse\n  puts 0\nend\n";
     assert_eq!(compile_link_run(src), "1\n");
   }
 
@@ -17189,7 +17276,7 @@ mod tests {
     // regardless of call reachability — `never_called` is declared but
     // never invoked from any top-level statement, yet the program must
     // still compile (no reachability analysis exists to skip it).
-    let src = "def never_called -> Symbol\n  :dead_code\nend\n\nputs 42\n";
+    let src = "fn never_called: Symbol do\n  :dead_code\nend\n\nputs 42\n";
     assert_eq!(compile_link_run(src), "42\n");
   }
 
@@ -17254,7 +17341,7 @@ mod tests {
     assert!(String::from_utf8_lossy(&output.stderr).contains("separator must not be empty"));
   }
 
-  const PLAN_45_WORKED_EXAMPLE: &str = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n\n  puts words[i]\n  i += 1\nend\n";
+  const PLAN_45_WORKED_EXAMPLE: &str = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n do\n  puts words[i]\n  i += 1\nend\n";
 
   #[test]
   fn plan_45_worked_example_linked_and_run() {
@@ -17353,14 +17440,14 @@ mod tests {
 
   #[test]
   fn assert_true_compiles_links_and_runs_with_no_output() {
-    let src = "def f() -> Void\n  assert(true)\nend\n\nf()\n";
+    let src = "fn f(): Void do\n  assert(true)\nend\n\nf()\n";
     assert_eq!(compile_link_run(src), "");
   }
 
   #[test]
   fn assert_false_raises_an_assertion_error_carrying_the_real_file_and_line() {
     // AC2: `assert(false)` on line 3 (1-based) of a file named `t.em`.
-    let src = "def f() -> Void\n  begin\n    assert(false)\n  rescue AssertionError => e\n    puts e.message\n  end\nend\n\nf()\n";
+    let src = "fn f(): Void do\n  begin\n    assert(false)\n  rescue AssertionError => e\n    puts e.message\n  end\nend\n\nf()\n";
     assert_eq!(compile_link_run_named(src, "t.em"), "t.em:3\n");
   }
 
@@ -17383,7 +17470,7 @@ mod tests {
     // actually uses `test`/`assert`/`assert_eq` — real, checked proof
     // against the emitted object file's own symbol table, not just "it
     // still compiles".
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("no_assertion_symbol");
     let obj_path = dir.join("hello.o");
@@ -17596,7 +17683,7 @@ mod tests {
     assert_eq!(find_non_escaping_news(&body), HashSet::new());
   }
 
-  const DISTANCE_SQUARED_AND_MAKE_POINT: &str = "class Point\n  x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\ndef distance_squared(x: Int64, y: Int64) -> Int64\n  p: Point = Point.new(x, y)\n  x * x + y * y\nend\n\ndef make_point(x: Int64, y: Int64) -> Point\n  p: Point = Point.new(x, y)\n  p\nend\n\nputs distance_squared(3, 4)\n";
+  const DISTANCE_SQUARED_AND_MAKE_POINT: &str = "class Point\n  x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\nfn distance_squared(x: Int64, y: Int64): Int64 do\n  p: Point = Point.new(x, y)\n  x * x + y * y\nend\n\nfn make_point(x: Int64, y: Int64): Point do\n  p: Point = Point.new(x, y)\n  p\nend\n\nputs distance_squared(3, 4)\n";
 
   #[test]
   fn distance_squared_worked_example_stack_allocates_and_prints_25() {
@@ -17611,7 +17698,7 @@ mod tests {
     // point`, which returns `p` directly) is untouched — a caller can
     // still read a field back through it via a `read`-sugared accessor
     // (plan 33).
-    let src = "class Point\n  read x: Int64\n  read y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\ndef make_point(x: Int64, y: Int64) -> Point\n  p: Point = Point.new(x, y)\n  p\nend\n\nq: Point = make_point(7, 9)\nputs q.x\nputs q.y\n";
+    let src = "class Point\n  read x: Int64\n  read y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\nfn make_point(x: Int64, y: Int64): Point do\n  p: Point = Point.new(x, y)\n  p\nend\n\nq: Point = make_point(7, 9)\nputs q.x\nputs q.y\n";
     assert_eq!(compile_link_run(src), "7\n9\n");
   }
 
@@ -17621,7 +17708,7 @@ mod tests {
     // inside a loop body must not produce a different alloca per
     // iteration — inspected directly in the emitted LLVM IR text via
     // `compile_to_object_ir_text_for_test`.
-    let src = "class Point\n  x: Int64\n\n  def initialize(x: Int64) -> Void\n    @x = x\n  end\nend\n\ndef touch_loop(n: Int64) -> Int64\n  i: Int64 = 0\n  while i < n\n    p: Point = Point.new(i)\n    i += 1\n  end\n  i\nend\n\nputs touch_loop(5)\n";
+    let src = "class Point\n  x: Int64\n\n  fn initialize(x: Int64): Void do\n    @x = x\n  end\nend\n\nfn touch_loop(n: Int64): Int64 do\n  i: Int64 = 0\n  while i < n do\n    p: Point = Point.new(i)\n    i += 1\n  end\n  i\nend\n\nputs touch_loop(5)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("loop_single_alloca");
     let obj_path = dir.join("out.o");
@@ -17685,7 +17772,7 @@ mod tests {
     // leaf-escape-instrumentation-and-report AC2: the contrasting
     // proof — isolated so no other `New` site in the program
     // contributes to either count.
-    let src = "class Point\n  x: Int64\n  y: Int64\n\n  def initialize(x: Int64, y: Int64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\ndef make_point(x: Int64, y: Int64) -> Point\n  p: Point = Point.new(x, y)\n  p\nend\n\nq: Point = make_point(3, 4)\n";
+    let src = "class Point\n  x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\nend\n\nfn make_point(x: Int64, y: Int64): Point do\n  p: Point = Point.new(x, y)\n  p\nend\n\nq: Point = make_point(3, 4)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("escape_stats_make_point");
     let obj_path = dir.join("out.o");
@@ -17713,7 +17800,7 @@ mod tests {
 
   // Plan 52 (algebraic data types and exhaustive pattern matching).
 
-  const SHAPE_ENUM_WORKED_EXAMPLE_CODEGEN: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\narea: Float64 = 0.0\ncase circle\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase square\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n\ncase rect\nwhen Circle(r)\n  area = 3.14159 * r * r\nwhen Square(s)\n  area = s * s\nwhen Rectangle(w, h)\n  area = w * h\nend\nputs area\n";
+  const SHAPE_ENUM_WORKED_EXAMPLE_CODEGEN: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\narea: Float64 = 0.0\nmatch circle do\nCircle(r) do\n  area = 3.14159 * r * r\nend\nSquare(s) do\n  area = s * s\nend\nRectangle(w, h) do\n  area = w * h\nend\nend\nputs area\n\nmatch square do\nCircle(r) do\n  area = 3.14159 * r * r\nend\nSquare(s) do\n  area = s * s\nend\nRectangle(w, h) do\n  area = w * h\nend\nend\nputs area\n\nmatch rect do\nCircle(r) do\n  area = 3.14159 * r * r\nend\nSquare(s) do\n  area = s * s\nend\nRectangle(w, h) do\n  area = w * h\nend\nend\nputs area\n";
 
   #[test]
   fn shape_worked_example_compiled_linked_and_run_prints_three_correct_areas() {
@@ -17737,7 +17824,7 @@ mod tests {
     // each land at their own distinct byte offset. If they aliased,
     // `w * h` would compute `w * w` or `h * h` instead of the real
     // product.
-    let src = "enum Shape = Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\ncase rect\nwhen Rectangle(w, h)\n  puts w\n  puts h\n  puts w * h\nend\n";
+    let src = "enum Shape = Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\nmatch rect do\nRectangle(w, h) do\n  puts w\n  puts h\n  puts w * h\nend\nend\n";
     assert_eq!(compile_link_run(src), "4\n5\n20\n");
   }
 
@@ -17750,7 +17837,7 @@ mod tests {
     // entirely (parses directly, calls compile_to_object) to prove
     // codegen's own `vars` map genuinely does not still resolve the
     // first arm's binding while building the second arm's block.
-    let src = "enum Shape = Circle(Float64) | Square(Float64)\n\nsquare: Shape = Square(3.0)\ncase square\nwhen Circle(r)\n  puts r\nwhen Square(s)\n  puts r\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64)\n\nsquare: Shape = Square(3.0)\nmatch square do\nCircle(r) do\n  puts r\nend\nSquare(s) do\n  puts r\nend\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("case_binding_scope");
     let obj_path = dir.join("out.o");
@@ -17775,7 +17862,7 @@ mod tests {
     // in the normal pipeline) returns a descriptive `Err`, not a
     // panic. Constructed directly: a `String`-typed scrutinee, which
     // is neither `Int64` nor any registered enum.
-    let src = "s: String = \"nope\"\ncase s\nwhen 1\n  puts 1\nend\n";
+    let src = "s: String = \"nope\"\nmatch s do\n1 do\n  puts 1\nend\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("case_bad_scrutinee");
     let obj_path = dir.join("out.o");
@@ -17791,7 +17878,7 @@ mod tests {
 
   fn result_worked_example(arg: &str) -> String {
     format!(
-      "def parse_int(s: String) -> Result[Int64, String]\n  if is_valid_int(s)\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\ndef try_parse(s: String) -> Result[Int64, String]\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"{arg}\")\ncase result\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n"
+      "fn parse_int(s: String): Result[Int64, String] do\n  if is_valid_int(s) do\n    return Ok(parse_digits(s))\n  end\n  return Err(\"not a number\")\nend\n\nfn try_parse(s: String): Result[Int64, String] do\n  n: Int64 = parse_int(s)?\n  return Ok(n * 2)\nend\n\nresult: Result[Int64, String] = try_parse(\"{arg}\")\nmatch result do\nOk(v) do\n  puts v\nend\nErr(e) do\n  puts e\nend\nend\n"
     )
   }
 
@@ -17828,7 +17915,7 @@ mod tests {
     // still carry an equal *string value* but a different *address*,
     // so this specifically rules that out, unlike the string-equality
     // proof the two tests above already give.
-    let src = "def fails -> Result[Int64, String]\n  return Err(\"boom\")\nend\n\ndef forwards -> Result[Int64, String]\n  n: Int64 = fails()?\n  return Ok(n)\nend\n\nr: Result[Int64, String] = forwards()\ncase r\nwhen Ok(v)\n  puts v\nwhen Err(e)\n  puts e\nend\n";
+    let src = "fn fails: Result[Int64, String] do\n  return Err(\"boom\")\nend\n\nfn forwards: Result[Int64, String] do\n  n: Int64 = fails()?\n  return Ok(n)\nend\n\nr: Result[Int64, String] = forwards()\nmatch r do\nOk(v) do\n  puts v\nend\nErr(e) do\n  puts e\nend\nend\n";
     // The forwarded Err's message must be the exact same string
     // `fails` constructed — if codegen had built a fresh Err instead
     // of forwarding the pointer, this would still print "boom" (same
@@ -17874,7 +17961,7 @@ mod tests {
   // method other than `initialize` may no longer declare a return
   // type — `value` now prints `@count` itself (`puts @count`) rather
   // than returning it for a top-level `puts a.value` to print.
-  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def value -> Void\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
+  const COUNTER_ACTOR_EXAMPLE: &str = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn value: Void do\n    puts @count\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n\na.increment\na.increment\nb.increment\n\na.value\nb.value\n";
 
   // Bugfix (first-ever `git push` this session — no remote existed
   // before, so this test's real failure rate had never been exercised
@@ -17922,7 +18009,7 @@ mod tests {
   // other compiled-and-run worked example in this file either. `pure`
   // itself is unaffected either way — `check_purity` only inspects
   // `Stmt`/`Expr` shapes, never how a value is returned.
-  const FIB_WORKER_EXAMPLE: &str = "pure def fib(n: Int64) -> Int64\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nactor Worker\n  def run(n: Int64) -> Void\n    puts fib(n)\n  end\nend\n\nw1: Worker = Worker.spawn()\nw2: Worker = Worker.spawn()\nw1.run(30)\nw2.run(31)\n";
+  const FIB_WORKER_EXAMPLE: &str = "pure fn fib(n: Int64): Int64 do\n  if n < 2 do\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nactor Worker\n  fn run(n: Int64): Void do\n    puts fib(n)\n  end\nend\n\nw1: Worker = Worker.spawn()\nw2: Worker = Worker.spawn()\nw1.run(30)\nw2.run(31)\n";
 
   #[test]
   fn fib_worker_worked_example_prints_both_fib_results_exactly_once_each() {
@@ -17945,7 +18032,7 @@ mod tests {
     // call — never a cached/shared region handle — so two live actor
     // instances are backed by two entirely separate arenas from the
     // moment they're constructed.
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\nend\n\na: Counter = Counter.spawn(0)\nb: Counter = Counter.spawn(100)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("actor_disjoint_regions_ir");
     let obj_path = dir.join("out.o");
@@ -17967,7 +18054,7 @@ mod tests {
     // intrinsic like `puts` used to be wrongly routed through
     // `build_expr` (which has no dispatch for `puts` at all) instead of
     // the full `build_stmt` dispatch every other statement gets.
-    let src = "class Foo\n  x: Int64\n\n  def initialize(x: Int64) -> Void\n    @x = x\n  end\n\n  def show -> Void\n    puts @x\n  end\nend\n\nf: Foo = Foo.new(5)\nf.show\n";
+    let src = "class Foo\n  x: Int64\n\n  fn initialize(x: Int64): Void do\n    @x = x\n  end\n\n  fn show: Void do\n    puts @x\n  end\nend\n\nf: Foo = Foo.new(5)\nf.show\n";
     let out = compile_link_run(src);
     assert_eq!(out, "5\n");
   }
@@ -17978,7 +18065,7 @@ mod tests {
   // plan's own literal text using it; adapted to `puts "#{@name}
   // #{@count}"`, plan 36's already-real string interpolation, which
   // prints the exact same output.
-  const PINGPONG_EXAMPLE: &str = "actor PingPong\n  name: String\n  limit: Int64\n  count: Int64\n  peer: PingPong\n\n  def initialize(name: String, limit: Int64) -> Void\n    @name = name\n    @limit = limit\n    @count = 0\n  end\n\n  def set_peer(other: PingPong) -> Void\n    @peer = other\n  end\n\n  def hit -> Void\n    @count = @count + 1\n    puts \"#{@name} #{@count}\"\n    if @count < @limit\n      @peer.hit\n    end\n  end\nend\n\na: PingPong = PingPong.spawn(\"A\", 5)\nb: PingPong = PingPong.spawn(\"B\", 5)\na.set_peer(b)\nb.set_peer(a)\na.hit\n";
+  const PINGPONG_EXAMPLE: &str = "actor PingPong\n  name: String\n  limit: Int64\n  count: Int64\n  peer: PingPong\n\n  fn initialize(name: String, limit: Int64): Void do\n    @name = name\n    @limit = limit\n    @count = 0\n  end\n\n  fn set_peer(other: PingPong): Void do\n    @peer = other\n  end\n\n  fn hit: Void do\n    @count = @count + 1\n    puts \"#{@name} #{@count}\"\n    if @count < @limit do\n      @peer.hit\n    end\n  end\nend\n\na: PingPong = PingPong.spawn(\"A\", 5)\nb: PingPong = PingPong.spawn(\"B\", 5)\na.set_peer(b)\nb.set_peer(a)\na.hit\n";
 
   #[test]
   fn pingpong_worked_example_compiled_linked_and_run_prints_the_expected_nine_lines() {
@@ -18033,7 +18120,7 @@ mod tests {
   // implemented method here — adapted to `"spinner #{@id} done"`.
   fn spinner_example(iterations: u64) -> String {
     format!(
-      "actor Spinner\n  id: Int64\n  total: Int64\n\n  def initialize(id: Int64) -> Void\n    @id = id\n    @total = 0\n  end\n\n  def spin(iterations: Int64) -> Void\n    i: Int64 = 0\n    while i < iterations\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns2: Spinner = Spinner.spawn(2)\ns1.spin({iterations})\ns2.spin({iterations})\n"
+      "actor Spinner\n  id: Int64\n  total: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n    @total = 0\n  end\n\n  fn spin(iterations: Int64): Void do\n    i: Int64 = 0\n    while i < iterations do\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns2: Spinner = Spinner.spawn(2)\ns1.spin({iterations})\ns2.spin({iterations})\n"
     )
   }
 
@@ -18060,7 +18147,7 @@ mod tests {
   // compiler has no auto-generated field-accessor convention (verified
   // this session: `infer_expr_type`'s `Expr::MethodCall` arm looks up
   // `info.methods` only, never falls back to `info.fields`).
-  const MESSAGE_SAFETY_EXAMPLE: &str = "class LogMessage\n  text: String\n\n  def initialize(text: String) -> Void\n    @text = text\n  end\n\n  def text -> String\n    @text\n  end\nend\n\nactor Logger\n  def log(msg: LogMessage) -> Void\n    puts msg.text\n  end\nend\n\ndef run -> Void\n  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  logger.log(msg)\nend\n\nrun()\n";
+  const MESSAGE_SAFETY_EXAMPLE: &str = "class LogMessage\n  text: String\n\n  fn initialize(text: String): Void do\n    @text = text\n  end\n\n  fn text: String do\n    @text\n  end\nend\n\nactor Logger\n  fn log(msg: LogMessage): Void do\n    puts msg.text\n  end\nend\n\nfn run: Void do\n  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  logger.log(msg)\nend\n\nrun()\n";
 
   #[test]
   fn message_safety_worked_example_compiled_linked_and_run_prints_hello_from_main() {
@@ -18082,7 +18169,7 @@ mod tests {
     // (`Pair[K, V]`'s own type-annotation grammar, mirroring `Array`/
     // `Hash`/`Result`), a real, disclosed collision found via this
     // exact pre-existing test failing to parse.
-    let src = "actor Duo\n  a: Int64\n  b: Int64\n\n  def set_a(v: Int64) -> Void\n    @a = v\n  end\n\n  def set_b(v: Int64) -> Void\n    @b = v\n  end\nend\n";
+    let src = "actor Duo\n  a: Int64\n  b: Int64\n\n  fn set_a(v: Int64): Void do\n    @a = v\n  end\n\n  fn set_b(v: Int64): Void do\n    @b = v\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("actor_trampoline_count_ir");
     let obj_path = dir.join("out.o");
@@ -18106,7 +18193,7 @@ mod tests {
     // correct independent of the scheduler, and that this leaf's
     // declared runtime signatures link successfully against
     // `leaf-thread-safe-runtime`'s actual implementations.
-    let src = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def value -> Int64\n    @count\n  end\nend\n";
+    let src = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn value: Int64 do\n    @count\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("actor_trampoline_direct_call");
     let obj_path = dir.join("actor.o");
@@ -18199,7 +18286,7 @@ int main(void) {
     // one (`crates/emerald-driver/tests/supervisor_runtime.rs`) — every
     // compiled actor method's own trampoline now wraps its real call in
     // the synthetic catch frame this leaf adds.
-    let src = "class Boom\nend\n\nactor Bomb\n  def explode -> Void\n    raise Boom.new()\n  end\nend\n\nactor Survivor\n  def ping -> Void\n    puts \"still alive\"\n  end\nend\n\nb: Bomb = Bomb.spawn()\ns: Survivor = Survivor.spawn()\nb.explode\ns.ping\n";
+    let src = "class Boom\nend\n\nactor Bomb\n  fn explode: Void do\n    raise Boom.new()\n  end\nend\n\nactor Survivor\n  fn ping: Void do\n    puts \"still alive\"\n  end\nend\n\nb: Bomb = Bomb.spawn()\ns: Survivor = Survivor.spawn()\nb.explode\ns.ping\n";
     let out = compile_link_run(src);
     assert_eq!(
       out, "still alive\n",
@@ -18214,7 +18301,7 @@ int main(void) {
     // Structural proof, independent of the black-box test above: every
     // actor method's own trampoline gets its own `push_handler`/
     // `setjmp` frame — not shared, not skipped for some methods.
-    let src = "actor Bomb\n  def explode -> Void\n  end\n\n  def defuse -> Void\n  end\nend\n";
+    let src = "actor Bomb\n  fn explode: Void do\n  end\n\n  fn defuse: Void do\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = fresh_temp_dir("actor_trampoline_catch_frame_ir");
     let obj_path = dir.join("out.o");
@@ -18261,7 +18348,7 @@ int main(void) {
   // interleaving) — inserting a real blocking sync point after every
   // send is what makes this test's own exact-output assertion below
   // sound rather than flaky.
-  const SUPERVISOR_EXAMPLE: &str = "class Boom\nend\n\nactor Worker\n  count: Int64\n\n  def initialize(seed: Int64) -> Void\n    @count = seed\n  end\n\n  def handle(n: Int64) -> Void\n    @count = @count + n\n    if @count == 3\n      raise Boom.new()\n    end\n    puts @count\n  end\nend\n\nactor Logger\n  prefix: String\n\n  def initialize(prefix: String) -> Void\n    @prefix = prefix\n  end\n\n  def handle(n: Int64) -> Void\n    puts @prefix\n  end\nend\n\nsup: Supervisor = supervise do\n  worker: Worker = Worker.spawn(0)\n  logger: Logger = Logger.spawn(\"log\")\nend\n\nw: Worker = sup.child(:worker)\nl: Logger = sup.child(:logger)\n\nw.handle(1)\nsync: Worker = sup.child(:worker)\nw.handle(1)\nsync = sup.child(:worker)\nl.handle(1)\nsync = sup.child(:worker)\nw.handle(1)\nsync = sup.child(:worker)\nw2: Worker = sup.child(:worker)\nl.handle(1)\nsync = sup.child(:worker)\nw2.handle(1)\nsync = sup.child(:worker)\n";
+  const SUPERVISOR_EXAMPLE: &str = "class Boom\nend\n\nactor Worker\n  count: Int64\n\n  fn initialize(seed: Int64): Void do\n    @count = seed\n  end\n\n  fn handle(n: Int64): Void do\n    @count = @count + n\n    if @count == 3 do\n      raise Boom.new()\n    end\n    puts @count\n  end\nend\n\nactor Logger\n  prefix: String\n\n  fn initialize(prefix: String): Void do\n    @prefix = prefix\n  end\n\n  fn handle(n: Int64): Void do\n    puts @prefix\n  end\nend\n\nsup: Supervisor = supervise do\n  worker: Worker = Worker.spawn(0)\n  logger: Logger = Logger.spawn(\"log\")\nend\n\nw: Worker = sup.child(:worker)\nl: Logger = sup.child(:logger)\n\nw.handle(1)\nsync: Worker = sup.child(:worker)\nw.handle(1)\nsync = sup.child(:worker)\nl.handle(1)\nsync = sup.child(:worker)\nw.handle(1)\nsync = sup.child(:worker)\nw2: Worker = sup.child(:worker)\nl.handle(1)\nsync = sup.child(:worker)\nw2.handle(1)\nsync = sup.child(:worker)\n";
 
   #[test]
   fn supervisor_worked_example_compiled_linked_and_run_prints_the_expected_six_lines_in_order() {
@@ -18324,7 +18411,7 @@ int main(void) {
   // mechanism) and passed by name — see `emerald-sema`'s
   // `check_enumerable_proc_arg`'s own doc comment for the full
   // citation trail.
-  const ENUMERABLE_EXAMPLE: &str = "is_even: Proc = ->(x: Int64) -> Boolean { x % 2 == 0 }\ndoubler: Proc = ->(x: Int64) -> Int64 { x * 2 }\n\narr: Array[Int64] = [1, 2, 3, 4, 5, 6]\nevens: Array[Int64] = arr.select(is_even)\ndoubled: Array[Int64] = evens.map(doubler)\ntotal: Int64 = doubled.sum()\nputs total\n";
+  const ENUMERABLE_EXAMPLE: &str = "is_even: Proc = do |x: Int64| x % 2 == 0 end\ndoubler: Proc = do |x: Int64| x * 2 end\n\narr: Array[Int64] = [1, 2, 3, 4, 5, 6]\nevens: Array[Int64] = arr.select(is_even)\ndoubled: Array[Int64] = evens.map(doubler)\ntotal: Int64 = doubled.sum()\nputs total\n";
 
   #[test]
   fn enumerable_worked_example_compiled_linked_and_run_prints_24() {
@@ -18340,7 +18427,7 @@ int main(void) {
   // proving the core mechanism (field/param/return substitution, two
   // simultaneous distinct instantiations, `{MangledName}_{method}`
   // dispatch) with plain `T`-typed fields only.
-  const GENERIC_CLASSES_EXAMPLE: &str = "class Stack[T]\n  slot0: T\n  slot1: T\n  slot2: T\n  count: Int64\n  def initialize() -> Void\n    @count = 0\n  end\n  def push(value: T) -> Void\n    if @count == 0\n      @slot0 = value\n    end\n    if @count == 1\n      @slot1 = value\n    end\n    if @count == 2\n      @slot2 = value\n    end\n    @count = @count + 1\n  end\n  def pop() -> T\n    @count = @count - 1\n    if @count == 0\n      return @slot0\n    end\n    if @count == 1\n      return @slot1\n    end\n    return @slot2\n  end\nend\n\nints: Stack[Int64] = Stack.new()\nints.push(10)\nints.push(20)\nints.push(30)\nputs ints.pop()\nputs ints.pop()\n\nstrs: Stack[String] = Stack.new()\nstrs.push(\"first\")\nstrs.push(\"second\")\nputs strs.pop()\nputs strs.pop()\n";
+  const GENERIC_CLASSES_EXAMPLE: &str = "class Stack[T]\n  slot0: T\n  slot1: T\n  slot2: T\n  count: Int64\n  fn initialize(): Void do\n    @count = 0\n  end\n  fn push(value: T): Void do\n    if @count == 0 do\n      @slot0 = value\n    end\n    if @count == 1 do\n      @slot1 = value\n    end\n    if @count == 2 do\n      @slot2 = value\n    end\n    @count = @count + 1\n  end\n  fn pop(): T do\n    @count = @count - 1\n    if @count == 0 do\n      return @slot0\n    end\n    if @count == 1 do\n      return @slot1\n    end\n    return @slot2\n  end\nend\n\nints: Stack[Int64] = Stack.new()\nints.push(10)\nints.push(20)\nints.push(30)\nputs ints.pop()\nputs ints.pop()\n\nstrs: Stack[String] = Stack.new()\nstrs.push(\"first\")\nstrs.push(\"second\")\nputs strs.pop()\nputs strs.pop()\n";
 
   #[test]
   fn generic_stack_worked_example_compiled_linked_and_run_prints_the_expected_four_lines() {
@@ -18429,25 +18516,25 @@ int main(void) {
 
   #[test]
   fn array_each_compiled_linked_and_run_prints_each_element() {
-    let src = "printer: Proc = ->(x: Int64) -> Void { puts x }\narr: Array[Int64] = [7, 8, 9]\narr.each(printer)\n";
+    let src = "printer: Proc = do |x: Int64| puts x end\narr: Array[Int64] = [7, 8, 9]\narr.each(printer)\n";
     assert_eq!(compile_link_run(src), "7\n8\n9\n");
   }
 
   #[test]
   fn array_each_with_index_compiled_linked_and_run_prints_index_then_value() {
-    let src = "printer: Proc = ->(x: Int64, i: Int64) -> Void { puts i\n  puts x }\narr: Array[Int64] = [10, 20, 30]\narr.each_with_index(printer)\n";
+    let src = "printer: Proc = do |x: Int64, i: Int64| puts i\n  puts x end\narr: Array[Int64] = [10, 20, 30]\narr.each_with_index(printer)\n";
     assert_eq!(compile_link_run(src), "0\n10\n1\n20\n2\n30\n");
   }
 
   #[test]
   fn array_sort_compiled_linked_and_run_prints_ascending_order() {
-    let src = "arr: Array[Int64] = [3, 1, 2]\nsorted: Array[Int64] = arr.sort()\nprinter: Proc = ->(x: Int64) -> Void { puts x }\nsorted.each(printer)\n";
+    let src = "arr: Array[Int64] = [3, 1, 2]\nsorted: Array[Int64] = arr.sort()\nprinter: Proc = do |x: Int64| puts x end\nsorted.each(printer)\n";
     assert_eq!(compile_link_run(src), "1\n2\n3\n");
   }
 
   #[test]
   fn array_reduce_compiled_linked_and_run_folds_to_the_sum() {
-    let src = "adder: Proc = ->(acc: Int64, x: Int64) -> Int64 { acc + x }\narr: Array[Int64] = [1, 2, 3, 4]\ntotal: Int64 = arr.reduce(0, adder)\nputs total\n";
+    let src = "adder: Proc = do |acc: Int64, x: Int64| acc + x end\narr: Array[Int64] = [1, 2, 3, 4]\ntotal: Int64 = arr.reduce(0, adder)\nputs total\n";
     assert_eq!(compile_link_run(src), "10\n");
   }
 
@@ -18459,7 +18546,7 @@ int main(void) {
 
   #[test]
   fn hash_each_compiled_linked_and_run_prints_every_key_then_value() {
-    let src = "printer: Proc = ->(p: Pair[Int64, Int64]) -> Void { puts p.key\n  puts p.value }\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.each(printer)\n";
+    let src = "printer: Proc = do |p: Pair[Int64, Int64]| puts p.key\n  puts p.value end\nh: Hash[Int64, Int64] = {1 => 10, 2 => 20}\nh.each(printer)\n";
     let out = compile_link_run(src);
     let mut lines: Vec<i64> = out.lines().map(|l| l.parse().unwrap()).collect();
     // No ordering guarantee over a Hash's own storage order (plan 25's
@@ -18512,7 +18599,7 @@ int main(void) {
     // miscompiled), just not via the specific diagnostic string the
     // plan's own text names.
     let errs = emerald_parser::parse(
-      "is_even: Proc = ->(x: Int64) -> Boolean { x % 2 == 0 }\ndoubler: Proc = ->(x: Int64) -> Int64 { x * 2 }\narr: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = arr.select(is_even).map(doubler)\n",
+      "is_even: Proc = do |x: Int64| x % 2 == 0 end\ndoubler: Proc = do |x: Int64| x * 2 end\narr: Array[Int64] = [1, 2, 3]\ndoubled: Array[Int64] = arr.select(is_even).map(doubler)\n",
     )
     .expect_err(
       "a chained `.select(...).map(...)` call must be rejected, not silently miscompiled",
@@ -18540,13 +18627,13 @@ int main(void) {
     // low port essentially never listening on any real machine, so
     // `connect()` fails fast with a real `ECONNREFUSED` (no long
     // `EMERALD_REMOTE_TIMEOUT_MS` wait needed for this specific gate).
-    let src = "actor Counter\n  count: Int64\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\nend\n\nbegin\n  handle: Counter = Counter.remote(\"127.0.0.1:1\", \"counter1\")\n  puts \"should not reach here\"\nrescue RemoteActorError => e\n  puts \"caught\"\nend\n";
+    let src = "actor Counter\n  count: Int64\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\nend\n\nbegin\n  handle: Counter = Counter.remote(\"127.0.0.1:1\", \"counter1\")\n  puts \"should not reach here\"\nrescue RemoteActorError => e\n  puts \"caught\"\nend\n";
     assert_eq!(compile_link_run(src), "caught\n");
   }
 
   // Plan 61 (comptime execution).
 
-  const FACTORIAL_SRC: &str = "comptime def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\nputs FACT10\n";
+  const FACTORIAL_SRC: &str = "comptime fn factorial(n: Int64): Int64 do\n  if n <= 1 do\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\nputs FACT10\n";
 
   #[test]
   fn comptime_factorial_worked_example_prints_3628800() {
@@ -18583,7 +18670,7 @@ int main(void) {
     // AC4: the size argument was computed at compile time, but the
     // allocation itself still happens at runtime, unchanged — proven by
     // filling and reading back every index up to 119 successfully.
-    let src = "comptime def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\na: Array[Int64] = Array.new(comptime factorial(5))\ni: Int64 = 0\nwhile i < 120\n  a[i] = i\n  i = i + 1\nend\nputs a[119]\n";
+    let src = "comptime fn factorial(n: Int64): Int64 do\n  if n <= 1 do\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\na: Array[Int64] = Array.new(comptime factorial(5))\ni: Int64 = 0\nwhile i < 120 do\n  a[i] = i\n  i = i + 1\nend\nputs a[119]\n";
     assert_eq!(compile_link_run(src), "119\n");
   }
 
@@ -18594,7 +18681,7 @@ int main(void) {
     // the same "injectable seam in tests, not a full million-iteration
     // wait" style plan 48 already used for its own fingerprint-override
     // tests.
-    let src = "comptime def spin(n: Int64) -> Int64\n  i: Int64 = 0\n  while true\n    i = i + 1\n  end\n  return i\nend\n\nX: Int64 = comptime spin(1)\nputs X\n";
+    let src = "comptime fn spin(n: Int64): Int64 do\n  i: Int64 = 0\n  while true do\n    i = i + 1\n  end\n  return i\nend\n\nX: Int64 = comptime spin(1)\nputs X\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = std::env::temp_dir();
     let unique = format!("{}_{:?}", std::process::id(), std::thread::current().id());
@@ -18613,7 +18700,7 @@ int main(void) {
     // AC5 (leaf-comptime-interpreter-core): the interpreter itself,
     // exercised directly against a hand-built runaway-loop AST with an
     // injected `limit: 100` — no compile pipeline involved at all.
-    let src = "while true\n  i: Int64 = 1\nend\n";
+    let src = "while true do\n  i: Int64 = 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let Item::Stmt(while_stmt) = &program.items[0] else {
       panic!("expected a top-level Stmt::While");
@@ -18632,7 +18719,7 @@ int main(void) {
 
   // Plan 62 (design-by-contract).
 
-  const DIVIDE_SRC: &str = "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b\nend\n";
+  const DIVIDE_SRC: &str = "fn divide(a: Int64, b: Int64): Int64\n  requires b != 0\n  ensures result * b <= a\ndo\n  return a / b\nend\n";
 
   #[test]
   fn contracts_worked_example_prints_5_then_catches_a_real_requires_violation() {
@@ -18663,7 +18750,7 @@ int main(void) {
     // deliberately wrong body (`a / b + 1`) that violates `ensures
     // result * b <= a` — proving the two checks are wired to their own,
     // independent injection points.
-    let src = "def divide2(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b + 1\nend\n\nbegin\n  puts divide2(10, 2)\nrescue ContractViolation => e\n  puts e.message\nend\n";
+    let src = "fn divide2(a: Int64, b: Int64): Int64\n  requires b != 0\n  ensures result * b <= a\ndo\n  return a / b + 1\nend\n\nbegin\n  puts divide2(10, 2)\nrescue ContractViolation => e\n  puts e.message\nend\n";
     let out = compile_link_run(src);
     assert!(
       out.contains("divide2") && out.contains("ensures") && out.contains("result * b <= a"),
@@ -18677,7 +18764,7 @@ int main(void) {
     // `ensures` usage anywhere — verified via white-box IR inspection
     // (the same "prove it, don't just assert it" standard this leaf's
     // own `AC3` calls for), not just by inferring it from output.
-    let src = "def add(a: Int64, b: Int64) -> Int64\n  return a + b\nend\n\nputs add(20, 22)\n";
+    let src = "fn add(a: Int64, b: Int64): Int64 do\n  return a + b\nend\n\nputs add(20, 22)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let dir = std::env::temp_dir();
     let unique = format!("{}_{:?}", std::process::id(), std::thread::current().id());
@@ -18718,7 +18805,7 @@ int main(void) {
   fn plan_66_puts_inside_a_def_body_prints_deterministically() {
     // Shape 1: `puts` as a non-trailing statement inside a user `def`
     // body (not the top level).
-    let src = "def greet(name: String) -> String\n  puts \"hello from inside a def\"\n  name\nend\n\nputs greet(\"world\")\n";
+    let src = "fn greet(name: String): String do\n  puts \"hello from inside a def\"\n  name\nend\n\nputs greet(\"world\")\n";
     let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
     for (i, out) in runs.iter().enumerate() {
       assert_eq!(
@@ -18805,7 +18892,7 @@ int main(void) {
     // its inner `puts`) at the final `puts greet("world")` line, so
     // "hello from inside a def" is emitted last, not first — sequential
     // execution order, not declaration order.
-    let src = "def greet(name: String) -> String\n  puts \"hello from inside a def\"\n  name\nend\n\ny: String = \"hello\"\nputs y\n\nphrase: String = \"hello world\"\nputs phrase.slice(1, 3)\n\nwords: Array[String] = phrase.split(\" \")\nputs words[0]\n\nfound: String? = nil\nfound ||= \"not found\"\nputs found\n\nputs greet(\"world\")\n";
+    let src = "fn greet(name: String): String do\n  puts \"hello from inside a def\"\n  name\nend\n\ny: String = \"hello\"\nputs y\n\nphrase: String = \"hello world\"\nputs phrase.slice(1, 3)\n\nwords: Array[String] = phrase.split(\" \")\nputs words[0]\n\nfound: String? = nil\nfound ||= \"not found\"\nputs found\n\nputs greet(\"world\")\n";
     let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
     let expected = "hello\nell\nhello\nnot found\nhello from inside a def\nworld\n";
     for (i, out) in runs.iter().enumerate() {

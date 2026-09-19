@@ -44,7 +44,7 @@ fn compile_em(source: &str, tag: &str) -> PathBuf {
 }
 
 /// The plan's own worked example's shared `counter_actor.em`, verbatim.
-const SHARED_ACTOR: &str = "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def report -> Void\n    puts @count\n  end\nend\n\n";
+const SHARED_ACTOR: &str = "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn report: Void do\n    puts @count\n  end\nend\n\n";
 
 fn host_src(port: u16) -> String {
   format!("{SHARED_ACTOR}c: Counter = Counter.spawn(0)\nc.register(\"counter1\", {port})\n")

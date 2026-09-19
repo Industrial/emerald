@@ -92,36 +92,38 @@ module.exports = grammar({
 			seq(
 				"interface",
 				field("name", $.identifier),
-				"def",
+				"fn",
 				field("method_name", $.identifier),
 				"(",
 				optional($.parameter_list),
 				")",
-				"->",
+				":",
 				field("return_type", $._type),
 				"end",
 			),
 
 		function_definition: ($) =>
 			seq(
-				"def",
+				"fn",
 				field("name", $.identifier),
 				optional($.type_param_clause),
 				optional($.param_clause),
-				"->",
+				":",
 				field("return_type", $._type),
+				"do",
 				field("body", repeat($._statement)),
 				"end",
 			),
 
 		method_definition: ($) =>
 			seq(
-				"def",
+				"fn",
 				field("name", $._method_name),
 				optional($.type_param_clause),
 				optional($.param_clause),
-				"->",
+				":",
 				field("return_type", $._type),
+				"do",
 				field("body", repeat($._statement)),
 				"end",
 			),
@@ -216,7 +218,8 @@ module.exports = grammar({
 				$.yield_statement,
 				$.begin_statement,
 				$.retry_statement,
-				$.case_statement,
+				$.match_statement,
+				$.match_result_statement,
 				$.multiple_assignment_statement,
 				$.compound_assignment_statement,
 				$.or_assign_statement,
@@ -238,6 +241,7 @@ module.exports = grammar({
 			seq(
 				"if",
 				field("condition", $._expression),
+				"do",
 				field("consequence", repeat($._statement)),
 				optional($._else_clause),
 				"end",
@@ -247,6 +251,7 @@ module.exports = grammar({
 			seq(
 				"unless",
 				field("condition", $._expression),
+				"do",
 				field("consequence", repeat($._statement)),
 				optional($._else_clause),
 				"end",
@@ -256,6 +261,7 @@ module.exports = grammar({
 			seq(
 				"while",
 				field("condition", $._expression),
+				"do",
 				field("body", repeat($._statement)),
 				"end",
 			),
@@ -264,6 +270,7 @@ module.exports = grammar({
 			seq(
 				"until",
 				field("condition", $._expression),
+				"do",
 				field("body", repeat($._statement)),
 				"end",
 			),
@@ -276,6 +283,7 @@ module.exports = grammar({
 			seq(
 				"elsif",
 				field("condition", $._expression),
+				"do",
 				field("consequence", repeat($._statement)),
 				optional($._else_clause),
 			),
@@ -342,22 +350,75 @@ module.exports = grammar({
 		ensure_clause: ($) => seq("ensure", field("body", repeat($._statement))),
 		retry_statement: (_) => "retry",
 
-		case_statement: ($) =>
+		// Plan 71: `case`/`when` becomes `match`/`do` — the scrutinee is
+		// followed by a mandatory "do", each arm supplies its own trailing
+		// "do ... end" instead of running until the next "when"/"else"/
+		// "end", and the default arm spells `_ do ... end` (match_wildcard)
+		// rather than reusing `_else_clause` (still owned exclusively by
+		// if/unless/elsif now). A separate, textually-disjoint
+		// match_result_statement covers the dedicated `Ok(...)`/`Err(...)`
+		// destructuring form — disambiguated from an ordinary match by the
+		// very next token after "do" ("Ok" is a reserved-keyword terminal,
+		// categorically distinct from the integer/identifier that head
+		// every other match_arm), mirroring grammar.lalrpop's own
+		// disambiguation exactly.
+		match_statement: ($) =>
 			seq(
-				"case",
+				"match",
 				field("scrutinee", $._expression),
-				repeat1($.case_arm),
-				optional($._else_clause),
+				"do",
+				repeat1($._match_arm),
+				optional($.match_wildcard),
 				"end",
 			),
 
-		case_arm: ($) =>
+		_match_arm: ($) => choice($.match_values_arm, $.match_variant_arm),
+
+		match_values_arm: ($) =>
 			seq(
-				"when",
 				field("values", $._case_values),
+				"do",
 				field("body", repeat($._statement)),
+				"end",
 			),
 		_case_values: ($) => sep1($.integer, ","),
+
+		match_variant_arm: ($) =>
+			seq(
+				field("name", $.identifier),
+				"(",
+				optional(field("bindings", $.binding_list)),
+				")",
+				"do",
+				field("body", repeat($._statement)),
+				"end",
+			),
+		binding_list: ($) => sep1($.identifier, ","),
+
+		match_wildcard: ($) =>
+			seq("_", "do", field("body", repeat($._statement)), "end"),
+
+		match_result_statement: ($) =>
+			seq(
+				"match",
+				field("scrutinee", $._expression),
+				"do",
+				"Ok",
+				"(",
+				field("ok_variable", $.identifier),
+				")",
+				"do",
+				field("ok_body", repeat($._statement)),
+				"end",
+				"Err",
+				"(",
+				field("err_variable", $.identifier),
+				")",
+				"do",
+				field("err_body", repeat($._statement)),
+				"end",
+				"end",
+			),
 
 		multiple_assignment_statement: ($) =>
 			seq(
@@ -581,19 +642,28 @@ module.exports = grammar({
 
 		_call_method_name: ($) => choice($.identifier, "read"),
 
+		// Plan 71: plan 10's `->(params) -> ReturnType { body }` lambda
+		// literal is deleted outright, not arrow-shortened — Sable has no
+		// separate lambda syntax at all. A function value is a bare
+		// `do |params: T| ... end` block used directly as an ordinary
+		// expression, typed entirely by its surrounding context (e.g. a
+		// `Proc` annotation on the binding it's assigned to) — never by its
+		// own literal syntax, which is why this production carries no
+		// return-type field of its own any more. Reachable from the general
+		// `_expression`/`_primary_expression` chain (not split into a
+		// separate Stmt-initial-exclusion the way grammar.lalrpop's own
+		// LALR(1) table needs) — this file's header comment explains why
+		// tree-sitter's GLR parser doesn't need that split.
 		lambda_expression: ($) =>
 			prec(
 				10,
 				seq(
-					"->",
-					"(",
+					"do",
+					"|",
 					optional($.parameter_list),
-					")",
-					"->",
-					field("return_type", $._type),
-					"{",
+					"|",
 					field("body", repeat($._statement)),
-					"}",
+					"end",
 				),
 			),
 

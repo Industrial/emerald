@@ -93,7 +93,7 @@ fn labels(response: &CompletionResponse) -> Vec<String> {
   }
 }
 
-const HELLO_SRC: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+const HELLO_SRC: &str = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
 
 #[test]
 fn completion_over_hello_em_includes_add_and_core_keywords() {
@@ -108,7 +108,7 @@ fn completion_over_hello_em_includes_add_and_core_keywords() {
     names.contains(&"add".to_string()),
     "missing 'add': {names:?}"
   );
-  for kw in ["def", "end", "if", "class"] {
+  for kw in ["fn", "end", "if", "class"] {
     assert!(
       names.contains(&kw.to_string()),
       "missing keyword '{kw}': {names:?}"
@@ -130,7 +130,7 @@ fn completion_over_an_unparseable_buffer_still_returns_the_keyword_list() {
   let names = labels(&response);
 
   assert!(!names.is_empty(), "expected a non-empty keyword-only list");
-  for kw in ["def", "end", "if", "class"] {
+  for kw in ["fn", "end", "if", "class"] {
     assert!(
       names.contains(&kw.to_string()),
       "missing keyword '{kw}': {names:?}"

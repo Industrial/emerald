@@ -90,8 +90,8 @@ fn goto_definition(
   }
 }
 
-const HELLO_SRC: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
-const CLASSES_SRC: &str = "class Counter\n  value: Int64\n\n  def initialize(start: Int64) -> Void\n    @value = start\n  end\n\n  def value -> Int64\n    @value\n  end\n\n  def add(n: Int64) -> Int64\n    @value + n\n  end\nend\n\nc: Counter = Counter.new(10)\nputs c.value\nputs c.add(5)\n\nclass Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+const HELLO_SRC: &str = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
+const CLASSES_SRC: &str = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn add(n: Int64): Int64 do\n    @value + n\n  end\nend\n\nc: Counter = Counter.new(10)\nputs c.value\nputs c.add(5)\n\nclass Point\n  x: Float64\n  y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn sum: Float64 do\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
 
 #[test]
 fn definition_of_add_at_its_call_site_finds_the_real_declaration() {
@@ -102,12 +102,12 @@ fn definition_of_add_at_its_call_site_finds_the_real_declaration() {
   // "add" inside "puts add(20, 22)" — line 4, cursor mid-word.
   let response = goto_definition(&client, "file:///hello.em", 4, 6);
 
-  assert_eq!(HELLO_SRC.find("def add"), Some(0));
+  assert_eq!(HELLO_SRC.find("fn add"), Some(0));
   let Some(GotoDefinitionResponse::Scalar(loc)) = response else {
     panic!("expected a scalar Location, got {response:?}");
   };
-  // "def add" -> "add" starts at byte/char offset 4 on line 0.
-  assert_eq!(loc.range.start, Position::new(0, 4));
+  // "fn add" -> "add" starts at byte/char offset 3 on line 0.
+  assert_eq!(loc.range.start, Position::new(0, 3));
 
   drop(client);
   handle.join().unwrap();
@@ -152,7 +152,7 @@ fn definition_on_a_method_call_target_returns_nothing_not_the_wrong_class() {
 fn definition_on_a_keyword_returns_nothing() {
   let (client, handle) = start_server();
   initialize(&client);
-  did_open(&client, "file:///t.em", "if true\n  puts 1\nend\n");
+  did_open(&client, "file:///t.em", "if true do\n  puts 1\nend\n");
 
   let response = goto_definition(&client, "file:///t.em", 0, 0);
   assert_eq!(response, None);

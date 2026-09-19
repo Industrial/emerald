@@ -1,7 +1,7 @@
 arr: Array[Int64] = [10, 20, 30]
 sum: Int64 = 0
 i: Int64 = 0
-while i < 3
+while i < 3 do
   sum: Int64 = sum + arr[i]
   i: Int64 = i + 1
 end
@@ -18,16 +18,16 @@ puts h[2]
 
 flag: Boolean = true
 other: Boolean = false
-if flag
+if flag do
   puts 1
 end
-if other
+if other do
   puts 2
 else
   puts 3
 end
 
 s: String? = nil
-if s == nil
+if s == nil do
   puts 4
 end

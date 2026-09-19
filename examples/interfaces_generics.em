@@ -1,15 +1,15 @@
 interface Comparable
-  def compare_to(other: Self) -> Int64
+  fn compare_to(other: Self): Int64
 end
 
 class Money implements Comparable
   read cents: Int64
 
-  def initialize(cents: Int64) -> Void
+  fn initialize(cents: Int64): Void do
     @cents = cents
   end
 
-  def compare_to(other: Money) -> Int64
+  fn compare_to(other: Money): Int64 do
     @cents - other.cents
   end
 end
@@ -17,17 +17,17 @@ end
 class Distance implements Comparable
   read meters: Int64
 
-  def initialize(meters: Int64) -> Void
+  fn initialize(meters: Int64): Void do
     @meters = meters
   end
 
-  def compare_to(other: Distance) -> Int64
+  fn compare_to(other: Distance): Int64 do
     @meters - other.meters
   end
 end
 
-def max[T: Comparable](a: T, b: T) -> T
-  if a.compare_to(b) >= 0
+fn max[T: Comparable](a: T, b: T): T do
+  if a.compare_to(b) >= 0 do
     return a
   end
   return b

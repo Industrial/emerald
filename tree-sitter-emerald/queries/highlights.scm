@@ -14,11 +14,12 @@
   "class"
   "module"
   "interface"
-  "def"
+  "fn"
   "end"
   "read"
   "implements"
   "require"
+  "do"
 ] @keyword
 
 [
@@ -30,8 +31,7 @@
   "until"
   "for"
   "in"
-  "case"
-  "when"
+  "match"
 ] @keyword.control.conditional
 
 (break_statement) @keyword.control.return
@@ -71,7 +71,6 @@
 (function_definition return_type: (identifier) @type)
 (method_definition return_type: (identifier) @type)
 (interface_definition return_type: (identifier) @type)
-(lambda_expression return_type: (identifier) @type)
 (let_statement type: (identifier) @type)
 (nullable_type base: (identifier) @type)
 (superclass_clause superclass: (identifier) @type)
@@ -155,7 +154,6 @@
   "%="
   "||="
   "&&="
-  "->"
   "=>"
   "&."
   ".."

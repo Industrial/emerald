@@ -10,8 +10,8 @@ deferred to the milestone plans that build it (`04`–`06`), per inception
 ## Toolchain Decisions
 
 Each decision below was made by building and running a real prototype
-against inception §17's milestone-1 slice (`def add(a: Int64, b: Int64)
--> Int64 \n a + b \n end`), per inception §14's "do a small prototype...
+against inception §17's milestone-1 slice (`fn add(a: Int64, b: Int64):
+Int64 do \n a + b \n end`), per inception §14's "do a small prototype...
 before committing" instruction — not by research alone.
 
 ### Lexer: `logos`
@@ -19,9 +19,12 @@ before committing" instruction — not by research alone.
 **Chosen.** Inception §14.2 names no alternative to compare against, so
 this was a feasibility check rather than a bake-off. `crates/emerald-lexer`
 tokenizes the full milestone-1 source correctly, including the `->` and `:`
-punctuation `spec/GRAMMAR.md` introduces, and correctly rejects both an
-unterminated string and `@@` (the removed class-variable sigil,
-`spec/GRAMMAR.md` §2) as lex errors rather than silently accepting them.
+punctuation `spec/GRAMMAR.md` introduced at the time (`->` was later removed
+outright by the Sable-alignment grammar cutover, plan 71 — this section
+describes milestone-1's own real, historical lexer behavior, not current
+syntax), and correctly rejects both an unterminated string and `@@` (the
+removed class-variable sigil, `spec/GRAMMAR.md` §2) as lex errors rather
+than silently accepting them.
 
 Evidence: `crates/emerald-lexer/src/lib.rs`, 3 passing tests.
 

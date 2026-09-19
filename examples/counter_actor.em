@@ -1,15 +1,15 @@
 actor Counter
   count: Int64
 
-  def initialize(start: Int64) -> Void
+  fn initialize(start: Int64): Void do
     @count = start
   end
 
-  def increment -> Void
+  fn increment: Void do
     @count = @count + 1
   end
 
-  def report -> Void
+  fn report: Void do
     puts @count
   end
 end

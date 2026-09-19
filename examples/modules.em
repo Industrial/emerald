@@ -1,5 +1,5 @@
 module MathUtils
-  def double(x: Int64) -> Int64
+  fn double(x: Int64): Int64 do
     x + x
   end
 end

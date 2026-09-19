@@ -120,11 +120,16 @@ function fail(message) {
 // grammar.lalrpop's actual literal keyword terminals (verified against
 // the real file this session — see the tmLanguage grammar's own
 // per-rule comments for exactly where each one is reserved).
+//
+// Plan 71: "def" -> "fn"; "case"/"when" are deleted outright in favor
+// of "match", with "do" now also mandatory after if/unless/while/
+// until/elsif's own condition and every match arm's own pattern —
+// both join this ground-truth list as new reserved terminals.
 const KEYWORDS = [
-  "class", "module", "def", "end", "if", "else", "elsif", "unless",
+  "class", "module", "fn", "end", "if", "else", "elsif", "unless",
   "while", "until", "for", "in", "return", "break", "next", "puts",
-  "raise", "yield", "begin", "rescue", "ensure", "retry", "case",
-  "when", "require", "interface", "implements", "read", "new",
+  "raise", "yield", "begin", "rescue", "ensure", "retry", "match",
+  "do", "require", "interface", "implements", "read", "new",
   "Array", "Hash", "Proc", "true", "false", "nil",
 ];
 

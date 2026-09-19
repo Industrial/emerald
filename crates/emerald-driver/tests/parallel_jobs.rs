@@ -21,8 +21,8 @@ fn write_worked_example(dir: &std::path::Path) {
   // the declaration and the call site for a zero-parameter function,
   // matching every other zero-arg example in this codebase (e.g.
   // `emerald-cli/src/require.rs`'s own `helper()`).
-  std::fs::write(dir.join("b.em"), "def b_value() -> Int64\n  10\nend\n").unwrap();
-  std::fs::write(dir.join("c.em"), "def c_value() -> Int64\n  20\nend\n").unwrap();
+  std::fs::write(dir.join("b.em"), "fn b_value(): Int64 do\n  10\nend\n").unwrap();
+  std::fs::write(dir.join("c.em"), "fn c_value(): Int64 do\n  20\nend\n").unwrap();
   std::fs::write(
     dir.join("main.em"),
     "require b\nrequire c\nputs b_value() + c_value()\n",
@@ -66,7 +66,7 @@ fn single_file_program_still_compiles_and_runs_identically_under_compile_paralle
   let dir = fresh_dir("single-file");
   std::fs::write(
     dir.join("hello.em"),
-    "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n",
+    "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n",
   )
   .unwrap();
   let output = dir.join("hello_out");
@@ -108,7 +108,7 @@ fn an_actor_shared_across_require_d_files_links_and_runs_correctly_under_jobs() 
   let dir = fresh_dir("actor-across-require");
   std::fs::write(
     dir.join("counter.em"),
-    "actor Counter\n  count: Int64\n\n  def initialize(start: Int64) -> Void\n    @count = start\n  end\n\n  def increment -> Void\n    @count = @count + 1\n  end\n\n  def report -> Void\n    puts @count\n  end\nend\n",
+    "actor Counter\n  count: Int64\n\n  fn initialize(start: Int64): Void do\n    @count = start\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\n\n  fn report: Void do\n    puts @count\n  end\nend\n",
   )
   .unwrap();
   std::fs::write(
@@ -143,7 +143,7 @@ fn main_referencing_a_function_b_does_not_export_is_rejected_not_silently_permis
   // cross-level visibility unconditionally permissive to get
   // parallelism. `b.em` never declares `not_exported`.
   let dir = fresh_dir("cross-level-visibility");
-  std::fs::write(dir.join("b.em"), "def b_value() -> Int64\n  10\nend\n").unwrap();
+  std::fs::write(dir.join("b.em"), "fn b_value(): Int64 do\n  10\nend\n").unwrap();
   std::fs::write(dir.join("main.em"), "require b\nputs not_exported()\n").unwrap();
   let cache = emerald_driver::cache::QueryCache::new(dir.join(".cache"));
   let result = emerald_driver::parallel::compile_parallel(

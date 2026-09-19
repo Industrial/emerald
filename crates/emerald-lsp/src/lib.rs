@@ -38,9 +38,17 @@ use std::collections::HashMap;
 /// set its TextMate grammar uses) — reused verbatim here for
 /// completion and semantic-token keyword tagging rather than a second,
 /// independently-drifting copy.
+///
+/// Plan 71: `"def"` is replaced by `"fn"` (no coexistence period —
+/// `def` is no longer a grammar keyword at all), and `"do"`/`"match"`
+/// join the list as the new universal-block/pattern-match keywords
+/// that now appear anywhere `"def"`'s own arrow-return or `case`/
+/// `"when"`'s value-match used to — `"case"`/`"when"` themselves were
+/// never in this curated subset to begin with, so there is nothing to
+/// remove for them specifically.
 const KEYWORDS: &[&str] = &[
-  "class", "module", "def", "end", "if", "else", "while", "return", "break", "next", "puts",
-  "raise", "begin", "rescue", "new", "Array", "Proc",
+  "class", "module", "fn", "end", "if", "else", "do", "match", "while", "return", "break", "next",
+  "puts", "raise", "begin", "rescue", "new", "Array", "Proc",
 ];
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -206,8 +214,9 @@ fn handle_request(
 /// tracking (neither the parser's AST nor `emerald-sema` carry
 /// declaration-site positions) — scoped to top-level names only.
 /// `word` naming a class/module/function is looked up via a
-/// `\b(?:def|class|module)\s+word\b`-shaped scan; anything else
-/// (a keyword, a method name, an unresolved identifier) returns
+/// `\b(?:fn|class|module)\s+word\b`-shaped scan (plan 71: `"fn"`
+/// replaces `"def"` as the function-declaration keyword); anything
+/// else (a keyword, a method name, an unresolved identifier) returns
 /// `None` rather than guessing wrong.
 fn goto_definition(
   text: &str,
@@ -223,7 +232,7 @@ fn goto_definition(
       "class"
     }
   } else if table.functions.contains_key(&word) {
-    "def"
+    "fn"
   } else {
     return None;
   };

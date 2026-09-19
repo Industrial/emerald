@@ -1,5 +1,5 @@
 module MathUtils
-  def add(a: Int64, b: Int64) -> Int64
+  fn add(a: Int64, b: Int64): Int64 do
     a + b
   end
 end

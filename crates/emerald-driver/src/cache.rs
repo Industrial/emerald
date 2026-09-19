@@ -342,7 +342,7 @@ mod tests {
   }
 
   const HELLO_SRC: &str =
-    "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
+    "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
 
   /// Call-counting test double (AC1: "verified via a call-counting
   /// test double, not just by timing") — records every HIT/MISS
@@ -565,7 +565,7 @@ mod tests {
       ("hello", HELLO_SRC),
       (
         "point",
-        "class Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(1.0, 2.0)\n",
+        "class Point\n  x: Float64\n  y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\nend\n\np: Point = Point.new(1.0, 2.0)\n",
       ),
       ("bad", "x: Int64 = \"nope\"\n"),
     ];
@@ -601,7 +601,7 @@ mod tests {
 
   // Plan 61's `leaf-comptime-query-cache-integration`.
 
-  const FACTORIAL_SRC: &str = "comptime def factorial(n: Int64) -> Int64\n  if n <= 1\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\n";
+  const FACTORIAL_SRC: &str = "comptime fn factorial(n: Int64): Int64 do\n  if n <= 1 do\n    return 1\n  end\n  return n * factorial(n - 1)\nend\n\nFACT10: Int64 = comptime factorial(10)\n";
 
   /// Pulls the one `comptime` expression out of `FACTORIAL_SRC`'s own
   /// top-level `FACT10` `Let` — the unwrapped inner `factorial(10)`

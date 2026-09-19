@@ -1,13 +1,13 @@
 x: Int64 = 10
-add_x: Proc = ->(y: Int64) -> Int64 { y + x }
+add_x: Proc = do |y: Int64| y + x end
 puts add_x.call(5)
 
-add_one: Proc = ->(y: Int64) -> Int64 { y + 1 }
+add_one: Proc = do |y: Int64| y + 1 end
 puts add_one.call(41)
 
-def repeat(n: Int64, &blk) -> Void
+fn repeat(n: Int64, &blk): Void do
   i: Int64 = 0
-  while i < n
+  while i < n do
     yield i
     i: Int64 = i + 1
   end

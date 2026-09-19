@@ -333,8 +333,8 @@ mod tests {
   #[test]
   fn worked_example_levels_to_deps_then_entry() {
     let dir = fresh_dir("levels");
-    std::fs::write(dir.join("b.em"), "def b_value -> Int64\n  10\nend\n").unwrap();
-    std::fs::write(dir.join("c.em"), "def c_value -> Int64\n  20\nend\n").unwrap();
+    std::fs::write(dir.join("b.em"), "fn b_value: Int64 do\n  10\nend\n").unwrap();
+    std::fs::write(dir.join("c.em"), "fn c_value: Int64 do\n  20\nend\n").unwrap();
     std::fs::write(
       dir.join("main.em"),
       "require b\nrequire c\nputs b_value + c_value\n",
@@ -360,8 +360,8 @@ mod tests {
   #[test]
   fn a_cycle_never_reaches_compute_levels() {
     let dir = fresh_dir("cycle");
-    std::fs::write(dir.join("a.em"), "require b\ndef a_fn -> Int64\n  1\nend\n").unwrap();
-    std::fs::write(dir.join("b.em"), "require a\ndef b_fn -> Int64\n  2\nend\n").unwrap();
+    std::fs::write(dir.join("a.em"), "require b\nfn a_fn: Int64 do\n  1\nend\n").unwrap();
+    std::fs::write(dir.join("b.em"), "require a\nfn b_fn: Int64 do\n  2\nend\n").unwrap();
     let result = build_require_graph(&dir.join("a.em"));
     assert!(matches!(result, Err(DriverError::Require(_))), "{result:?}");
     std::fs::remove_dir_all(&dir).ok();
@@ -370,15 +370,15 @@ mod tests {
   #[test]
   fn diamond_dependency_is_visited_once() {
     let dir = fresh_dir("diamond");
-    std::fs::write(dir.join("base.em"), "def base_fn -> Int64\n  1\nend\n").unwrap();
+    std::fs::write(dir.join("base.em"), "fn base_fn: Int64 do\n  1\nend\n").unwrap();
     std::fs::write(
       dir.join("left.em"),
-      "require base\ndef left_fn -> Int64\n  base_fn()\nend\n",
+      "require base\nfn left_fn: Int64 do\n  base_fn()\nend\n",
     )
     .unwrap();
     std::fs::write(
       dir.join("right.em"),
-      "require base\ndef right_fn -> Int64\n  base_fn()\nend\n",
+      "require base\nfn right_fn: Int64 do\n  base_fn()\nend\n",
     )
     .unwrap();
     std::fs::write(
@@ -412,7 +412,7 @@ mod tests {
   #[test]
   fn a_two_file_real_program_resolves_and_levels() {
     let dir = fresh_dir("twofile");
-    std::fs::write(dir.join("helper.em"), "def helper() -> Int64\n  5\nend\n").unwrap();
+    std::fs::write(dir.join("helper.em"), "fn helper(): Int64 do\n  5\nend\n").unwrap();
     std::fs::write(dir.join("main.em"), "require helper\nputs helper()\n").unwrap();
     let graph = build_require_graph(&dir.join("main.em")).unwrap();
     let levels = compute_levels(&graph);
@@ -423,8 +423,8 @@ mod tests {
   #[test]
   fn worked_example_has_no_unsupported_constructs() {
     let dir = fresh_dir("unsupported-check");
-    std::fs::write(dir.join("b.em"), "def b_value -> Int64\n  10\nend\n").unwrap();
-    std::fs::write(dir.join("c.em"), "def c_value -> Int64\n  20\nend\n").unwrap();
+    std::fs::write(dir.join("b.em"), "fn b_value: Int64 do\n  10\nend\n").unwrap();
+    std::fs::write(dir.join("c.em"), "fn c_value: Int64 do\n  20\nend\n").unwrap();
     std::fs::write(
       dir.join("main.em"),
       "require b\nrequire c\nputs b_value + c_value\n",
@@ -442,7 +442,7 @@ mod tests {
     let dir = fresh_dir("class-unsupported");
     std::fs::write(
       dir.join("shapes.em"),
-      "class Point\n  x: Int64\n\n  def initialize(x: Int64) -> Void\n    @x = x\n  end\nend\n",
+      "class Point\n  x: Int64\n\n  fn initialize(x: Int64): Void do\n    @x = x\n  end\nend\n",
     )
     .unwrap();
     std::fs::write(dir.join("main.em"), "require shapes\nputs 1\n").unwrap();

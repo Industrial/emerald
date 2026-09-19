@@ -2,16 +2,16 @@ READ: Int64 = 1
 WRITE: Int64 = 2
 EXEC: Int64 = 4
 
-def has_flag(flags: Int64, flag: Int64) -> Boolean
+fn has_flag(flags: Int64, flag: Int64): Boolean do
   return flags & flag == flag
 end
 
 perms: Int64 = READ | WRITE
 puts perms
-if has_flag(perms, READ)
+if has_flag(perms, READ) do
   puts 1
 end
-if has_flag(perms, EXEC)
+if has_flag(perms, EXEC) do
   puts 0
 end
 puts perms ^ WRITE
@@ -21,7 +21,7 @@ puts 256 >> 4
 
 total: Int64 = 0
 i: Int64 = 0
-while i < 5
+while i < 5 do
   total += i
   i += 1
 end

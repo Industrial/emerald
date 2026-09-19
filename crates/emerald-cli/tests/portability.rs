@@ -32,7 +32,7 @@ fn copied_alone_binary_links_and_runs_with_no_repo_access() {
   let source_path = scratch.join("hello.em");
   std::fs::write(
     &source_path,
-    "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n",
+    "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n",
   )
   .expect("failed to write the scratch .em source");
 

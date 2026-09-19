@@ -105,11 +105,11 @@ fn semantic_tokens(client: &Connection, uri: &str) -> Vec<(u32, u32, u32, u32)> 
   out
 }
 
-const HELLO_SRC: &str = "def add(a: Int64, b: Int64) -> Int64\n  a + b\nend\n\nputs add(20, 22)\n";
-const CLASSES_SRC: &str = "class Counter\n  value: Int64\n\n  def initialize(start: Int64) -> Void\n    @value = start\n  end\n\n  def value -> Int64\n    @value\n  end\n\n  def add(n: Int64) -> Int64\n    @value + n\n  end\nend\n\nc: Counter = Counter.new(10)\nputs c.value\nputs c.add(5)\n\nclass Point\n  x: Float64\n  y: Float64\n\n  def initialize(x: Float64, y: Float64) -> Void\n    @x = x\n    @y = y\n  end\n\n  def sum -> Float64\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
+const HELLO_SRC: &str = "fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n\nputs add(20, 22)\n";
+const CLASSES_SRC: &str = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn add(n: Int64): Int64 do\n    @value + n\n  end\nend\n\nc: Counter = Counter.new(10)\nputs c.value\nputs c.add(5)\n\nclass Point\n  x: Float64\n  y: Float64\n\n  fn initialize(x: Float64, y: Float64): Void do\n    @x = x\n    @y = y\n  end\n\n  fn sum: Float64 do\n    @x + @y\n  end\nend\n\np: Point = Point.new(2.0, 3.0)\nputs p.sum\n";
 
 #[test]
-fn hello_em_tags_add_as_function_and_def_end_puts_as_keywords() {
+fn hello_em_tags_add_as_function_and_fn_end_puts_as_keywords() {
   let (client, handle) = start_server();
   initialize(&client);
   did_open(&client, "file:///hello.em", HELLO_SRC);
@@ -127,8 +127,8 @@ fn hello_em_tags_add_as_function_and_def_end_puts_as_keywords() {
     "expected puts-as-keyword at (4,0,4): {tokens:?}"
   );
   assert!(
-    tokens.contains(&(0, 0, 3, TOKEN_KEYWORD)),
-    "expected def-as-keyword at (0,0,3): {tokens:?}"
+    tokens.contains(&(0, 0, 2, TOKEN_KEYWORD)),
+    "expected fn-as-keyword at (0,0,2): {tokens:?}"
   );
   assert!(
     tokens.contains(&(2, 0, 3, TOKEN_KEYWORD)),

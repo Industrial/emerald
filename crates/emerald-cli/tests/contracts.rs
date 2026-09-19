@@ -14,7 +14,7 @@ fn contracts_worked_example_compiles_links_and_runs_via_the_real_cli() {
 
   std::fs::write(
     &src_path,
-    "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  ensures result * b <= a\n  return a / b\nend\n\ny: Int64 = 10\nz: Int64 = 2\nputs divide(y, z)\n\nx: Int64 = 3\nw: Int64 = x - 3\nbegin\n  puts divide(20, w)\nrescue ContractViolation => e\n  puts e.message\nend\n",
+    "fn divide(a: Int64, b: Int64): Int64 requires b != 0 ensures result * b <= a do\n  return a / b\nend\n\ny: Int64 = 10\nz: Int64 = 2\nputs divide(y, z)\n\nx: Int64 = 3\nw: Int64 = x - 3\nbegin\n  puts divide(20, w)\nrescue ContractViolation => e\n  puts e.message\nend\n",
   )
   .unwrap();
 
@@ -62,7 +62,7 @@ fn a_literal_zero_divisor_is_rejected_at_compile_time_with_no_binary_emitted() {
 
   std::fs::write(
     &src_path,
-    "def divide(a: Int64, b: Int64) -> Int64\n  requires b != 0\n  return a / b\nend\n\nputs divide(10, 0)\n",
+    "fn divide(a: Int64, b: Int64): Int64 requires b != 0 do\n  return a / b\nend\n\nputs divide(10, 0)\n",
   )
   .unwrap();
 

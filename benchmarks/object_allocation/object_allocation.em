@@ -1,18 +1,18 @@
 class Box
   value: Int64
 
-  def initialize(v: Int64) -> Void
+  fn initialize(v: Int64): Void do
     @value = v
   end
 
-  def value -> Int64
+  fn value: Int64 do
     @value
   end
 end
 
 total: Int64 = 0
 i: Int64 = 0
-while i < 1000000
+while i < 1000000 do
   b: Box = Box.new(i)
   total += b.value
   i += 1

@@ -3,27 +3,27 @@ class Stack[T]
   slot1: T
   slot2: T
   count: Int64
-  def initialize() -> Void
+  fn initialize(): Void do
     @count = 0
   end
-  def push(value: T) -> Void
-    if @count == 0
+  fn push(value: T): Void do
+    if @count == 0 do
       @slot0 = value
     end
-    if @count == 1
+    if @count == 1 do
       @slot1 = value
     end
-    if @count == 2
+    if @count == 2 do
       @slot2 = value
     end
     @count = @count + 1
   end
-  def pop() -> T
+  fn pop(): T do
     @count = @count - 1
-    if @count == 0
+    if @count == 0 do
       return @slot0
     end
-    if @count == 1
+    if @count == 1 do
       return @slot1
     end
     return @slot2
