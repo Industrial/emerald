@@ -64,6 +64,7 @@ None of this is rounded up. Where a claim couldn't be verified directly it isn't
 | [`spec/GRAMMAR.md`](spec/GRAMMAR.md) / [`spec/TYPE_SYSTEM.md`](spec/TYPE_SYSTEM.md) | What's legal to write |
 | [`spec/SEMANTICS.md`](spec/SEMANTICS.md) | What it means once written |
 | [`spec/RUNTIME.md`](spec/RUNTIME.md) | Memory model, actors/scheduler/supervision, distribution |
+| [`spec/OWNERSHIP.md`](spec/OWNERSHIP.md) | Forward design for real ownership/borrowing (plan 82) — not yet implemented |
 | [`spec/COMPILER.md`](spec/COMPILER.md) | How source becomes a binary |
 | [`editors/README.md`](editors/README.md) | VSCode/Cursor, Neovim, Helix, Zed, MCP client setup |
 | [`benchmarks/REPORT.md`](benchmarks/REPORT.md) | Full performance methodology and results |

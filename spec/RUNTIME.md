@@ -63,7 +63,9 @@ beyond routing allocation-heavy code through explicit regions or actors.
 Revisiting this (reference counting, a tracing collector, or a more
 aggressive escape-analysis/region-inference story) is open post-v1 work;
 inception §12 itself names all three as future options, deliberately
-undecided. `benchmarks/REPORT.md`'s `object_allocation` benchmark gives this
+undecided. **This is no longer only a deferred question — see
+`spec/OWNERSHIP.md` for a real, decided (though not yet implemented)
+design for ownership/borrowing on top of this section's own regions.** `benchmarks/REPORT.md`'s `object_allocation` benchmark gives this
 a real number: 1,000,000 `emerald_alloc`-backed instances runs measurably
 slower than every other language in that report, including Crystal and
 Ruby's own garbage-collected allocation — the likely mechanism (never
