@@ -362,13 +362,21 @@ pub enum Expr {
   /// arguments); plan `10` is the first to actually parse a non-empty
   /// argument list here.
   MethodCall(Box<Spanned<Expr>>, String, Vec<Spanned<Expr>>),
-  /// `receiver&.method(args)` (plan 43's Decision log) — kept distinct
-  /// from `MethodCall`, not a reuse: sema's dispatch (nullable receiver
-  /// only, pointer-representable return type only) and codegen (a real
-  /// is-nil-guarded branch + PHI, producing a `U?` result) are both
+  /// `receiver?.method(args)` (plan 73's Decision log — replaces plan
+  /// 43's `&.` outright, same AST shape, new `Option[T]` semantics): kept
+  /// distinct from `MethodCall`, not a reuse — sema's dispatch (an
+  /// `Option[T]` receiver only) and codegen (a real match-on-tag branch +
+  /// PHI, producing an `Option[U]` result: `None` if the receiver was
+  /// `None`, `Some(v.method(args))` if it was `Some(v)`) are both
   /// genuinely different, not just an evaluation-order variant of an
   /// ordinary call.
   SafeCall(Box<Spanned<Expr>>, String, Vec<Spanned<Expr>>),
+  /// `lhs ?? rhs` (plan 73's Decision log) — `Option[T]` coalesce: `rhs`
+  /// (a plain `T`) only if `lhs` (an `Option[T]`) is `None`; `lhs`'s own
+  /// unwrapped `Some` payload otherwise. Purely a desugaring onto the
+  /// same match machinery `Option[T]` construction/pattern-matching
+  /// already uses — no new runtime representation.
+  Coalesce(Box<Spanned<Expr>>, Box<Spanned<Expr>>),
   /// `@name` — instance-variable read, valid only inside a method body.
   InstanceVar(String),
   /// `[e1, e2, ...]` — an array literal.
@@ -386,9 +394,6 @@ pub enum Expr {
   /// `true`/`false` (plan 25's Decision log) — a real `Boolean` value,
   /// not just `Compare`'s byproduct.
   Bool(bool),
-  /// `nil` (plan 25's Decision log — deliberately narrow: no `T?`
-  /// nullable-type system, just a bare `Nil`-typed value).
-  Nil,
   /// `{k1 => v1, k2 => v2, ...}` (plan 25's Decision log) — `Int64`
   /// keys only, no `Symbol`-keyed `{a: 1}` shorthand.
   HashLit(Vec<(Spanned<Expr>, Spanned<Expr>)>),
@@ -640,27 +645,6 @@ pub enum Stmt {
   /// the `begin` construct at all, unlike `Return`/`Break`/`Next`/
   /// `Raise`.
   Retry,
-  /// `name ||= default` (plan 43's Decision log) — assign `default` only
-  /// if `name`'s current value is nil, restricted to a plain already-
-  /// declared local (never `@field`/an index target), the same
-  /// restriction plan 31's `+=`-family compound assignment already
-  /// makes. Genuinely conditional, not desugared into `Stmt::Assign`
-  /// the way `+=`/etc. are — sema additionally narrows `name`'s tracked
-  /// type from `Nullable(inner)` to `inner` immediately after this
-  /// statement (sound by construction: either branch leaves `name`
-  /// unconditionally `inner`-typed).
-  OrAssign {
-    name: String,
-    default: Spanned<Expr>,
-  },
-  /// `name &&= value` (plan 43's Decision log) — assign `value` only if
-  /// `name`'s current value is non-nil; the asymmetric twin of
-  /// `OrAssign` that does NOT narrow `name`'s tracked type (the
-  /// nil-and-skipped branch leaves it exactly as nilable as before).
-  AndAssign {
-    name: String,
-    value: Spanned<Expr>,
-  },
   /// `case scrutinee when Ok(ok_var) ok_body when Err(err_var) err_body
   /// end` (plan 53's Decision log) — a small, dedicated destructuring
   /// form for `Result[T, E]`, deliberately independent of plan 52's
@@ -921,6 +905,19 @@ pub struct EnumVariant {
 pub struct EnumDef {
   pub name: String,
   pub variants: Vec<EnumVariant>,
+  /// `enum Option[T] = Some(T) | None` (plan 73's Decision log) — mirrors
+  /// `ClassDef.type_params` exactly: empty for every ordinary, non-generic
+  /// enum (unchanged from plan 52), non-empty marks this `EnumDef` as a
+  /// raw, unresolved TEMPLATE — `emerald-sema`/`emerald-codegen` route it
+  /// into a separate `generic_enums` registry instead of the ordinary
+  /// enum table, monomorphized on demand per concrete type argument the
+  /// same way a generic class already is (plan 41/58's strategy, reused
+  /// here for the first time on an enum). `Option[T]` itself is a
+  /// compiler-synthesized `EnumDef` built directly in Rust (never parsed
+  /// from source), so it can declare `None`'s zero-field variant despite
+  /// `EnumVariant`'s own grammar-level "at least one field" restriction,
+  /// which still applies unchanged to every user-written `enum`.
+  pub type_params: Vec<TypeParam>,
 }
 
 /// `actor Counter ... end` (plan 54's Decision log) — a flat,

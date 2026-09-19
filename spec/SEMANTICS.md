@@ -46,6 +46,11 @@ structural mutation.
 
 ## 2. Nil
 
+**Superseded by plan 73 — see `TYPE_SYSTEM.md` §4's own superseded
+banner.** `T?`/`nil`/`&.`/`||=` are gone; `Option[T]`/`Some`/`None`/
+`?.`/`??` replace them outright. The summary below describes the v1
+design this replaced, kept for historical accuracy, not current syntax.
+
 Fully decided in [`TYPE_SYSTEM.md` §4](./TYPE_SYSTEM.md#4-nil-and-nullable-types);
 summarized here for completeness against inception §19's question list:
 

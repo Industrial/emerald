@@ -10,10 +10,8 @@ puts x
 n: Int64 = strlen("hello")
 puts n
 
-var found: String? = String.from_cstring(strstr("hello world", "world"))
-found ||= "not found"
-puts found
+found: Option[String] = String.from_cstring(strstr("hello world", "world"))
+puts found ?? "not found"
 
-var missing: String? = String.from_cstring(strstr("hello world", "xyz"))
-missing ||= "not found"
-puts missing
+missing: Option[String] = String.from_cstring(strstr("hello world", "xyz"))
+puts missing ?? "not found"

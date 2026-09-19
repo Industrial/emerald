@@ -27,7 +27,12 @@ else
   puts 3
 end
 
-s: String? = nil
-if s == nil do
-  puts 4
+s: Option[String] = None
+match s do
+  Some(text) do
+    puts 0
+  end
+  None do
+    puts 4
+  end
 end

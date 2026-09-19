@@ -18,7 +18,7 @@ cargo run -p emerald-cli -- examples/<file>.em -o /tmp/out && /tmp/out
 | `hello.em` | `def`/return type, `Call`, `puts`, `Add` | `42` |
 | `control_flow.em` | `CompareOp`s, `if`/`elsif`/`else`/`unless`, `while`/`until`, `break`, `next`, `return`, `for..in` over a literal array, `case`/`when` | see test |
 | `classes.em` | `class`, fields, `initialize`, `@field` read/write, `.new`, methods, `Float64` fields | `10`, `15`, `5` |
-| `collections.em` | `Array[T]`/`Hash[K,V]` literals, indexed read/write, `Boolean`, nullable `String?` compared to `nil` | see test |
+| `collections.em` | `Array[T]`/`Hash[K,V]` literals, indexed read/write, `Boolean`, `Option[String]`/`None` matched via `match` | see test |
 | `closures.em` | `Proc` type, lambda literals, `.call`, `&blk`/`yield` blocks | `15`, `42`, `0`, `1`, `2` |
 | `exceptions.em` | `raise`, `begin`/`rescue`/`ensure`/`retry` | `99`, `5`, `2`, `777` |
 | `modules.em` | `module`, namespaced static method calls | `42` |
@@ -30,7 +30,7 @@ cargo run -p emerald-cli -- examples/<file>.em -o /tmp/out && /tmp/out
 | `operator_overloading.em` | `def +`/`def ==` on a class, dispatched from `a + b` / `a == b` | `4`, `6`, `0`, `1` |
 | `function_signatures.em` | default parameter values, keyword-argument calls (`f(x: 1)`), splat params (`*xs: T`), tuple returns + destructuring (`a, b = f()`) | `1`,`2`,`3`,`2`,`60` |
 | `strings.em` | `"...#{expr}..."` interpolation, `String` intrinsics (`.strip`/`.upcase`/`.downcase`/`.length`/`.split_count`/`.to_i`/`.to_f`) | see test |
-| `nullable_safe_nav.em` | `T?` nullable types, `obj&.method` safe navigation, `||=` | `1`, `0` |
+| `nullable_safe_nav.em` | `Option[T]`/`Some`/`None`, `obj?.method` safe navigation, `match` | `1`, `0` |
 | `test_framework.em` | `test "..." do ... end`, `assert_eq` — run via `emerald test examples/test_framework.em`, **not** the ordinary compile path (which rejects a `Program` containing a `test` block) | `PASS`/`FAIL`/pass-fail counts, exit 1 (one test is deliberately broken, matching the plan record's own worked example) |
 | `generic_classes.em` | `class Stack[T]`, user-declared generic classes, monomorphized per instantiation (`Stack[Int64]` and `Stack[String]` in one program) | `30`, `20`, `second`, `first` — all 4 lines; the previously-noted "4th line silently dropped" bug was investigated and found not to be a compiler defect (see "Real bugs found") |
 | `c_ffi.em` | `unsafe extern "C" { fn ... }`, calling real libc (`llabs`, `strlen`, `strstr`), `CString`/`String.from_cstring` | `42`, `5`, `world`, `not found` — all 4 lines; the safe-navigation bug previously noted below was fixed (see "Real bugs found") |
@@ -182,18 +182,17 @@ doesn't need to rediscover the constraint from scratch:
   its `puts` output or fails at codegen**~~ — **Fixed; same race as
   above, not a codegen gap.** The exact shape plan 43's own worked
   example uses, and the exact shape `c_ffi.em` hits directly (its
-  `found: String?` populated via `String.from_cstring(strstr(...))`
-  then `found ||= "not found"` then `puts found`), both print correctly
-  and deterministically on the current build — `c_ffi.em`'s verified
-  output is the full 4 lines (`42`, `5`, `world`, `not found`), not 3 as
-  previously noted here. Regression tests:
+  `found: Option[String]` populated via
+  `String.from_cstring(strstr(...))` then `puts found ?? "not found"`),
+  both print correctly and deterministically on the current build —
+  `c_ffi.em`'s verified output is the full 4 lines (`42`, `5`, `world`,
+  `not found`), not 3 as previously noted here. Regression tests:
   `plan_66_a_string_optional_via_safe_nav_and_coalesce_prints_deterministically`
   and `plan_66_the_c_ffi_string_optional_safe_nav_shape_prints_deterministically`
   (the latter runs the exact `c_ffi.em` FFI example 20x end-to-end).
-  `nullable_safe_nav.em`'s own safe-navigation demo still compares the
-  result to `nil` rather than printing the unwrapped value — that
-  choice predates this fix and is left as-is, not because printing it
-  would fail.
+  Post plan-73 migration, `nullable_safe_nav.em`'s own safe-navigation
+  demo now `match`es the `Option[String]` result instead of comparing
+  to a removed `nil` sentinel — same underlying proof, updated syntax.
 - ~~**A second consecutive `puts` of a generic method's return value on
   a monomorphized instance can silently drop its output**~~ —
   **Investigated (plan 68) and not a compiler defect.** `strs.pop()`'s

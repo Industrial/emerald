@@ -290,7 +290,14 @@ ExternFnDecl: ExternFn = {
 // has. `enum` is reserved the same LALR(1) way `class`/`module`/
 // `interface` already are.
 EnumDef: EnumDef = {
-  "enum" <name:Ident> "=" <variants:EnumVariants> => EnumDef { name, variants },
+  // Plan 73's Decision log: `<type_params:TypeParamClause?>` slots in
+  // immediately after the enum name, before `"="` — reuses
+  // `TypeParamClause`/`TypeParamList` (plan 41/58's own generic-function/
+  // -class `[T: Bound]` clause) verbatim, no new grammar production, the
+  // same reuse `ClassDef` already makes. `Option[T]` itself is compiler-
+  // synthesized (never parsed via this rule), but the grammar admits any
+  // user-written `enum Name[T] = ...` too, monomorphized the same way.
+  "enum" <name:Ident> <type_params:TypeParamClause?> "=" <variants:EnumVariants> => EnumDef { name, variants, type_params: type_params.unwrap_or_default() },
 };
 
 // Mandatory-first-element, right-recursive on "|" — the same
@@ -456,7 +463,6 @@ DefaultLit: Spanned<Expr> = {
   <l:@L> <s:StringLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::StringLit(decode_string_lit(&s)) },
   <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
   <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
-  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
 };
 
 SplatParam: Param = {
@@ -724,23 +730,6 @@ Stmt: Spanned<Stmt> = {
       error: format!("invalid compound-assignment target: {other:?}"),
     }),
   },
-  // Plan 43's Decision log: genuinely conditional, unlike `+=`/etc.
-  // above — NOT desugared into `Stmt::Assign` (`x = x + 1`'s rewrite
-  // works because `+` is unconditionally evaluated either way; `||=`/
-  // `&&=` are not). Same plain-local-target restriction as every
-  // compound-assignment form above.
-  <l:@L> <lhs:StmtExpr> "||=" <default:Expr> <r:@R> =>? match lhs.node {
-    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::OrAssign { name, default } }),
-    other => Err(lalrpop_util::ParseError::User {
-      error: format!("invalid compound-assignment target: {other:?}"),
-    }),
-  },
-  <l:@L> <lhs:StmtExpr> "&&=" <value:Expr> <r:@R> =>? match lhs.node {
-    Expr::Ident(name) => Ok(Spanned { span: (l, r), node: Stmt::AndAssign { name, value } }),
-    other => Err(lalrpop_util::ParseError::User {
-      error: format!("invalid compound-assignment target: {other:?}"),
-    }),
-  },
   // Plan 31: fixed-arity multiple assignment (`a, b = b, a`) — a raw,
   // right-recursive `Ident`/`Expr` list (not routed through `StmtExpr`,
   // unlike every rule above), since the deciding factor between this
@@ -820,6 +809,16 @@ MultiAssignValues: Vec<Spanned<Expr>> = {
 // token it's no longer at a Stmt-initial position and the array-literal
 // ambiguity this split exists to avoid can't recur.
 StmtExpr: Spanned<Expr> = {
+  StmtCoalesceExpr,
+};
+
+// Plan 73's Decision log: mirrors `CoalesceExpr` above — only the
+// leftmost position stays `Stmt`-restricted, the RHS falls back to the
+// ordinary (non-`Stmt`) `OrExpr` tier, the same "only the leftmost tier
+// position needs the split" precedent every `Stmt*` mirror in this
+// ladder already follows.
+StmtCoalesceExpr: Spanned<Expr> = {
+  <l:@L> <lhs:StmtCoalesceExpr> "??" <rhs:OrExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Coalesce(Box::new(lhs), Box::new(rhs)) },
   StmtOrExpr,
 };
 
@@ -990,13 +989,13 @@ StmtPrimaryExpr: Spanned<Expr> = {
   },
   <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, vec![]) },
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
-  // immediately above exactly, `"&."` in place of `"."` — a genuinely
+  // immediately above exactly, `"?."` in place of `"."` — a genuinely
   // new terminal, distinct from `"."`/`"&"` (bitwise/block-param
   // marker)/`"&&"`, so there's no FIRST-set overlap to disambiguate.
-  <l:@L> <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
+  <l:@L> <recv:Ident> "?." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
     Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
-  <l:@L> <recv:Ident> "&." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  <l:@L> <recv:Ident> "?." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   // Plan 47's Decision log: `assert`/`assert_eq` need their own
   // productions (not the generic `<name:Ident> "(" <args:Args> ")"`
   // call shape) purely to capture `@L` — LALRPOP's own byte-offset
@@ -1015,7 +1014,6 @@ StmtPrimaryExpr: Spanned<Expr> = {
   <l:@L> <s:SymbolLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::SymbolLit(s) },
   <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
   <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
-  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
   // Plan 34/87: `HashLit`'s bare `"{" HashPairs "}"` alternative stays
   // deliberately dropped from this Stmt-initial position — plan 34's
   // own reason (a real LALR(1) conflict against a trailing `{`-
@@ -1148,6 +1146,18 @@ CaseArm: CaseArm = {
   <name:Ident> "(" <bindings:BindingNames> ")" "do" <body:Stmt*> "end" => {
     (CasePattern::Variant { name, bindings }, body)
   },
+  // Plan 73's Decision log: a bare, paren-less nullary-variant pattern
+  // (`None do ... end`) — needed for `Option[T]`'s own `None` variant,
+  // the first variant in this compiler with zero fields (every
+  // user-written `enum`'s own `EnumVariant` still requires at least one,
+  // grammar-level, unchanged — this alternative is only ever reachable
+  // for a compiler-synthesized zero-field variant like `Option[T]`'s
+  // `None`). Disambiguated from the paren'd alternative immediately
+  // above by the very next token after `<name:Ident>` (`"("` vs. `"do"`)
+  // — no FIRST-set overlap.
+  <name:Ident> "do" <body:Stmt*> "end" => {
+    (CasePattern::Variant { name, bindings: Vec::new() }, body)
+  },
 };
 
 // Plan 71's Decision log: `match`'s own default arm spells `_ do ...
@@ -1215,6 +1225,16 @@ EnsureClause: Vec<Spanned<Stmt>> = {
 // that parses the rest of the program rather than inventing a second,
 // smaller one.
 pub Expr: Spanned<Expr> = {
+  CoalesceExpr,
+};
+
+// Plan 73's Decision log: `??` (`Option[T]` coalesce) binds looser than
+// `||` — the loosest tier in this ladder — mirroring most languages'
+// own null-coalescing precedence (JS/C#/Kotlin's `??`/`?:` all sit below
+// their boolean-or). Left-associative via ordinary left recursion, the
+// same shape every other binary tier in this grammar already uses.
+CoalesceExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CoalesceExpr> "??" <rhs:OrExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Coalesce(Box::new(lhs), Box::new(rhs)) },
   OrExpr,
 };
 
@@ -1394,11 +1414,11 @@ PrimaryExpr: Spanned<Expr> = {
   <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) },
   <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, vec![]) },
   // Plan 43's Decision log: mirrors the two `MethodCall` alternatives
-  // immediately above exactly, `"&."` in place of `"."`.
-  <l:@L> <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
+  // immediately above exactly, `"?."` in place of `"."`.
+  <l:@L> <recv:Ident> "?." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
     Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
-  <l:@L> <recv:Ident> "&." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  <l:@L> <recv:Ident> "?." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   <l:@L> "[" <elements:Args> "]" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayLit(elements) },
   // Plan 71: plan 10's `->(params) -> ReturnType { body }` lambda
   // literal is deleted outright, not arrow-shortened — Sable has no
@@ -1443,7 +1463,6 @@ PrimaryExpr: Spanned<Expr> = {
   <l:@L> <s:SymbolLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::SymbolLit(s) },
   <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
   <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
-  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
   <l:@L> "{" <pairs:HashPairs> "}" <r:@R> => Spanned { span: (l, r), node: Expr::HashLit(pairs) },
   <l:@L> <name:InstanceVarTok> <r:@R> => Spanned { span: (l, r), node: Expr::InstanceVar(name) },
   <l:@L> <name:Ident> <r:@R> => Spanned { span: (l, r), node: Expr::Ident(name) },
@@ -1482,6 +1501,17 @@ PrimaryExpr: Spanned<Expr> = {
 // of `cond` before the mandatory `"do"`, and every one of this ladder's
 // tiers can be that last token via its own right-hand operand.
 CondExpr: Spanned<Expr> = {
+  CondCoalesceExpr,
+};
+
+// Plan 73's Decision log: mirrors `CoalesceExpr`, but — like every other
+// tier in this specific `Cond*` ladder (unlike the `Stmt*` ladder) —
+// stays `Cond`-prefixed on the RHS too, for the reason `CondExpr`'s own
+// header comment gives: every intermediate tier here must stay
+// restricted, not just the leftmost, since any of them could be the
+// last token right before the mandatory `"do"`.
+CondCoalesceExpr: Spanned<Expr> = {
+  <l:@L> <lhs:CondCoalesceExpr> "??" <rhs:CondOrExpr> <r:@R> => Spanned { span: (l, r), node: Expr::Coalesce(Box::new(lhs), Box::new(rhs)) },
   CondOrExpr,
 };
 
@@ -1569,10 +1599,10 @@ CondPrimaryExpr: Spanned<Expr> = {
   <l:@L> "(" <recv:ChainCallExpr> ")" "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(recv), method, vec![]) },
   <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, args) },
   <l:@L> <recv:InstanceVarTok> "." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::MethodCall(Box::new(Spanned::synthetic(Expr::InstanceVar(recv))), method, vec![]) },
-  <l:@L> <recv:Ident> "&." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
+  <l:@L> <recv:Ident> "?." <method:CallMethodName> "(" <args:Args> ")" <r:@R> => {
     Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, args) }
   },
-  <l:@L> <recv:Ident> "&." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
+  <l:@L> <recv:Ident> "?." <method:CallMethodName> <r:@R> => Spanned { span: (l, r), node: Expr::SafeCall(Box::new(Spanned::synthetic(Expr::Ident(recv))), method, vec![]) },
   <l:@L> "[" <elements:Args> "]" <r:@R> => Spanned { span: (l, r), node: Expr::ArrayLit(elements) },
   <e:DoBlock> => e,
   <l:@L> <f:FloatLit> <r:@R> => Spanned { span: (l, r), node: Expr::Float(f) },
@@ -1583,7 +1613,6 @@ CondPrimaryExpr: Spanned<Expr> = {
   <l:@L> <s:SymbolLitTok> <r:@R> => Spanned { span: (l, r), node: Expr::SymbolLit(s) },
   <l:@L> "true" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(true) },
   <l:@L> "false" <r:@R> => Spanned { span: (l, r), node: Expr::Bool(false) },
-  <l:@L> "nil" <r:@R> => Spanned { span: (l, r), node: Expr::Nil },
   <l:@L> "{" <pairs:HashPairs> "}" <r:@R> => Spanned { span: (l, r), node: Expr::HashLit(pairs) },
   <l:@L> <name:InstanceVarTok> <r:@R> => Spanned { span: (l, r), node: Expr::InstanceVar(name) },
   <l:@L> <name:Ident> <r:@R> => Spanned { span: (l, r), node: Expr::Ident(name) },
@@ -1643,15 +1672,6 @@ Param: Param = {
 // need to enforce that narrowing (it's just a name here, same as
 // `Array[Elem]`'s own compound-string convention, plan 09's Decision
 // log).
-// Plan 43's Decision log: `<base:TypeName> "?"` is ordinary left
-// recursion (the same shape every other left-recursive production in
-// this grammar already uses, e.g. `AddExpr`) — `"?"` is a genuinely new
-// terminal, not reused from anywhere else. `Type::Nullable`'s own
-// reference-type-only restriction (rejecting `Int64?`/`Float64?`/
-// `Boolean?`/`Proc?`) is entirely `resolve_type`'s job, not the
-// grammar's — `T?` stays a plain compound-string annotation here,
-// mirroring `Array[Elem]`/`Hash[K, V]`'s own convention (plan 09's
-// Decision log).
 TypeName: String = {
   <name:Ident> => name,
   "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
@@ -1668,7 +1688,6 @@ TypeName: String = {
   // is the thing that turns this into a real `Type::Result`.
   "Result" "[" <t:Ident> "," <e:Ident> "]" => format!("Result[{t}, {e}]"),
   "Proc" => "Proc".to_string(),
-  <base:TypeName> "?" => format!("{base}?"),
   // Plan 39's Decision log: `"(" T1 "," T2 [, ...] ")"`, mirroring
   // `Array[Elem]`/`Hash[K, V]`'s own compound-string convention
   // (formatted as e.g. `"(Int64, Int64)"`). Added as a grammar-wide

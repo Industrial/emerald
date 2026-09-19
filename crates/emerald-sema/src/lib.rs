@@ -13,8 +13,8 @@
 //! `Spanned<T>` doc comment for why that's the cheaper edit.
 
 use emerald_parser::{
-  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, Expr, Function, Item,
-  ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart,
+  ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
+  Function, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart, TypeParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -31,9 +31,6 @@ pub enum Type {
   /// a cheap interned-integer compare in codegen (`ValKind::Symbol`),
   /// not a string compare.
   Symbol,
-  /// Plan 25's Decision log: deliberately narrow — no `T?` nullable-type
-  /// system, just a bare, standalone type a `nil` literal produces.
-  Nil,
   /// An instance of a user-defined class, named by its declaration.
   Class(String),
   /// A packed, contiguous array of a single element type
@@ -69,16 +66,6 @@ pub enum Type {
   /// A method call on a `bound: None`-typed value is rejected outright
   /// — there is no interface to resolve the call against.
   Generic(String, Option<String>),
-  /// `T?` (plan 43's Decision log) — the union of `T` and `Nil`,
-  /// scoped to reference types only (`Class`/`String`/`Array`/`Hash` —
-  /// every kind that already lowers to a pointer-backed `ValKind` in
-  /// codegen, which has a spare `null` bit pattern to spend on nilness
-  /// for free). `resolve_type` never constructs this over `Int64`/
-  /// `Float64`/`Boolean`/`Proc`/`Nil`/`Generic` — boxing a value type
-  /// just to steal a spare bit is the exact cost this project already
-  /// declines to pay for arbitrary-precision `Integer` (`spec/
-  /// TYPE_SYSTEM.md` §3).
-  Nullable(Box<Type>),
   /// A fixed-arity anonymous tuple (plan 39's Decision log) — valid
   /// ONLY as a function's declared return type, never a parameter
   /// type, a field type, a `Let`'s local type, an array element type,
@@ -290,7 +277,6 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     "String" => Ok(Type::String),
     "Void" => Ok(Type::Void),
     "Boolean" => Ok(Type::Boolean),
-    "Nil" => Ok(Type::Nil),
     "Symbol" => Ok(Type::Symbol),
     // Plan 59's Decision log: a `CString` value needs an ordinary
     // annotation position too (an intermediate `c: CString = s.
@@ -299,32 +285,6 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     // comment) means no METHOD dispatches on it, not that it can't be
     // named.
     "CString" => Ok(Type::CString),
-    // Plan 43's Decision log: checked before every other compound-string
-    // case below (`Array[Elem]?`/`Hash[K, V]?` recurse cleanly through
-    // this) — scoped to reference types only (`Class`/`String`/`Array`/
-    // `Hash`); `Int64?`/`Float64?`/`Boolean?`/`Proc?`/`Nil?`/a `T?`
-    // referencing a generic type parameter are all rejected here, at the
-    // type-annotation boundary, naming the exact reason.
-    other if other.ends_with('?') => {
-      let inner_name = &other[..other.len() - 1];
-      let inner = resolve_type(inner_name, classes)?;
-      match inner {
-        Type::Class(_) | Type::String | Type::Array(_) | Type::Hash(_, _) => {
-          Ok(Type::Nullable(Box::new(inner)))
-        }
-        // Plan 22's Decision log: type *annotations* are plain strings
-        // in this grammar (plan 09's compound-string convention), never
-        // a `Spanned` AST node — there is no real span to blame here
-        // more precisely than "no position at all," disclosed via
-        // `(0, 0)` rather than fabricated.
-        other_inner => Err(Diagnostic::new(
-          format!(
-            "`{inner_name}?` is not supported — only reference types (a class, String, Array, or Hash) can be nullable, found {other_inner:?}"
-          ),
-          (0, 0),
-        )),
-      }
-    }
     // Plan 52's Decision log: checked before the ordinary `Type::Class`
     // branch below — an enum shares the same `classes` registry
     // (Decision log's disclosed adaptation) but must resolve to
@@ -405,12 +365,18 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     // real, disclosed simplification: this path reports the SAME
     // "unknown type" diagnostic as the ordinary case below, rather than
     // re-deriving which specific type argument failed).
+    // Plan 73's Decision log: a generic-ENUM instantiation (`"Option[
+    // Int64]"`) mangles exactly the same way a generic-class one does —
+    // the two share one mangled-name-keyed `classes` registry (plan
+    // 52's own disclosed adaptation) — but must resolve to `Type::Enum`,
+    // never `Type::Class`, the same split the ordinary (non-generic)
+    // enum-vs-class check above already makes.
     other if parse_generic_instantiation(other).is_some() => {
       let mangled = mangle_type_name(other);
-      if classes.contains_key(&mangled) {
-        Ok(Type::Class(mangled))
-      } else {
-        Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0)))
+      match classes.get(&mangled) {
+        Some(info) if info.enum_variants.is_some() => Ok(Type::Enum(mangled)),
+        Some(_) => Ok(Type::Class(mangled)),
+        None => Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0))),
       }
     }
     other => Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0))),
@@ -641,6 +607,184 @@ fn instantiate_generic_class(
   Ok(mangled)
 }
 
+/// Plan 73: `Option[T]`'s own monomorphization — the first GENERIC enum
+/// this compiler ships, extending plan 41/58's exact generic-class
+/// strategy (`instantiate_generic_class`/`build_generic_class_info`
+/// immediately above) to `enum` declarations instead. Mirrors
+/// `instantiate_generic_class` line for line: same mangled-name
+/// memoization, same `in_progress` self-reference/depth-limit handling
+/// (a recursive generic enum — `enum Tree[T] = Node(T, Tree[T]) | Leaf`
+/// — hits the identical hazard a recursive generic class does). The one
+/// real difference: builds a `ClassInfo` with `enum_variants: Some(...)`
+/// populated instead of `fields`/`methods` — reusing plan 52's own
+/// "enums share the classes table" adaptation, so `resolve_type`/
+/// `check_case`/`find_all_variants` need no separate registry at all.
+fn instantiate_generic_enum(
+  base_name: &str,
+  type_args: &[&str],
+  generic_classes: &HashMap<String, &ClassDef>,
+  generic_enums: &HashMap<String, &EnumDef>,
+  classes: &mut HashMap<String, ClassInfo>,
+  in_progress: &mut Vec<String>,
+) -> Result<String, Diagnostic> {
+  let mangled_args: Vec<String> = type_args.iter().map(|a| mangle_type_name(a)).collect();
+  let mangled = format!("{base_name}${}", mangled_args.join("$"));
+
+  if classes.contains_key(&mangled) {
+    return Ok(mangled);
+  }
+  if in_progress.last().map(String::as_str) == Some(mangled.as_str()) {
+    classes.insert(
+      mangled.clone(),
+      ClassInfo {
+        fields: HashMap::new(),
+        methods: HashMap::new(),
+        is_module: false,
+        superclass: None,
+        implements: None,
+        enum_variants: Some(Vec::new()),
+        is_actor: false,
+      },
+    );
+    return Ok(mangled);
+  }
+  if in_progress.len() >= GENERIC_INSTANTIATION_DEPTH_LIMIT {
+    return Err(Diagnostic::new(
+      format!(
+        "generic instantiation `{mangled}` exceeds the maximum nesting depth of {GENERIC_INSTANTIATION_DEPTH_LIMIT} — likely an unbounded recursive generic enum"
+      ),
+      (0, 0),
+    ));
+  }
+  let Some(e) = generic_enums.get(base_name).copied() else {
+    return Err(Diagnostic::new(
+      format!("undefined generic enum `{base_name}`"),
+      (0, 0),
+    ));
+  };
+  if e.type_params.len() != type_args.len() {
+    return Err(Diagnostic::new(
+      format!(
+        "generic enum `{base_name}` expects {} type argument(s), found {}",
+        e.type_params.len(),
+        type_args.len()
+      ),
+      (0, 0),
+    ));
+  }
+
+  let subst: HashMap<&str, &str> = e
+    .type_params
+    .iter()
+    .map(|tp| tp.name.as_str())
+    .zip(type_args.iter().copied())
+    .collect();
+
+  in_progress.push(mangled.clone());
+  let result = build_generic_enum_info(
+    base_name,
+    e,
+    type_args,
+    &subst,
+    generic_classes,
+    generic_enums,
+    classes,
+    in_progress,
+  );
+  in_progress.pop();
+
+  let info = result?;
+  classes.insert(mangled.clone(), info);
+  Ok(mangled)
+}
+
+/// Plan 73: builds the monomorphized `ClassInfo` (its `enum_variants`
+/// populated, `fields`/`methods` left empty) for `base_name<type_args>`
+/// — bound-checks each type argument the same way `build_generic_class_
+/// info` does, then substitutes every type-parameter-named variant field
+/// type via `subst`. Doesn't push/pop `in_progress` itself (the caller,
+/// `instantiate_generic_enum`, owns that), mirroring `build_generic_
+/// class_info`'s own precedent exactly.
+#[allow(clippy::too_many_arguments)]
+fn build_generic_enum_info(
+  base_name: &str,
+  e: &EnumDef,
+  type_args: &[&str],
+  subst: &HashMap<&str, &str>,
+  generic_classes: &HashMap<String, &ClassDef>,
+  generic_enums: &HashMap<String, &EnumDef>,
+  classes: &mut HashMap<String, ClassInfo>,
+  in_progress: &mut Vec<String>,
+) -> Result<ClassInfo, Diagnostic> {
+  for (tp, arg) in e.type_params.iter().zip(type_args.iter()) {
+    let Some(bound) = &tp.bound else { continue };
+    let arg_class_name = if let Some((abase, aargs)) = parse_generic_instantiation(arg) {
+      if generic_classes.contains_key(abase) {
+        instantiate_generic_class(abase, &aargs, generic_classes, classes, in_progress)?
+      } else if generic_enums.contains_key(abase) {
+        instantiate_generic_enum(
+          abase,
+          &aargs,
+          generic_classes,
+          generic_enums,
+          classes,
+          in_progress,
+        )?
+      } else {
+        mangle_type_name(arg)
+      }
+    } else {
+      (*arg).to_string()
+    };
+    let conforms = classes
+      .get(&arg_class_name)
+      .is_some_and(|info| info.implements.as_deref() == Some(bound.as_str()));
+    if !conforms {
+      return Err(Diagnostic::new(
+        format!(
+          "`{arg}` does not implement `{bound}`, required by generic enum `{base_name}`'s type parameter `{}`",
+          tp.name
+        ),
+        (0, 0),
+      ));
+    }
+  }
+
+  let mut variants = Vec::new();
+  for v in &e.variants {
+    let mut field_types = Vec::new();
+    for f in &v.fields {
+      let substituted = substitute_type_params(f, subst);
+      if let Some((base, args)) = parse_generic_instantiation(&substituted) {
+        if generic_classes.contains_key(base) {
+          instantiate_generic_class(base, &args, generic_classes, classes, in_progress)?;
+        } else if generic_enums.contains_key(base) {
+          instantiate_generic_enum(
+            base,
+            &args,
+            generic_classes,
+            generic_enums,
+            classes,
+            in_progress,
+          )?;
+        }
+      }
+      field_types.push(resolve_type(&substituted, classes)?);
+    }
+    variants.push((v.name.clone(), field_types));
+  }
+
+  Ok(ClassInfo {
+    fields: HashMap::new(),
+    methods: HashMap::new(),
+    is_module: false,
+    superclass: None,
+    implements: None,
+    enum_variants: Some(variants),
+    is_actor: false,
+  })
+}
+
 /// Plan 58: whole-program walk collecting every generic-class-
 /// instantiation type-name string actually written anywhere (`Let`
 /// annotations, ordinary function/method/actor param/return types,
@@ -802,9 +946,7 @@ fn collect_typenames_in_stmt(stmt: &Spanned<Stmt>, out: &mut Vec<String>) {
     | Stmt::Expr(_)
     | Stmt::Raise(_)
     | Stmt::Yield(_)
-    | Stmt::Retry
-    | Stmt::OrAssign { .. }
-    | Stmt::AndAssign { .. } => {}
+    | Stmt::Retry => {}
   }
 }
 
@@ -906,17 +1048,97 @@ fn check_generic_class_body(
 /// currently registered in `classes` (an entry's `enum_variants` is
 /// `Some` only for an actual enum, per the Decision log's disclosed
 /// "enums share the classes table" adaptation) for a variant named
-/// `name`. Registration-time collision checks in `check_program`
-/// guarantee at most one enum ever owns a given variant name.
-fn find_variant(name: &str, classes: &HashMap<String, ClassInfo>) -> Option<(String, Vec<Type>)> {
+/// `name`.
+///
+/// Plan 73's Decision log: registration-time collision checks still
+/// guarantee at most one ORDINARY (non-generic) enum ever owns a given
+/// variant name, but a generic enum monomorphized more than once (e.g.
+/// both `Option[Int64]` and `Option[String]` used in the same program)
+/// genuinely has *multiple* enums — `Option$Int64`, `Option$String` —
+/// both declaring `Some`/`None`. Returns every match rather than just
+/// the first (`HashMap` iteration order is otherwise undefined) so the
+/// caller can disambiguate.
+fn find_all_variants(name: &str, classes: &HashMap<String, ClassInfo>) -> Vec<(String, Vec<Type>)> {
+  let mut out = Vec::new();
   for (enum_name, info) in classes {
     if let Some(variants) = &info.enum_variants {
       if let Some((_, field_types)) = variants.iter().find(|(vn, _)| vn == name) {
-        return Some((enum_name.clone(), field_types.clone()));
+        out.push((enum_name.clone(), field_types.clone()));
       }
     }
   }
-  None
+  // Deterministic order (`classes` is a `HashMap`) — cosmetic only (it
+  // never changes which candidate is chosen), but keeps a "candidates:
+  // ..." diagnostic's own wording reproducible across compiler runs.
+  out.sort_by(|a, b| a.0.cmp(&b.0));
+  out
+}
+
+/// Plan 73's Decision log: `Option[T]`'s own compiler-synthesized enum
+/// name is always `"Option"` (bare, unresolved template) or `"Option$
+/// ..."` (monomorphized, per `mangle_type_name`'s `$`-separator
+/// convention) — used wherever a diagnostic or a dispatch decision needs
+/// to recognize "this is specifically an `Option`," not just "some
+/// enum" (e.g. the direct-`.method`-on-`Option` diagnostic below, and
+/// `?.`/`??`'s own typing rules).
+fn is_option_type(ty: &Type, _classes: &HashMap<String, ClassInfo>) -> bool {
+  matches!(ty, Type::Enum(name) if name == "Option" || name.starts_with("Option$"))
+}
+
+/// Plan 73's Decision log: resolves and checks a variant CONSTRUCTION
+/// (`Expr::Call(name, args)`, or a bare zero-arg `Expr::Ident(name)` —
+/// `Option[T]`'s own `None`) directly against one SPECIFIC, already-known
+/// enum — used at every "expected-type-providing position" this
+/// compiler already has (`Let`'s declared type, `Assign`'s recorded
+/// type, `Return`'s threaded return type, and a function body's own
+/// final implicit-return expression), the same precedent `Result[T,
+/// E]`'s `check_result_construction` established for `Ok`/`Err`, gener-
+/// alized to any enum (this is what makes a bare, unqualified `None`
+/// resolvable at all — seeing which SPECIFIC `Option[T]` instantiation
+/// it means is otherwise ambiguous the moment two coexist, per
+/// `find_all_variants`'s own doc comment). Returns `Ok(true)` if `expr`
+/// really was shaped like one of `enum_name`'s own variants (already
+/// fully checked — the caller should treat this position as handled);
+/// `Ok(false)` if `expr` wasn't a construction of ANY variant of this
+/// specific enum — the caller falls back to its own ordinary
+/// `infer_expr_type`-based check (which still gives the right diagnostic
+/// when `expr` is, say, an ordinary function call rather than a variant
+/// construction at all).
+#[allow(clippy::too_many_arguments)]
+fn check_enum_variant_construction(
+  enum_name: &str,
+  expr: &Spanned<Expr>,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  self_fields: Option<&HashMap<String, Type>>,
+  gctx: &GenericsCtx,
+) -> Result<bool, Diagnostic> {
+  let (name, args): (&str, &[Spanned<Expr>]) = match &expr.node {
+    Expr::Call(n, a) => (n.as_str(), a.as_slice()),
+    Expr::Ident(n) => (n.as_str(), &[]),
+    _ => return Ok(false),
+  };
+  let Some(info) = classes.get(enum_name) else {
+    return Ok(false);
+  };
+  let Some(variants) = &info.enum_variants else {
+    return Ok(false);
+  };
+  let Some((_, field_types)) = variants.iter().find(|(vn, _)| vn == name) else {
+    return Ok(false);
+  };
+  check_args(
+    name,
+    args,
+    field_types,
+    env,
+    sigs,
+    classes,
+    self_fields,
+    gctx,
+  )?;
+  Ok(true)
 }
 
 /// Splits `s` on top-level `,` only — a nested `Array[...]`/`Hash[...]`/
@@ -987,6 +1209,38 @@ fn mangle_type_name(ty: &str) -> String {
       format!("{base}${}", mangled_args.join("$"))
     }
     None => ty.to_string(),
+  }
+}
+
+/// Plan 73's Decision log: the inverse of `resolve_type` for the finite
+/// slice of `Type` values `?.`'s own result-rewrapping needs to name as
+/// an `Option[T]` type ARGUMENT string (fed into `mangle_type_name` to
+/// look up an already-instantiated `"Option${arg}"` in `classes`).
+/// `None` for anything `Option[T]` was never going to be instantiated
+/// over anyway (`Tuple`/`Proc`/`Supervisor`/... — none of these are
+/// legal generic-instantiation arguments in this compiler at all).
+fn type_annotation_string(ty: &Type) -> Option<String> {
+  match ty {
+    Type::Int64 => Some("Int64".to_string()),
+    Type::Float64 => Some("Float64".to_string()),
+    Type::String => Some("String".to_string()),
+    Type::Boolean => Some("Boolean".to_string()),
+    Type::Void => Some("Void".to_string()),
+    Type::Symbol => Some("Symbol".to_string()),
+    Type::CString => Some("CString".to_string()),
+    Type::Class(name) | Type::Enum(name) => Some(name.clone()),
+    Type::Array(elem) => type_annotation_string(elem).map(|e| format!("Array[{e}]")),
+    Type::Hash(k, v) => {
+      let k = type_annotation_string(k)?;
+      let v = type_annotation_string(v)?;
+      Some(format!("Hash[{k}, {v}]"))
+    }
+    Type::Generic(_, _)
+    | Type::Proc(_, _)
+    | Type::Tuple(_)
+    | Type::Result(_, _)
+    | Type::Supervisor(_)
+    | Type::Pair(_, _) => None,
   }
 }
 
@@ -1101,22 +1355,15 @@ fn resolve_extern_type(name: &str, is_return_position: bool) -> Result<Type, Dia
   }
 }
 
-/// Plan 43's Decision log: replaces the raw `actual != declared`
-/// equality check at every assignability check-site in this file —
-/// exact-equality for every non-nullable `declared` (so every
-/// non-`T?` program's accept/reject outcome is provably unchanged,
-/// same predicate, same answer), additionally accepting `Type::Nil` or
-/// the unwrapped inner type into a `Type::Nullable(inner)` `declared`,
-/// per `spec/TYPE_SYSTEM.md` §10's assignability table (`nil → T?` ✓,
-/// `T → T?` ✓ widens, `nil → T` ✗).
+/// Plan 43's Decision log originally widened this beyond plain equality
+/// for `T?`'s own `nil → T?`/`T → T?` widening rules; plan 73 removes
+/// `T?`/`Nil` from the type system entirely, so this is exact structural
+/// equality again — `Option[T]` carries no implicit widening of its own
+/// (a bare `T` is never assignable to a declared `Option[T]`; the source
+/// must write `Some(value)` explicitly, checked separately by
+/// `check_enum_variant_construction`).
 fn is_assignable(actual: &Type, declared: &Type) -> bool {
-  if actual == declared {
-    return true;
-  }
-  if let Type::Nullable(inner) = declared {
-    return *actual == Type::Nil || actual == inner.as_ref();
-  }
-  false
+  actual == declared
 }
 
 fn function_signature(
@@ -1986,6 +2233,42 @@ fn infer_expr_type(
   gctx: &GenericsCtx,
 ) -> Result<Type, Diagnostic> {
   match &expr.node {
+    // Plan 73's Decision log: a bare, zero-arg variant reference —
+    // `Option[T]`'s own `None` — parses as an ordinary `Expr::Ident` (no
+    // grammar changes at all: `None` is not a reserved keyword, just an
+    // identifier that happens to name a nullary variant), checked here
+    // only once `env` itself has no binding for `name` (an ordinary
+    // local always wins — the same "no reserved word" precedent this
+    // fallback relies on). Real ambiguity between multiple nullary
+    // candidates (two different `Option[T]` instantiations both
+    // declaring `None`) can't be resolved from arguments (there are
+    // none) — reached only when `check_enum_variant_construction`'s own
+    // expected-type-providing positions didn't already resolve it, so
+    // this is a genuine, disclosed diagnostic, not a silent guess (the
+    // same limitation Rust's own `None` inference has outside an
+    // expected-type position).
+    Expr::Ident(name) if !env.contains_key(name) && !find_all_variants(name, classes).is_empty() => {
+      let candidates = find_all_variants(name, classes);
+      let nullary: Vec<&(String, Vec<Type>)> =
+        candidates.iter().filter(|(_, ft)| ft.is_empty()).collect();
+      match nullary.len() {
+        1 => Ok(Type::Enum(nullary[0].0.clone())),
+        0 => Err(Diagnostic::new(
+          format!("`{name}` is not a nullary variant — it takes arguments (write `{name}(...)`)"),
+          expr.span,
+        )),
+        _ => {
+          let names: Vec<&str> = nullary.iter().map(|(n, _)| n.as_str()).collect();
+          Err(Diagnostic::new(
+            format!(
+              "ambiguous construction `{name}` — matches more than one instantiation: `{}` — add a declared type here (a `let`, `return`, or function argument with an explicit `Option[T]` type) to disambiguate",
+              names.join("`, `")
+            ),
+            expr.span,
+          ))
+        }
+      }
+    }
     Expr::Ident(name) => env
       .get(name)
       .cloned()
@@ -2158,18 +2441,6 @@ fn infer_expr_type(
         };
       }
       let rt = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
-      // Plan 43's Decision log: a `Nullable(_)` operand against `Nil` —
-      // either order — always type-checks to `Boolean`, the explicit
-      // nil-check alternative to `&.`. Scoped to exactly this shape
-      // (never `Nullable == Nullable` between two different nilable
-      // values), checked before the `lt != rt` strict-equality rule
-      // below, which stays completely unchanged for every other pair.
-      if matches!(
-        (&lt, &rt),
-        (Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nullable(_))
-      ) {
-        return Ok(Type::Boolean);
-      }
       if lt != rt {
         return Err(Diagnostic::new(
           format!(
@@ -2411,8 +2682,67 @@ fn infer_expr_type(
     // construction instead. Registration-time collision checks in
     // `check_program` already guarantee a name is never both a
     // declared variant and a declared function.
-    Expr::Call(name, args) if find_variant(name, classes).is_some() => {
-      let (enum_name, field_types) = find_variant(name, classes).unwrap();
+    Expr::Call(name, args) if !find_all_variants(name, classes).is_empty() => {
+      let mut candidates = find_all_variants(name, classes);
+      // Plan 73's Decision log: an ordinary (non-generic) enum's variant
+      // name is unique across the whole program (registration-time
+      // collision check), so this is the overwhelmingly common case —
+      // exactly one candidate, unchanged behavior from plan 52. A
+      // generic enum instantiated more than once (`Option[Int64]` AND
+      // `Option[String]` both used) genuinely has several candidates
+      // sharing this variant name; a non-nullary variant (`Some(x)`)
+      // disambiguates the same way an overloaded call would — by
+      // checking which candidate's own field types the ARGUMENTS
+      // actually match, entirely from context already at hand, no
+      // expected-type threading needed. A nullary variant (`None`) has
+      // no arguments to disambiguate from at all — this arm is only ever
+      // reached for one when `check_enum_variant_construction` (an
+      // expected-type-providing position) didn't already resolve it, so
+      // real ambiguity here is a genuine diagnostic, not a silent guess.
+      if candidates.len() > 1 {
+        let arg_types: Vec<Type> = args
+          .iter()
+          .map(|a| infer_expr_type(a, env, sigs, classes, self_fields, gctx))
+          .collect::<Result<Vec<_>, _>>()?;
+        let matching: Vec<(String, Vec<Type>)> = candidates
+          .iter()
+          .filter(|(_, field_types)| {
+            field_types.len() == arg_types.len()
+              && field_types.iter().zip(&arg_types).all(|(f, a)| f == a)
+          })
+          .cloned()
+          .collect();
+        match matching.len() {
+          1 => candidates = matching,
+          0 => {
+            let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+            return Err(Diagnostic::new(
+              format!(
+                "`{name}({arg_types:?})` does not match any of `{}`'s variant `{name}` — candidates: `{}`",
+                names.join("`, `"),
+                names.join("`, `")
+              ),
+              expr.span,
+            ));
+          }
+          _ => {
+            let names: Vec<&str> = matching.iter().map(|(n, _)| n.as_str()).collect();
+            return Err(Diagnostic::new(
+              format!(
+                "ambiguous construction `{name}(...)` — matches more than one instantiation: `{}` — add a declared type here (a `let`, `return`, or function argument with an explicit `Option[T]` type) to disambiguate",
+                names.join("`, `")
+              ),
+              expr.span,
+            ));
+          }
+        }
+        let (enum_name, field_types) = candidates.into_iter().next().unwrap();
+        check_args(
+          name, args, &field_types, env, sigs, classes, self_fields, gctx,
+        )?;
+        return Ok(Type::Enum(enum_name));
+      }
+      let (enum_name, field_types) = candidates.into_iter().next().unwrap();
       check_args(
         name,
         args,
@@ -2423,7 +2753,7 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
-      Ok(Type::Enum(enum_name.to_string()))
+      Ok(Type::Enum(enum_name))
     }
     Expr::Call(name, args) => {
       let sig = sigs
@@ -2791,9 +3121,13 @@ fn infer_expr_type(
     // Plan 59's Decision log: `String.from_cstring(ptr)` — the same
     // reserved-namespace static-call shape as `File` immediately above,
     // for the same reason (`String` is never a real `ModuleDef`).
-    // `String?` reuses plan 43's real, already-shipped `Type::
-    // Nullable(Box<Type>)` — a C function's real `NULL` return is
-    // exactly what a nullable reference type is for.
+    // Plan 73's Decision log: `String?` (plan 43's now-removed `T?`)
+    // becomes `Option[String]` — a C function's real `NULL` return is
+    // exactly what `None` is for. `"Option$String"` is unconditionally
+    // pre-instantiated by `check_program` (see its own Decision log)
+    // specifically so this one compiler-internal use of `Option[String]`
+    // — never spelled out as literal source text anywhere a program
+    // might otherwise trigger its monomorphization — always exists.
     Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "String") =>
     {
       if method != "from_cstring" {
@@ -2812,7 +3146,7 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
-      Ok(Type::Nullable(Box::new(Type::String)))
+      Ok(Type::Enum("Option$String".to_string()))
     }
     // `Name.method(args)` on a module (plan 12) dispatches straight to
     // its method table — checked *before* the `.call`/`Type::Proc` arm
@@ -2993,16 +3327,17 @@ fn infer_expr_type(
     }
     Expr::MethodCall(recv, method, args) => {
       let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
-      // Plan 43's Decision log: the plan's actual payoff — a direct
-      // `.method` on a `T?` receiver is a compile-time diagnostic,
-      // checked before the existing `Type::Class` match below (which
+      // Plan 73's Decision log: a direct `.method` on an `Option[T]`
+      // receiver is a compile-time diagnostic naming the exact fix,
+      // checked before the ordinary `Type::Class` match below (which
       // would otherwise reject it with the generic, less useful
-      // "non-class type" message this arm already produces for other
-      // mismatches).
-      if let Type::Nullable(_) = &recv_ty {
+      // "non-class type" message that arm already produces for other
+      // mismatches) — the same "actual payoff" precedent plan 43's own
+      // now-removed `T?` check established, retargeted at `Option[T]`.
+      if is_option_type(&recv_ty, classes) {
         return Err(Diagnostic::new(
           format!(
-            "method call `.{method}` on a nullable receiver (type {recv_ty:?}) — use safe navigation `&.` or an explicit `== nil` check"
+            "method call `.{method}` on an `Option` receiver (type {recv_ty:?}) — use safe navigation `?.` or a `match` on `Some`/`None`"
           ),
           recv.span,
         ));
@@ -3170,65 +3505,150 @@ fn infer_expr_type(
       }
       Ok(sig.return_type.clone())
     }
-    // Plan 43's Decision log: scoped to a class-typed nullable receiver
-    // whose dispatched method's return type is itself one of the four
-    // pointer-representable kinds (`Class`/`String`/`Array`/`Hash`) —
-    // `Int64`/`Float64`/`Boolean`/`Void`/`Nil` would need `&.`'s result
-    // to be a boxed `Int64?`/etc., the exact cost this plan already
-    // declines to pay. Reuses `check_args` for arity/type checking
-    // against the method's own declared signature, same as the
-    // ordinary `MethodCall` arm above.
+    // Plan 73's Decision log: `?.` replaces plan 43's `&.` outright —
+    // scoped to an `Option[T]`-typed receiver whose own `T` (looked up
+    // from the SPECIFIC monomorphized enum's `Some` variant, not a
+    // structural `Nullable(inner)` unwrap — `Option[T]` is a real ADT
+    // now) is a class or `String`. Short-circuits to `None` at runtime
+    // if the receiver was `None` (codegen's job); sema's job here is
+    // just checking the call shape and computing the result type:
+    // `Option[U]` where `U` is the dispatched method's own return type.
+    // `Option[U]` must already be instantiated somewhere else in this
+    // program (an explicit `x: Option[U] = ...` annotation, the same
+    // "expected-type-providing position" every other construction-
+    // ambiguity fix in this plan relies on) — `classes` is borrowed
+    // immutably this deep in `infer_expr_type`, so a brand-new `U` this
+    // program never otherwise names cannot be monomorphized on the fly
+    // here; a real, disclosed limitation, not a silent wrong answer.
     Expr::SafeCall(recv, method, args) => {
       let recv_ty = infer_expr_type(recv, env, sigs, classes, self_fields, gctx)?;
-      let Type::Nullable(inner) = &recv_ty else {
+      if !is_option_type(&recv_ty, classes) {
         return Err(Diagnostic::new(
-          format!("`&.{method}` requires a nullable receiver, found {recv_ty:?} — use `.` instead"),
+          format!("`?.{method}` requires an `Option[T]` receiver, found {recv_ty:?} — use `.` instead"),
           recv.span,
-        ));
-      };
-      let Type::Class(class_name) = inner.as_ref() else {
-        return Err(Diagnostic::new(
-          format!(
-            "`&.{method}` is only supported on a nullable class-typed receiver, found {recv_ty:?}"
-          ),
-          recv.span,
-        ));
-      };
-      let info = classes.get(class_name).ok_or_else(|| {
-        Diagnostic::new(
-          format!("internal error: unregistered class `{class_name}`"),
-          expr.span,
-        )
-      })?;
-      let sig = info.methods.get(method).ok_or_else(|| {
-        Diagnostic::new(
-          format!("class `{class_name}` has no method `{method}`"),
-          expr.span,
-        )
-      })?;
-      if !matches!(
-        sig.return_type,
-        Type::Class(_) | Type::String | Type::Array(_) | Type::Hash(_, _)
-      ) {
-        return Err(Diagnostic::new(
-          format!(
-            "`&.{method}` returns {:?}, which cannot be wrapped as a nullable result — only a class, String, Array, or Hash return type is supported",
-            sig.return_type
-          ),
-          expr.span,
         ));
       }
+      let Type::Enum(enum_name) = &recv_ty else {
+        unreachable!("is_option_type only accepts Type::Enum");
+      };
+      let variants = classes[enum_name]
+        .enum_variants
+        .as_ref()
+        .expect("Type::Enum is only ever constructed for a registered enum");
+      let inner_ty = variants
+        .iter()
+        .find(|(n, _)| n == "Some")
+        .and_then(|(_, fts)| fts.first())
+        .cloned()
+        .ok_or_else(|| {
+          Diagnostic::new(
+            format!("internal error: `{enum_name}` has no `Some` variant"),
+            expr.span,
+          )
+        })?;
+      let (ret_ty, expected_params) = match &inner_ty {
+        Type::Class(class_name) => {
+          let info = classes.get(class_name).ok_or_else(|| {
+            Diagnostic::new(
+              format!("internal error: unregistered class `{class_name}`"),
+              expr.span,
+            )
+          })?;
+          let sig = info.methods.get(method).ok_or_else(|| {
+            Diagnostic::new(
+              format!("class `{class_name}` has no method `{method}`"),
+              expr.span,
+            )
+          })?;
+          (sig.return_type.clone(), sig.params.clone())
+        }
+        Type::String => {
+          let Some((expected_params, ret)) = string_intrinsic_signature(method) else {
+            return Err(Diagnostic::new(
+              format!("String has no method `{method}`"),
+              expr.span,
+            ));
+          };
+          (ret, expected_params)
+        }
+        other => {
+          return Err(Diagnostic::new(
+            format!(
+              "`?.{method}` is only supported when `Option[T]`'s `T` is a class or String, found {other:?}"
+            ),
+            recv.span,
+          ));
+        }
+      };
       check_args(
         method,
         args,
-        &sig.params,
+        &expected_params,
         env,
         sigs,
         classes,
         self_fields,
         gctx,
       )?;
-      Ok(Type::Nullable(Box::new(sig.return_type.clone())))
+      let Some(ret_annotation) = type_annotation_string(&ret_ty) else {
+        return Err(Diagnostic::new(
+          format!("`?.{method}` returns {ret_ty:?}, which cannot be re-wrapped in `Option[T]`"),
+          expr.span,
+        ));
+      };
+      let mangled = format!("Option${ret_annotation}");
+      if !classes.contains_key(&mangled) {
+        return Err(Diagnostic::new(
+          format!(
+            "`?.{method}` would produce `Option[{ret_annotation}]`, but that instantiation doesn't exist yet in this program — add an explicit `Option[{ret_annotation}]` type annotation somewhere (e.g. a `let`) so the compiler generates it"
+          ),
+          expr.span,
+        ));
+      }
+      Ok(Type::Enum(mangled))
+    }
+    // Plan 73's Decision log: `lhs ?? rhs` — `lhs` must be `Option[T]`;
+    // `rhs` must be the SAME `T` (no coercion, mirroring every other
+    // "no implicit conversion" rule in this compiler). Purely a
+    // desugaring onto the same match machinery `Option[T]` construction/
+    // pattern-matching already uses (codegen's job) — sema's job is just
+    // this type check.
+    Expr::Coalesce(lhs, rhs) => {
+      let lhs_ty = infer_expr_type(lhs, env, sigs, classes, self_fields, gctx)?;
+      if !is_option_type(&lhs_ty, classes) {
+        return Err(Diagnostic::new(
+          format!("`??`'s left operand must be `Option[T]`, found {lhs_ty:?}"),
+          lhs.span,
+        ));
+      }
+      let Type::Enum(enum_name) = &lhs_ty else {
+        unreachable!("is_option_type only accepts Type::Enum");
+      };
+      let variants = classes[enum_name]
+        .enum_variants
+        .as_ref()
+        .expect("Type::Enum is only ever constructed for a registered enum");
+      let inner_ty = variants
+        .iter()
+        .find(|(n, _)| n == "Some")
+        .and_then(|(_, fts)| fts.first())
+        .cloned()
+        .ok_or_else(|| {
+          Diagnostic::new(
+            format!("internal error: `{enum_name}` has no `Some` variant"),
+            expr.span,
+          )
+        })?;
+      let rhs_ty = infer_expr_type(rhs, env, sigs, classes, self_fields, gctx)?;
+      if rhs_ty != inner_ty {
+        return Err(Diagnostic::new(
+          format!(
+            "`??`'s right operand has type {rhs_ty:?}, expected {inner_ty:?} (`Option[T]`'s own `T`)"
+          ),
+          rhs.span,
+        ));
+      }
+      Ok(inner_ty)
     }
     Expr::InstanceVar(name) => {
       let fields = self_fields.ok_or_else(|| {
@@ -3311,8 +3731,6 @@ fn infer_expr_type(
     } => infer_lambda_type(params, return_type, body, env, sigs, classes, gctx),
     // Plan 25: a real `Boolean` value, not just `Compare`'s byproduct.
     Expr::Bool(_) => Ok(Type::Boolean),
-    // Plan 25: deliberately narrow — see `Type::Nil`'s doc comment.
-    Expr::Nil => Ok(Type::Nil),
     // A `{}` empty literal has no key/value type to infer — same
     // reasoning `infer_array_lit_type` already applies to `[]` (plan
     // 09's Decision log), applied here for the second container kind.
@@ -4411,6 +4829,20 @@ fn check_stmt(
       is_var,
     } => {
       let declared = resolve_type(ty, classes)?;
+      // Plan 73's Decision log: an `Option[T]`'s `Some`/`None`
+      // construction, the fourth "expected-type-providing position"
+      // this compiler now has (mirroring `Ok`/`Err`'s dedicated `Let`
+      // arm above, generalized to any enum) — checked before the
+      // ordinary `infer_expr_type` fallback below so a bare `None` (and
+      // an ambiguous `Some(x)` across multiple `Option[T]`
+      // instantiations) always resolves unambiguously here.
+      if let Type::Enum(enum_name) = &declared {
+        if check_enum_variant_construction(enum_name, value, env, sigs, classes, self_fields, gctx)?
+        {
+          declare_local(env, mutable_locals, name, declared, *is_var);
+          return Ok(());
+        }
+      }
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
         return Err(Diagnostic::new(
@@ -4503,73 +4935,21 @@ fn check_stmt(
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
       check_mutable(name, mutable_locals, stmt.span)?;
+      // Plan 73's Decision log: mirrors `Let`'s own identical addition
+      // above — `Option[T]`'s `Some`/`None` construction against an
+      // `Assign`'s already-recorded declared type.
+      if let Type::Enum(enum_name) = &declared {
+        if check_enum_variant_construction(enum_name, value, env, sigs, classes, self_fields, gctx)?
+        {
+          return Ok(());
+        }
+      }
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
         return Err(Diagnostic::new(
           format!(
             "type mismatch in `{name} = ...`: `{name}` has type {declared:?}, value has type {actual:?}"
           ),
-          value.span,
-        ));
-      }
-      Ok(())
-    }
-    // Plan 43's Decision log: genuinely conditional — assigns `default`
-    // only when `name`'s current value is nil, then narrows `name`'s
-    // tracked type from `Nullable(inner)` to `inner` directly (sound by
-    // construction: either branch leaves `name` unconditionally
-    // `inner`-typed). `default` itself must be the *unwrapped* `inner`
-    // type, not `inner?` again — widening a still-nullable default
-    // would make the narrowing unsound.
-    Stmt::OrAssign { name, default } => {
-      let declared = env
-        .get(name)
-        .cloned()
-        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
-      check_mutable(name, mutable_locals, stmt.span)?;
-      let Type::Nullable(inner) = &declared else {
-        return Err(Diagnostic::new(
-          format!(
-            "`{name} ||= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
-          ),
-          stmt.span,
-        ));
-      };
-      let actual = infer_expr_type(default, env, sigs, classes, self_fields, gctx)?;
-      if !is_assignable(&actual, inner) {
-        return Err(Diagnostic::new(
-          format!("type mismatch in `{name} ||= ...`: expected {inner:?}, found {actual:?}"),
-          default.span,
-        ));
-      }
-      env.insert(name.clone(), (**inner).clone());
-      Ok(())
-    }
-    // Plan 43's Decision log: the asymmetric twin of `OrAssign` above —
-    // assigns `value` only when `name`'s current value is non-nil, and
-    // deliberately does NOT narrow `name`'s tracked type (the
-    // nil-and-skipped branch leaves it exactly as nilable as before).
-    // `value` must be assignable to `name`'s *full* declared
-    // `Nullable(inner)` type (so widening a plain `inner`-typed value
-    // still works, via the same `is_assignable` helper).
-    Stmt::AndAssign { name, value } => {
-      let declared = env
-        .get(name)
-        .cloned()
-        .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
-      check_mutable(name, mutable_locals, stmt.span)?;
-      if !matches!(declared, Type::Nullable(_)) {
-        return Err(Diagnostic::new(
-          format!(
-            "`{name} &&= ...` requires `{name}`'s declared type to be nullable, found {declared:?}"
-          ),
-          stmt.span,
-        ));
-      }
-      let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
-      if !is_assignable(&actual, &declared) {
-        return Err(Diagnostic::new(
-          format!("type mismatch in `{name} &&= ...`: expected {declared:?}, found {actual:?}"),
           value.span,
         ));
       }
@@ -4662,6 +5042,15 @@ fn check_stmt(
       },
     )) => check_result_construction(return_type, e, env, sigs, classes, self_fields, gctx),
     Stmt::Return(Some(e)) => {
+      // Plan 73's Decision log: mirrors `Let`/`Assign`'s own identical
+      // addition above — `Option[T]`'s `Some`/`None` construction
+      // against a `Return`'s already-threaded declared return type, the
+      // fourth "expected-type-providing position."
+      if let Type::Enum(enum_name) = return_type {
+        if check_enum_variant_construction(enum_name, e, env, sigs, classes, self_fields, gctx)? {
+          return Ok(());
+        }
+      }
       let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&t, return_type) {
         return Err(Diagnostic::new(
@@ -5319,6 +5708,20 @@ fn check_implicit_return(
     if is_cross_actor_send(e, env, self_fields, classes) {
       return Ok(());
     }
+    // Plan 73's Decision log: a bare trailing `Some(x)`/`None` (no
+    // `return` keyword) as a function body's own final, implicit-return
+    // expression — this plan's own concrete target proof needs exactly
+    // this shape (`fn find(...): Option[Int64] do ... None end`). A
+    // real, disclosed EXTENSION beyond `Result[T, E]`'s own narrower
+    // three-position scope (`Ok`/`Err`'s doc comment explicitly lists
+    // only `Let`/`Assign`/`Return`, not a bare implicit return) — this
+    // fourth position is added here specifically because `Option[T]`'s
+    // own headline proof requires it, not retrofitted onto `Result`.
+    if let Type::Enum(enum_name) = declared_return {
+      if check_enum_variant_construction(enum_name, e, env, sigs, classes, self_fields, gctx)? {
+        return Ok(());
+      }
+    }
     let t = infer_expr_type(e, env, sigs, classes, self_fields, gctx)?;
     if t != *declared_return {
       return Err(Diagnostic::new(
@@ -5399,11 +5802,9 @@ fn check_message_safety_stmt(
   moved: &mut HashMap<String, (usize, usize)>,
 ) -> Result<(), Diagnostic> {
   match &stmt.node {
-    Stmt::Let { value, .. }
-    | Stmt::SetField { value, .. }
-    | Stmt::Assign { value, .. }
-    | Stmt::OrAssign { default: value, .. }
-    | Stmt::AndAssign { value, .. } => expr_moved_read(value, moved),
+    Stmt::Let { value, .. } | Stmt::SetField { value, .. } | Stmt::Assign { value, .. } => {
+      expr_moved_read(value, moved)
+    }
     Stmt::SetIndex {
       array,
       index,
@@ -5595,7 +5996,7 @@ fn check_message_arg(
       }
       Ok(())
     }
-    Expr::Lambda { .. } | Expr::StringLit(_) | Expr::Nil => Ok(()),
+    Expr::Lambda { .. } | Expr::StringLit(_) => Ok(()),
     // Bucket 1: value types, always legal by literal shape.
     Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::SymbolLit(_) => Ok(()),
     // Bucket 3: a named local — value-typed locals are exempt (still
@@ -5671,9 +6072,6 @@ fn check_wire_safety(
     Expr::Bool(_) => Some(Type::Boolean),
     Expr::SymbolLit(_) => Some(Type::Symbol),
     Expr::StringLit(_) | Expr::Interpolate(_) => Some(Type::String),
-    // Carries no data at all — nothing here for a wire-safety check to
-    // reject.
-    Expr::Nil => None,
     Expr::New(class_name, _) => Some(Type::Class(class_name.clone())),
     // An actor reference — `is_wire_safe_type`'s own `is_actor` check
     // below rejects this uniformly with `Expr::Ident` naming an
@@ -5764,7 +6162,6 @@ fn expr_moved_read(
     | Expr::StringLit(_)
     | Expr::SymbolLit(_)
     | Expr::Bool(_)
-    | Expr::Nil
     | Expr::InstanceVar(_) => Ok(()),
     Expr::Add(a, b)
     | Expr::Sub(a, b)
@@ -5812,6 +6209,10 @@ fn expr_moved_read(
         expr_moved_read(a, moved)?;
       }
       Ok(())
+    }
+    Expr::Coalesce(a, b) => {
+      expr_moved_read(a, moved)?;
+      expr_moved_read(b, moved)
     }
     Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
       for e in elems {
@@ -6046,11 +6447,7 @@ fn collect_purity_edges_stmt(
   out: &mut HashSet<usize>,
 ) {
   match &stmt.node {
-    Stmt::Let { value, .. }
-    | Stmt::SetField { value, .. }
-    | Stmt::Assign { value, .. }
-    | Stmt::OrAssign { default: value, .. }
-    | Stmt::AndAssign { value, .. } => {
+    Stmt::Let { value, .. } | Stmt::SetField { value, .. } | Stmt::Assign { value, .. } => {
       collect_purity_edges_expr(value, node_index, env, classes, out)
     }
     Stmt::SetIndex {
@@ -6207,7 +6604,6 @@ fn collect_purity_edges_expr(
     | Expr::StringLit(_)
     | Expr::SymbolLit(_)
     | Expr::Bool(_)
-    | Expr::Nil
     | Expr::InstanceVar(_) => {}
     Expr::Add(a, b)
     | Expr::Sub(a, b)
@@ -6225,7 +6621,7 @@ fn collect_purity_edges_expr(
       collect_purity_edges_expr(a, node_index, env, classes, out);
       collect_purity_edges_expr(b, node_index, env, classes, out);
     }
-    Expr::Compare(a, _, b) => {
+    Expr::Compare(a, _, b) | Expr::Coalesce(a, b) => {
       collect_purity_edges_expr(a, node_index, env, classes, out);
       collect_purity_edges_expr(b, node_index, env, classes, out);
     }
@@ -6265,6 +6661,10 @@ fn collect_purity_edges_expr(
         }
       }
       collect_purity_edges_expr(recv, node_index, env, classes, out);
+      // Plan 73: `Expr::Coalesce` handled at the tail of this match —
+      // no purity edge of its own (neither operand is a method call
+      // site), just recurses into both, mirroring `Compare`'s own
+      // two-operand recursion below.
       for a in args {
         collect_purity_edges_expr(a, node_index, env, classes, out);
       }
@@ -6394,10 +6794,7 @@ fn check_purity_stmt(
       "a `pure` function may not write an index (`arr[i] = ...`) — index mutation is forbidden inside a `pure` function",
       stmt.span,
     )),
-    Stmt::Let { value, .. }
-    | Stmt::Assign { value, .. }
-    | Stmt::OrAssign { default: value, .. }
-    | Stmt::AndAssign { value, .. } => check_purity_expr(
+    Stmt::Let { value, .. } | Stmt::Assign { value, .. } => check_purity_expr(
       value,
       cycle_members,
       node_index,
@@ -6756,7 +7153,6 @@ fn check_purity_expr(
     | Expr::StringLit(_)
     | Expr::SymbolLit(_)
     | Expr::Bool(_)
-    | Expr::Nil
     | Expr::InstanceVar(_) => Ok(()),
     Expr::Add(a, b)
     | Expr::Sub(a, b)
@@ -6792,7 +7188,7 @@ fn check_purity_expr(
         verified_pure,
       )
     }
-    Expr::Compare(a, _, b) => {
+    Expr::Compare(a, _, b) | Expr::Coalesce(a, b) => {
       check_purity_expr(
         a,
         cycle_members,
@@ -7428,15 +7824,7 @@ fn check_comptime_legal_stmt(
       "comptime evaluation may not use `Result[T, E]` — Result unwinding is not modeled by the compile-time interpreter",
       stmt.span,
     )),
-    Stmt::SetField { .. }
-    | Stmt::SetIndex { .. }
-    | Stmt::Break
-    | Stmt::Next
-    // `OrAssign`'s own field is named `default` (not `value` — see
-    // `ast.rs`'s own field name), unlike `AndAssign`'s; irrelevant here
-    // either way since both are rejected unconditionally.
-    | Stmt::OrAssign { .. }
-    | Stmt::AndAssign { .. } => Err(Diagnostic::new(
+    Stmt::SetField { .. } | Stmt::SetIndex { .. } | Stmt::Break | Stmt::Next => Err(Diagnostic::new(
       "this statement form is not part of the comptime-legal subset",
       stmt.span,
     )),
@@ -7534,9 +7922,9 @@ fn check_comptime_legal_expr(
     | Expr::CallKw(_, _)
     | Expr::MethodCall(_, _, _)
     | Expr::SafeCall(_, _, _)
+    | Expr::Coalesce(_, _)
     | Expr::ArrayLit(_)
     | Expr::Index(_, _)
-    | Expr::Nil
     | Expr::HashLit(_)
     | Expr::ArrayNew(_)
     | Expr::TupleLit(_)
@@ -7608,12 +7996,9 @@ fn scan_comptime_position_stmt(stmt: &Spanned<Stmt>, diags: &mut Vec<Diagnostic>
       }
       scan_comptime_position_expr(value, diags);
     }
-    Stmt::SetField { value, .. } | Stmt::Assign { value, .. } | Stmt::AndAssign { value, .. } => {
+    Stmt::SetField { value, .. } | Stmt::Assign { value, .. } => {
       scan_comptime_position_expr(value, diags)
     }
-    // `OrAssign`'s own field is named `default`, not `value` (see
-    // `ast.rs`'s own field name).
-    Stmt::OrAssign { default, .. } => scan_comptime_position_expr(default, diags),
     Stmt::SetIndex {
       array,
       index,
@@ -7752,8 +8137,7 @@ fn scan_comptime_position_expr(expr: &Spanned<Expr>, diags: &mut Vec<Diagnostic>
     | Expr::StringLit(_)
     | Expr::SymbolLit(_)
     | Expr::InstanceVar(_)
-    | Expr::Bool(_)
-    | Expr::Nil => {}
+    | Expr::Bool(_) => {}
     Expr::Interpolate(parts) => {
       for p in parts {
         if let StringPart::Expr(e) = p {
@@ -7799,6 +8183,10 @@ fn scan_comptime_position_expr(expr: &Spanned<Expr>, diags: &mut Vec<Diagnostic>
       for a in args {
         scan_comptime_position_expr(a, diags);
       }
+    }
+    Expr::Coalesce(a, b) => {
+      scan_comptime_position_expr(a, diags);
+      scan_comptime_position_expr(b, diags);
     }
     Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
       for e in elems {
@@ -8629,10 +9017,50 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // colliding with a variant already seen in ANY enum registered so
   // far (a flat, single namespace, the same discipline `resolve_type`
   // already enforces between class and module names).
+  // Plan 73: `Option[T]` — this compiler's first GENERIC enum,
+  // synthesized directly in Rust (never parsed from source, so
+  // `EnumVariant`'s own grammar-level "at least one field" restriction
+  // doesn't apply to `None`'s zero fields) and registered into
+  // `generic_enums` exactly like any user-written `enum Name[T] = ...`
+  // would be — no special-casing anywhere downstream of this point.
+  let option_enum_def = EnumDef {
+    name: "Option".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Some".to_string(),
+        fields: vec!["T".to_string()],
+      },
+      EnumVariant {
+        name: "None".to_string(),
+        fields: vec![],
+      },
+    ],
+    type_params: vec![TypeParam {
+      name: "T".to_string(),
+      bound: None,
+    }],
+  };
+  // Plan 73: enums, like classes above, split into a generic-TEMPLATE
+  // registry (never monomorphized without a real instantiation actually
+  // written somewhere in the program) and the ordinary per-name
+  // registration pass below.
+  let mut generic_enums: HashMap<String, &EnumDef> = HashMap::new();
+  generic_enums.insert("Option".to_string(), &option_enum_def);
   let mut enum_defs: Vec<&EnumDef> = Vec::new();
   let mut seen_variant_names: HashSet<String> = HashSet::new();
   for item in &program.items {
     if let Item::Enum(e) = item {
+      if !e.type_params.is_empty() {
+        if generic_enums.contains_key(&e.name) {
+          diags.push(Diagnostic::new(
+            format!("`{}` is already declared as a generic enum", e.name),
+            (0, 0),
+          ));
+          continue;
+        }
+        generic_enums.insert(e.name.clone(), e);
+        continue;
+      }
       if classes.contains_key(&e.name) {
         diags.push(Diagnostic::new(
           format!(
@@ -8769,7 +9197,44 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         ) {
           diags.push(d);
         }
+      } else if generic_enums.contains_key(base) {
+        // Plan 73: the identical discovery mechanism above, extended to
+        // a generic ENUM — `Option[Int64]` written anywhere as a `Let`/
+        // param/return/field type annotation triggers its own
+        // monomorphization here, exactly the same way `Stack[Int64]`
+        // already does for a generic class.
+        let mut in_progress = Vec::new();
+        if let Err(d) = instantiate_generic_enum(
+          base,
+          &args,
+          &generic_classes,
+          &generic_enums,
+          &mut classes,
+          &mut in_progress,
+        ) {
+          diags.push(d);
+        }
       }
+    }
+  }
+  // Plan 73: `String.from_cstring`'s own real return type is `Option[
+  // String]` (see that call site's Decision log) — unconditionally
+  // pre-instantiated here, regardless of whether this specific program
+  // ever writes `"Option[String]"` as literal annotation text anywhere,
+  // since that's the one case this compiler derives an `Option[T]`
+  // internally rather than from a textual type annotation the discovery
+  // pass above can see.
+  {
+    let mut in_progress = Vec::new();
+    if let Err(d) = instantiate_generic_enum(
+      "Option",
+      &["String"],
+      &generic_classes,
+      &generic_enums,
+      &mut classes,
+      &mut in_progress,
+    ) {
+      diags.push(d);
     }
   }
 
@@ -9659,19 +10124,21 @@ mod tests {
     assert_eq!(check_program(&program), Ok(()));
   }
 
+  // Plan 73's Decision log: `nil`/`Nil` are removed outright, replaced
+  // by `Option[T]`/`Some`/`None` — `accepts_nil_literal_example`'s own
+  // premise (a bare `Nil`-typed parameter, a bare `nil` literal) has no
+  // `Option[T]` analogue at all (`Nil` was a standalone, trivial type,
+  // not a wrapper), so it is deleted rather than rewritten.
   #[test]
-  fn accepts_nil_literal_example() {
-    let src = "fn check_nil(x: Nil): Int64 do\n  if x == nil do\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
+  fn rejects_a_some_construction_assigned_to_a_non_option_type() {
+    // The direct `Option[T]` analogue of the old `x: Int64 = nil`
+    // rejection: `Some(5)` is a real `Option[Int64]` construction, and
+    // assigning it to a plain `Int64`-typed `Let` (not `Option[Int64]`)
+    // must still be rejected as a type mismatch.
+    let src = "x: Int64 = Some(5)\n";
     let program = emerald_parser::parse(src).expect("should parse");
-    assert_eq!(check_program(&program), Ok(()));
-  }
-
-  #[test]
-  fn rejects_nil_assigned_to_non_nil_type() {
-    let src = "x: Int64 = nil\n";
-    let program = emerald_parser::parse(src).expect("should parse");
-    let errs = check_program(&program).expect_err("must reject `x: Int64 = nil`");
-    assert!(errs[0].message.contains("Int64") && errs[0].message.contains("Nil"));
+    let errs = check_program(&program).expect_err("must reject `x: Int64 = Some(5)`");
+    assert!(errs[0].message.contains("Int64"), "{errs:?}");
   }
 
   #[test]
@@ -10465,11 +10932,12 @@ mod tests {
       .any(|d| d.message.contains("generic methods are not supported")));
   }
 
-  // Plan 43 (nullable types and safe navigation).
+  // Plan 43 (nullable types and safe navigation) — replaced outright by
+  // plan 73's `Option[T]`/`Some`/`None`/`?.`/`??`.
 
-  const GREETER_PREFIX: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\n";
+  const GREETER_PREFIX: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Option[Greeter] do\n  if id == 1 do\n    return Some(Greeter.new(\"ada\"))\n  end\n  return None\nend\n\n";
 
-  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  var message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Option[Greeter] do\n  if id == 1 do\n    return Some(Greeter.new(\"ada\"))\n  end\n  return None\nend\n\nfn greet(id: Int64): String do\n  g: Option[Greeter] = find_greeter(id)\n  message: String = g?.shout ?? \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
 
   #[test]
   fn accepts_the_nullable_worked_example() {
@@ -10478,108 +10946,109 @@ mod tests {
   }
 
   #[test]
-  fn accepts_a_real_class_value_and_nil_both_widening_into_a_nullable_let() {
-    let src = format!("{GREETER_PREFIX}g1: Greeter? = Greeter.new(\"ada\")\ng2: Greeter? = nil\n");
-    let program = emerald_parser::parse(&src).expect("should parse");
-    assert_eq!(check_program(&program), Ok(()));
-  }
-
-  #[test]
-  fn rejects_nil_into_a_non_nullable_int64_let() {
-    let src = "x: Int64 = nil\n";
-    let program = emerald_parser::parse(src).expect("should parse");
-    assert!(check_program(&program).is_err());
-  }
-
-  #[test]
-  fn rejects_a_nullable_value_type_annotation() {
-    let src = "y: Int64? = 5\n";
-    let program = emerald_parser::parse(src).expect("should parse");
-    let errs = check_program(&program).expect_err("Int64? is not supported");
-    assert!(errs[0].message.contains("nullable"));
-  }
-
-  #[test]
-  fn rejects_a_direct_method_call_on_a_nullable_receiver() {
+  fn accepts_a_real_class_value_and_none_both_widening_into_an_option_let() {
     let src = format!(
-      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  return g.shout\nend\n"
-    );
-    let program = emerald_parser::parse(&src).expect("should parse");
-    let errs = check_program(&program).expect_err("g is nullable, .shout is unguarded");
-    assert!(errs[0].message.contains("&.") || errs[0].message.contains("nil"));
-  }
-
-  #[test]
-  fn nullable_vs_nil_comparison_type_checks_to_boolean() {
-    let src = format!(
-      "{GREETER_PREFIX}fn is_missing(id: Int64): Boolean do\n  g: Greeter? = find_greeter(id)\n  return g == nil\nend\n"
+      "{GREETER_PREFIX}g1: Option[Greeter] = Some(Greeter.new(\"ada\"))\ng2: Option[Greeter] = None\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
+  // `rejects_a_nullable_value_type_annotation` (the old `y: Int64? = 5`
+  // rejection) is deleted, not rewritten — `Int64?` doesn't parse at
+  // all anymore (plan 73 removes `T?` outright), and the restriction it
+  // tested (nullable VALUE types are unsupported) genuinely no longer
+  // exists under `Option[T]`: `Option[Int64]` is an ordinary generic-
+  // enum instantiation over a value-typed field, the same shape
+  // `Result[T, E]`/user `enum`s already support (see e.g. plan 52's own
+  // `Rectangle(Float64, Float64)`), not a pointer-nullness sentinel
+  // that only ever worked for pointer-representable `T`.
+
   #[test]
-  fn safe_call_on_a_nullable_class_receiver_type_checks_to_the_wrapped_return_type() {
+  fn rejects_a_direct_method_call_on_an_option_receiver() {
     let src = format!(
-      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  var message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Option[Greeter] = find_greeter(id)\n  return g.shout\nend\n"
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program).expect_err("g is Option[Greeter], .shout is unguarded");
+    assert!(errs[0].message.contains("Option"), "{errs:?}");
+  }
+
+  #[test]
+  fn option_match_on_some_and_none_type_checks_to_boolean() {
+    // The `Option[T]` analogue of the old `g == nil` truthiness check —
+    // `==`/`!=` are not supported on enum-typed operands at all (only
+    // `match` distinguishes `Some`/`None`), so this exercises the real
+    // replacement mechanism instead of a removed comparison operator.
+    let src = format!(
+      "{GREETER_PREFIX}fn is_missing(id: Int64): Boolean do\n  g: Option[Greeter] = find_greeter(id)\n  var result: Boolean = false\n  match g do\n    Some(v) do\n      result = false\n    end\n    None do\n      result = true\n    end\n  end\n  return result\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
-  fn rejects_safe_call_on_a_non_nullable_receiver() {
-    let src = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn greet: String? do\n  g: Greeter = Greeter.new(\"ada\")\n  return g&.shout\nend\n";
-    let program = emerald_parser::parse(src).expect("should parse");
-    let errs = check_program(&program).expect_err("g is never nil, & . is illegal");
-    assert!(errs[0].message.contains("nullable"));
-  }
-
-  #[test]
-  fn rejects_safe_call_on_a_method_returning_a_value_type() {
-    let src = "class Greeter\n  age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn years: Int64 do\n    @age\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  return nil\nend\n\nfn ages(id: Int64): Int64 do\n  g: Greeter? = find_greeter(id)\n  x: Int64? = g&.years\n  return 0\nend\n";
-    let program = emerald_parser::parse(src).expect("should parse");
-    let errs = check_program(&program).expect_err("Int64 is not pointer-representable");
-    assert!(errs.iter().any(|d| d.message.contains("Int64")));
-  }
-
-  #[test]
-  fn or_assign_narrows_the_tracked_type_so_a_later_return_type_checks() {
+  fn safe_call_on_an_option_class_receiver_type_checks_to_the_wrapped_return_type() {
     let src = format!(
-      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  var message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Option[Greeter] = find_greeter(id)\n  message: String = g?.shout ?? \"nobody here\"\n  return message\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
-  const UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn upgrade(id: Int64): String do\n  var g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  var message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
+  #[test]
+  fn rejects_safe_call_on_a_non_option_receiver() {
+    let src = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn greet: Option[String] do\n  g: Greeter = Greeter.new(\"ada\")\n  return g?.shout\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("g is never Option[T], ?. is illegal");
+    assert!(errs[0].message.contains("Option[T]"), "{errs:?}");
+  }
 
   #[test]
-  fn accepts_the_and_assign_upgrade_worked_example() {
-    let program = emerald_parser::parse(UPGRADE_EXAMPLE).expect("should parse");
+  fn rejects_safe_call_on_a_method_returning_a_value_type_with_no_prior_option_instantiation() {
+    // `?.`'s ret-rewrap requires the resulting `Option[U]` to already be
+    // instantiated somewhere else in the program (Decision log) — a
+    // bare `g?.years` with no `Option[Int64]` annotated anywhere else
+    // is genuinely rejected, the direct `Option[T]` descendant of the
+    // old "Int64 is not pointer-representable" rejection.
+    let src = "class Greeter\n  age: Int64\n\n  fn initialize(age: Int64): Void do\n    @age = age\n  end\n\n  fn years: Int64 do\n    @age\n  end\nend\n\nfn find_greeter(id: Int64): Option[Greeter] do\n  return None\nend\n\nfn ages(id: Int64): Int64 do\n  g: Option[Greeter] = find_greeter(id)\n  g?.years\n  return 0\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Option[Int64] is never instantiated");
+    assert!(errs.iter().any(|d| d.message.contains("Int64")), "{errs:?}");
+  }
+
+  #[test]
+  fn coalesce_narrows_the_tracked_type_so_a_later_return_type_checks() {
+    // The `Option[T]` analogue of the old `||=`-narrowing test: `??`
+    // itself (not a two-step reassignment) is what narrows `Option[T]`
+    // down to a plain `T`, so `return message` type-checks against the
+    // enclosing `String`-returning function.
+    let src = format!(
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Option[Greeter] = find_greeter(id)\n  message: String = g?.shout ?? \"nobody here\"\n  return message\nend\n"
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
+  // `accepts_the_and_assign_upgrade_worked_example`/`UPGRADE_EXAMPLE`
+  // (plan 43's `&&=`, "assign only if the target is currently non-nil")
+  // and `rejects_and_assign_on_a_non_nullable_target` are deleted, not
+  // rewritten — plan 73's Decision log replaces `&.`/`||=` with `?.`/
+  // `??` but introduces no `&&=`-shaped operator at all, so there is no
+  // `Option[T]` construct left for either test to exercise.
+
   #[test]
-  fn rejects_or_assign_on_a_non_nullable_target() {
-    let src = "var s: String = \"x\"\ns ||= \"y\"\n";
+  fn rejects_coalesce_on_a_non_option_target() {
+    let src = "s: String = \"x\"\nt: String = s ?? \"y\"\n";
     let program = emerald_parser::parse(src).expect("should parse");
-    let errs = check_program(&program).expect_err("s is not nullable");
-    assert!(errs[0].message.contains("nullable"));
+    let errs = check_program(&program).expect_err("s is not Option[T]");
+    assert!(errs[0].message.contains("Option[T]"), "{errs:?}");
   }
 
   #[test]
-  fn rejects_and_assign_on_a_non_nullable_target() {
+  fn rejects_coalesce_default_that_is_itself_an_option() {
     let src =
-      format!("{GREETER_PREFIX}var s: Greeter = Greeter.new(\"ada\")\ns &&= Greeter.new(\"b\")\n");
-    let program = emerald_parser::parse(&src).expect("should parse");
-    let errs = check_program(&program).expect_err("s is not nullable");
-    assert!(errs[0].message.contains("nullable"));
-  }
-
-  #[test]
-  fn rejects_or_assign_default_that_is_itself_nullable() {
-    let src = "var message: String? = nil\nother: String? = nil\nmessage ||= other\n";
+      "message: Option[String] = None\nother: Option[String] = None\nresult: String = message ?? other\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert!(check_program(&program).is_err());
   }
@@ -11644,11 +12113,11 @@ mod tests {
   }
 
   #[test]
-  fn string_from_cstring_type_checks_to_nullable_string_and_rejects_a_direct_method_call() {
-    let src = "unsafe extern \"C\" {\n  fn f(): CString\n}\n\nr: String? = String.from_cstring(f())\nputs r.length\n";
+  fn string_from_cstring_type_checks_to_option_string_and_rejects_a_direct_method_call() {
+    let src = "unsafe extern \"C\" {\n  fn f(): CString\n}\n\nr: Option[String] = String.from_cstring(f())\nputs r.length\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
-      .expect_err("a direct method call on the un-narrowed String? result must be rejected");
+      .expect_err("a direct method call on the un-narrowed Option[String] result must be rejected");
     assert!(!errs.is_empty(), "{errs:?}");
   }
 

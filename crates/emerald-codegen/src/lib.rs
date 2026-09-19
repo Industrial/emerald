@@ -22,7 +22,7 @@
 use emerald_parser::{
   CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
   Function as AstFunction, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
-  StringPart,
+  StringPart, TypeParam,
 };
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
@@ -67,11 +67,7 @@ enum ValKind {
   Str,
   Void,
   Bool,
-  /// Plan 25 — deliberately narrow (no `T?` nullable-type system): a
-  /// fixed `i64` sentinel (always `0`), real storage/param/return kind,
-  /// never compared against anything but another `Nil`.
-  Nil,
-  /// Plan 44 — `i64`-backed, exactly like `Int64`/`Nil` above: a
+  /// Plan 44 — `i64`-backed, exactly like `Int64` above: a
   /// compile-time-assigned dense integer ID (`Ctx::symbol_table`), not
   /// a pointer — symbol equality is a plain `icmp` on this kind, never
   /// a runtime string comparison.
@@ -99,23 +95,10 @@ fn value_kind_for_type(ty: &str) -> ValKind {
     // Plan 19: `String` is a real, declarable type too — kept distinct
     // from the generic `Ptr` bucket (see `ValKind`'s doc comment).
     "String" => ValKind::Str,
-    "Nil" => ValKind::Nil,
     "Symbol" => ValKind::Symbol,
     // Plan 59's Decision log: `CString` is stored identically to
     // `String` — a bare pointer, no new runtime representation.
     "CString" => ValKind::Str,
-    // Plan 43 already stores a nullable reference type as the SAME bare
-    // `ptr` as its non-null form (its own Decision log: "both are
-    // backed by an LLVM `ptr`... a spare bit pattern to spend on
-    // nilness for free") — `String?` is the one case that actually
-    // diverges from the general `_ => ValKind::Ptr` catch-all below
-    // (every other nullable — a class, `Array[_]`, `Hash[_,_]` — was
-    // already `ValKind::Ptr` even in its non-null form, so stripping
-    // `?` changes nothing for them). Found and fixed this session:
-    // `puts` on a `||=`-narrowed `String?` local previously stored as
-    // the wrong `ValKind` (the generic `Ptr` bucket, not `Str`),
-    // rejected by `puts`'s own Int64/Float64/String-only dispatch.
-    "String?" => ValKind::Str,
     // `Hash[K, V]` (plan 25) shares the generic `Ptr` bucket — unlike
     // `Array[Elem]`, indexing it needs a key type too, which the
     // side-table `local_classes` (repurposed to hold `"Hash[K, V]"`
@@ -267,7 +250,7 @@ fn ret_kind_for_type(ty: &str) -> ValKind {
 /// `make_fn_type`), not a user-input-dependent case.
 fn local_llvm_type<'ctx>(context: &'ctx Context, kind: &ValKind) -> BasicTypeEnum<'ctx> {
   match kind {
-    ValKind::Int64 | ValKind::Nil | ValKind::Symbol => context.i64_type().into(),
+    ValKind::Int64 | ValKind::Symbol => context.i64_type().into(),
     ValKind::Float64 => context.f64_type().into(),
     ValKind::Ptr | ValKind::Str => context.ptr_type(AddressSpace::default()).into(),
     ValKind::Bool => context.bool_type().into(),
@@ -305,9 +288,7 @@ fn make_fn_type<'ctx>(
     .collect();
   match ret_kind {
     ValKind::Void => context.void_type().fn_type(&param_types, false),
-    ValKind::Int64 | ValKind::Nil | ValKind::Symbol => {
-      context.i64_type().fn_type(&param_types, false)
-    }
+    ValKind::Int64 | ValKind::Symbol => context.i64_type().fn_type(&param_types, false),
     ValKind::Float64 => context.f64_type().fn_type(&param_types, false),
     ValKind::Ptr | ValKind::Str => context
       .ptr_type(AddressSpace::default())
@@ -359,6 +340,13 @@ struct EnumLayout {
   /// typed struct GEP, matching every other compound type in this
   /// backend).
   variant_fields: HashMap<String, Vec<ValKind>>,
+  /// Plan 73's Decision log: the ORIGINAL, unresolved type-name string
+  /// per field, alongside `variant_fields`' own `ValKind` — needed
+  /// wherever a variant's payload must be resolved back to a class name
+  /// (`local_classes`' own bookkeeping, e.g. `?.`'s dispatch on
+  /// `Option[T]`'s unwrapped `Some` payload when `T` is a class), which
+  /// `ValKind::Ptr` alone can't distinguish from "any other pointer."
+  variant_field_types: HashMap<String, Vec<String>>,
   size: u64,
 }
 
@@ -371,16 +359,19 @@ struct EnumLayout {
 fn build_enum_layout(e: &EnumDef) -> EnumLayout {
   let mut variant_tags = HashMap::new();
   let mut variant_fields = HashMap::new();
+  let mut variant_field_types = HashMap::new();
   let mut max_fields = 0usize;
   for (i, v) in e.variants.iter().enumerate() {
     variant_tags.insert(v.name.clone(), i as u64);
     let kinds: Vec<ValKind> = v.fields.iter().map(|f| value_kind_for_type(f)).collect();
     max_fields = max_fields.max(kinds.len());
     variant_fields.insert(v.name.clone(), kinds);
+    variant_field_types.insert(v.name.clone(), v.fields.clone());
   }
   EnumLayout {
     variant_tags,
     variant_fields,
+    variant_field_types,
     size: 8 + 8 * max_fields as u64,
   }
 }
@@ -654,6 +645,104 @@ fn resolve_substituted_type_cg(
   substituted
 }
 
+/// Plan 73: codegen's own independent re-derivation of `emerald-sema`'s
+/// `instantiate_generic_enum`/`build_generic_enum_info` — mirrors
+/// `instantiate_generic_class_defs` immediately above exactly (same
+/// mangled-name memoization, same `in_progress` self-reference/depth-
+/// limit defense), building a synthesized, monomorphized `EnumDef`
+/// (variant field types substituted) instead of a `ClassDef`. `Option[T]`
+/// is the first generic enum this backend ever monomorphizes.
+#[allow(clippy::too_many_arguments)]
+fn instantiate_generic_enum_defs(
+  base_name: &str,
+  type_args: &[&str],
+  generic_enum_defs: &HashMap<String, &EnumDef>,
+  generic_class_defs: &HashMap<String, &ClassDef>,
+  synthesized_classes: &mut HashMap<String, ClassDef>,
+  synthesized_enums: &mut HashMap<String, EnumDef>,
+  in_progress: &mut Vec<String>,
+) -> String {
+  let mangled_args: Vec<String> = type_args.iter().map(|a| mangle_type_name(a)).collect();
+  let mangled = format!("{base_name}${}", mangled_args.join("$"));
+
+  if synthesized_enums.contains_key(&mangled) {
+    return mangled;
+  }
+  if in_progress.last().map(String::as_str) == Some(mangled.as_str()) {
+    synthesized_enums.insert(
+      mangled.clone(),
+      EnumDef {
+        name: mangled.clone(),
+        variants: Vec::new(),
+        type_params: Vec::new(),
+      },
+    );
+    return mangled;
+  }
+  if in_progress.len() >= GENERIC_INSTANTIATION_DEPTH_LIMIT {
+    return mangled;
+  }
+  let Some(e) = generic_enum_defs.get(base_name).copied() else {
+    return mangled;
+  };
+
+  let subst: HashMap<&str, &str> = e
+    .type_params
+    .iter()
+    .map(|tp| tp.name.as_str())
+    .zip(type_args.iter().copied())
+    .collect();
+
+  in_progress.push(mangled.clone());
+  let variants: Vec<EnumVariant> = e
+    .variants
+    .iter()
+    .map(|v| EnumVariant {
+      name: v.name.clone(),
+      fields: v
+        .fields
+        .iter()
+        .map(|f| {
+          let substituted = substitute_type_params(f, &subst);
+          if let Some((base, args)) = parse_generic_instantiation(&substituted) {
+            if generic_class_defs.contains_key(base) {
+              return instantiate_generic_class_defs(
+                base,
+                &args,
+                generic_class_defs,
+                synthesized_classes,
+                in_progress,
+              );
+            } else if generic_enum_defs.contains_key(base) {
+              return instantiate_generic_enum_defs(
+                base,
+                &args,
+                generic_enum_defs,
+                generic_class_defs,
+                synthesized_classes,
+                synthesized_enums,
+                in_progress,
+              );
+            }
+          }
+          substituted
+        })
+        .collect(),
+    })
+    .collect();
+  in_progress.pop();
+
+  synthesized_enums.insert(
+    mangled.clone(),
+    EnumDef {
+      name: mangled.clone(),
+      variants,
+      type_params: Vec::new(),
+    },
+  );
+  mangled
+}
+
 /// Plan 58: whole-program walk collecting every generic-class-
 /// instantiation type-name string actually written anywhere — mirrors
 /// `emerald-sema`'s identically-shaped `collect_generic_instantiation_
@@ -812,9 +901,7 @@ fn collect_typenames_in_stmt(stmt: &Spanned<Stmt>, out: &mut Vec<String>) {
     | Stmt::Expr(_)
     | Stmt::Raise(_)
     | Stmt::Yield(_)
-    | Stmt::Retry
-    | Stmt::OrAssign { .. }
-    | Stmt::AndAssign { .. } => {}
+    | Stmt::Retry => {}
   }
 }
 
@@ -894,8 +981,7 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
     | Expr::SymbolLit(_)
     | Expr::InstanceVar(_)
     | Expr::Lambda { .. }
-    | Expr::Bool(_)
-    | Expr::Nil => {}
+    | Expr::Bool(_) => {}
     Expr::ArrayNew(size) => collect_idents_in_expr(size, out),
     Expr::Comptime(inner) => collect_idents_in_expr(inner, out),
     Expr::HashLit(pairs) => {
@@ -921,7 +1007,7 @@ fn collect_idents_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
       collect_idents_in_expr(r, out);
     }
     Expr::Neg(e) | Expr::Not(e) | Expr::BitNot(e) => collect_idents_in_expr(e, out),
-    Expr::Compare(l, _, r) => {
+    Expr::Compare(l, _, r) | Expr::Coalesce(l, r) => {
       collect_idents_in_expr(l, out);
       collect_idents_in_expr(r, out);
     }
@@ -1015,17 +1101,6 @@ fn collect_idents_in_stmt(
     // reassigning a captured outer variable still needs that name
     // captured, not treated as if declared here).
     Stmt::Assign { name, value } => {
-      referenced.push(name.clone());
-      collect_idents_in_expr(value, referenced);
-    }
-    // Plan 43's Decision log: mirrors `Stmt::Assign` immediately above
-    // exactly — always a reassignment of an already-bound outer name,
-    // never a fresh declaration.
-    Stmt::OrAssign { name, default } => {
-      referenced.push(name.clone());
-      collect_idents_in_expr(default, referenced);
-    }
-    Stmt::AndAssign { name, value } => {
       referenced.push(name.clone());
       collect_idents_in_expr(value, referenced);
     }
@@ -1318,8 +1393,7 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
     | Expr::StringLit(_)
     | Expr::InstanceVar(_)
     | Expr::Lambda { .. }
-    | Expr::Bool(_)
-    | Expr::Nil => {}
+    | Expr::Bool(_) => {}
     Expr::ArrayNew(size) => collect_symbols_in_expr(size, table),
     Expr::Comptime(inner) => collect_symbols_in_expr(inner, table),
     Expr::HashLit(pairs) => {
@@ -1345,7 +1419,7 @@ fn collect_symbols_in_expr(expr: &Spanned<Expr>, table: &mut HashMap<String, i64
       collect_symbols_in_expr(r, table);
     }
     Expr::Neg(e) | Expr::Not(e) | Expr::BitNot(e) => collect_symbols_in_expr(e, table),
-    Expr::Compare(l, _, r) => {
+    Expr::Compare(l, _, r) | Expr::Coalesce(l, r) => {
       collect_symbols_in_expr(l, table);
       collect_symbols_in_expr(r, table);
     }
@@ -1415,8 +1489,6 @@ fn collect_symbols_in_stmt(stmt: &Spanned<Stmt>, table: &mut HashMap<String, i64
       collect_symbols_in_expr(value, table);
     }
     Stmt::Assign { value, .. } => collect_symbols_in_expr(value, table),
-    Stmt::OrAssign { default, .. } => collect_symbols_in_expr(default, table),
-    Stmt::AndAssign { value, .. } => collect_symbols_in_expr(value, table),
     Stmt::MultiAssign { values, .. } => {
       for v in values {
         collect_symbols_in_expr(v, table);
@@ -1742,8 +1814,7 @@ fn collect_specializations_in_expr(
     | Expr::SymbolLit(_)
     | Expr::InstanceVar(_)
     | Expr::Lambda { .. }
-    | Expr::Bool(_)
-    | Expr::Nil => {}
+    | Expr::Bool(_) => {}
     Expr::ArrayNew(size) => collect_specializations_in_expr(size, generic_fns, local_classes, out),
     Expr::Comptime(inner) => {
       collect_specializations_in_expr(inner, generic_fns, local_classes, out)
@@ -1773,7 +1844,7 @@ fn collect_specializations_in_expr(
     Expr::Neg(e) | Expr::Not(e) | Expr::BitNot(e) => {
       collect_specializations_in_expr(e, generic_fns, local_classes, out)
     }
-    Expr::Compare(l, _, r) => {
+    Expr::Compare(l, _, r) | Expr::Coalesce(l, r) => {
       collect_specializations_in_expr(l, generic_fns, local_classes, out);
       collect_specializations_in_expr(r, generic_fns, local_classes, out);
     }
@@ -1867,12 +1938,6 @@ fn collect_specializations_in_stmt(
       collect_specializations_in_expr(value, generic_fns, local_classes, out);
     }
     Stmt::Assign { value, .. } => {
-      collect_specializations_in_expr(value, generic_fns, local_classes, out)
-    }
-    Stmt::OrAssign { default, .. } => {
-      collect_specializations_in_expr(default, generic_fns, local_classes, out)
-    }
-    Stmt::AndAssign { value, .. } => {
       collect_specializations_in_expr(value, generic_fns, local_classes, out)
     }
     Stmt::MultiAssign { values, .. } => {
@@ -2377,8 +2442,6 @@ fn collect_referenced_idents(stmts: &[Spanned<Stmt>], out: &mut HashSet<String>)
         mark_expr(&end.node, out);
         collect_referenced_idents(body, out);
       }
-      Stmt::OrAssign { default, .. } => mark_expr(&default.node, out),
-      Stmt::AndAssign { value, .. } => mark_expr(&value.node, out),
       // Plan 53: `ok_var`/`err_var` are fresh bindings, like a pattern
       // binding — only the scrutinee is a reference site.
       Stmt::MatchResult {
@@ -2420,7 +2483,7 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
       mark_expr(&b.node, out);
     }
     Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => mark_expr(&a.node, out),
-    Expr::Compare(a, _, b) => {
+    Expr::Compare(a, _, b) | Expr::Coalesce(a, b) => {
       mark_expr(&a.node, out);
       mark_expr(&b.node, out);
     }
@@ -2470,12 +2533,7 @@ fn mark_expr(e: &Expr, out: &mut HashSet<String>) {
         }
       }
     }
-    Expr::Int(_)
-    | Expr::Float(_)
-    | Expr::StringLit(_)
-    | Expr::SymbolLit(_)
-    | Expr::Bool(_)
-    | Expr::Nil => {}
+    Expr::Int(_) | Expr::Float(_) | Expr::StringLit(_) | Expr::SymbolLit(_) | Expr::Bool(_) => {}
     Expr::Ok(e) | Expr::Err(e) | Expr::Try(e) => mark_expr(&e.node, out),
     Expr::Supervise(body) => collect_referenced_idents(body, out),
     Expr::Remote { addr, name, .. } => {
@@ -3056,7 +3114,7 @@ fn declare_actor_trampolines<'ctx>(
           .map_err(|e| e.to_string())?
           .into_int_value();
         let value: BasicMetadataValueEnum = match value_kind_for_type(&p.ty) {
-          ValKind::Int64 | ValKind::Nil | ValKind::Symbol => raw.into(),
+          ValKind::Int64 | ValKind::Symbol => raw.into(),
           ValKind::Float64 => builder
             .build_bit_cast(raw, context.f64_type(), "argf64")
             .map_err(|e| e.to_string())?
@@ -3267,7 +3325,7 @@ fn declare_supervisor_respawn_thunks<'ctx>(
             .map_err(|e| e.to_string())?
             .into_int_value();
           let value: BasicMetadataValueEnum = match value_kind_for_type(&p.ty) {
-            ValKind::Int64 | ValKind::Nil | ValKind::Symbol => raw.into(),
+            ValKind::Int64 | ValKind::Symbol => raw.into(),
             ValKind::Float64 => builder
               .build_bit_cast(raw, context.f64_type(), "respawnargf64")
               .map_err(|e| e.to_string())?
@@ -3327,7 +3385,7 @@ fn is_wire_safe_class_field(
   seen: &mut HashSet<String>,
 ) -> bool {
   match value_kind_for_type(ty) {
-    ValKind::Int64 | ValKind::Float64 | ValKind::Bool | ValKind::Symbol | ValKind::Nil => true,
+    ValKind::Int64 | ValKind::Float64 | ValKind::Bool | ValKind::Symbol => true,
     ValKind::Str => true,
     ValKind::Ptr => {
       if actor_names.contains(ty) {
@@ -3480,7 +3538,7 @@ fn declare_wire_class_codecs<'ctx>(
             )
             .map_err(|e| e.to_string())?;
         }
-        ValKind::Int64 | ValKind::Nil | ValKind::Symbol => {
+        ValKind::Int64 | ValKind::Symbol => {
           builder
             .build_call(
               actor_funcs.wirebuf_push_i64,
@@ -3558,7 +3616,7 @@ fn declare_wire_class_codecs<'ctx>(
             .map_err(|e| e.to_string())?
             .into()
         }
-        ValKind::Int64 | ValKind::Nil | ValKind::Symbol => {
+        ValKind::Int64 | ValKind::Symbol => {
           let call = builder
             .build_call(
               actor_funcs.wirebuf_read_i64,
@@ -4733,6 +4791,29 @@ fn build_expr<'ctx>(
 ) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
   match &expr.node {
     Expr::Ident(name) => {
+      // Plan 73's Decision log: a bare, zero-arg variant reference —
+      // `Option[T]`'s own `None` — reaches here as an ordinary
+      // `Expr::Ident` (mirrors `emerald-sema`'s identical fallback),
+      // checked only once `vars` itself has no binding for `name` (an
+      // ordinary local always wins, unchanged). Constructs it exactly
+      // like `build_call_expr`'s own `Expr::Call`-shaped variant
+      // construction just below — allocate `layout.size` bytes, store
+      // the tag, no field writes (a nullary variant has none).
+      if !vars.contains_key(name) {
+        if let Some((enum_name, tag)) = find_variant_layout(name, ctx.enums) {
+          let layout = &ctx.enums[enum_name];
+          let size_val = context.i64_type().const_int(layout.size, false);
+          let alloc_call = builder
+            .build_call(ctx.alloc, &[size_val.into()], "enumlit")
+            .map_err(|e| e.to_string())?;
+          let ptr = call_result(alloc_call)?.into_pointer_value();
+          let tag_ptr = field_ptr(context, builder, ptr, 0)?;
+          builder
+            .build_store(tag_ptr, context.i64_type().const_int(tag, false))
+            .map_err(|e| e.to_string())?;
+          return Ok((ptr.into(), ValKind::Ptr));
+        }
+      }
       let (ptr, kind) = vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
@@ -5172,25 +5253,6 @@ fn build_expr<'ctx>(
             "codegen: `{op:?}` is not supported on String — only `==`/`!=` are (no lexicographic ordering is defined)"
           ));
         }
-        // Plan 25: `Nil == Nil`/`Nil != Nil` — trivial (both operands
-        // are always the same fixed `i64` sentinel) but real: a genuine
-        // `icmp`, not hand-folded to a constant, so it flows through
-        // the same generic machinery every other comparison does.
-        (ValKind::Nil, ValKind::Nil) if matches!(op, CompareOp::Eq | CompareOp::Ne) => {
-          let pred = if matches!(op, CompareOp::Eq) {
-            IntPredicate::EQ
-          } else {
-            IntPredicate::NE
-          };
-          builder
-            .build_int_compare(pred, l.into_int_value(), r.into_int_value(), "nilcmptmp")
-            .map_err(|e| e.to_string())?
-        }
-        (ValKind::Nil, ValKind::Nil) => {
-          return Err(format!(
-            "codegen: `{op:?}` is not supported on Nil — only `==`/`!=` are"
-          ));
-        }
         // Plan 44's Decision log: `Symbol == Symbol`/`!=` — a plain
         // `icmp` on two `i64`s (compile-time-assigned dense IDs), the
         // same one-instruction shape as the `Nil` arm immediately
@@ -5214,34 +5276,6 @@ fn build_expr<'ctx>(
           return Err(format!(
             "codegen: `{op:?}` is not supported on Symbol — only `==`/`!=` are"
           ));
-        }
-        // Plan 43's Decision log: a `Nullable(_)` operand (`ValKind::
-        // Ptr`/`Str`, both real pointers) against a literal `nil`
-        // (`ValKind::Nil`, `Expr::Nil`'s fixed `i64` `0` sentinel —
-        // plan 25's design, NOT a pointer) — either order — lowers as a
-        // genuine null-pointer test on the pointer-backed side
-        // (`build_is_null`), not a general pointer-equality comparison.
-        // Distinct from the `(Nil, Nil)` case above (a bare `Nil`-typed
-        // variable's own comparison, e.g. `x: Nil` — unrelated to `T?`).
-        (ValKind::Ptr | ValKind::Str, ValKind::Nil)
-        | (ValKind::Nil, ValKind::Ptr | ValKind::Str)
-          if matches!(op, CompareOp::Eq | CompareOp::Ne) =>
-        {
-          let ptr_val = if lk == ValKind::Nil {
-            r.into_pointer_value()
-          } else {
-            l.into_pointer_value()
-          };
-          let is_null = builder
-            .build_is_null(ptr_val, "isniltest")
-            .map_err(|e| e.to_string())?;
-          if matches!(op, CompareOp::Ne) {
-            builder
-              .build_not(is_null, "nilnetmp")
-              .map_err(|e| e.to_string())?
-          } else {
-            is_null
-          }
         }
         _ => return Err("codegen: comparison operands must both be Int64 or both Float64".into()),
       };
@@ -5559,7 +5593,7 @@ fn build_expr<'ctx>(
             ctx,
           )?;
           let raw = match kind {
-            ValKind::Int64 | ValKind::Nil | ValKind::Symbol => v.into_int_value(),
+            ValKind::Int64 | ValKind::Symbol => v.into_int_value(),
             ValKind::Float64 => builder
               .build_bit_cast(v, i64_ty, "supargraw")
               .map_err(|e| e.to_string())?
@@ -5703,17 +5737,164 @@ fn build_expr<'ctx>(
       local_array_elem_types,
       ctx,
     ),
-    Expr::SafeCall(recv, method, args) => build_safe_call(
-      context,
-      builder,
-      recv,
-      method,
-      args,
-      vars,
-      local_classes,
-      local_array_elem_types,
-      ctx,
-    ),
+    Expr::SafeCall(recv, method, args) => {
+      let (v, k, _enum_name) = build_safe_call(
+        context,
+        builder,
+        recv,
+        method,
+        args,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      Ok((v, k))
+    }
+    // Plan 73's Decision log: `lhs ?? rhs` — a real is-guarded-basic-
+    // blocks-plus-PHI shape, the identical pattern `build_safe_call`
+    // above uses: branch on `lhs`'s own tag, load the `Some` payload on
+    // that path, evaluate `rhs` (a plain, un-wrapped `T`, sema-checked
+    // already) on the other, merge via `phi`. Unlike `?.`, no fresh
+    // enum needs constructing — the result is a plain `T`, not another
+    // `Option[T]`.
+    Expr::Coalesce(lhs, rhs) => {
+      // Plan 73's Decision log: `lhs` is either a plain local (`recv ??
+      // default`) or a `?.` chain (`recv?.method ?? default`, this
+      // plan's own concrete target proof) — the latter needs `build_
+      // safe_call` called DIRECTLY rather than through the generic
+      // `build_expr` dispatch, since only `build_safe_call` itself
+      // knows which fresh `Option[U]` it just produced (see its own
+      // doc comment); a plain local instead resolves its enum name the
+      // ordinary way, via `local_classes`.
+      let (lhs_val, lhs_kind, enum_name) = match &lhs.node {
+        Expr::SafeCall(recv, method, args) => build_safe_call(
+          context,
+          builder,
+          recv,
+          method,
+          args,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?,
+        Expr::Ident(lhs_name) => {
+          let (v, k) = build_expr(
+            context,
+            builder,
+            lhs,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          let enum_name = local_classes.get(lhs_name).cloned().ok_or_else(|| {
+            format!("codegen: `??` requires an `Option[T]`-typed left operand, found untyped local `{lhs_name}`")
+          })?;
+          (v, k, enum_name)
+        }
+        _ => {
+          return Err(
+            "codegen: `??`'s left operand must be a plain local variable or a `?.` chain"
+              .to_string(),
+          );
+        }
+      };
+      if lhs_kind != ValKind::Ptr {
+        return Err(format!(
+          "codegen: `??`'s left operand must be `Option[T]`, found {lhs_kind:?}"
+        ));
+      }
+      let layout = ctx.enums.get(enum_name.as_str()).ok_or_else(|| {
+        format!("codegen: internal error — unregistered enum `{enum_name}` (sema should have rejected this)")
+      })?;
+      let some_tag = *layout
+        .variant_tags
+        .get("Some")
+        .ok_or_else(|| format!("codegen: internal error — `{enum_name}` has no `Some` variant"))?;
+      let inner_kind = layout
+        .variant_fields
+        .get("Some")
+        .and_then(|f| f.first())
+        .cloned()
+        .ok_or_else(|| format!("codegen: internal error — `{enum_name}`'s `Some` has no field"))?;
+
+      let ptr = lhs_val.into_pointer_value();
+      let tag_val = load_field(
+        context,
+        builder,
+        ptr,
+        FieldInfo {
+          offset: 0,
+          kind: ValKind::Int64,
+        },
+      )?
+      .into_int_value();
+      let some_tag_const = context.i64_type().const_int(some_tag, false);
+      let is_some = builder
+        .build_int_compare(IntPredicate::EQ, tag_val, some_tag_const, "coalesceissome")
+        .map_err(|e| e.to_string())?;
+
+      let entry_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block")?;
+      let func = entry_block
+        .get_parent()
+        .ok_or("codegen: internal error — block has no parent function")?;
+      let some_block = context.append_basic_block(func, "coalesce.some");
+      let none_block = context.append_basic_block(func, "coalesce.none");
+      let merge_block = context.append_basic_block(func, "coalesce.merge");
+      builder
+        .build_conditional_branch(is_some, some_block, none_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(some_block);
+      let some_val = load_field(
+        context,
+        builder,
+        ptr,
+        FieldInfo {
+          offset: 8,
+          kind: inner_kind.clone(),
+        },
+      )?;
+      let some_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after some")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(none_block);
+      let (none_val, none_kind) = build_expr(
+        context,
+        builder,
+        rhs,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if none_kind != inner_kind {
+        return Err(format!(
+          "codegen: internal error — `??`'s right operand has kind {none_kind:?}, expected {inner_kind:?} (sema should have rejected this)"
+        ));
+      }
+      let none_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after none")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
+      let phi = builder
+        .build_phi(local_llvm_type(context, &inner_kind), "coalesceresult")
+        .map_err(|e| e.to_string())?;
+      phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
+      Ok((phi.as_basic_value(), inner_kind))
+    }
     Expr::InstanceVar(name) => {
       let (self_ptr, fields, _) = ctx
         .self_ctx
@@ -5760,7 +5941,7 @@ fn build_expr<'ctx>(
       context.bool_type().const_int(u64::from(*b), false).into(),
       ValKind::Bool,
     )),
-    Expr::Nil => Ok((context.i64_type().const_int(0, false).into(), ValKind::Nil)),
+
     Expr::HashLit(pairs) => {
       let ptr = build_hash_lit(
         context,
@@ -6188,14 +6369,22 @@ fn build_method_call<'ctx>(
     };
   }
 
-  // Plan 59's Decision log: `String.from_cstring(ptr)` — the same
-  // reserved-namespace static-call shape as `File` immediately above,
-  // for the same reason (`String` is never a real `ModuleDef`). A pure
-  // type-level relabeling with zero emitted instructions beyond
-  // whatever already produced the argument's own pointer value — the
-  // Decision log's null-representation convergence with plan 43's
-  // `String?` (both a real C `NULL` and Emerald's own nil-nullable
-  // representation are bit-for-bit the same `ptr` value).
+  // Plan 59's Decision log (superseded by plan 73's own Decision log
+  // below): `String.from_cstring(ptr)` — the same reserved-namespace
+  // static-call shape as `File` immediately above, for the same reason
+  // (`String` is never a real `ModuleDef`).
+  //
+  // Plan 73's Decision log: `emerald-sema` now types this call's result
+  // as a real `Option[String]` ADT value, not plan 43's old raw-
+  // pointer `String?` (where a real C `NULL` and Emerald's own nil-
+  // nullable sentinel were bit-for-bit the same `ptr` value, so no
+  // conversion was ever needed). That bit-representation convergence
+  // no longer holds — `Option[String]` is a heap-allocated tag+payload
+  // struct now, the same shape every other `Some`/`None` construction
+  // in this module already uses — so this call site must itself
+  // branch on the incoming C pointer's nullness and build the matching
+  // tagged value, merging both paths via a real LLVM `phi`, the same
+  // pattern `Expr::Coalesce`'s own codegen above already establishes.
   if recv_name == "String" {
     if method != "from_cstring" {
       return Err(format!(
@@ -6214,7 +6403,80 @@ fn build_method_call<'ctx>(
       local_array_elem_types,
       ctx,
     )?;
-    return Ok((v, ValKind::Str));
+    let enum_name = "Option$String";
+    let layout = ctx.enums.get(enum_name).ok_or_else(|| {
+      "codegen: internal error — `Option$String` was not pre-instantiated for `String.from_cstring`"
+        .to_string()
+    })?;
+    let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
+      "codegen: internal error — `Option$String` has no `Some` variant".to_string()
+    })?;
+    let none_tag = *layout.variant_tags.get("None").ok_or_else(|| {
+      "codegen: internal error — `Option$String` has no `None` variant".to_string()
+    })?;
+    let size_val = context.i64_type().const_int(layout.size, false);
+    let ptr_val = v.into_pointer_value();
+    let is_null = builder
+      .build_is_null(ptr_val, "fromcstringisnull")
+      .map_err(|e| e.to_string())?;
+
+    let entry_block = builder
+      .get_insert_block()
+      .ok_or("codegen: internal error — no current block")?;
+    let func = entry_block
+      .get_parent()
+      .ok_or("codegen: internal error — block has no parent function")?;
+    let some_block = context.append_basic_block(func, "fromcstring.some");
+    let none_block = context.append_basic_block(func, "fromcstring.none");
+    let merge_block = context.append_basic_block(func, "fromcstring.merge");
+    builder
+      .build_conditional_branch(is_null, none_block, some_block)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(some_block);
+    let some_alloc = builder
+      .build_call(ctx.alloc, &[size_val.into()], "fromcstringsome")
+      .map_err(|e| e.to_string())?;
+    let some_ptr = call_result(some_alloc)?.into_pointer_value();
+    let some_tag_ptr = field_ptr(context, builder, some_ptr, 0)?;
+    builder
+      .build_store(some_tag_ptr, context.i64_type().const_int(some_tag, false))
+      .map_err(|e| e.to_string())?;
+    let some_field_ptr = field_ptr(context, builder, some_ptr, 8)?;
+    builder
+      .build_store(some_field_ptr, ptr_val)
+      .map_err(|e| e.to_string())?;
+    let some_end_block = builder
+      .get_insert_block()
+      .ok_or("codegen: internal error — no current block after some")?;
+    builder
+      .build_unconditional_branch(merge_block)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(none_block);
+    let none_alloc = builder
+      .build_call(ctx.alloc, &[size_val.into()], "fromcstringnone")
+      .map_err(|e| e.to_string())?;
+    let none_ptr = call_result(none_alloc)?.into_pointer_value();
+    let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
+    builder
+      .build_store(none_tag_ptr, context.i64_type().const_int(none_tag, false))
+      .map_err(|e| e.to_string())?;
+    let none_end_block = builder
+      .get_insert_block()
+      .ok_or("codegen: internal error — no current block after none")?;
+    builder
+      .build_unconditional_branch(merge_block)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(merge_block);
+    let phi = builder
+      .build_phi(local_llvm_type(context, &ValKind::Ptr), "fromcstringresult")
+      .map_err(|e| e.to_string())?;
+    let some_val: BasicValueEnum = some_ptr.into();
+    let none_val: BasicValueEnum = none_ptr.into();
+    phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
+    return Ok((phi.as_basic_value(), ValKind::Ptr));
   }
 
   // Plan 45's Decision log: dispatched by checking `vars.get(recv_name)`'s
@@ -7973,7 +8235,7 @@ fn build_actor_enqueue_call<'ctx>(
       ctx,
     )?;
     let raw = match kind {
-      ValKind::Int64 | ValKind::Nil | ValKind::Symbol => v.into_int_value(),
+      ValKind::Int64 | ValKind::Symbol => v.into_int_value(),
       ValKind::Float64 => builder
         .build_bit_cast(v, i64_ty, "argraw")
         .map_err(|e| e.to_string())?
@@ -8384,18 +8646,36 @@ fn build_actor_register_call<'ctx>(
   Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
 }
 
-/// `obj&.method(args)` (plan 43's Decision log) — reuses `build_short_
-/// circuit`'s own is-null-guarded-basic-blocks-plus-PHI pattern
-/// wholesale: a real `is null` test on the receiver, `build_method_
-/// call` invoked only on the non-null path (never on a null pointer),
-/// merging both paths into one well-typed result via a real LLVM
-/// `phi` — `null` on the nil path, the method's own return value on
-/// the other. sema already restricts this to a class-typed nullable
-/// receiver whose dispatched method's return type is itself pointer-
-/// representable (`Class`/`String`/`Array`/`Hash`, all `ValKind::Ptr`/
-/// `Str`, both backed by a real LLVM `ptr`), so the `phi`'s type is
-/// always a bare `ptr` — codegen trusts that invariant, per every
-/// prior plan's "codegen runs on already-checked input" contract.
+/// `recv?.method(args)` (plan 73's Decision log — replaces plan 43's
+/// `&.` outright, new `Option[T]` semantics): `recv` is an `Option[T]`
+/// value (a real tagged-union pointer, plan 52's mechanism, never a
+/// bare nullable pointer any more) — this branches on its own tag
+/// (`Some` vs. `None`), dispatches `method` on the unwrapped `Some`
+/// payload only on the `Some` path, then re-wraps the result as a
+/// FRESH `Option[U]` value (`Some(result)` / `None`), merged via a real
+/// LLVM `phi` over that fresh enum's own tagged-union pointer — the
+/// same is-guarded-basic-blocks-plus-PHI shape `build_short_circuit`/
+/// plan 43's own now-replaced implementation already established, just
+/// branching on a loaded tag instead of `is_null`.
+///
+/// Real, disclosed limitation: codegen has no expected-type context
+/// here (unlike `emerald-sema`, which resolves this from the enclosing
+/// `let`/`return`'s own declared type) — the fresh `Option[U]` to wrap
+/// into is found by scanning `ctx.enums` for the unique already-
+/// instantiated `"Option$..."` whose `Some` payload `ValKind` matches
+/// the dispatched method's own return kind. Correct whenever the
+/// program has at most one `Option[T]` instantiation per distinct
+/// `ValKind` (the overwhelmingly common case); genuinely ambiguous only
+/// if two DIFFERENT `Option[T]`/`Option[U]` instantiations share the
+/// same underlying `ValKind` (e.g. two different classes, both
+/// `ValKind::Ptr`) — a real gap, disclosed rather than silently
+/// mis-wrapped: this errors out by name in that case.
+/// Returns `(the result value, its ValKind — always `Ptr`, the FRESH
+/// `Option[U]`'s own enum name)` — the third element lets a caller that
+/// itself needs to know which `Option[U]` this produced (`Expr::
+/// Coalesce`'s own `lhs` handling, when `lhs` is itself a `?.` chain
+/// rather than a plain local) reuse it directly instead of re-deriving
+/// it from scratch.
 #[allow(clippy::too_many_arguments)]
 fn build_safe_call<'ctx>(
   context: &'ctx Context,
@@ -8407,10 +8687,10 @@ fn build_safe_call<'ctx>(
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
-) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
-  if !matches!(&recv.node, Expr::Ident(_)) {
-    return Err("codegen: `&.` is only supported on a plain local-variable receiver".to_string());
-  }
+) -> Result<(BasicValueEnum<'ctx>, ValKind, String), String> {
+  let Expr::Ident(recv_name) = &recv.node else {
+    return Err("codegen: `?.` is only supported on a plain local-variable receiver".to_string());
+  };
   let (recv_val, recv_kind) = build_expr(
     context,
     builder,
@@ -8422,11 +8702,49 @@ fn build_safe_call<'ctx>(
   )?;
   if recv_kind != ValKind::Ptr {
     return Err(format!(
-      "codegen: `&.` requires a pointer-backed receiver, found {recv_kind:?}"
+      "codegen: `?.` requires an `Option[T]` receiver, found {recv_kind:?}"
     ));
   }
-  let is_null = builder
-    .build_is_null(recv_val.into_pointer_value(), "isnil")
+  let enum_name = local_classes.get(recv_name).cloned().ok_or_else(|| {
+    format!(
+      "codegen: `?.` requires an `Option[T]`-typed receiver, found untyped local `{recv_name}`"
+    )
+  })?;
+  let layout = ctx.enums.get(enum_name.as_str()).ok_or_else(|| {
+    format!(
+      "codegen: internal error — unregistered enum `{enum_name}` (sema should have rejected this)"
+    )
+  })?;
+  let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
+    format!("codegen: internal error — `{enum_name}` has no `Some` variant (sema should have rejected this)")
+  })?;
+  let inner_kind = layout
+    .variant_fields
+    .get("Some")
+    .and_then(|f| f.first())
+    .cloned()
+    .ok_or_else(|| format!("codegen: internal error — `{enum_name}`'s `Some` has no field"))?;
+  let inner_ty = layout
+    .variant_field_types
+    .get("Some")
+    .and_then(|f| f.first())
+    .cloned()
+    .unwrap_or_default();
+
+  let ptr = recv_val.into_pointer_value();
+  let tag_val = load_field(
+    context,
+    builder,
+    ptr,
+    FieldInfo {
+      offset: 0,
+      kind: ValKind::Int64,
+    },
+  )?
+  .into_int_value();
+  let some_tag_const = context.i64_type().const_int(some_tag, false);
+  let is_some = builder
+    .build_int_compare(IntPredicate::EQ, tag_val, some_tag_const, "issome")
     .map_err(|e| e.to_string())?;
 
   let entry_block = builder
@@ -8436,27 +8754,128 @@ fn build_safe_call<'ctx>(
     .get_parent()
     .ok_or("codegen: internal error — block has no parent function")?;
   let call_block = context.append_basic_block(func, "safecall.call");
+  let none_block = context.append_basic_block(func, "safecall.none");
   let merge_block = context.append_basic_block(func, "safecall.merge");
 
   builder
-    .build_conditional_branch(is_null, merge_block, call_block)
+    .build_conditional_branch(is_some, call_block, none_block)
     .map_err(|e| e.to_string())?;
 
   builder.position_at_end(call_block);
+  let inner_val = load_field(
+    context,
+    builder,
+    ptr,
+    FieldInfo {
+      offset: 8,
+      kind: inner_kind.clone(),
+    },
+  )?;
+  // Plan 62's own "synthesize a fresh AST node and reuse the existing
+  // codegen path unchanged" technique (`build_requires_checks`'
+  // Decision log), applied here: `build_method_call` needs a real
+  // `Expr::Ident` receiver to dispatch through `local_classes` — stash
+  // the just-unwrapped payload into its own scratch stack slot under a
+  // synthetic name, in a CLONED `vars`/`local_classes` (never mutating
+  // the caller's real environment), then call through exactly like any
+  // other local.
+  let synthetic_name = format!("__safecall_recv_{recv_name}");
+  let alloca = builder
+    .build_alloca(local_llvm_type(context, &inner_kind), &synthetic_name)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(alloca, inner_val)
+    .map_err(|e| e.to_string())?;
+  let mut inner_vars = vars.clone();
+  inner_vars.insert(synthetic_name.clone(), (alloca, inner_kind.clone()));
+  let mut inner_local_classes = local_classes.clone();
+  if ctx.classes.contains_key(inner_ty.as_str()) {
+    inner_local_classes.insert(synthetic_name.clone(), inner_ty.clone());
+  }
+  let synthetic_recv = Spanned::synthetic(Expr::Ident(synthetic_name));
   let (call_val, call_kind) = build_method_call(
     context,
     builder,
-    recv,
+    &synthetic_recv,
     method,
     args,
-    vars,
-    local_classes,
+    &inner_vars,
+    &inner_local_classes,
     local_array_elem_types,
     ctx,
   )?;
+
+  // Re-wrap the call's result as a fresh `Option[U]` — see this
+  // function's own doc comment for the real, disclosed limitation this
+  // lookup has.
+  let result_enum_name = ctx
+    .enums
+    .iter()
+    .filter(|(name, l)| {
+      name.starts_with("Option$")
+        && l
+          .variant_fields
+          .get("Some")
+          .and_then(|f| f.first())
+          .is_some_and(|k| *k == call_kind)
+    })
+    .map(|(name, _)| name.clone())
+    .collect::<Vec<_>>();
+  let [result_enum_name] = result_enum_name.as_slice() else {
+    return Err(format!(
+      "codegen: `?.{method}`'s result type ({call_kind:?}) doesn't uniquely identify an already-instantiated `Option[U]` — candidates: {result_enum_name:?}; add an explicit `Option[U]` type annotation elsewhere in this program"
+    ));
+  };
+  let result_layout = &ctx.enums[result_enum_name];
+  let result_size = context.i64_type().const_int(result_layout.size, false);
+  let alloc_call = builder
+    .build_call(ctx.alloc, &[result_size.into()], "safecallwrap")
+    .map_err(|e| e.to_string())?;
+  let result_ptr = call_result(alloc_call)?.into_pointer_value();
+  let result_tag_ptr = field_ptr(context, builder, result_ptr, 0)?;
+  let result_some_tag = *result_layout.variant_tags.get("Some").ok_or_else(|| {
+    format!("codegen: internal error — `{result_enum_name}` has no `Some` variant")
+  })?;
+  builder
+    .build_store(
+      result_tag_ptr,
+      context.i64_type().const_int(result_some_tag, false),
+    )
+    .map_err(|e| e.to_string())?;
+  let result_field_ptr = field_ptr(context, builder, result_ptr, 8)?;
+  builder
+    .build_store(result_field_ptr, call_val)
+    .map_err(|e| e.to_string())?;
+
   let call_end_block = builder
     .get_insert_block()
     .ok_or("codegen: internal error — no current block after call")?;
+  builder
+    .build_unconditional_branch(merge_block)
+    .map_err(|e| e.to_string())?;
+
+  // On the `None` path, the result is a FRESH `None` too — allocated in
+  // its own block rather than reusing the receiver's own pointer (a
+  // distinct `Option[U]` instantiation may have a different `size`/
+  // layout than `Option[T]`).
+  builder.position_at_end(none_block);
+  let result_none_tag = *result_layout.variant_tags.get("None").ok_or_else(|| {
+    format!("codegen: internal error — `{result_enum_name}` has no `None` variant")
+  })?;
+  let none_alloc_call = builder
+    .build_call(ctx.alloc, &[result_size.into()], "safecallnone")
+    .map_err(|e| e.to_string())?;
+  let none_ptr = call_result(none_alloc_call)?.into_pointer_value();
+  let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
+  builder
+    .build_store(
+      none_tag_ptr,
+      context.i64_type().const_int(result_none_tag, false),
+    )
+    .map_err(|e| e.to_string())?;
+  let none_end_block = builder
+    .get_insert_block()
+    .ok_or("codegen: internal error — no current block after none")?;
   builder
     .build_unconditional_branch(merge_block)
     .map_err(|e| e.to_string())?;
@@ -8466,12 +8885,8 @@ fn build_safe_call<'ctx>(
   let phi = builder
     .build_phi(ptr_ty, "safecallresult")
     .map_err(|e| e.to_string())?;
-  let null_val = ptr_ty.const_null();
-  phi.add_incoming(&[
-    (&null_val, entry_block),
-    (&call_val.into_pointer_value(), call_end_block),
-  ]);
-  Ok((phi.as_basic_value(), call_kind))
+  phi.add_incoming(&[(&none_ptr, none_end_block), (&result_ptr, call_end_block)]);
+  Ok((phi.as_basic_value(), ValKind::Ptr, result_enum_name.clone()))
 }
 
 /// `emerald_alloc`s a flat `elements.len() * 8`-byte buffer, then
@@ -10287,40 +10702,25 @@ fn build_stmt<'a, 'ctx>(
     Stmt::Let {
       name, ty, value, ..
     } => {
-      // Plan 43's Decision log: a `Greeter?`-typed local's storage is a
-      // `ptr` slot (`value_kind_for_type` falls through any non-
-      // primitive-named string, including `"Greeter?"`, to `ValKind::
-      // Ptr`) — `Expr::Nil`'s generic `build_expr` arm unconditionally
-      // emits a fixed `i64` `0` (plan 25's design), a real LLVM type
-      // mismatch when stored into that slot. A literal `nil` value into
-      // a pointer-backed declared type builds a real null pointer
-      // constant directly instead.
-      let expected_kind = value_kind_for_type(ty);
-      let v = if matches!(value.node, Expr::Nil)
-        && matches!(expected_kind, ValKind::Ptr | ValKind::Str)
-      {
-        context
-          .ptr_type(AddressSpace::default())
-          .const_null()
-          .into()
-      } else {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          value,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        v
-      };
-      // Plan 43's Decision log: `local_classes` only ever needs a bare
-      // class name, independent of nullability — strip a trailing `?`
-      // before the lookup so a `Greeter?` local is still recorded as
-      // class `Greeter`, exactly what `&.`'s dispatch (`build_method_
-      // call`, reused by `build_safe_call`) needs to find.
-      let bare_ty = ty.strip_suffix('?').unwrap_or(ty);
+      // Plan 73's Decision log: plan 43's `T?`/`Expr::Nil` sentinel
+      // special-case (a `nil` literal into a pointer-backed declared
+      // type built a raw null-pointer constant directly, bypassing
+      // ordinary codegen) is removed outright along with `T?` itself —
+      // `Option[T]` is a real, monomorphized enum value now (tag +
+      // payload), constructed by the same ordinary `build_expr` path
+      // every other enum variant already uses (`Some`/`None` are
+      // `Expr::Call`/`Expr::Ident` like any other variant), never a bare
+      // null pointer.
+      let (v, _) = build_expr(
+        context,
+        builder,
+        value,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let bare_ty = ty.as_str();
       // Plan 52: an enum-typed local carries its enum name the same
       // way a class-typed local carries its class name — `build_case`
       // consults this to detect an enum scrutinee.
@@ -10334,8 +10734,19 @@ fn build_stmt<'a, 'ctx>(
       // like an ordinary one.
       if let Some(resolved) = resolve_local_class_name(bare_ty, ctx.classes) {
         local_classes.insert(name.clone(), resolved);
-      } else if ctx.enums.contains_key(bare_ty) || bare_ty == "Supervisor" {
+      } else if bare_ty == "Supervisor" || ctx.enums.contains_key(bare_ty) {
         local_classes.insert(name.clone(), bare_ty.to_string());
+      } else {
+        // Plan 73: a generic-ENUM-instantiation-typed local (`Option[
+        // Int64]`) resolves to its real, monomorphized `EnumLayout`
+        // exactly like a generic-class-instantiation-typed local
+        // already does via `resolve_local_class_name` above — the
+        // identical mangled-name fallback, just against `ctx.enums`
+        // instead of `ctx.classes`.
+        let mangled = mangle_type_name(bare_ty);
+        if mangled != bare_ty && ctx.enums.contains_key(&mangled) {
+          local_classes.insert(name.clone(), mangled);
+        }
       }
       if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
         local_array_elem_types.insert(name.clone(), value_kind_for_type(elem_name));
@@ -10380,124 +10791,24 @@ fn build_stmt<'a, 'ctx>(
     // it in the normal pipeline, but codegen alone shouldn't assume
     // that).
     Stmt::Assign { name, value } => {
-      let (ptr, target_kind) = vars
+      let (ptr, _) = vars
         .get(name)
         .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
-      let (ptr, target_kind) = (*ptr, target_kind.clone());
-      // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot special
-      // case as `Stmt::Let` above, driven by the target's already-
-      // recorded `ValKind` in `vars` instead of a declared-type string.
-      let v =
-        if matches!(value.node, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
-          context
-            .ptr_type(AddressSpace::default())
-            .const_null()
-            .into()
-        } else {
-          let (v, _) = build_expr(
-            context,
-            builder,
-            value,
-            vars,
-            local_classes,
-            local_array_elem_types,
-            ctx,
-          )?;
-          v
-        };
+      let ptr = *ptr;
+      // Plan 73's Decision log: plan 43's `Expr::Nil`-into-`ptr`-slot
+      // special case is removed outright along with `T?`/`nil` — see
+      // `Stmt::Let`'s own identical removal above for the full
+      // rationale.
+      let (v, _) = build_expr(
+        context,
+        builder,
+        value,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       builder.build_store(ptr, v).map_err(|e| e.to_string())?;
-      Ok(false)
-    }
-    // Plan 43's Decision log: a real is-nil-guarded conditional store —
-    // two basic blocks plus a merge, no `phi` needed since (unlike
-    // `build_safe_call`) this statement produces no value at all.
-    // Assigns `default` only when `name`'s CURRENT value is nil.
-    Stmt::OrAssign { name, default } => {
-      let (ptr, kind) = vars
-        .get(name)
-        .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
-      let (ptr, kind) = (*ptr, kind.clone());
-      let current = builder
-        .build_load(local_llvm_type(context, &kind), ptr, name)
-        .map_err(|e| e.to_string())?;
-      let is_null = builder
-        .build_is_null(current.into_pointer_value(), "orassign.isnil")
-        .map_err(|e| e.to_string())?;
-      let assign_block = context.append_basic_block(func, "orassign.assign");
-      let merge_block = context.append_basic_block(func, "orassign.merge");
-      builder
-        .build_conditional_branch(is_null, assign_block, merge_block)
-        .map_err(|e| e.to_string())?;
-
-      builder.position_at_end(assign_block);
-      let v = if matches!(default.node, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
-        context
-          .ptr_type(AddressSpace::default())
-          .const_null()
-          .into()
-      } else {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          default,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        v
-      };
-      builder.build_store(ptr, v).map_err(|e| e.to_string())?;
-      builder
-        .build_unconditional_branch(merge_block)
-        .map_err(|e| e.to_string())?;
-
-      builder.position_at_end(merge_block);
-      Ok(false)
-    }
-    // Plan 43's Decision log: the asymmetric twin of `OrAssign` above —
-    // assigns `value` only when `name`'s CURRENT value is non-nil.
-    Stmt::AndAssign { name, value } => {
-      let (ptr, kind) = vars
-        .get(name)
-        .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?;
-      let (ptr, kind) = (*ptr, kind.clone());
-      let current = builder
-        .build_load(local_llvm_type(context, &kind), ptr, name)
-        .map_err(|e| e.to_string())?;
-      let is_null = builder
-        .build_is_null(current.into_pointer_value(), "andassign.isnil")
-        .map_err(|e| e.to_string())?;
-      let assign_block = context.append_basic_block(func, "andassign.assign");
-      let merge_block = context.append_basic_block(func, "andassign.merge");
-      builder
-        .build_conditional_branch(is_null, merge_block, assign_block)
-        .map_err(|e| e.to_string())?;
-
-      builder.position_at_end(assign_block);
-      let v = if matches!(value.node, Expr::Nil) && matches!(kind, ValKind::Ptr | ValKind::Str) {
-        context
-          .ptr_type(AddressSpace::default())
-          .const_null()
-          .into()
-      } else {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          value,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        v
-      };
-      builder.build_store(ptr, v).map_err(|e| e.to_string())?;
-      builder
-        .build_unconditional_branch(merge_block)
-        .map_err(|e| e.to_string())?;
-
-      builder.position_at_end(merge_block);
       Ok(false)
     }
     // Plan 31: every `values` expression is built into a temporary SSA
@@ -10531,35 +10842,23 @@ fn build_stmt<'a, 'ctx>(
         }
       }
       let mut evaluated = Vec::with_capacity(values.len());
-      for (name, v) in names.iter().zip(values) {
-        // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot
-        // special case, driven by each *target's* own already-recorded
-        // `ValKind` — peeking at it here is a read, not a write, so it
-        // doesn't disturb this statement's own "evaluate every value
-        // before writing any target" ordering (the Decision log's own
-        // reason `a, b = b, a` is a real swap).
-        let target_kind = &vars
-          .get(name)
-          .ok_or_else(|| format!("codegen: undefined variable `{name}`"))?
-          .1;
-        let val =
-          if matches!(v.node, Expr::Nil) && matches!(target_kind, ValKind::Ptr | ValKind::Str) {
-            context
-              .ptr_type(AddressSpace::default())
-              .const_null()
-              .into()
-          } else {
-            let (val, _) = build_expr(
-              context,
-              builder,
-              v,
-              vars,
-              local_classes,
-              local_array_elem_types,
-              ctx,
-            )?;
-            val
-          };
+      for v in values {
+        // Plan 73's Decision log: plan 43's `Expr::Nil`-into-`ptr`-slot
+        // special case is removed outright — see `Stmt::Let`'s own
+        // identical removal above for the full rationale. Ordinary
+        // `build_expr` still runs BEFORE any target is written (this
+        // loop's own "evaluate every value before writing any target"
+        // ordering, the reason `a, b = b, a` is a real swap, is
+        // unaffected).
+        let (val, _) = build_expr(
+          context,
+          builder,
+          v,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
         evaluated.push(val);
       }
       for (name, val) in names.iter().zip(evaluated) {
@@ -10717,26 +11016,18 @@ fn build_stmt<'a, 'ctx>(
       Ok(false)
     }
     Stmt::Return(Some(e)) => {
-      // Plan 43's Decision log: same `Expr::Nil`-into-`ptr`-slot special
-      // case, driven by `ret_kind` (already a `build_stmt` parameter —
-      // the enclosing function/method's own declared return kind).
-      let v = if matches!(e.node, Expr::Nil) && matches!(ret_kind, ValKind::Ptr | ValKind::Str) {
-        context
-          .ptr_type(AddressSpace::default())
-          .const_null()
-          .into()
-      } else {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          e,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        v
-      };
+      // Plan 73's Decision log: plan 43's `Expr::Nil`-into-`ptr`-slot
+      // special case is removed outright — see `Stmt::Let`'s own
+      // identical removal above for the full rationale.
+      let (v, _) = build_expr(
+        context,
+        builder,
+        e,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       // Plan 62's Decision log: runs BEFORE `emit_active_ensures` —
       // deliberately. A failed `ensures` clause raises a real exception
       // (`build_raise`, `longjmp`-based), which must be caught by
@@ -13613,10 +13904,8 @@ fn collect_runtime_call_names_stmt(stmt: &Spanned<Stmt>, out: &mut HashSet<Strin
     Stmt::Let { value, .. }
     | Stmt::SetField { value, .. }
     | Stmt::Assign { value, .. }
-    | Stmt::AndAssign { value, .. }
     | Stmt::Raise(value)
     | Stmt::Expr(value) => collect_runtime_call_names_expr(value, out),
-    Stmt::OrAssign { default, .. } => collect_runtime_call_names_expr(default, out),
     Stmt::SetIndex {
       array,
       index,
@@ -13753,8 +14042,7 @@ fn collect_runtime_call_names_expr(expr: &Spanned<Expr>, out: &mut HashSet<Strin
     | Expr::StringLit(_)
     | Expr::SymbolLit(_)
     | Expr::InstanceVar(_)
-    | Expr::Bool(_)
-    | Expr::Nil => {}
+    | Expr::Bool(_) => {}
     Expr::Interpolate(parts) => {
       for p in parts {
         if let StringPart::Expr(e) = p {
@@ -13785,7 +14073,7 @@ fn collect_runtime_call_names_expr(expr: &Spanned<Expr>, out: &mut HashSet<Strin
     | Expr::Ok(a)
     | Expr::Err(a)
     | Expr::Try(a) => collect_runtime_call_names_expr(a, out),
-    Expr::Compare(a, _, b) => {
+    Expr::Compare(a, _, b) | Expr::Coalesce(a, b) => {
       collect_runtime_call_names_expr(a, out);
       collect_runtime_call_names_expr(b, out);
     }
@@ -14022,7 +14310,6 @@ fn infer_expr_val_kind(
     Expr::Bool(_) => ValKind::Bool,
     Expr::StringLit(_) | Expr::Interpolate(_) => ValKind::Str,
     Expr::SymbolLit(_) => ValKind::Symbol,
-    Expr::Nil => ValKind::Nil,
     Expr::Not(_) | Expr::And(_, _) | Expr::Or(_, _) | Expr::Compare(_, _, _) => ValKind::Bool,
     Expr::Add(l, _)
     | Expr::Sub(l, _)
@@ -14803,11 +15090,91 @@ fn compile_to_object_impl(
   // (plan 32's Decision log) — sema's own registration-time checks
   // already guarantee every enum name and variant name here is unique
   // and collision-free before codegen ever runs.
+  // Plan 73: `Option[T]` — codegen's own mirror of `emerald-sema`'s
+  // identical synthetic `EnumDef` (see that crate's `check_program` own
+  // Decision log) — same reasoning: never parsed from source, so
+  // `None`'s zero fields don't need a grammar-level exception, and
+  // registered into `generic_enum_defs` exactly like a user-written
+  // `enum Name[T] = ...` would be.
+  let option_enum_def_cg = EnumDef {
+    name: "Option".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Some".to_string(),
+        fields: vec!["T".to_string()],
+      },
+      EnumVariant {
+        name: "None".to_string(),
+        fields: vec![],
+      },
+    ],
+    type_params: vec![TypeParam {
+      name: "T".to_string(),
+      bound: None,
+    }],
+  };
+  let mut generic_enum_defs: HashMap<String, &EnumDef> = HashMap::new();
+  generic_enum_defs.insert("Option".to_string(), &option_enum_def_cg);
+  for item in &program.items {
+    if let Item::Enum(e) = item {
+      if !e.type_params.is_empty() {
+        generic_enum_defs.insert(e.name.clone(), e);
+      }
+    }
+  }
+  let mut synthesized_enums: HashMap<String, EnumDef> = HashMap::new();
+  let mut enum_synth_classes: HashMap<String, ClassDef> = HashMap::new();
+  for ty in collect_generic_instantiation_typenames(program) {
+    if let Some((base, args)) = parse_generic_instantiation(&ty) {
+      if generic_enum_defs.contains_key(base) {
+        let mut in_progress = Vec::new();
+        instantiate_generic_enum_defs(
+          base,
+          &args,
+          &generic_enum_defs,
+          &generic_class_defs,
+          &mut enum_synth_classes,
+          &mut synthesized_enums,
+          &mut in_progress,
+        );
+      }
+    }
+  }
+  // Plan 73: `String.from_cstring`'s own real return type is `Option[
+  // String]` — unconditionally pre-instantiated here the same way
+  // `emerald-sema`'s `check_program` does, so its `EnumLayout` always
+  // exists regardless of whether this specific program ever writes
+  // `"Option[String]"` as literal annotation text anywhere.
+  {
+    let mut in_progress = Vec::new();
+    instantiate_generic_enum_defs(
+      "Option",
+      &["String"],
+      &generic_enum_defs,
+      &generic_class_defs,
+      &mut enum_synth_classes,
+      &mut synthesized_enums,
+      &mut in_progress,
+    );
+  }
+  for c in enum_synth_classes.values() {
+    class_defs.insert(c.name.clone(), c);
+  }
+  for name in enum_synth_classes.keys() {
+    classes.insert(name.clone(), build_class_layout(name, &class_defs)?);
+    class_tags.insert(name.clone(), class_tags.len() as i64);
+  }
+
   let mut enums: HashMap<String, EnumLayout> = HashMap::new();
   for item in &program.items {
     if let Item::Enum(e) = item {
-      enums.insert(e.name.clone(), build_enum_layout(e));
+      if e.type_params.is_empty() {
+        enums.insert(e.name.clone(), build_enum_layout(e));
+      }
     }
+  }
+  for (name, e) in &synthesized_enums {
+    enums.insert(name.clone(), build_enum_layout(e));
   }
 
   // Plan 44: see `Ctx::symbol_table`'s own doc comment — built once,
@@ -15772,6 +16139,7 @@ fn ensure_contract_violation_class(items: &mut Vec<Item>) {
 fn send_error_enum_item() -> Item {
   Item::Enum(EnumDef {
     name: "SendError".to_string(),
+    type_params: Vec::new(),
     variants: vec![
       EnumVariant {
         name: "ActorTerminated".to_string(),
@@ -16548,13 +16916,6 @@ mod tests {
     assert_eq!(compile_link_run(BOOL_EXAMPLE), "1\n0\n");
   }
 
-  const NIL_EXAMPLE: &str = "fn check_nil(x: Nil): Int64 do\n  if x == nil do\n    return 1\n  end\n  return 0\nend\n\nputs check_nil(nil)\n";
-
-  #[test]
-  fn nil_literal_example_linked_and_run() {
-    assert_eq!(compile_link_run(NIL_EXAMPLE), "1\n");
-  }
-
   const HASH_EXAMPLE: &str =
     "h: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nputs h[2]\nh[2] = 99\nputs h[2]\n";
 
@@ -17192,49 +17553,23 @@ mod tests {
 
   // Plan 43 (nullable types and safe navigation).
 
-  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Option[Greeter] do\n  if id == 1 do\n    return Some(Greeter.new(\"ada\"))\n  end\n  return None\nend\n\nfn greet(id: Int64): String do\n  g: Option[Greeter] = find_greeter(id)\n  message: String = g?.shout ?? \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
 
   #[test]
   fn nullable_worked_example_linked_and_run() {
-    // Real executed proof, combining all three leaves: a real non-null
-    // `Greeter` pointer (`greet(1)`) and a real null pointer
-    // (`greet(2)`, `find_greeter`'s "not found" path) both round-trip
-    // correctly through a `Greeter?`-typed local without crashing or
-    // misreading the wrong bit pattern; `g&.shout` actually skips
-    // calling `shout` on the null receiver and actually performs it on
-    // the non-null one, merging both paths via a real LLVM `phi`; and
-    // `||=` narrows `message` so `return message` type-checks and
-    // prints the right string on both paths.
+    // Real executed proof, combining all three leaves: a real `Some`
+    // (`greet(1)`) and a real `None` (`greet(2)`, `find_greeter`'s
+    // "not found" path) both round-trip correctly through an
+    // `Option[Greeter]`-typed local without crashing or misreading the
+    // wrong tag; `g?.shout` actually skips calling `shout` on the
+    // `None` receiver and actually performs it on the `Some` one,
+    // merging both paths via a real LLVM `phi`; and `??` unwraps
+    // `message` so `return message` type-checks and prints the right
+    // string on both paths.
     assert_eq!(
       compile_link_run(NULLABLE_WORKED_EXAMPLE),
       "ada!\nnobody here\n"
     );
-  }
-
-  const AND_ASSIGN_UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn upgrade(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
-
-  #[test]
-  fn and_assign_upgrade_worked_example_linked_and_run() {
-    // Real executed proof of `&&=`'s both branches: `upgrade(1)`'s `g`
-    // is non-nil, so `&&=` actually assigns (`g` becomes the
-    // `"upgraded"` Greeter, whose `shout` produces `"upgraded!"`);
-    // `upgrade(2)`'s `g` is nil, so `&&=` is genuinely skipped (`g`
-    // stays nil — a real is-nil-guarded conditional store, not an
-    // unconditional one), `g&.shout` short-circuits, and `||=` supplies
-    // the default.
-    assert_eq!(
-      compile_link_run(AND_ASSIGN_UPGRADE_EXAMPLE),
-      "upgraded!\nstill nobody\n"
-    );
-  }
-
-  #[test]
-  fn plan_25_nil_example_still_compiles_and_runs_unchanged() {
-    // Regression: a bare `Nil`-typed variable's own `== nil` comparison
-    // (plan 25, unrelated to `T?`) still flows through its own
-    // `(ValKind::Nil, ValKind::Nil)` codegen case, not the new
-    // `Ptr`/`Str`-vs-`Nil` null-pointer-test case this plan adds.
-    assert_eq!(compile_link_run(NIL_EXAMPLE), "1\n");
   }
 
   // Plan 67 (String equality codegen).
@@ -18522,8 +18857,8 @@ int main(void) {
   // `strlen` proves an Emerald `String` passed directly to a real C
   // function with zero conversion, and `strstr`'s two calls prove
   // `CString`/`String.from_cstring` on both the found and the real-
-  // `NULL` (not-found) path, defaulted through plan 43's own `||=`.
-  const FFI_EXAMPLE: &str = "unsafe extern \"C\" {\n  fn llabs(x: Int64): Int64\n  fn strlen(s: String): Int64\n  fn strstr(haystack: String, needle: String): CString\n}\n\nx: Int64 = llabs(-42)\nputs x\n\nn: Int64 = strlen(\"hello\")\nputs n\n\nfound: String? = String.from_cstring(strstr(\"hello world\", \"world\"))\nfound ||= \"not found\"\nputs found\n\nmissing: String? = String.from_cstring(strstr(\"hello world\", \"xyz\"))\nmissing ||= \"not found\"\nputs missing\n";
+  // `NULL` (not-found) path, defaulted through plan 73's own `??`.
+  const FFI_EXAMPLE: &str = "unsafe extern \"C\" {\n  fn llabs(x: Int64): Int64\n  fn strlen(s: String): Int64\n  fn strstr(haystack: String, needle: String): CString\n}\n\nx: Int64 = llabs(-42)\nputs x\n\nn: Int64 = strlen(\"hello\")\nputs n\n\nfound: Option[String] = String.from_cstring(strstr(\"hello world\", \"world\"))\nputs found ?? \"not found\"\n\nmissing: Option[String] = String.from_cstring(strstr(\"hello world\", \"xyz\"))\nputs missing ?? \"not found\"\n";
 
   #[test]
   fn c_ffi_worked_example_compiled_linked_and_run_prints_the_expected_four_lines() {
@@ -18872,10 +19207,11 @@ int main(void) {
 
   #[test]
   fn plan_66_a_string_optional_via_safe_nav_and_coalesce_prints_deterministically() {
-    // Shape 5: `puts` of a `String?` populated via `||=` after starting
-    // `nil` — the exact shape `nullable_safe_nav.em` and `c_ffi.em` hit,
-    // mirrored here without the `unsafe extern "C"` dependency.
-    let src = "found: String? = nil\nfound ||= \"not found\"\nputs found\n";
+    // Shape 5: `puts` of an `Option[String]` populated via `??` after
+    // starting `None` — the exact shape `nullable_safe_nav.em` and
+    // `c_ffi.em` hit, mirrored here without the `unsafe extern "C"`
+    // dependency.
+    let src = "found: Option[String] = None\nputs found ?? \"not found\"\n";
     let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
     for (i, out) in runs.iter().enumerate() {
       assert_eq!(
@@ -18908,7 +19244,7 @@ int main(void) {
     // its inner `puts`) at the final `puts greet("world")` line, so
     // "hello from inside a def" is emitted last, not first — sequential
     // execution order, not declaration order.
-    let src = "fn greet(name: String): String do\n  puts \"hello from inside a def\"\n  name\nend\n\ny: String = \"hello\"\nputs y\n\nphrase: String = \"hello world\"\nputs phrase.slice(1, 3)\n\nwords: Array[String] = phrase.split(\" \")\nputs words[0]\n\nfound: String? = nil\nfound ||= \"not found\"\nputs found\n\nputs greet(\"world\")\n";
+    let src = "fn greet(name: String): String do\n  puts \"hello from inside a def\"\n  name\nend\n\ny: String = \"hello\"\nputs y\n\nphrase: String = \"hello world\"\nputs phrase.slice(1, 3)\n\nwords: Array[String] = phrase.split(\" \")\nputs words[0]\n\nfound: Option[String] = None\nputs found ?? \"not found\"\n\nputs greet(\"world\")\n";
     let runs = compile_link_run_n_times(src, PLAN_66_REPEAT_COUNT);
     let expected = "hello\nell\nhello\nnot found\nhello from inside a def\nworld\n";
     for (i, out) in runs.iter().enumerate() {

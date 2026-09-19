@@ -182,8 +182,6 @@ fn rewrite_stmt(stmt: &mut Spanned<Stmt>, name: &str, source: &str) {
     | Stmt::SetField { value, .. }
     | Stmt::Assign { value, .. }
     | Stmt::Raise(value)
-    | Stmt::OrAssign { default: value, .. }
-    | Stmt::AndAssign { value, .. }
     | Stmt::Expr(value) => rewrite_expr(value, name, source),
     Stmt::SetIndex {
       array,
@@ -290,7 +288,6 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
     | Expr::StringLit(_)
     | Expr::SymbolLit(_)
     | Expr::Bool(_)
-    | Expr::Nil
     | Expr::InstanceVar(_) => {}
     Expr::Interpolate(parts) => {
       for p in parts {
@@ -318,7 +315,7 @@ fn rewrite_expr(expr: &mut Spanned<Expr>, name: &str, source: &str) {
     Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) | Expr::ArrayNew(a) | Expr::Comptime(a) => {
       rewrite_expr(a, name, source)
     }
-    Expr::Compare(a, _, b) => {
+    Expr::Compare(a, _, b) | Expr::Coalesce(a, b) => {
       rewrite_expr(a, name, source);
       rewrite_expr(b, name, source);
     }
@@ -1848,8 +1845,8 @@ mod tests {
   // Plan 25 (stdlib expansion).
 
   #[test]
-  fn parses_bool_and_nil_literals() {
-    let program = parse("puts true\nputs false\nputs nil\n")
+  fn parses_bool_literals() {
+    let program = parse("puts true\nputs false\n")
       .expect("should parse")
       .items;
     let Item::Stmt(Spanned {
@@ -1874,17 +1871,6 @@ mod tests {
       panic!("expected a puts call, got {:?}", program[1]);
     };
     assert_eq!(a2[0], Expr::Bool(false));
-    let Item::Stmt(Spanned {
-      node: Stmt::Expr(Spanned {
-        node: Expr::Call(_, a3),
-        ..
-      }),
-      ..
-    }) = &program[2]
-    else {
-      panic!("expected a puts call, got {:?}", program[2]);
-    };
-    assert_eq!(a3[0], Expr::Nil);
   }
 
   #[test]
@@ -2834,11 +2820,13 @@ mod tests {
     assert!(!errs.is_empty());
   }
 
-  // Plan 43 (nullable types and safe navigation).
+  // Plan 73 (Option[T] and nullability replacement — plan 43's `T?`/
+  // `nil`/`&.`/`||=` are gone outright; see this plan's own Decision
+  // log).
 
   #[test]
-  fn nullable_suffix_parses_into_a_compound_type_string() {
-    let src = "g: Greeter? = nil\n";
+  fn generic_instantiation_type_string_parses_option_of_int64() {
+    let src = "g: Option[Int64] = Some(1)\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
       node: Stmt::Let { ty, .. },
@@ -2847,12 +2835,26 @@ mod tests {
     else {
       panic!("expected a Let, got {:?}", program.items[0]);
     };
-    assert_eq!(ty, "Greeter?");
+    assert_eq!(ty, "Option[Int64]");
   }
 
   #[test]
-  fn safe_call_parses_to_expr_safe_call() {
-    let src = "message: String? = g&.shout\n";
+  fn bare_none_parses_to_expr_call_with_no_args() {
+    let src = "g: Option[Int64] = None\n";
+    let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
+    assert_eq!(*value, Expr::Ident("None".to_string()));
+  }
+
+  #[test]
+  fn safe_nav_parses_to_expr_safe_call() {
+    let src = "message: Option[String] = g?.shout\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
       node: Stmt::Let { value, .. },
@@ -2872,8 +2874,8 @@ mod tests {
   }
 
   #[test]
-  fn safe_call_with_args_parses_to_expr_safe_call() {
-    let src = "x: Int64? = g&.add(1, 2)\n";
+  fn safe_nav_with_args_parses_to_expr_safe_call() {
+    let src = "x: Option[Int64] = g?.add(1, 2)\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
       node: Stmt::Let { value, .. },
@@ -2914,44 +2916,32 @@ mod tests {
   }
 
   #[test]
-  fn or_assign_parses_to_stmt_or_assign() {
-    let src = "message: String? = nil\nmessage ||= \"nobody here\"\n";
+  fn coalesce_parses_to_expr_coalesce() {
+    let src = "message: String = g?.shout ?? \"nobody here\"\n";
     let program = parse(src).expect("should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { value, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let, got {:?}", program.items[0]);
+    };
     assert_eq!(
-      program.items[1],
-      Item::Stmt(s(Stmt::OrAssign {
-        name: "message".to_string(),
-        default: s(Expr::StringLit("nobody here".to_string())),
-      }))
+      *value,
+      Expr::Coalesce(
+        Box::new(s(Expr::SafeCall(
+          Box::new(s(Expr::Ident("g".to_string()))),
+          "shout".to_string(),
+          vec![]
+        ))),
+        Box::new(s(Expr::StringLit("nobody here".to_string()))),
+      )
     );
   }
 
   #[test]
-  fn and_assign_parses_to_stmt_and_assign() {
-    let src = "g: Greeter? = nil\ng &&= Greeter.new(\"upgraded\")\n";
-    let program = parse(src).expect("should parse");
-    assert_eq!(
-      program.items[1],
-      Item::Stmt(s(Stmt::AndAssign {
-        name: "g".to_string(),
-        value: s(Expr::New(
-          "Greeter".to_string(),
-          vec![s(Expr::StringLit("upgraded".to_string()))]
-        )),
-      }))
-    );
-  }
-
-  #[test]
-  fn or_assign_on_a_non_ident_target_is_a_parse_error_not_a_panic() {
-    let src = "arr[0] ||= 1\n";
-    let errs = parse(src).unwrap_err();
-    assert!(!errs.is_empty());
-  }
-
-  #[test]
-  fn nullable_worked_example_parses_end_to_end() {
-    let src = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+  fn option_worked_example_parses_end_to_end() {
+    let src = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Option[Greeter] do\n  if id == 1 do\n    return Some(Greeter.new(\"ada\"))\n  end\n  return None\nend\n\nfn greet(id: Int64): String do\n  g: Option[Greeter] = find_greeter(id)\n  message: String = g?.shout ?? \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
     let program = parse(src).expect("should parse");
     assert_eq!(program.items.len(), 5);
   }

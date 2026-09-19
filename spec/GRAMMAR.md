@@ -31,7 +31,7 @@ requires (mainly: type annotations on parameters/returns/fields/locals).
 | Symbol literals (`:foo`) | KEEP | Kept as a distinct interned `Symbol` type; see `TYPE_SYSTEM.md`. |
 | Array literals (`[1, 2, 3]`) | MODIFY | Element type is unified/checked statically at the literal site; a heterogeneous literal is a type error, not a runtime `Array` of mixed objects. |
 | Hash literals (`{a: 1}`) | MODIFY | Same static unification as arrays, over key and value types independently. |
-| `nil` | KEEP | Denotes the single value of type `Nil`; see `SEMANTICS.md` §2 (Nil) for assignability rules. |
+| `nil` | REMOVED (Sable) | Was: the single value of type `Nil`; see `SEMANTICS.md` §2's own superseded banner. Plan 73 removes `nil`/`Nil`/`T?` outright in favor of `Option[T]`'s `Some(T)`/`None` — write `None`, not `nil`. |
 | `true` / `false` | KEEP | Values of `Boolean`. |
 | Range literals (`1..10`, `1...10`) | KEEP | Statically typed as `Range[T]` where `T` is the endpoint type; container type is added to the v1 universe (see `TYPE_SYSTEM.md`). |
 | `%w[]`, `%i[]` word/symbol arrays | KEEP | Sugar over `Array[String]` / `Array[Symbol]` literals; no new semantics. |

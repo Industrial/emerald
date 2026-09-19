@@ -88,6 +88,19 @@ the question.
 
 ## 4. Nil and nullable types
 
+**Superseded by the Sable-alignment grammar cutover (plan 73) — kept
+below as the historical record of the v1 design, not current syntax.**
+`T?`/`nil`/`&.`/`||=` are removed outright, not kept alongside a
+replacement: `Option[T]` is now a real generic ADT (`Some(T)`/`None`,
+plan 52's enum/pattern-matching mechanism extended to accept a type
+parameter — the project's first generic enum), with `?.`/`??` as sugar
+over `Option[T]` pattern matching rather than a pointer-nullness check.
+`nil`'s old `i64`-zero sentinel is gone from codegen entirely. See
+`history/2026-09-19T112000Z-plan-73-option-type-and-nullability-
+replacement.md` for the full design and decision log. The section below
+describes what came before, unedited, for historical accuracy — do not
+treat it as current.
+
 - `Nil` is a real type with exactly one value, `nil`.
 - A plain type name (`Int64`, `String`, `Point`) is **not** nil-assignable.
   `x: Int64 = nil` is a compile error.
