@@ -861,6 +861,12 @@ fn check_generic_class_body(
 
   for m in &c.methods {
     let mut env = HashMap::new();
+    // Plan 72's Decision log: a generic class template's own method
+    // parameters are immutable by construction, the same as an
+    // ordinary class's (`check_method_body`) — no `var` slot exists on
+    // a parameter regardless of which class/method-checking path binds
+    // it.
+    let mut mutable_locals: HashSet<String> = HashSet::new();
     for p in &m.params {
       env.insert(p.name.clone(), resolve_maybe_generic(&p.ty)?);
     }
@@ -868,6 +874,7 @@ fn check_generic_class_body(
     check_block(
       &m.body,
       &mut env,
+      &mut mutable_locals,
       sigs,
       classes,
       Some(&self_fields),
@@ -2717,6 +2724,7 @@ fn infer_expr_type(
                 node: Expr::Spawn(class_name, _),
                 ..
               },
+            ..
           } => {
             if ty != class_name {
               return Err(Diagnostic::new(
@@ -3472,9 +3480,16 @@ fn infer_lambda_type(
   // method that declares `block_param` is), whether this is plan 10's
   // original top-level `Proc` lambda or plan 34's block literal reusing
   // the same `Expr::Lambda` node.
+  // Plan 72's Decision log: a lambda/block-literal parameter is
+  // immutable by construction, the same as an ordinary function's — a
+  // fresh, empty set (no outer `mutable_locals` to inherit: a lambda
+  // body's own scope for this purpose starts clean, matching
+  // `lambda_env`'s own fresh-`HashMap` precedent immediately above).
+  let mut lambda_mutable: HashSet<String> = HashSet::new();
   check_block(
     body,
     &mut lambda_env,
+    &mut lambda_mutable,
     sigs,
     classes,
     None,
@@ -3927,6 +3942,7 @@ fn check_tuple_multi_assign(
   value: &Spanned<Expr>,
   ts: &[Type],
   env: &HashMap<String, Type>,
+  mutable_locals: &HashSet<String>,
 ) -> Result<(), Diagnostic> {
   if ts.len() != names.len() {
     return Err(Diagnostic::new(
@@ -3943,6 +3959,7 @@ fn check_tuple_multi_assign(
       .get(name)
       .cloned()
       .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), value.span))?;
+    check_mutable(name, mutable_locals, value.span)?;
     if !is_assignable(t, &declared) {
       return Err(Diagnostic::new(
         format!(
@@ -3967,11 +3984,34 @@ fn check_multi_assign(
   names: &[String],
   values: &[Spanned<Expr>],
   env: &HashMap<String, Type>,
+  mutable_locals: &HashSet<String>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
   gctx: &GenericsCtx,
+  stmt_span: (usize, usize),
 ) -> Result<(), Diagnostic> {
+  // Plan 72's Decision log: two separate passes over `names`, not one
+  // combined loop — every target's EXISTENCE is confirmed first (an
+  // undefined-variable diagnostic always takes priority, matching
+  // `Stmt::Assign`'s own ordering), and only once every target is
+  // confirmed to exist does the second pass check `mutable_locals`.
+  // Interleaving the two into one loop would make an earlier
+  // immutable-but-declared name (`a` in `a, z = 1, 2` when `z` is
+  // undefined) shadow a later target's genuine "undefined variable"
+  // diagnostic, purely because of its position in `names` — an
+  // accidental, position-dependent behavior, not a real design choice.
+  for name in names {
+    if !env.contains_key(name) {
+      return Err(Diagnostic::new(
+        format!("undefined variable `{name}`"),
+        stmt_span,
+      ));
+    }
+  }
+  for name in names {
+    check_mutable(name, mutable_locals, stmt_span)?;
+  }
   // Plan 39's Decision log: `x, y = f()` — a single call-shaped value
   // whose declared return type is a `Type::Tuple` of matching arity —
   // unpacks positionally, entirely ahead of the ordinary per-value path
@@ -3984,7 +4024,7 @@ fn check_multi_assign(
     if let Expr::Call(..) = &value.node {
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if let Type::Tuple(ts) = &actual {
-        return check_tuple_multi_assign(names, value, ts, env);
+        return check_tuple_multi_assign(names, value, ts, env, mutable_locals);
       }
     }
   }
@@ -4110,15 +4150,75 @@ fn check_try(
   Ok((**t_ty).clone())
 }
 
+/// Plan 72's Decision log: records a fresh (or re-declared/shadowed)
+/// local's mutability alongside its type in the same motion as binding
+/// it — `is_var: true` on some `Stmt::Let` is the ONLY way a name ever
+/// enters `mutable_locals`; every other binding-introducing construct
+/// in this file (a function/method parameter, a splat parameter, a
+/// `for`/`for...in..` induction variable, a `case`/`match`-arm
+/// pattern binding, a `rescue` clause's own exception variable) calls
+/// `env.insert` directly instead of this helper, so none of them are
+/// ever added to `mutable_locals` and stay immutable by construction —
+/// a deliberate, uniform default rather than a per-construct decision.
+/// Re-declaring the same name via a second `Let` always resets its
+/// mutability to match the new declaration's own `is_var` (removing a
+/// stale `mutable_locals` entry left by an earlier `var`-declared
+/// binding of the same name would otherwise silently outlive its own
+/// declaration).
+fn declare_local(
+  env: &mut HashMap<String, Type>,
+  mutable_locals: &mut HashSet<String>,
+  name: &str,
+  ty: Type,
+  is_var: bool,
+) {
+  env.insert(name.to_string(), ty);
+  if is_var {
+    mutable_locals.insert(name.to_string());
+  } else {
+    mutable_locals.remove(name);
+  }
+}
+
+/// Plan 72's Decision log: the actual reassignment check shared by
+/// every mutation form that targets an already-declared plain local —
+/// `Stmt::Assign` (and, via parse-time desugaring, `+=`/`-=`/`*=`/`/=`/
+/// `%=`), `Stmt::MultiAssign`, and `Stmt::OrAssign`/`Stmt::AndAssign`
+/// (plan 43's `||=`/`&&=` — not named in the plan's own text, but the
+/// identical mutation hazard: exempting them would leave a silent,
+/// easy-to-miss hole in an otherwise-uniform rule). Called only after
+/// the caller has already confirmed `name` exists in `env` (an
+/// undefined-variable diagnostic always takes priority over an
+/// immutability one).
+fn check_mutable(
+  name: &str,
+  mutable_locals: &HashSet<String>,
+  span: (usize, usize),
+) -> Result<(), Diagnostic> {
+  if mutable_locals.contains(name) {
+    Ok(())
+  } else {
+    Err(Diagnostic::new(
+      format!("cannot reassign immutable binding `{name}`, declared without `var`"),
+      span,
+    ))
+  }
+}
+
 /// Type-checks one statement, threading a mutable local-variable
 /// environment and the enclosing function's declared return type (used to
 /// check every `return <expr>`, not just a trailing one). `in_loop` gates
 /// `break`/`next` legality. `self_fields` is `Some` only inside a method
-/// body (see `infer_expr_type`).
+/// body (see `infer_expr_type`). `mutable_locals` (plan 72's Decision
+/// log) is the companion set of names actually declared `var` — always
+/// scoped, cloned, and discarded in lockstep with `env` itself, so a
+/// `var`-marked name never leaks past the scope its own `Let` declared
+/// it in.
 #[allow(clippy::too_many_arguments)]
 fn check_stmt(
   stmt: &Spanned<Stmt>,
   env: &mut HashMap<String, Type>,
+  mutable_locals: &mut HashSet<String>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
@@ -4139,7 +4239,12 @@ fn check_stmt(
     // `resolve_type("Proc", ...)`'s opaque placeholder, any actual
     // `Type::Proc(_, _)` is accepted and *that* — the real signature
     // inferred from the bound `Expr::Lambda` — is what's stored in `env`.
-    Stmt::Let { name, ty, value } if ty == "Proc" => {
+    Stmt::Let {
+      name,
+      ty,
+      value,
+      is_var,
+    } if ty == "Proc" => {
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !matches!(actual, Type::Proc(_, _)) {
         return Err(Diagnostic::new(
@@ -4149,7 +4254,7 @@ fn check_stmt(
           value.span,
         ));
       }
-      env.insert(name.clone(), actual);
+      declare_local(env, mutable_locals, name, actual, *is_var);
       Ok(())
     }
     // `Supervisor` is special-cased the same way `Proc` is immediately
@@ -4160,7 +4265,12 @@ fn check_stmt(
     // any actual `Type::Supervisor(_)` is accepted and *that* — the
     // real tracked-children record inferred from the bound `Expr::
     // Supervise` — is what's stored in `env`.
-    Stmt::Let { name, ty, value } if ty == "Supervisor" => {
+    Stmt::Let {
+      name,
+      ty,
+      value,
+      is_var,
+    } if ty == "Supervisor" => {
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !matches!(actual, Type::Supervisor(_)) {
         return Err(Diagnostic::new(
@@ -4170,7 +4280,7 @@ fn check_stmt(
           value.span,
         ));
       }
-      env.insert(name.clone(), actual);
+      declare_local(env, mutable_locals, name, actual, *is_var);
       Ok(())
     }
     // `Array.new(size)`'s element type comes from the enclosing `Let`'s
@@ -4184,6 +4294,7 @@ fn check_stmt(
         node: Expr::ArrayNew(size),
         ..
       },
+      is_var,
     } => {
       let declared = resolve_type(ty, classes)?;
       if !matches!(declared, Type::Array(_)) {
@@ -4201,7 +4312,7 @@ fn check_stmt(
           size.span,
         ));
       }
-      env.insert(name.clone(), declared);
+      declare_local(env, mutable_locals, name, declared, *is_var);
       Ok(())
     }
     // Plan 53's Decision log: `Ok`/`Err` construction, one of the three
@@ -4213,10 +4324,11 @@ fn check_stmt(
         node: Expr::Ok(_) | Expr::Err(_),
         ..
       },
+      is_var,
     } => {
       let declared = resolve_type(ty, classes)?;
       check_result_construction(&declared, value, env, sigs, classes, self_fields, gctx)?;
-      env.insert(name.clone(), declared);
+      declare_local(env, mutable_locals, name, declared, *is_var);
       Ok(())
     }
     // Plan 53's Decision log: `n: T = parse_int(s)?` — the `Let` half
@@ -4228,6 +4340,7 @@ fn check_stmt(
         node: Expr::Try(inner),
         ..
       },
+      is_var,
     } => {
       let unwrapped = check_try(inner, return_type, env, sigs, classes, self_fields, gctx)?;
       let declared = resolve_type(ty, classes)?;
@@ -4239,7 +4352,7 @@ fn check_stmt(
           inner.span,
         ));
       }
-      env.insert(name.clone(), declared);
+      declare_local(env, mutable_locals, name, declared, *is_var);
       Ok(())
     }
     // Plan 58's Decision log: `s: Stack[Int64] = Stack.new()` — resolves
@@ -4257,6 +4370,7 @@ fn check_stmt(
         node: Expr::New(class_name, args),
         ..
       },
+      is_var,
     } if parse_generic_instantiation(ty).is_some_and(|(base, _)| base == class_name.as_str()) => {
       let declared = resolve_type(ty, classes)?;
       let Type::Class(mangled) = &declared else {
@@ -4287,10 +4401,15 @@ fn check_stmt(
           ));
         }
       }
-      env.insert(name.clone(), declared);
+      declare_local(env, mutable_locals, name, declared, *is_var);
       Ok(())
     }
-    Stmt::Let { name, ty, value } => {
+    Stmt::Let {
+      name,
+      ty,
+      value,
+      is_var,
+    } => {
       let declared = resolve_type(ty, classes)?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
@@ -4301,7 +4420,7 @@ fn check_stmt(
           value.span,
         ));
       }
-      env.insert(name.clone(), declared);
+      declare_local(env, mutable_locals, name, declared, *is_var);
       Ok(())
     }
     Stmt::SetField { name, value } => {
@@ -4350,6 +4469,7 @@ fn check_stmt(
         .get(name)
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
+      check_mutable(name, mutable_locals, stmt.span)?;
       check_result_construction(&declared, value, env, sigs, classes, self_fields, gctx)
     }
     // Plan 53's Decision log: `name = parse_int(s)?` — the `Assign`
@@ -4366,6 +4486,7 @@ fn check_stmt(
         .get(name)
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
+      check_mutable(name, mutable_locals, stmt.span)?;
       if !is_assignable(&unwrapped, &declared) {
         return Err(Diagnostic::new(
           format!(
@@ -4381,6 +4502,7 @@ fn check_stmt(
         .get(name)
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
+      check_mutable(name, mutable_locals, stmt.span)?;
       let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
       if !is_assignable(&actual, &declared) {
         return Err(Diagnostic::new(
@@ -4404,6 +4526,7 @@ fn check_stmt(
         .get(name)
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
+      check_mutable(name, mutable_locals, stmt.span)?;
       let Type::Nullable(inner) = &declared else {
         return Err(Diagnostic::new(
           format!(
@@ -4434,6 +4557,7 @@ fn check_stmt(
         .get(name)
         .cloned()
         .ok_or_else(|| Diagnostic::new(format!("undefined variable `{name}`"), stmt.span))?;
+      check_mutable(name, mutable_locals, stmt.span)?;
       if !matches!(declared, Type::Nullable(_)) {
         return Err(Diagnostic::new(
           format!(
@@ -4451,9 +4575,17 @@ fn check_stmt(
       }
       Ok(())
     }
-    Stmt::MultiAssign { names, values } => {
-      check_multi_assign(names, values, env, sigs, classes, self_fields, gctx)
-    }
+    Stmt::MultiAssign { names, values } => check_multi_assign(
+      names,
+      values,
+      env,
+      mutable_locals,
+      sigs,
+      classes,
+      self_fields,
+      gctx,
+      stmt.span,
+    ),
     Stmt::If {
       cond,
       then_branch,
@@ -4471,6 +4603,7 @@ fn check_stmt(
       check_block(
         then_branch,
         env,
+        mutable_locals,
         sigs,
         classes,
         self_fields,
@@ -4484,6 +4617,7 @@ fn check_stmt(
         check_block(
           else_b,
           env,
+          mutable_locals,
           sigs,
           classes,
           self_fields,
@@ -4507,6 +4641,7 @@ fn check_stmt(
       check_block(
         body,
         env,
+        mutable_locals,
         sigs,
         classes,
         self_fields,
@@ -4592,6 +4727,7 @@ fn check_stmt(
       rescues,
       ensure,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -4610,6 +4746,7 @@ fn check_stmt(
       arms,
       else_body,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -4637,10 +4774,16 @@ fn check_stmt(
       else {
         unreachable!("infer_array_lit_type always returns Type::Array")
       };
+      // Plan 72's Decision log: `for`'s induction variable has no `var`
+      // slot anywhere in this grammar — an ordinary `env.insert`, never
+      // `declare_local`, so it's unconditionally immutable, the same
+      // "no syntax to opt in, so it can't be mutable" reasoning a
+      // parameter or a `case`/`rescue` pattern binding gets below.
       env.insert(var.clone(), *elem_ty);
       check_block(
         body,
         env,
+        mutable_locals,
         sigs,
         classes,
         self_fields,
@@ -4680,10 +4823,14 @@ fn check_stmt(
           end.span,
         ));
       }
+      // Plan 72's Decision log: same reasoning as `Stmt::For`'s own
+      // arm above — no `var` slot on a `for...in start..end` induction
+      // variable either, so it's unconditionally immutable.
       env.insert(var.clone(), Type::Int64);
       check_block(
         body,
         env,
+        mutable_locals,
         sigs,
         classes,
         self_fields,
@@ -4722,6 +4869,7 @@ fn check_stmt(
       err_var,
       err_body,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -4745,6 +4893,7 @@ fn check_case(
   arms: &[CaseArm],
   else_body: &Option<Vec<Spanned<Stmt>>>,
   env: &mut HashMap<String, Type>,
+  mutable_locals: &mut HashSet<String>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
@@ -4799,13 +4948,21 @@ fn check_case(
       // discarded once this arm's body is checked, so a binding never
       // leaks into a later arm, the `else` body, or a statement after
       // the `case` ends.
+      // Plan 72's Decision log: `bname` is an ordinary `env.insert` (not
+      // `declare_local`) into the cloned `arm_env` — a `case`/`match`
+      // pattern binding has no `var` slot in this grammar, so it's
+      // unconditionally immutable, and `arm_mutable` is cloned from the
+      // OUTER `mutable_locals` (not left empty) so a `var`-declared name
+      // visible before the `case` stays reassignable inside each arm.
       let mut arm_env = env.clone();
+      let mut arm_mutable = mutable_locals.clone();
       for (bname, bty) in bindings.iter().zip(field_types.iter()) {
         arm_env.insert(bname.clone(), bty.clone());
       }
       check_block(
         body,
         &mut arm_env,
+        &mut arm_mutable,
         sigs,
         classes,
         self_fields,
@@ -4836,6 +4993,7 @@ fn check_case(
       check_block(
         else_b,
         env,
+        mutable_locals,
         sigs,
         classes,
         self_fields,
@@ -4873,6 +5031,7 @@ fn check_case(
     check_block(
       body,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -4887,6 +5046,7 @@ fn check_case(
     check_block(
       else_b,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -4916,6 +5076,7 @@ fn check_match_result(
   err_var: &str,
   err_body: &[Spanned<Stmt>],
   env: &mut HashMap<String, Type>,
+  mutable_locals: &mut HashSet<String>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
@@ -4934,11 +5095,20 @@ fn check_match_result(
       scrutinee.span,
     ));
   };
+  // Plan 72's Decision log: `ok_var`/`err_var` are ordinary `env.insert`s
+  // (not `declare_local`) into their own cloned env — no `var` slot
+  // exists on either binding in this grammar, so both are
+  // unconditionally immutable; each `mutable_locals` clone still
+  // carries forward whatever was already reassignable before the
+  // `match`, the same "clone, don't reset" precedent `check_case`'s own
+  // `arm_mutable` sets.
   let mut ok_env = env.clone();
+  let mut ok_mutable = mutable_locals.clone();
   ok_env.insert(ok_var.to_string(), (**t_ty).clone());
   check_block(
     ok_body,
     &mut ok_env,
+    &mut ok_mutable,
     sigs,
     classes,
     self_fields,
@@ -4949,10 +5119,12 @@ fn check_match_result(
     gctx,
   )?;
   let mut err_env = env.clone();
+  let mut err_mutable = mutable_locals.clone();
   err_env.insert(err_var.to_string(), (**e_ty).clone());
   check_block(
     err_body,
     &mut err_env,
+    &mut err_mutable,
     sigs,
     classes,
     self_fields,
@@ -4982,6 +5154,7 @@ fn check_begin(
   rescues: &[RescueClause],
   ensure: &Option<Vec<Spanned<Stmt>>>,
   env: &mut HashMap<String, Type>,
+  mutable_locals: &mut HashSet<String>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
@@ -4994,6 +5167,7 @@ fn check_begin(
   check_block(
     body,
     env,
+    mutable_locals,
     sigs,
     classes,
     self_fields,
@@ -5015,11 +5189,17 @@ fn check_begin(
           (0, 0),
         ));
       }
+      // Plan 72's Decision log: flat scoping (no clone — matches this
+      // whole clause's existing "joins the same environment" doc comment
+      // above), and an ordinary `env.insert`, never `declare_local` — a
+      // `rescue` exception variable has no `var` slot in this grammar,
+      // so it's unconditionally immutable.
       env.insert(rescue.var.clone(), rescue_ty);
     }
     check_block(
       &rescue.body,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -5034,6 +5214,7 @@ fn check_begin(
     check_block(
       ensure_body,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -5051,6 +5232,7 @@ fn check_begin(
 fn check_block(
   stmts: &[Spanned<Stmt>],
   env: &mut HashMap<String, Type>,
+  mutable_locals: &mut HashSet<String>,
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   self_fields: Option<&HashMap<String, Type>>,
@@ -5064,6 +5246,7 @@ fn check_block(
     check_stmt(
       stmt,
       env,
+      mutable_locals,
       sigs,
       classes,
       self_fields,
@@ -5740,9 +5923,14 @@ fn rebuild_purity_env(
   } else {
     resolve_return_type(&f.return_type, classes).unwrap_or(Type::Void)
   };
+  // Plan 72: this re-run's result is discarded (see the doc comment
+  // above) and `mutable_locals` is never inspected afterward — a fresh,
+  // empty set is enough.
+  let mut mutable_locals: HashSet<String> = HashSet::new();
   let _ = check_block(
     &f.body,
     &mut env,
+    &mut mutable_locals,
     sigs,
     classes,
     self_fields,
@@ -7700,13 +7888,23 @@ fn check_function_body(
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   let mut env = HashMap::new();
+  // Plan 72's Decision log: a function parameter has no `var` slot
+  // anywhere in this grammar (`ParenParams`/`Params` never accept one)
+  // — an ordinary `env.insert`, never `declare_local`, so every
+  // parameter is unconditionally immutable inside its own function
+  // body. This is the simplest rule available (no syntax exists to opt
+  // a parameter into mutability, so there's no "sometimes" case to
+  // design around) and matches Sable's own examples, none of which
+  // reassign a parameter.
+  let mut mutable_locals: HashSet<String> = HashSet::new();
   for p in &f.params {
     env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
   }
   // Plan 39: a splat parameter is bound inside the body as a real
   // `Array[Elem]` — call sites pack it into one at each call site (the
   // same representation plan 09 already proved), so the body indexes
-  // it exactly like any other array-typed local.
+  // it exactly like any other array-typed local. Plan 72: same
+  // immutable-by-construction rule as an ordinary parameter above.
   if let Some(p) = &f.splat_param {
     let elem_ty = resolve_type(&p.ty, classes)?;
     env.insert(p.name.clone(), Type::Array(Box::new(elem_ty)));
@@ -7716,6 +7914,7 @@ fn check_function_body(
   check_block(
     &f.body,
     &mut env,
+    &mut mutable_locals,
     sigs,
     classes,
     None,
@@ -7801,6 +8000,9 @@ fn check_method_body(
     ));
   }
   let mut env = HashMap::new();
+  // Plan 72's Decision log: same as `check_function_body` — a method
+  // parameter is unconditionally immutable inside its own body.
+  let mut mutable_locals: HashSet<String> = HashSet::new();
   for p in &m.params {
     env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
   }
@@ -7808,6 +8010,7 @@ fn check_method_body(
   check_block(
     &m.body,
     &mut env,
+    &mut mutable_locals,
     sigs,
     classes,
     Some(fields),
@@ -8017,9 +8220,13 @@ fn check_one_block_call_site(
     blk_param_types.push(t.clone());
     blk_env.insert(p.name.clone(), t);
   }
+  // Plan 72's Decision log: a block literal's own parameter is
+  // immutable by construction, same as a lambda's — fresh, empty set.
+  let mut blk_mutable: HashSet<String> = HashSet::new();
   if let Err(d) = check_block(
     blk_body,
     &mut blk_env,
+    &mut blk_mutable,
     sigs,
     classes,
     None,
@@ -8745,6 +8952,10 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   let mut top_env: HashMap<String, Type> = HashMap::new();
   top_env.insert("ARGV".to_string(), Type::Array(Box::new(Type::String)));
   top_env.insert("ARGC".to_string(), Type::Int64);
+  // Plan 72's Decision log: declared once, alongside `top_env` itself,
+  // so a top-level `var`-declared binding stays reassignable across
+  // later `Item::Stmt`s the same way `top_env`'s own types already do.
+  let mut top_mutable: HashSet<String> = HashSet::new();
   // Plan 61's Decision log: every top-level function's own name known to
   // be `is_comptime: true` — `check_comptime_legal`'s own `Call` arm
   // uses this to make comptime evaluation compositional (a `comptime`
@@ -8817,6 +9028,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         if let Err(d) = check_stmt(
           s,
           &mut top_env,
+          &mut top_mutable,
           &sigs,
           &classes,
           None,
@@ -8994,9 +9206,13 @@ fn check_generic_function_body(
   } else {
     resolve_type(&f.return_type, classes)?
   };
+  // Plan 72's Decision log: a generic function's own parameter is
+  // immutable by construction, same as an ordinary function's.
+  let mut mutable_locals: HashSet<String> = HashSet::new();
   check_block(
     &f.body,
     &mut env,
+    &mut mutable_locals,
     sigs,
     classes,
     None,
@@ -9572,7 +9788,7 @@ mod tests {
 
   #[test]
   fn accepts_bare_reassignment_of_an_existing_local() {
-    let src = "x: Int64 = 1\nx = 2\nputs x\n";
+    let src = "var x: Int64 = 1\nx = 2\nputs x\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -9587,7 +9803,7 @@ mod tests {
 
   #[test]
   fn rejects_reassignment_type_mismatch() {
-    let src = "x: Int64 = 1\nx = \"mismatched\"\n";
+    let src = "var x: Int64 = 1\nx = \"mismatched\"\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject Int64 reassigned to a String");
     assert!(errs[0].message.contains("Int64") && errs[0].message.contains("String"));
@@ -9596,21 +9812,21 @@ mod tests {
   #[test]
   fn accepts_compound_plus_assign_accumulator() {
     let src =
-      "total: Int64 = 0\ni: Int64 = 0\nwhile i < 5 do\n  total += i\n  i += 1\nend\nputs total\n";
+      "var total: Int64 = 0\nvar i: Int64 = 0\nwhile i < 5 do\n  total += i\n  i += 1\nend\nputs total\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn accepts_multiple_assignment_swap() {
-    let src = "a: Int64 = 1\nb: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
+    let src = "var a: Int64 = 1\nvar b: Int64 = 2\na, b = b, a\nputs a\nputs b\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
   #[test]
   fn rejects_multiple_assignment_positional_type_mismatch() {
-    let src = "a: Int64 = 1\nb: Int64 = 2\na, b = \"s\", 1\n";
+    let src = "var a: Int64 = 1\nvar b: Int64 = 2\na, b = \"s\", 1\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("must reject a positional type mismatch in `a, b = ...`");
@@ -9619,7 +9835,7 @@ mod tests {
 
   #[test]
   fn rejects_multiple_assignment_arity_mismatch() {
-    let src = "a: Int64 = 1\nb: Int64 = 2\na, b = 1, 2, 3\n";
+    let src = "var a: Int64 = 1\nvar b: Int64 = 2\na, b = 1, 2, 3\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject an arity mismatch");
     assert!(errs[0].message.contains("arity mismatch"));
@@ -9631,6 +9847,95 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject an undefined multi-assign target");
     assert!(errs[0].message.contains("undefined variable"));
+  }
+
+  // Plan 72 (immutable-by-default bindings).
+
+  #[test]
+  fn accepts_reassignment_of_a_var_declared_local() {
+    let src = "var x: Int64 = 1\nx = 2\nputs x\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_reassignment_of_a_non_var_declared_local() {
+    let src = "x: Int64 = 1\nx = 2\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a binding declared without `var` must reject reassignment");
+    assert!(
+      errs[0]
+        .message
+        .contains("cannot reassign immutable binding `x`"),
+      "expected the real immutable-binding diagnostic: {errs:?}"
+    );
+    assert!(errs[0].message.contains("declared without `var`"));
+  }
+
+  #[test]
+  fn rejects_compound_assign_reassignment_of_a_non_var_declared_local() {
+    // `+=` desugars to `Stmt::Assign` at parse time (plan 31's Decision
+    // log) — this proves the immutability check fires against the
+    // desugared form too, not just a literal `=`.
+    let src = "x: Int64 = 1\nx += 1\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`+=` on a non-`var` binding must be rejected the same as a bare `=`");
+    assert!(errs[0]
+      .message
+      .contains("cannot reassign immutable binding `x`"));
+  }
+
+  #[test]
+  fn rejects_multiple_assignment_when_any_target_is_declared_without_var() {
+    let src = "var a: Int64 = 1\nb: Int64 = 2\na, b = b, a\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`b` is declared without `var` — the whole multi-assign must be rejected");
+    assert!(errs[0]
+      .message
+      .contains("cannot reassign immutable binding `b`"));
+  }
+
+  #[test]
+  fn rejects_reassigning_a_function_parameter_without_var() {
+    // Plan 72's Decision log: a parameter has no `var` slot in this
+    // grammar at all — reassigning one inside its own function body is
+    // unconditionally rejected, not silently accepted.
+    let src = "fn f(x: Int64): Int64 do\n  x = x + 1\n  x\nend\n\nputs f(1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("reassigning a parameter without `var` must be rejected");
+    assert!(errs[0]
+      .message
+      .contains("cannot reassign immutable binding `x`"));
+  }
+
+  #[test]
+  fn rejects_reassigning_a_for_loops_induction_variable() {
+    // Plan 72's Decision log: `for`'s induction variable has no `var`
+    // slot either — unconditionally immutable, the same rule as a
+    // parameter.
+    let src = "for i in [1, 2, 3]\n  i = i + 1\n  puts i\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("reassigning a `for` loop's own induction variable must be rejected");
+    assert!(errs[0]
+      .message
+      .contains("cannot reassign immutable binding `i`"));
+  }
+
+  #[test]
+  fn accepts_reassigning_an_instance_field_with_no_var_marker() {
+    // Plan 72's Decision log: class instance fields (`@x`) are
+    // deliberately exempt from this rule — every existing example
+    // reassigns `@field` with no marker, and the grammar has no `var`
+    // slot on a `ClassField` at all. `Stmt::SetField` is untouched by
+    // this whole plan.
+    let src = "class Counter\n  count: Int64\n\n  fn initialize: Void do\n    @count = 0\n  end\n\n  fn increment: Void do\n    @count = @count + 1\n  end\nend\n\nc: Counter = Counter.new()\nc.increment\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
   }
 
   // Plan 32 (class inheritance).
@@ -9892,7 +10197,7 @@ mod tests {
     assert!(errs[0].message.contains("not supported on methods"));
   }
 
-  const GREET_EXAMPLE: &str = "fn greet(name: String, times: Int64 = 1): Void do\n  i: Int64 = 0\n  while i < times do\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
+  const GREET_EXAMPLE: &str = "fn greet(name: String, times: Int64 = 1): Void do\n  var i: Int64 = 0\n  while i < times do\n    puts name\n    i += 1\n  end\nend\n\ngreet(name: \"yo\")\ngreet(name: \"hi\", times: 2)\n";
 
   #[test]
   fn accepts_the_greet_worked_example_keyword_calls_and_defaults() {
@@ -9930,7 +10235,7 @@ mod tests {
     assert!(errs[0].message.contains("duplicate keyword `name`"));
   }
 
-  const SUM_ALL_EXAMPLE: &str = "fn sum_all(*xs: Int64): Int64 do\n  total: Int64 = 0\n  i: Int64 = 0\n  while i < 4 do\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
+  const SUM_ALL_EXAMPLE: &str = "fn sum_all(*xs: Int64): Int64 do\n  var total: Int64 = 0\n  var i: Int64 = 0\n  while i < 4 do\n    total += xs[i]\n    i += 1\n  end\n  total\nend\n\nputs sum_all(1, 2, 3, 4)\n";
 
   #[test]
   fn accepts_splat_call_type_checking_trailing_arguments() {
@@ -9963,7 +10268,7 @@ mod tests {
     assert!(errs[0].message.contains("not supported on methods"));
   }
 
-  const DIVMOD_EXAMPLE: &str = "fn divmod(a: Int64, b: Int64): (Int64, Int64) do\n  return a / b, a % b\nend\n\nq: Int64 = 0\nr: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
+  const DIVMOD_EXAMPLE: &str = "fn divmod(a: Int64, b: Int64): (Int64, Int64) do\n  return a / b, a % b\nend\n\nvar q: Int64 = 0\nvar r: Int64 = 0\nq, r = divmod(17, 5)\nputs q\nputs r\n";
 
   #[test]
   fn accepts_the_divmod_worked_example_tuple_return() {
@@ -10164,7 +10469,7 @@ mod tests {
 
   const GREETER_PREFIX: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\n";
 
-  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
+  const NULLABLE_WORKED_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  var message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n\nputs greet(1)\nputs greet(2)\n";
 
   #[test]
   fn accepts_the_nullable_worked_example() {
@@ -10216,7 +10521,7 @@ mod tests {
   #[test]
   fn safe_call_on_a_nullable_class_receiver_type_checks_to_the_wrapped_return_type() {
     let src = format!(
-      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  var message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
@@ -10241,13 +10546,13 @@ mod tests {
   #[test]
   fn or_assign_narrows_the_tracked_type_so_a_later_return_type_checks() {
     let src = format!(
-      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
+      "{GREETER_PREFIX}fn greet(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  var message: String? = g&.shout\n  message ||= \"nobody here\"\n  return message\nend\n"
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
 
-  const UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn upgrade(id: Int64): String do\n  g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
+  const UPGRADE_EXAMPLE: &str = "class Greeter\n  name: String\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn shout: String do\n    @name + \"!\"\n  end\nend\n\nfn find_greeter(id: Int64): Greeter? do\n  if id == 1 do\n    return Greeter.new(\"ada\")\n  end\n  return nil\nend\n\nfn upgrade(id: Int64): String do\n  var g: Greeter? = find_greeter(id)\n  g &&= Greeter.new(\"upgraded\")\n  var message: String? = g&.shout\n  message ||= \"still nobody\"\n  return message\nend\n\nputs upgrade(1)\nputs upgrade(2)\n";
 
   #[test]
   fn accepts_the_and_assign_upgrade_worked_example() {
@@ -10257,7 +10562,7 @@ mod tests {
 
   #[test]
   fn rejects_or_assign_on_a_non_nullable_target() {
-    let src = "s: String = \"x\"\ns ||= \"y\"\n";
+    let src = "var s: String = \"x\"\ns ||= \"y\"\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("s is not nullable");
     assert!(errs[0].message.contains("nullable"));
@@ -10266,7 +10571,7 @@ mod tests {
   #[test]
   fn rejects_and_assign_on_a_non_nullable_target() {
     let src =
-      format!("{GREETER_PREFIX}s: Greeter = Greeter.new(\"ada\")\ns &&= Greeter.new(\"b\")\n");
+      format!("{GREETER_PREFIX}var s: Greeter = Greeter.new(\"ada\")\ns &&= Greeter.new(\"b\")\n");
     let program = emerald_parser::parse(&src).expect("should parse");
     let errs = check_program(&program).expect_err("s is not nullable");
     assert!(errs[0].message.contains("nullable"));
@@ -10274,7 +10579,7 @@ mod tests {
 
   #[test]
   fn rejects_or_assign_default_that_is_itself_nullable() {
-    let src = "message: String? = nil\nother: String? = nil\nmessage ||= other\n";
+    let src = "var message: String? = nil\nother: String? = nil\nmessage ||= other\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert!(check_program(&program).is_err());
   }
@@ -10407,7 +10712,7 @@ mod tests {
 
   #[test]
   fn accepts_the_plan_45_worked_example() {
-    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\ni: Int64 = 0\nwhile i < n do\n  puts words[i]\n  i += 1\nend\n";
+    let src = "input: String = \"hello world foo\"\nupper: String = input.upcase\nFile.write(\"plan45_demo.txt\", upper)\nreadback: String = File.read(\"plan45_demo.txt\")\nputs readback\nn: Int64 = readback.split_count(\" \")\nputs n\nwords: Array[String] = readback.split(\" \")\nvar i: Int64 = 0\nwhile i < n do\n  puts words[i]\n  i += 1\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     assert_eq!(check_program(&program), Ok(()));
   }
@@ -10546,7 +10851,7 @@ mod tests {
 
   // Plan 52 (algebraic data types and exhaustive pattern matching).
 
-  const SHAPE_ENUM_WORKED_EXAMPLE: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch square do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch rect do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n";
+  const SHAPE_ENUM_WORKED_EXAMPLE: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\nvar area: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch square do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch rect do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n";
 
   #[test]
   fn accepts_the_shape_worked_example() {
@@ -10556,7 +10861,7 @@ mod tests {
 
   #[test]
   fn rejects_a_case_missing_a_variant_naming_it_specifically() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nvar area: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject a non-exhaustive case");
     assert!(
@@ -10573,7 +10878,7 @@ mod tests {
 
   #[test]
   fn rejects_an_unknown_variant_pattern() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w, h) do  area = w\n  end\n  Triangle(a, b, c) do  area = a\n  end\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nvar area: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w, h) do  area = w\n  end\n  Triangle(a, b, c) do  area = a\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Triangle is not a variant of Shape");
     assert!(
@@ -10584,7 +10889,7 @@ mod tests {
 
   #[test]
   fn rejects_a_duplicate_variant_arm() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Circle(r2) do  area = r2\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w, h) do  area = w\n  end\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nvar area: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Circle(r2) do  area = r2\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w, h) do  area = w\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Circle matched twice");
     assert!(
@@ -10595,7 +10900,7 @@ mod tests {
 
   #[test]
   fn rejects_an_arity_mismatched_pattern() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\narea: Float64 = 0.0\nmatch rect do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w) do  area = w\n  end\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\nrect: Shape = Rectangle(4.0, 5.0)\nvar area: Float64 = 0.0\nmatch rect do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = s\n  end\n  Rectangle(w) do  area = w\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("Rectangle needs two bindings, not one");
     assert!(
@@ -10614,7 +10919,7 @@ mod tests {
 
   #[test]
   fn rejects_a_pattern_binding_referenced_outside_its_own_arm() {
-    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\narea: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = r\n  end\n  Rectangle(w, h) do  area = w\n  end\nend\n";
+    let src = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nvar area: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = r\n  end\n  Square(s) do  area = r\n  end\n  Rectangle(w, h) do  area = w\n  end\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program)
       .expect_err("`r` is Circle's own binding, not visible inside the Square arm");
@@ -10936,7 +11241,7 @@ mod tests {
     // a loop body — a send anywhere in the body is checked against
     // every other use anywhere else in that SAME body.
     let src = message_safety_program(
-      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3 do\n    logger.log(msg)\n    puts msg.text\n    i = i + 1\n  end\n",
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  var i: Int64 = 0\n  while i < 3 do\n    logger.log(msg)\n    puts msg.text\n    i = i + 1\n  end\n",
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     let errs = check_program(&program)
@@ -10947,7 +11252,7 @@ mod tests {
   #[test]
   fn rejects_a_read_after_a_loop_whose_body_sent() {
     let src = message_safety_program(
-      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  i: Int64 = 0\n  while i < 3 do\n    logger.log(msg)\n    i = i + 1\n  end\n  puts msg.text\n",
+      "  logger: Logger = Logger.spawn()\n  msg: LogMessage = LogMessage.new(\"hello from main\")\n  var i: Int64 = 0\n  while i < 3 do\n    logger.log(msg)\n    i = i + 1\n  end\n  puts msg.text\n",
     );
     let program = emerald_parser::parse(&src).expect("should parse");
     let errs = check_program(&program).expect_err(

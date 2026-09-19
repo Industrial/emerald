@@ -131,7 +131,7 @@ fn pingpong_ordering_holds_across_20_repetitions_under_a_forced_multi_worker_poo
 /// This plan's own `Spinner` worked example.
 fn spinner_example(iterations: u64) -> String {
   format!(
-    "actor Spinner\n  id: Int64\n  total: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n    @total = 0\n  end\n\n  fn spin(iterations: Int64): Void do\n    i: Int64 = 0\n    while i < iterations do\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns2: Spinner = Spinner.spawn(2)\ns1.spin({iterations})\ns2.spin({iterations})\n"
+    "actor Spinner\n  id: Int64\n  total: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n    @total = 0\n  end\n\n  fn spin(iterations: Int64): Void do\n    var i: Int64 = 0\n    while i < iterations do\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns2: Spinner = Spinner.spawn(2)\ns1.spin({iterations})\ns2.spin({iterations})\n"
   )
 }
 
@@ -139,7 +139,7 @@ fn spinner_example(iterations: u64) -> String {
 /// "a single `spin(200000000)` call's own measured time."
 fn single_spin_example(iterations: u64) -> String {
   format!(
-    "actor Spinner\n  id: Int64\n  total: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n    @total = 0\n  end\n\n  fn spin(iterations: Int64): Void do\n    i: Int64 = 0\n    while i < iterations do\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns1.spin({iterations})\n"
+    "actor Spinner\n  id: Int64\n  total: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n    @total = 0\n  end\n\n  fn spin(iterations: Int64): Void do\n    var i: Int64 = 0\n    while i < iterations do\n      @total = @total + i\n      i = i + 1\n    end\n    puts \"spinner #{{@id}} done\"\n  end\nend\n\ns1: Spinner = Spinner.spawn(1)\ns1.spin({iterations})\n"
   )
 }
 

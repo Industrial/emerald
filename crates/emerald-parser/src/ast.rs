@@ -508,6 +508,15 @@ pub enum Stmt {
     name: String,
     ty: String,
     value: Spanned<Expr>,
+    /// Plan 72's Decision log: `true` only when this declaration spelled
+    /// the `var` keyword (`var name: Type = expr`) — a binding declared
+    /// without it is immutable by default (Sable §5), and `emerald-sema`
+    /// rejects any later `Stmt::Assign`/`Stmt::MultiAssign`/`OrAssign`/
+    /// `AndAssign` targeting a `false` binding with a real diagnostic
+    /// rather than silently accepting the reassignment. Never read by
+    /// `emerald-codegen` — mutability is a purely static, sema-time
+    /// property with no runtime representation.
+    is_var: bool,
   },
   /// `@name = value` — instance-variable write, valid only inside a
   /// method body. No type annotation (the field's type is already

@@ -1846,7 +1846,9 @@ fn collect_specializations_in_stmt(
   out: &mut HashMap<String, HashSet<String>>,
 ) {
   match &stmt.node {
-    Stmt::Let { name, ty, value } => {
+    Stmt::Let {
+      name, ty, value, ..
+    } => {
       collect_specializations_in_expr(value, generic_fns, local_classes, out);
       if classes.contains_key(ty.as_str()) {
         local_classes.insert(name.clone(), ty.clone());
@@ -2069,6 +2071,7 @@ fn collect_lambda_infos(program: &Program) -> Result<HashMap<String, LambdaInfo>
               node: Expr::Lambda { params, body, .. },
               ..
             },
+          ..
         },
       ..
     }) = item
@@ -9921,6 +9924,7 @@ fn build_stmt<'a, 'ctx>(
         node: Expr::Lambda { .. },
         ..
       },
+      ..
     } if ty == "Proc" => {
       build_lambda_let(context, builder, name, vars, ctx)?;
       Ok(false)
@@ -9936,6 +9940,7 @@ fn build_stmt<'a, 'ctx>(
         node: Expr::ArrayNew(size),
         ..
       },
+      ..
     } => {
       let elem_name = ty
         .strip_prefix("Array[")
@@ -9998,6 +10003,7 @@ fn build_stmt<'a, 'ctx>(
         node: Expr::New(class_name, args),
         ..
       },
+      ..
     } if ctx
       .object_allocas
       .is_some_and(|allocas| allocas.contains_key(name)) =>
@@ -10067,6 +10073,7 @@ fn build_stmt<'a, 'ctx>(
         node: Expr::New(class_name, args),
         ..
       },
+      ..
     } if parse_generic_instantiation(ty.strip_suffix('?').unwrap_or(ty.as_str()))
       .is_some_and(|(base, _)| base == class_name.as_str()) =>
     {
@@ -10120,6 +10127,7 @@ fn build_stmt<'a, 'ctx>(
         node: Expr::Try(inner),
         ..
       },
+      ..
     } => {
       let (result_val, _) = build_expr(
         context,
@@ -10276,7 +10284,9 @@ fn build_stmt<'a, 'ctx>(
         .map_err(|e| e.to_string())?;
       Ok(false)
     }
-    Stmt::Let { name, ty, value } => {
+    Stmt::Let {
+      name, ty, value, ..
+    } => {
       // Plan 43's Decision log: a `Greeter?`-typed local's storage is a
       // `ptr` slot (`value_kind_for_type` falls through any non-
       // primitive-named string, including `"Greeter?"`, to `ValKind::
@@ -14071,6 +14081,7 @@ fn declare_lambda_functions<'ctx>(
               node: Expr::Lambda { params, body, .. },
               ..
             },
+          ..
         },
       ..
     }) = item
@@ -15174,6 +15185,7 @@ fn compile_to_object_impl(
                 node: Expr::Lambda { params, body, .. },
                 ..
               },
+            ..
           },
         ..
       }) if ty == "Proc" => {
@@ -15870,11 +15882,13 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
       name: "passed".to_string(),
       ty: "Int64".to_string(),
       value: syn(Expr::Int(0)),
+      is_var: true,
     }),
     syn(Stmt::Let {
       name: "failed".to_string(),
       ty: "Int64".to_string(),
       value: syn(Expr::Int(0)),
+      is_var: true,
     }),
   ];
 
@@ -17580,6 +17594,7 @@ mod tests {
       name: name.to_string(),
       ty: "Point".to_string(),
       value: new_point(args),
+      is_var: false,
     })
   }
 
@@ -17678,6 +17693,7 @@ mod tests {
           return_type: "Void".to_string(),
           body: vec![Spanned::synthetic(Stmt::Expr(ident("p")))],
         }),
+        is_var: false,
       }),
     ];
     assert_eq!(find_non_escaping_news(&body), HashSet::new());

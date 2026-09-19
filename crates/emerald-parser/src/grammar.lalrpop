@@ -512,7 +512,15 @@ Stmt: Spanned<Stmt> = {
   // every one of `names` to already be a pre-declared, typed local,
   // the identical rule plain `Stmt::Assign` enforces, with zero special
   // casing for the multi-target form.
-  <l:@L> <name:Ident> ":" <ty:TypeName> "=" <value:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Let { name, ty, value } },
+  // Plan 72: `var` is a new, optional, reserved-the-same-LALR(1)-way
+  // keyword slotted in immediately before the binding's name — its
+  // presence is the only way this grammar can ever set `Stmt::Let.
+  // is_var: true`; every other binding-introducing construct in this
+  // grammar (a parameter, a `for`/`for...in..` induction variable, a
+  // `case`/`match` arm's pattern bindings, a `rescue` clause's own
+  // exception variable) has no `var` slot at all, so `emerald-sema`
+  // treats all of those as unconditionally immutable (Decision log).
+  <l:@L> <is_var:"var"?> <name:Ident> ":" <ty:TypeName> "=" <value:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Let { name, ty, value, is_var: is_var.is_some() } },
   // Plan 71: `"do"` is now mandatory right after `cond` — a bare `if
   // cond` `... end` with no `"do"` is a real parse error, not an
   // accepted alternate form (Sable design brief §44/§50: `do...end` is

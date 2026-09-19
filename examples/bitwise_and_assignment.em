@@ -19,16 +19,16 @@ puts ~0
 puts 1 << 4
 puts 256 >> 4
 
-total: Int64 = 0
-i: Int64 = 0
+var total: Int64 = 0
+var i: Int64 = 0
 while i < 5 do
   total += i
   i += 1
 end
 puts total
 
-a: Int64 = 1
-b: Int64 = 2
+var a: Int64 = 1
+var b: Int64 = 2
 a, b = b, a
 puts a
 puts b

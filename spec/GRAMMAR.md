@@ -55,11 +55,14 @@ xs: Array[Int64] = [1, 2, 3]
 | Global variables (`$foo`) | REMOVE | Encourages implicit, non-local state; not part of the static-analysis-friendly core inception §3 requires. |
 | Constant identifiers (`Foo`, `FOO`) | KEEP | See `SEMANTICS.md` §1 (Variables) for mutability rules. |
 | Local variable declaration with type annotation (`x: Int64 = 0`) | MODIFY | New required-at-first-use surface form; Ruby has no equivalent. This is the one syntax addition inception §6 anticipates. |
-| Local variable declaration without annotation (`x = 0`) | UNDECIDED | Whether type is inferred from the initializer or must always be annotated is a `SEMANTICS.md` §1 question. |
+| Local variable declaration without annotation (`x = 0`) | REMOVED | Settled, not merely decided: the Sable-alignment grammar cutover (plan 71) made an explicit type annotation mandatory on every local binding — a bare, untyped `x = 0` is a real parse/sema error, not an inference case. |
+| Mutable local declaration (`var x: Int64 = 0`) | MODIFY (Sable) | A binding declared without `var` is immutable — reassigning it is a compile error (`"cannot reassign immutable binding..."`). `var` opts a binding into plan 31's existing free-reassignment behavior. Applies to plain locals only: class fields (`@x`) and function/loop parameters have no `var` form and follow their own, separate mutability rules — see `SEMANTICS.md` §1. Added by the Sable-alignment grammar cutover (plan 72), not part of the original inception design. |
 
-**Example (MODIFY: typed local declaration):**
+**Example (MODIFY: typed local declaration, immutable by default):**
 ```ruby
 total: Int64 = 0
+var count: Int64 = 0
+count += 1
 ```
 
 ---
@@ -68,8 +71,8 @@ total: Int64 = 0
 
 | Ruby grammar area | Status | Emerald form / reason |
 |---|---|---|
-| Simple assignment (`x = expr`) | KEEP | Requires `x` already declared with a compatible type, or is the declaring occurrence when annotated — see `SEMANTICS.md` §1. |
-| Compound assignment (`x += 1`, etc.) | KEEP | Desugars to `x = x + 1` under the receiver's statically resolved `+` method. |
+| Simple assignment (`x = expr`) | KEEP | Requires `x` already declared with a compatible type, or is the declaring occurrence when annotated; also requires `x` to have been declared `var` (plan 72) — see `SEMANTICS.md` §1. |
+| Compound assignment (`x += 1`, etc.) | KEEP | Desugars to `x = x + 1` under the receiver's statically resolved `+` method; same `var` requirement as simple assignment. |
 | Multiple assignment (`a, b = 1, 2`) | KEEP | Each target's type is checked against its corresponding source expression's type positionally; no splat-driven arity magic. |
 | Splat in multiple assignment (`a, *b = [1, 2, 3]`) | UNDECIDED | Requires `b: Array[T]` typing rules for the captured remainder — deferred to `SEMANTICS.md` §6 (Arrays) once `09 collections` lands; not needed for the v1 milestone in inception §17. |
 | Parallel/nested destructuring (`(a, b), c = [[1, 2], 3]`) | REMOVE | High grammar/type-inference cost for a rarely-essential feature; not in inception §5's initial keep list. |

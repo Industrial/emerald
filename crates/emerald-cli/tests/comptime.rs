@@ -7,7 +7,7 @@
 
 use std::process::Command;
 
-const SPIN_SRC: &str = "comptime fn spin(n: Int64): Int64 do\n  i: Int64 = 0\n  while true do\n    i = i + 1\n  end\n  return i\nend\n\nX: Int64 = comptime spin(1)\nputs X\n";
+const SPIN_SRC: &str = "comptime fn spin(n: Int64): Int64 do\n  var i: Int64 = 0\n  while true do\n    i = i + 1\n  end\n  return i\nend\n\nX: Int64 = comptime spin(1)\nputs X\n";
 
 #[test]
 fn comptime_step_limit_flag_fails_compilation_with_the_step_ceiling_diagnostic() {

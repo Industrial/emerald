@@ -533,6 +533,11 @@ fn hoist_enumerable_blocks(
             node: Stmt::Let {
               name: fresh,
               ty: "Proc".to_string(),
+              // A compiler-synthesized temporary (never itself the
+              // target of a source-level reassignment) — `false` matches
+              // the immutable-by-default rule the same way any other
+              // unmarked `Let` does.
+              is_var: false,
               value: Spanned {
                 span: old.span,
                 node: Expr::Lambda {
@@ -794,7 +799,9 @@ mod tests {
     assert_eq!(program.items.len(), 2);
 
     let Item::Stmt(Spanned {
-      node: Stmt::Let { name, ty, value },
+      node: Stmt::Let {
+        name, ty, value, ..
+      },
       ..
     }) = &program.items[0]
     else {
@@ -934,7 +941,9 @@ mod tests {
     );
 
     let Item::Stmt(Spanned {
-      node: Stmt::Let { name, ty, value },
+      node: Stmt::Let {
+        name, ty, value, ..
+      },
       ..
     }) = &program.items[1]
     else {
@@ -985,7 +994,9 @@ mod tests {
     assert_eq!(program.items.len(), 4);
 
     let Item::Stmt(Spanned {
-      node: Stmt::Let { name, ty, value },
+      node: Stmt::Let {
+        name, ty, value, ..
+      },
       ..
     }) = &program.items[0]
     else {
@@ -1068,7 +1079,9 @@ mod tests {
     assert_eq!(program.items.len(), 3);
 
     let Item::Stmt(Spanned {
-      node: Stmt::Let { name, ty, value },
+      node: Stmt::Let {
+        name, ty, value, ..
+      },
       ..
     }) = &program.items[1]
     else {
@@ -1822,6 +1835,7 @@ mod tests {
         name: "label".into(),
         ty: "Int64".into(),
         value: s(Expr::Int(10)),
+        is_var: false,
       })]
     );
     assert_eq!(
@@ -1878,7 +1892,9 @@ mod tests {
     let src = "h: Hash[Int64, Int64] = {1 => 10, 2 => 20, 3 => 30}\nputs h[2]\nh[2] = 99\n";
     let program = parse(src).expect("should parse");
     let Item::Stmt(Spanned {
-      node: Stmt::Let { name, ty, value },
+      node: Stmt::Let {
+        name, ty, value, ..
+      },
       ..
     }) = &program.items[0]
     else {
@@ -1913,6 +1929,7 @@ mod tests {
         name: "arr".into(),
         ty: "Array[Int64]".into(),
         value: s(Expr::ArrayNew(Box::new(s(Expr::Int(5))))),
+        is_var: false,
       }))
     );
   }
@@ -1926,6 +1943,7 @@ mod tests {
         name: "arr".into(),
         ty: "Array[Int64]".into(),
         value: s(Expr::ArrayNew(Box::new(s(Expr::Ident("n".into()))))),
+        is_var: false,
       }))
     );
   }
@@ -2618,6 +2636,7 @@ mod tests {
         name: "s".into(),
         ty: "String".into(),
         value: s(Expr::StringLit("hello".into())),
+        is_var: false,
       }))
     );
     assert_eq!(
@@ -2629,6 +2648,7 @@ mod tests {
           Box::new(s(Expr::StringLit("foo".into()))),
           Box::new(s(Expr::StringLit("bar".into())))
         )),
+        is_var: false,
       }))
     );
   }
@@ -2958,6 +2978,7 @@ mod tests {
         name: "x".to_string(),
         ty: "Symbol".to_string(),
         value: s(Expr::SymbolLit("foo".to_string())),
+        is_var: false,
       }))
     );
   }
@@ -2972,6 +2993,7 @@ mod tests {
         name: "x".to_string(),
         ty: "Int64".to_string(),
         value: s(Expr::Int(1)),
+        is_var: false,
       }))
     );
   }
@@ -3018,6 +3040,7 @@ mod tests {
       Item::Stmt(s(Stmt::Let {
         name: "content".to_string(),
         ty: "String".to_string(),
+        is_var: false,
         value: s(Expr::MethodCall(
           Box::new(s(Expr::Ident("File".to_string()))),
           "read".to_string(),

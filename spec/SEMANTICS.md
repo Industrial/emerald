@@ -15,10 +15,21 @@ structural mutation.
 
 ## 1. Variables
 
-1. **Local variables are mutable by default.** `x: Int64 = 0; x = 1` is
-   legal without a separate `mut` keyword. Ruby has no immutable-by-default
-   locals, and inception §2.2's minimal-modification principle disfavors
-   adding a Rust-style mutability qualifier for v1.
+1. **Superseded by the Sable-alignment grammar cutover (plan 72) — local
+   variables are now immutable by default.** This point originally read
+   "local variables are mutable by default... without a separate `mut`
+   keyword," true through v1 and inherited from Ruby having no
+   immutable-by-default locals. That decision was reversed, not amended:
+   `x: Int64 = 0; x = 1` is now a compile error
+   (`"cannot reassign immutable binding `x`, declared without `var`"`).
+   Mutation requires an explicit `var` at declaration:
+   `var x: Int64 = 0; x = 1` is legal. Class fields (`@x`) and function/
+   loop parameters are unaffected by this — they have no `var` form and
+   keep their own, separately-decided mutability (fields: freely
+   reassignable, unmarked; parameters and loop induction variables:
+   never reassignable, no `var` form exists for them at all). See
+   `GRAMMAR.md` §2/§3 and `history/2026-09-19T111000Z-plan-72-immutable-
+   by-default-bindings.md` for the full decision log.
 2. **Constants are truly immutable after their first assignment.** A
    second assignment to a constant identifier (`GRAMMAR.md` §2) is a
    compile error, not Ruby's runtime warning. This is one of the few

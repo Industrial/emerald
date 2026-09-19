@@ -10,10 +10,10 @@ puts x
 n: Int64 = strlen("hello")
 puts n
 
-found: String? = String.from_cstring(strstr("hello world", "world"))
+var found: String? = String.from_cstring(strstr("hello world", "world"))
 found ||= "not found"
 puts found
 
-missing: String? = String.from_cstring(strstr("hello world", "xyz"))
+var missing: String? = String.from_cstring(strstr("hello world", "xyz"))
 missing ||= "not found"
 puts missing
