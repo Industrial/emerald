@@ -22,7 +22,7 @@
 use emerald_parser::{
   CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
   Function as AstFunction, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
-  StringPart, TypeParam,
+  StringPart, TypeExpr, TypeParam,
 };
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
@@ -82,30 +82,53 @@ enum ValKind {
   Tuple(Vec<ValKind>),
 }
 
-fn value_kind_for_type(ty: &str) -> ValKind {
+/// Type names never reified as a real class/enum instantiation-under-a-
+/// mangled-name — mirrors `emerald-sema`'s identically-named constant
+/// (a real, disclosed duplication of bookkeeping between the two
+/// passes, matching this codebase's own established pattern — see
+/// `ClassInfo` vs. `ClassLayout`).
+const NATIVE_GENERIC_NAMES: [&str; 4] = ["Array", "Hash", "Pair", "Result"];
+
+fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
   match ty {
-    "Float64" => ValKind::Float64,
-    "Int64" => ValKind::Int64,
-    "Void" => ValKind::Void,
-    // Plan 18: `Boolean` is a real, declarable type now (e.g. `def
-    // noisy(n: Int64) -> Boolean`), not just an internal marker for a
-    // `Compare`/`&&`/`||`/`!` result on its way straight into a
-    // branch — both uses share the same `i1` storage kind.
-    "Boolean" => ValKind::Bool,
-    // Plan 19: `String` is a real, declarable type too — kept distinct
-    // from the generic `Ptr` bucket (see `ValKind`'s doc comment).
-    "String" => ValKind::Str,
-    "Symbol" => ValKind::Symbol,
-    // Plan 59's Decision log: `CString` is stored identically to
-    // `String` — a bare pointer, no new runtime representation.
-    "CString" => ValKind::Str,
-    // `Hash[K, V]` (plan 25) shares the generic `Ptr` bucket — unlike
-    // `Array[Elem]`, indexing it needs a key type too, which the
-    // side-table `local_classes` (repurposed to hold `"Hash[K, V]"`
-    // strings alongside class names — see `build_index`) already
-    // carries without needing a whole new parameter threaded through
-    // every codegen function in this file.
-    _ => ValKind::Ptr,
+    TypeExpr::Named(name) => match name.as_str() {
+      "Float64" => ValKind::Float64,
+      "Int64" => ValKind::Int64,
+      "Void" => ValKind::Void,
+      // Plan 18: `Boolean` is a real, declarable type now (e.g. `def
+      // noisy(n: Int64) -> Boolean`), not just an internal marker for a
+      // `Compare`/`&&`/`||`/`!` result on its way straight into a
+      // branch — both uses share the same `i1` storage kind.
+      "Boolean" => ValKind::Bool,
+      // Plan 19: `String` is a real, declarable type too — kept distinct
+      // from the generic `Ptr` bucket (see `ValKind`'s doc comment).
+      "String" => ValKind::Str,
+      "Symbol" => ValKind::Symbol,
+      // Plan 59's Decision log: `CString` is stored identically to
+      // `String` — a bare pointer, no new runtime representation.
+      "CString" => ValKind::Str,
+      // Every other bare name (a class, an enum, a bound-less generic
+      // type parameter's own placeholder) shares the generic `Ptr`
+      // bucket.
+      _ => ValKind::Ptr,
+    },
+    // `Array[Elem]`/`Hash[K, V]`/`Pair[K, V]`/`Result[T, E]`/a user
+    // generic class or enum instantiation/`Proc[Args..., Ret]` all
+    // share the generic `Ptr` bucket too — unlike `Array[Elem]`,
+    // indexing a `Hash[K, V]` needs a key type too, which the
+    // side-table `local_classes` (repurposed to hold a `Hash[K, V]`
+    // type's own `Display` string alongside class names — see
+    // `build_index`) already carries without needing a whole new
+    // parameter threaded through every codegen function in this file.
+    TypeExpr::Generic(..) | TypeExpr::Func(..) => ValKind::Ptr,
+    // `Tuple` is valid only as a function's own declared return kind
+    // (`ret_kind_for_type`'s own dedicated handling below) — reached
+    // here only for a param/local/field/array-element position, which
+    // sema already rejects everywhere but a top-level-function-like
+    // return type; falls through to the same `Ptr` catch-all the old
+    // flat-string convention's `_ => ValKind::Ptr` arm gave this
+    // unreachable-in-practice shape.
+    TypeExpr::Tuple(_) => ValKind::Ptr,
   }
 }
 
@@ -118,103 +141,71 @@ fn value_kind_for_type(ty: &str) -> ValKind {
 /// (`"(Int64, Int64)"`, or in principle `"(Hash[Int64, Int64], Int64)"`)
 /// splits correctly even when an element is itself a compound type
 /// whose own convention already uses `", "`.
-fn split_top_level_commas(s: &str) -> Vec<&str> {
-  let mut parts = Vec::new();
-  let mut depth = 0i32;
-  let mut start = 0usize;
-  for (i, b) in s.bytes().enumerate() {
-    match b {
-      b'[' | b'(' => depth += 1,
-      b']' | b')' => depth -= 1,
-      b',' if depth == 0 => {
-        parts.push(s[start..i].trim());
-        start = i + 1;
-      }
-      _ => {}
-    }
-  }
-  parts.push(s[start..].trim());
-  parts
-}
-
-/// Plan 58: mirrors `emerald-sema`'s identically-named helper (the same
-/// real, disclosed duplication `split_top_level_commas` above already
-/// documents) — parses `"Stack[Int64]"` into `("Stack", ["Int64"])`,
-/// excluding the 4 hardcoded compound forms by base name. By the time
-/// codegen ever sees a generic-instantiation type-name string, sema has
-/// already accepted the whole program, so this never needs to produce
-/// its own diagnostics — a bad shape here just falls through to
-/// `None`, same as an ordinary unresolvable annotation would.
-fn parse_generic_instantiation(ty: &str) -> Option<(&str, Vec<&str>)> {
-  let open = ty.find('[')?;
-  if !ty.ends_with(']') {
-    return None;
-  }
-  let base = &ty[..open];
-  if matches!(base, "Array" | "Hash" | "Pair" | "Result") {
-    return None;
-  }
-  let inner = &ty[open + 1..ty.len() - 1];
-  let args = split_top_level_commas(inner);
-  if args.is_empty() || args.iter().any(|a| a.is_empty()) {
-    return None;
-  }
-  Some((base, args))
-}
-
-/// Plan 58: `"Stack[Int64]"` -> `"Stack$Int64"` — mirrors `emerald-
-/// sema`'s identically-named helper exactly (this string doubles as
-/// both sema's synthesized `Type::Class` name and codegen's own
-/// `{ClassName}_{method}` mangling prefix, by design).
-fn mangle_type_name(ty: &str) -> String {
-  match parse_generic_instantiation(ty) {
-    Some((base, args)) => {
-      let mangled_args: Vec<String> = args.iter().map(|a| mangle_type_name(a)).collect();
+/// Plan 88: `"Stack[Int64]"` -> `"Stack$Int64"`, recursively — the
+/// `TypeExpr`-native replacement for the old string-splitting `mangle_
+/// type_name`/`parse_generic_instantiation`/`split_top_level_commas`
+/// trio, mirroring `emerald-sema`'s identically-named `mangle_type_expr`
+/// exactly (this string doubles as both sema's synthesized `Type::
+/// Class` name and codegen's own `{ClassName}_{method}` mangling
+/// prefix, by design).
+fn mangle_type_expr(t: &TypeExpr) -> String {
+  match t {
+    TypeExpr::Generic(base, args) if !NATIVE_GENERIC_NAMES.contains(&base.as_str()) => {
+      let mangled_args: Vec<String> = args.iter().map(mangle_type_expr).collect();
       format!("{base}${}", mangled_args.join("$"))
     }
-    None => ty.to_string(),
+    other => other.to_string(),
   }
 }
 
-/// Plan 58: mirrors `emerald-sema`'s identically-named helper — whole-
-/// token identifier-run substitution, so substituting `T` never touches
-/// `Total`.
-fn substitute_type_params(raw: &str, subst: &HashMap<&str, &str>) -> String {
-  let mut out = String::with_capacity(raw.len());
-  let bytes = raw.as_bytes();
-  let mut i = 0;
-  while i < bytes.len() {
-    let b = bytes[i];
-    if b.is_ascii_alphabetic() || b == b'_' {
-      let start = i;
-      while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-      }
-      let word = &raw[start..i];
-      out.push_str(subst.get(word).copied().unwrap_or(word));
-    } else {
-      out.push(bytes[i] as char);
-      i += 1;
-    }
+/// Plan 88: whole-tree type-parameter substitution — mirrors `emerald-
+/// sema`'s identically-named helper exactly (the `TypeExpr`-native
+/// replacement for the old byte-scanning identifier-run substitution).
+fn substitute_type_params(raw: &TypeExpr, subst: &HashMap<&str, &TypeExpr>) -> TypeExpr {
+  match raw {
+    TypeExpr::Named(name) => subst
+      .get(name.as_str())
+      .map(|t| (*t).clone())
+      .unwrap_or_else(|| raw.clone()),
+    TypeExpr::Generic(base, args) => TypeExpr::Generic(
+      base.clone(),
+      args
+        .iter()
+        .map(|a| substitute_type_params(a, subst))
+        .collect(),
+    ),
+    TypeExpr::Tuple(parts) => TypeExpr::Tuple(
+      parts
+        .iter()
+        .map(|p| substitute_type_params(p, subst))
+        .collect(),
+    ),
+    TypeExpr::Func(params, ret) => TypeExpr::Func(
+      params
+        .iter()
+        .map(|p| substitute_type_params(p, subst))
+        .collect(),
+      Box::new(substitute_type_params(ret, subst)),
+    ),
   }
-  out
 }
 
-/// Plan 58: resolves a possibly-generic-instantiation type-name string
-/// (`"Stack[Int64]"`) to whichever key actually names it in `classes` —
-/// its mangled form (`"Stack$Int64"`) if that's what's registered,
-/// otherwise the bare string unchanged (an ordinary class name, or an
-/// unresolvable one — `None` either way, matching every pre-existing
-/// `ctx.classes.contains_key(bare_ty)` call site's own behavior for a
-/// name that just isn't a class).
+/// Plan 58: resolves a possibly-generic-instantiation type (`Stack[
+/// Int64]`) to whichever key actually names it in `classes` — its
+/// mangled form (`"Stack$Int64"`) if that's what's registered,
+/// otherwise its bare `Display` string unchanged (an ordinary class
+/// name, or an unresolvable one — `None` either way, matching every
+/// pre-existing `ctx.classes.contains_key(bare_ty)` call site's own
+/// behavior for a name that just isn't a class).
 fn resolve_local_class_name(
-  bare_ty: &str,
+  ty: &TypeExpr,
   classes: &HashMap<String, ClassLayout>,
 ) -> Option<String> {
-  if classes.contains_key(bare_ty) {
-    return Some(bare_ty.to_string());
+  let bare_ty = ty.to_string();
+  if classes.contains_key(&bare_ty) {
+    return Some(bare_ty);
   }
-  let mangled = mangle_type_name(bare_ty);
+  let mangled = mangle_type_expr(ty);
   if mangled != bare_ty && classes.contains_key(&mangled) {
     return Some(mangled);
   }
@@ -233,12 +224,9 @@ fn resolve_local_class_name(
 /// Ptr` catch-all for this shape (unreachable in practice: sema already
 /// rejects a tuple annotation everywhere but a top-level-function-like
 /// return type before codegen ever runs).
-fn ret_kind_for_type(ty: &str) -> ValKind {
-  if let Some(inner) = ty.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-    let elem_kinds = split_top_level_commas(inner)
-      .into_iter()
-      .map(value_kind_for_type)
-      .collect();
+fn ret_kind_for_type(ty: &TypeExpr) -> ValKind {
+  if let TypeExpr::Tuple(parts) = ty {
+    let elem_kinds = parts.iter().map(value_kind_for_type).collect();
     return ValKind::Tuple(elem_kinds);
   }
   value_kind_for_type(ty)
@@ -363,10 +351,16 @@ fn build_enum_layout(e: &EnumDef) -> EnumLayout {
   let mut max_fields = 0usize;
   for (i, v) in e.variants.iter().enumerate() {
     variant_tags.insert(v.name.clone(), i as u64);
-    let kinds: Vec<ValKind> = v.fields.iter().map(|f| value_kind_for_type(f)).collect();
+    let kinds: Vec<ValKind> = v.fields.iter().map(value_kind_for_type).collect();
     max_fields = max_fields.max(kinds.len());
     variant_fields.insert(v.name.clone(), kinds);
-    variant_field_types.insert(v.name.clone(), v.fields.clone());
+    variant_field_types.insert(
+      v.name.clone(),
+      v.fields
+        .iter()
+        .map(|f| f.to_string())
+        .collect::<Vec<String>>(),
+    );
   }
   EnumLayout {
     variant_tags,
@@ -467,7 +461,7 @@ fn build_class_layout(
           kind: value_kind_for_type(&f.ty),
         },
       );
-      field_classes.insert(f.name.clone(), f.ty.clone());
+      field_classes.insert(f.name.clone(), f.ty.to_string());
       offset += 8;
     }
   }
@@ -504,12 +498,12 @@ const GENERIC_INSTANTIATION_DEPTH_LIMIT: usize = 32;
 /// never an intermediate `T`-typed local.
 fn instantiate_generic_class_defs(
   base_name: &str,
-  type_args: &[&str],
+  type_args: &[TypeExpr],
   generic_class_defs: &HashMap<String, &ClassDef>,
   synthesized: &mut HashMap<String, ClassDef>,
   in_progress: &mut Vec<String>,
 ) -> String {
-  let mangled_args: Vec<String> = type_args.iter().map(|a| mangle_type_name(a)).collect();
+  let mangled_args: Vec<String> = type_args.iter().map(mangle_type_expr).collect();
   let mangled = format!("{base_name}${}", mangled_args.join("$"));
 
   if synthesized.contains_key(&mangled) {
@@ -539,11 +533,11 @@ fn instantiate_generic_class_defs(
     return mangled;
   };
 
-  let subst: HashMap<&str, &str> = c
+  let subst: HashMap<&str, &TypeExpr> = c
     .type_params
     .iter()
     .map(|tp| tp.name.as_str())
-    .zip(type_args.iter().copied())
+    .zip(type_args.iter())
     .collect();
 
   in_progress.push(mangled.clone());
@@ -624,22 +618,18 @@ fn instantiate_generic_class_defs(
 }
 
 fn resolve_substituted_type_cg(
-  raw: &str,
-  subst: &HashMap<&str, &str>,
+  raw: &TypeExpr,
+  subst: &HashMap<&str, &TypeExpr>,
   generic_class_defs: &HashMap<String, &ClassDef>,
   synthesized: &mut HashMap<String, ClassDef>,
   in_progress: &mut Vec<String>,
-) -> String {
+) -> TypeExpr {
   let substituted = substitute_type_params(raw, subst);
-  if let Some((base, args)) = parse_generic_instantiation(&substituted) {
-    if generic_class_defs.contains_key(base) {
-      return instantiate_generic_class_defs(
-        base,
-        &args,
-        generic_class_defs,
-        synthesized,
-        in_progress,
-      );
+  if let TypeExpr::Generic(base, args) = &substituted {
+    if generic_class_defs.contains_key(base.as_str()) {
+      let mangled =
+        instantiate_generic_class_defs(base, args, generic_class_defs, synthesized, in_progress);
+      return TypeExpr::Named(mangled);
     }
   }
   substituted
@@ -655,14 +645,14 @@ fn resolve_substituted_type_cg(
 #[allow(clippy::too_many_arguments)]
 fn instantiate_generic_enum_defs(
   base_name: &str,
-  type_args: &[&str],
+  type_args: &[TypeExpr],
   generic_enum_defs: &HashMap<String, &EnumDef>,
   generic_class_defs: &HashMap<String, &ClassDef>,
   synthesized_classes: &mut HashMap<String, ClassDef>,
   synthesized_enums: &mut HashMap<String, EnumDef>,
   in_progress: &mut Vec<String>,
 ) -> String {
-  let mangled_args: Vec<String> = type_args.iter().map(|a| mangle_type_name(a)).collect();
+  let mangled_args: Vec<String> = type_args.iter().map(mangle_type_expr).collect();
   let mangled = format!("{base_name}${}", mangled_args.join("$"));
 
   if synthesized_enums.contains_key(&mangled) {
@@ -686,11 +676,11 @@ fn instantiate_generic_enum_defs(
     return mangled;
   };
 
-  let subst: HashMap<&str, &str> = e
+  let subst: HashMap<&str, &TypeExpr> = e
     .type_params
     .iter()
     .map(|tp| tp.name.as_str())
-    .zip(type_args.iter().copied())
+    .zip(type_args.iter())
     .collect();
 
   in_progress.push(mangled.clone());
@@ -704,25 +694,27 @@ fn instantiate_generic_enum_defs(
         .iter()
         .map(|f| {
           let substituted = substitute_type_params(f, &subst);
-          if let Some((base, args)) = parse_generic_instantiation(&substituted) {
-            if generic_class_defs.contains_key(base) {
-              return instantiate_generic_class_defs(
+          if let TypeExpr::Generic(base, args) = &substituted {
+            if generic_class_defs.contains_key(base.as_str()) {
+              let mangled = instantiate_generic_class_defs(
                 base,
-                &args,
+                args,
                 generic_class_defs,
                 synthesized_classes,
                 in_progress,
               );
-            } else if generic_enum_defs.contains_key(base) {
-              return instantiate_generic_enum_defs(
+              return TypeExpr::Named(mangled);
+            } else if generic_enum_defs.contains_key(base.as_str()) {
+              let mangled = instantiate_generic_enum_defs(
                 base,
-                &args,
+                args,
                 generic_enum_defs,
                 generic_class_defs,
                 synthesized_classes,
                 synthesized_enums,
                 in_progress,
               );
+              return TypeExpr::Named(mangled);
             }
           }
           substituted
@@ -749,7 +741,7 @@ fn instantiate_generic_enum_defs(
 /// typenames`/`collect_typenames_in_stmt`. A generic class TEMPLATE's
 /// own raw field/method types are deliberately skipped (handled via
 /// substitution inside `instantiate_generic_class_defs` instead).
-fn collect_generic_instantiation_typenames(program: &Program) -> Vec<String> {
+fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
   let mut out = Vec::new();
   for item in &program.items {
     match item {
@@ -820,13 +812,15 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<String> {
   out
 }
 
-fn push_generic_typename(ty: &str, out: &mut Vec<String>) {
-  if parse_generic_instantiation(ty).is_some() {
-    out.push(ty.to_string());
+fn push_generic_typename(ty: &TypeExpr, out: &mut Vec<TypeExpr>) {
+  if let TypeExpr::Generic(base, _) = ty {
+    if !NATIVE_GENERIC_NAMES.contains(&base.as_str()) {
+      out.push(ty.clone());
+    }
   }
 }
 
-fn collect_typenames_in_stmt(stmt: &Spanned<Stmt>, out: &mut Vec<String>) {
+fn collect_typenames_in_stmt(stmt: &Spanned<Stmt>, out: &mut Vec<TypeExpr>) {
   match &stmt.node {
     Stmt::Let { ty, .. } => push_generic_typename(ty, out),
     Stmt::If {
@@ -920,12 +914,12 @@ fn collect_generic_class_specializations(
     return synthesized;
   }
   for ty in collect_generic_instantiation_typenames(program) {
-    if let Some((base, args)) = parse_generic_instantiation(&ty) {
-      if generic_class_defs.contains_key(base) {
+    if let TypeExpr::Generic(base, args) = &ty {
+      if generic_class_defs.contains_key(base.as_str()) {
         let mut in_progress = Vec::new();
         instantiate_generic_class_defs(
           base,
-          &args,
+          args,
           generic_class_defs,
           &mut synthesized,
           &mut in_progress,
@@ -958,6 +952,37 @@ fn build_method_owners(
     result.insert(name.clone(), owners);
   }
   Ok(result)
+}
+
+/// Real, disclosed regression fix (this session): plan 88 taught
+/// `emerald-sema` to fully type-check a class method's own `[T]`/
+/// `[T: Bound]` type parameter (`ClassInfo.generic_methods`) instead
+/// of rejecting it outright — but this backend was never extended to
+/// monomorphize such a method's body, so a call sema now accepts would
+/// otherwise reach `build_method_call`'s ordinary per-class dispatch
+/// and crash the LLVM verifier instead of failing cleanly. Independent
+/// of sema's own registry (this crate never sees `emerald-sema`'s
+/// private `ClassInfo`) — derived straight from the same raw
+/// `ClassDef.methods` `build_method_owners` immediately above already
+/// walks, keyed by the DECLARING class only (no inheritance-chain
+/// flattening needed: `build_method_call`'s check runs against
+/// `method_owners`' own already-resolved `defining_class`).
+fn build_generic_class_methods(
+  class_defs: &HashMap<String, &ClassDef>,
+) -> HashMap<String, HashSet<String>> {
+  let mut result = HashMap::new();
+  for (name, c) in class_defs {
+    let generic_names: HashSet<String> = c
+      .methods
+      .iter()
+      .filter(|m| !m.type_params.is_empty())
+      .map(|m| m.name.clone())
+      .collect();
+    if !generic_names.is_empty() {
+      result.insert((*name).clone(), generic_names);
+    }
+  }
+  result
 }
 
 /// A lambda literal's captured-variable layout — the closure-conversion
@@ -1724,8 +1749,10 @@ fn param_local_classes(
 ) -> HashMap<String, String> {
   params
     .iter()
-    .filter(|p| classes.contains_key(p.ty.as_str()))
-    .map(|p| (p.name.clone(), p.ty.clone()))
+    .filter_map(|p| {
+      let ty = p.ty.to_string();
+      classes.contains_key(&ty).then(|| (p.name.clone(), ty))
+    })
     .collect()
 }
 
@@ -1791,7 +1818,7 @@ fn collect_specializations_in_expr(
     if let Some(g) = generic_fns.get(name) {
       if let Some(type_param) = g.type_params.first() {
         for (i, p) in g.params.iter().enumerate() {
-          if p.ty == type_param.name {
+          if p.ty.as_named() == Some(type_param.name.as_str()) {
             if let Some(concrete) = args
               .get(i)
               .and_then(|a| resolve_arg_concrete_class(a, local_classes))
@@ -1921,8 +1948,9 @@ fn collect_specializations_in_stmt(
       name, ty, value, ..
     } => {
       collect_specializations_in_expr(value, generic_fns, local_classes, out);
-      if classes.contains_key(ty.as_str()) {
-        local_classes.insert(name.clone(), ty.clone());
+      let ty_str = ty.to_string();
+      if classes.contains_key(&ty_str) {
+        local_classes.insert(name.clone(), ty_str);
       }
     }
     Stmt::SetField { value, .. } => {
@@ -2061,11 +2089,11 @@ fn substitute_generic_function(
   type_param: &str,
   concrete_class: &str,
 ) -> AstFunction {
-  let substitute = |ty: &str| -> String {
-    if ty == type_param {
-      concrete_class.to_string()
+  let substitute = |ty: &TypeExpr| -> TypeExpr {
+    if ty.as_named() == Some(type_param) {
+      TypeExpr::Named(concrete_class.to_string())
     } else {
-      ty.to_string()
+      ty.clone()
     }
   };
   AstFunction {
@@ -2113,7 +2141,7 @@ fn free_vars_in_lambda(params: &[Param], body: &[Spanned<Stmt>]) -> Vec<String> 
 }
 
 fn collect_lambda_infos(program: &Program) -> Result<HashMap<String, LambdaInfo>, String> {
-  let mut top_level_types: HashMap<String, String> = HashMap::new();
+  let mut top_level_types: HashMap<String, TypeExpr> = HashMap::new();
   for item in &program.items {
     if let Item::Stmt(Spanned {
       node: Stmt::Let { name, ty, .. },
@@ -2143,7 +2171,14 @@ fn collect_lambda_infos(program: &Program) -> Result<HashMap<String, LambdaInfo>
     else {
       continue;
     };
-    if ty != "Proc" {
+    // Plan 88's Decision log: a top-level `Let`-bound lambda is
+    // collected as a real, compiled top-level Proc whether it's typed
+    // via the bare `Proc` annotation (the pre-existing lambda-literal-
+    // inference path, unchanged) OR the new, real `Proc[Args..., Ret]`
+    // written form — both name the identical `Type::Proc` shape, and
+    // this collection pass only ever cares about "is this a Proc-typed
+    // top-level Let with a Lambda value," never which spelling wrote it.
+    if ty.as_named() != Some("Proc") && !matches!(ty, TypeExpr::Func(..)) {
       continue;
     }
 
@@ -3384,7 +3419,7 @@ fn is_wire_safe_class_field(
   actor_names: &HashSet<String>,
   seen: &mut HashSet<String>,
 ) -> bool {
-  match value_kind_for_type(ty) {
+  match value_kind_for_type(&TypeExpr::Named(ty.to_string())) {
     ValKind::Int64 | ValKind::Float64 | ValKind::Bool | ValKind::Symbol => true,
     ValKind::Str => true,
     ValKind::Ptr => {
@@ -3745,13 +3780,13 @@ fn declare_actor_wire_arg_codecs<'ctx>(
               )
               .map_err(|e| e.to_string())?;
           }
-          ValKind::Ptr if wire_encode_fns.contains_key(&p.ty) => {
+          ValKind::Ptr if wire_encode_fns.contains_key(&p.ty.to_string()) => {
             let obj_ptr = builder
               .build_int_to_ptr(raw, ptr_ty, "encargobjptr")
               .map_err(|e| e.to_string())?;
             builder
               .build_call(
-                wire_encode_fns[&p.ty],
+                wire_encode_fns[&p.ty.to_string()],
                 &[obj_ptr.into(), out_param.into()],
                 "encargrec",
               )
@@ -3794,9 +3829,13 @@ fn declare_actor_wire_arg_codecs<'ctx>(
               .build_ptr_to_int(str_ptr, i64_ty, "decargstrraw")
               .map_err(|e| e.to_string())?
           }
-          ValKind::Ptr if wire_decode_fns.contains_key(&p.ty) => {
+          ValKind::Ptr if wire_decode_fns.contains_key(&p.ty.to_string()) => {
             let call = builder
-              .build_call(wire_decode_fns[&p.ty], &[in_param.into()], "decargrec")
+              .build_call(
+                wire_decode_fns[&p.ty.to_string()],
+                &[in_param.into()],
+                "decargrec",
+              )
               .map_err(|e| e.to_string())?;
             let obj_ptr = call_result(call)?.into_pointer_value();
             builder
@@ -3949,6 +3988,16 @@ struct Ctx<'a, 'ctx> {
   /// (`d.age` on a `Dog` that never declares `age` must call
   /// `Animal_age`, since `Dog_age` was never compiled).
   method_owners: &'a HashMap<String, HashMap<String, String>>,
+  /// `{class name} -> {generic method names it directly declares}` —
+  /// see `build_generic_class_methods`'s own doc comment for why this
+  /// exists (a codegen-only regression gate, independent of `emerald-
+  /// sema`'s own `ClassInfo.generic_methods`). `build_method_call`
+  /// checks this against the resolved `defining_class` and refuses the
+  /// call with a clean diagnostic instead of emitting LLVM IR that
+  /// would crash the verifier. Empty entries are never inserted, so a
+  /// program with no generic method anywhere pays for an empty map
+  /// lookup only.
+  generic_class_methods: &'a HashMap<String, HashSet<String>>,
   exc_funcs: ExceptionRuntimeFuncs<'ctx>,
   /// Names of every top-level `module` — `build_method_call` checks
   /// this before anything else to route `Name.method(args)` to the
@@ -6606,6 +6655,39 @@ fn build_method_call<'ctx>(
       .get(class_name.as_str())
       .and_then(|owners| owners.get(method))
       .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
+
+    // Plan 88 aftermath (real, disclosed regression fix): sema now
+    // fully type-checks a class method's own `[T]`/`[T: Bound]` type
+    // parameter via `ClassInfo.generic_methods`/`GenericMethodSig`
+    // (see `emerald-sema`'s own doc comments), so a call like this one
+    // sails past sema with no diagnostic at all — but this backend was
+    // never extended to actually monomorphize a generic method's body:
+    // `define_method` still compiles it exactly ONCE, with the
+    // method's own type parameter folded to the generic `ValKind::Ptr`
+    // bucket regardless of the real argument type at any given call
+    // site. Before plan 88 this whole program shape was cleanly
+    // rejected at sema time ("generic methods are not supported");
+    // now, left unchecked here, it would instead reach the LLVM
+    // verifier with a mismatched argument type (e.g. `i64` passed
+    // where the compiled signature expects `ptr`) and abort there —
+    // a real crash, not a diagnostic. `ctx.generic_class_methods`
+    // (built once in `compile_to_object_impl`, straight from the raw
+    // `ClassDef.methods`' own `type_params`, independent of sema)
+    // lets this call site catch exactly that shape and refuse it
+    // cleanly instead. Real monomorphization is a separate, larger
+    // undertaking left to its own future plan — this is scoped
+    // narrowly to turning a codegen-time crash into a codegen-time
+    // diagnostic.
+    if ctx
+      .generic_class_methods
+      .get(defining_class.as_str())
+      .is_some_and(|names| names.contains(method))
+    {
+      return Err(format!(
+        "codegen: generic methods are not yet supported for code generation (only type-checking) — `{defining_class}.{method}` declares its own type parameter; tracked for a future plan"
+      ));
+    }
+
     let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
 
     // Plan 55's Decision log: the dispatch rule is purely syntactic —
@@ -9205,7 +9287,10 @@ fn build_call_kw_expr<'ctx>(
 fn parse_hash_type(s: &str) -> Option<(ValKind, ValKind)> {
   let inner = s.strip_prefix("Hash[")?.strip_suffix(']')?;
   let (k, v) = inner.split_once(", ")?;
-  Some((value_kind_for_type(k), value_kind_for_type(v)))
+  Some((
+    value_kind_for_type(&TypeExpr::Named(k.to_string())),
+    value_kind_for_type(&TypeExpr::Named(v.to_string())),
+  ))
 }
 
 /// Plan 42 (enumerable stdlib): mirrors `parse_hash_type` exactly, for
@@ -9215,7 +9300,10 @@ fn parse_hash_type(s: &str) -> Option<(ValKind, ValKind)> {
 fn parse_pair_type(s: &str) -> Option<(ValKind, ValKind)> {
   let inner = s.strip_prefix("Pair[")?.strip_suffix(']')?;
   let (k, v) = inner.split_once(", ")?;
-  Some((value_kind_for_type(k), value_kind_for_type(v)))
+  Some((
+    value_kind_for_type(&TypeExpr::Named(k.to_string())),
+    value_kind_for_type(&TypeExpr::Named(v.to_string())),
+  ))
 }
 
 /// Linear-scans a `Hash[K, V]`'s `[count:i64][(key,value) pairs]`
@@ -10340,7 +10428,7 @@ fn build_stmt<'a, 'ctx>(
         ..
       },
       ..
-    } if ty == "Proc" => {
+    } if ty.as_named() == Some("Proc") || matches!(ty, TypeExpr::Func(..)) => {
       build_lambda_let(context, builder, name, vars, ctx)?;
       Ok(false)
     }
@@ -10357,13 +10445,17 @@ fn build_stmt<'a, 'ctx>(
       },
       ..
     } => {
-      let elem_name = ty
-        .strip_prefix("Array[")
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| {
+      let elem_ty = match ty {
+        TypeExpr::Generic(base, args) if base == "Array" => args.first().ok_or_else(|| {
           format!("codegen: `{name}: {ty} = Array.new(...)` — declared type is not an Array")
-        })?;
-      let elem_kind = value_kind_for_type(elem_name);
+        })?,
+        _ => {
+          return Err(format!(
+            "codegen: `{name}: {ty} = Array.new(...)` — declared type is not an Array"
+          ))
+        }
+      };
+      let elem_kind = value_kind_for_type(elem_ty);
       let (size_val, size_kind) = build_expr(
         context,
         builder,
@@ -10428,7 +10520,7 @@ fn build_stmt<'a, 'ctx>(
       // name — sema only ever accepts this shape when `ty` is a
       // matching generic instantiation (`Stack[Int64]`), so mangling
       // `ty` here always finds the real, monomorphized class.
-      let effective_class_name = mangle_type_name(ty.strip_suffix('?').unwrap_or(ty.as_str()));
+      let effective_class_name = mangle_type_expr(ty);
       let effective_class_name = if ctx.classes.contains_key(&effective_class_name) {
         effective_class_name.as_str()
       } else {
@@ -10452,8 +10544,7 @@ fn build_stmt<'a, 'ctx>(
       // name` also tries the MANGLED form (`"Stack[Int64]"` ->
       // `"Stack$Int64"`) — a generic-instantiation-typed local resolves
       // to its real, monomorphized class exactly like an ordinary one.
-      let bare_ty = ty.strip_suffix('?').unwrap_or(ty.as_str());
-      if let Some(resolved) = resolve_local_class_name(bare_ty, ctx.classes) {
+      if let Some(resolved) = resolve_local_class_name(ty, ctx.classes) {
         local_classes.insert(name.clone(), resolved);
       }
       let (dst, _) = *vars
@@ -10489,10 +10580,8 @@ fn build_stmt<'a, 'ctx>(
         ..
       },
       ..
-    } if parse_generic_instantiation(ty.strip_suffix('?').unwrap_or(ty.as_str()))
-      .is_some_and(|(base, _)| base == class_name.as_str()) =>
-    {
-      let mangled = mangle_type_name(ty.strip_suffix('?').unwrap_or(ty.as_str()));
+    } if matches!(ty, TypeExpr::Generic(base, _) if base == class_name) => {
+      let mangled = mangle_type_expr(ty);
       let layout = ctx
         .classes
         .get(&mangled)
@@ -10605,11 +10694,12 @@ fn build_stmt<'a, 'ctx>(
           kind: target_kind.clone(),
         },
       )?;
-      if ty.starts_with("Result[")
-        || ctx.classes.contains_key(ty.as_str())
-        || ctx.enums.contains_key(ty.as_str())
+      let ty_str = ty.to_string();
+      if matches!(ty, TypeExpr::Generic(base, _) if base == "Result")
+        || ctx.classes.contains_key(&ty_str)
+        || ctx.enums.contains_key(&ty_str)
       {
-        local_classes.insert(name.clone(), ty.clone());
+        local_classes.insert(name.clone(), ty_str);
       }
       let (dst, _) = *vars
         .get(name)
@@ -10720,7 +10810,7 @@ fn build_stmt<'a, 'ctx>(
         local_array_elem_types,
         ctx,
       )?;
-      let bare_ty = ty.as_str();
+      let bare_ty = ty.to_string();
       // Plan 52: an enum-typed local carries its enum name the same
       // way a class-typed local carries its class name — `build_case`
       // consults this to detect an enum scrutinee.
@@ -10732,10 +10822,10 @@ fn build_stmt<'a, 'ctx>(
       // (`"Stack[Int64]"` -> `"Stack$Int64"`) — a generic-instantiation-
       // typed local resolves to its real, monomorphized class exactly
       // like an ordinary one.
-      if let Some(resolved) = resolve_local_class_name(bare_ty, ctx.classes) {
+      if let Some(resolved) = resolve_local_class_name(ty, ctx.classes) {
         local_classes.insert(name.clone(), resolved);
-      } else if bare_ty == "Supervisor" || ctx.enums.contains_key(bare_ty) {
-        local_classes.insert(name.clone(), bare_ty.to_string());
+      } else if bare_ty == "Supervisor" || ctx.enums.contains_key(&bare_ty) {
+        local_classes.insert(name.clone(), bare_ty.clone());
       } else {
         // Plan 73: a generic-ENUM-instantiation-typed local (`Option[
         // Int64]`) resolves to its real, monomorphized `EnumLayout`
@@ -10743,28 +10833,26 @@ fn build_stmt<'a, 'ctx>(
         // already does via `resolve_local_class_name` above — the
         // identical mangled-name fallback, just against `ctx.enums`
         // instead of `ctx.classes`.
-        let mangled = mangle_type_name(bare_ty);
+        let mangled = mangle_type_expr(ty);
         if mangled != bare_ty && ctx.enums.contains_key(&mangled) {
           local_classes.insert(name.clone(), mangled);
         }
       }
-      if let Some(elem_name) = ty.strip_prefix("Array[").and_then(|s| s.strip_suffix(']')) {
-        local_array_elem_types.insert(name.clone(), value_kind_for_type(elem_name));
+      if let TypeExpr::Generic(base, args) = ty {
+        if base == "Array" {
+          if let Some(elem_ty) = args.first() {
+            local_array_elem_types.insert(name.clone(), value_kind_for_type(elem_ty));
+          }
+        }
       }
       // Plan 25: `local_classes` doubles as the side-table for
       // `"Hash[K, V]"` locals too (see `value_kind_for_type`'s doc
       // comment) — `build_index`/`build_set_index` check for this
       // prefix to route to hash-lookup codegen instead of array
       // indexing.
-      if ty.starts_with("Hash[") {
-        local_classes.insert(name.clone(), ty.clone());
-      }
       // Plan 53: `local_classes` doubles as the side-table for
       // `"Result[T, E]"` locals too — `Stmt::MatchResult`'s codegen
       // reads this to know each arm's real payload `ValKind`.
-      if ty.starts_with("Result[") {
-        local_classes.insert(name.clone(), ty.clone());
-      }
       // Plan 42: `local_classes` doubles as the side-table for
       // `"Pair[K, V]"` locals too — `build_method_call`'s new `.key`/
       // `.value` dispatch reads this the same way `Hash`'s own
@@ -10773,8 +10861,9 @@ fn build_stmt<'a, 'ctx>(
       // block's own parameter, bound the identical way (see that
       // dispatch's own codegen), but this covers an explicit `p: Pair
       // [K, V] = ...`-annotated `Let` too, for free.
-      if ty.starts_with("Pair[") {
-        local_classes.insert(name.clone(), ty.clone());
+      if matches!(ty, TypeExpr::Generic(base, _) if base == "Hash" || base == "Result" || base == "Pair")
+      {
+        local_classes.insert(name.clone(), bare_ty.clone());
       }
       let (ptr, _) = *vars
         .get(name)
@@ -11440,8 +11529,8 @@ fn build_stmt<'a, 'ctx>(
       let (t_name, e_name) = inner.split_once(", ").ok_or_else(|| {
         format!("codegen: internal error — malformed `Result[T, E]` type `{result_ty}`")
       })?;
-      let ok_kind = value_kind_for_type(t_name);
-      let err_kind = value_kind_for_type(e_name);
+      let ok_kind = value_kind_for_type(&TypeExpr::Named(t_name.to_string()));
+      let err_kind = value_kind_for_type(&TypeExpr::Named(e_name.to_string()));
       build_match_result(
         context,
         builder,
@@ -12636,7 +12725,7 @@ fn effective_params(f: &AstFunction) -> Vec<Param> {
   if let Some(splat) = &f.splat_param {
     params.push(Param {
       name: splat.name.clone(),
-      ty: format!("Array[{}]", splat.ty),
+      ty: TypeExpr::Generic("Array".to_string(), vec![splat.ty.clone()]),
       default: None,
     });
   }
@@ -12671,8 +12760,9 @@ fn bind_params<'ctx>(
       .build_store(alloca, param_val)
       .map_err(|e| e.to_string())?;
     vars.insert(p.name.clone(), (alloca, kind));
-    if classes.contains_key(p.ty.as_str()) {
-      local_classes.insert(p.name.clone(), p.ty.clone());
+    let p_ty_str = p.ty.to_string();
+    if classes.contains_key(&p_ty_str) {
+      local_classes.insert(p.name.clone(), p_ty_str.clone());
     }
     // Plan 42 (enumerable stdlib): a `Pair[K, V]`-typed parameter
     // (only ever reachable via a `Hash[K,V].each` Proc — `Type::Pair`'s
@@ -12680,15 +12770,15 @@ fn bind_params<'ctx>(
     // `Stmt::Let`'s own generic arm already gives a `Pair[K, V]` local,
     // so `build_method_call`'s `.key`/`.value` dispatch can resolve it
     // from inside the Proc's own compiled body.
-    if p.ty.starts_with("Pair[") {
-      local_classes.insert(p.name.clone(), p.ty.clone());
+    if matches!(&p.ty, TypeExpr::Generic(base, _) if base == "Pair") {
+      local_classes.insert(p.name.clone(), p_ty_str);
     }
-    if let Some(elem_name) = p
-      .ty
-      .strip_prefix("Array[")
-      .and_then(|s| s.strip_suffix(']'))
-    {
-      local_array_elem_types.insert(p.name.clone(), value_kind_for_type(elem_name));
+    if let TypeExpr::Generic(base, args) = &p.ty {
+      if base == "Array" {
+        if let Some(elem_ty) = args.first() {
+          local_array_elem_types.insert(p.name.clone(), value_kind_for_type(elem_ty));
+        }
+      }
     }
   }
   Ok(())
@@ -14275,8 +14365,8 @@ fn declare_user_functions<'ctx>(
 fn infer_lambda_ret_kind(
   params: &[Param],
   body: &[Spanned<Stmt>],
-  top_level_types: &HashMap<String, String>,
-  user_fn_return_types: &HashMap<String, String>,
+  top_level_types: &HashMap<String, TypeExpr>,
+  user_fn_return_types: &HashMap<String, TypeExpr>,
 ) -> ValKind {
   let mut env: HashMap<&str, ValKind> = HashMap::new();
   for (name, ty) in top_level_types {
@@ -14301,7 +14391,7 @@ fn infer_lambda_ret_kind(
 fn infer_expr_val_kind(
   expr: &Spanned<Expr>,
   env: &HashMap<&str, ValKind>,
-  user_fn_return_types: &HashMap<String, String>,
+  user_fn_return_types: &HashMap<String, TypeExpr>,
 ) -> ValKind {
   match &expr.node {
     Expr::Ident(name) => env.get(name.as_str()).cloned().unwrap_or(ValKind::Int64),
@@ -14326,7 +14416,7 @@ fn infer_expr_val_kind(
     Expr::Call(name, _) if name == "puts" => ValKind::Void,
     Expr::Call(name, _) => user_fn_return_types
       .get(name)
-      .map(|t| value_kind_for_type(t))
+      .map(value_kind_for_type)
       .unwrap_or(ValKind::Void),
     Expr::MethodCall(_, method, _) if method == "key" || method == "value" => ValKind::Int64,
     _ => ValKind::Ptr,
@@ -14339,8 +14429,8 @@ fn declare_lambda_functions<'ctx>(
   program: &Program,
   lambda_infos: &HashMap<String, LambdaInfo>,
 ) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
-  let mut top_level_types: HashMap<String, String> = HashMap::new();
-  let mut user_fn_return_types: HashMap<String, String> = HashMap::new();
+  let mut top_level_types: HashMap<String, TypeExpr> = HashMap::new();
+  let mut user_fn_return_types: HashMap<String, TypeExpr> = HashMap::new();
   for item in &program.items {
     match item {
       Item::Stmt(Spanned {
@@ -14375,10 +14465,21 @@ fn declare_lambda_functions<'ctx>(
     else {
       continue;
     };
-    if ty != "Proc" || !lambda_infos.contains_key(name) {
+    let is_bare_proc = ty.as_named() == Some("Proc");
+    if (!is_bare_proc && !matches!(ty, TypeExpr::Func(..))) || !lambda_infos.contains_key(name) {
       continue;
     }
-    let ret_kind = infer_lambda_ret_kind(params, body, &top_level_types, &user_fn_return_types);
+    // Plan 88's Decision log: a REAL written `Proc[Args..., Ret]`
+    // annotation states its own return type directly — no need for
+    // `infer_lambda_ret_kind`'s own syntax-only heuristic, which exists
+    // purely to cover the bare `Proc` annotation's own "no return type
+    // can be stated at all" gap (plan 71's Decision log). Using the
+    // real, sema-checked annotation here is strictly more precise.
+    let ret_kind = if let TypeExpr::Func(_, ret) = ty {
+      value_kind_for_type(ret)
+    } else {
+      infer_lambda_ret_kind(params, body, &top_level_types, &user_fn_return_types)
+    };
     let mut kinds = vec![ValKind::Ptr]; // env
     kinds.extend(param_kinds(params));
     let fn_ty = make_fn_type(context, &kinds, &ret_kind);
@@ -15083,6 +15184,7 @@ fn compile_to_object_impl(
     class_tags.insert(name.clone(), class_tags.len() as i64);
   }
   let method_owners = build_method_owners(&class_defs)?;
+  let generic_class_methods = build_generic_class_methods(&class_defs);
 
   // Plan 52: independently re-derived from the raw `Program`/`Item::
   // Enum` list, the same "no shared sema→codegen structure"
@@ -15101,7 +15203,7 @@ fn compile_to_object_impl(
     variants: vec![
       EnumVariant {
         name: "Some".to_string(),
-        fields: vec!["T".to_string()],
+        fields: vec![TypeExpr::Named("T".to_string())],
       },
       EnumVariant {
         name: "None".to_string(),
@@ -15110,7 +15212,7 @@ fn compile_to_object_impl(
     ],
     type_params: vec![TypeParam {
       name: "T".to_string(),
-      bound: None,
+      bounds: Vec::new(),
     }],
   };
   let mut generic_enum_defs: HashMap<String, &EnumDef> = HashMap::new();
@@ -15125,12 +15227,12 @@ fn compile_to_object_impl(
   let mut synthesized_enums: HashMap<String, EnumDef> = HashMap::new();
   let mut enum_synth_classes: HashMap<String, ClassDef> = HashMap::new();
   for ty in collect_generic_instantiation_typenames(program) {
-    if let Some((base, args)) = parse_generic_instantiation(&ty) {
-      if generic_enum_defs.contains_key(base) {
+    if let TypeExpr::Generic(base, args) = &ty {
+      if generic_enum_defs.contains_key(base.as_str()) {
         let mut in_progress = Vec::new();
         instantiate_generic_enum_defs(
           base,
-          &args,
+          args,
           &generic_enum_defs,
           &generic_class_defs,
           &mut enum_synth_classes,
@@ -15149,7 +15251,7 @@ fn compile_to_object_impl(
     let mut in_progress = Vec::new();
     instantiate_generic_enum_defs(
       "Option",
-      &["String"],
+      &[TypeExpr::Named("String".to_string())],
       &generic_enum_defs,
       &generic_class_defs,
       &mut enum_synth_classes,
@@ -15423,6 +15525,7 @@ fn compile_to_object_impl(
     class_tags: &class_tags,
     rescue_tag_sets: &rescue_tag_sets,
     method_owners: &method_owners,
+    generic_class_methods: &generic_class_methods,
     exc_funcs,
     module_names: &module_names,
     alloc_zeroed,
@@ -15555,7 +15658,7 @@ fn compile_to_object_impl(
             ..
           },
         ..
-      }) if ty == "Proc" => {
+      }) if ty.as_named() == Some("Proc") || matches!(ty, TypeExpr::Func(..)) => {
         if let (Some(info), Some((fv, ret_kind))) =
           (lambda_infos.get(name), lambda_func_ids.get(name))
         {
@@ -15920,7 +16023,7 @@ fn assertion_error_class_item() -> Item {
     derive: None,
     fields: vec![Param {
       name: "message".to_string(),
-      ty: "String".to_string(),
+      ty: TypeExpr::Named("String".to_string()),
       default: None,
     }],
     methods: vec![
@@ -15928,10 +16031,10 @@ fn assertion_error_class_item() -> Item {
         name: "initialize".to_string(),
         params: vec![Param {
           name: "message".to_string(),
-          ty: "String".to_string(),
+          ty: TypeExpr::Named("String".to_string()),
           default: None,
         }],
-        return_type: "Void".to_string(),
+        return_type: TypeExpr::Named("Void".to_string()),
         body: vec![syn(Stmt::SetField {
           name: "message".to_string(),
           value: syn(Expr::Ident("message".to_string())),
@@ -15947,7 +16050,7 @@ fn assertion_error_class_item() -> Item {
       AstFunction {
         name: "message".to_string(),
         params: Vec::new(),
-        return_type: "String".to_string(),
+        return_type: TypeExpr::Named("String".to_string()),
         body: vec![syn(Stmt::Expr(syn(Expr::InstanceVar(
           "message".to_string(),
         ))))],
@@ -15988,7 +16091,7 @@ fn remote_actor_error_class_item() -> Item {
     derive: None,
     fields: vec![Param {
       name: "message".to_string(),
-      ty: "String".to_string(),
+      ty: TypeExpr::Named("String".to_string()),
       default: None,
     }],
     methods: vec![
@@ -15996,10 +16099,10 @@ fn remote_actor_error_class_item() -> Item {
         name: "initialize".to_string(),
         params: vec![Param {
           name: "message".to_string(),
-          ty: "String".to_string(),
+          ty: TypeExpr::Named("String".to_string()),
           default: None,
         }],
-        return_type: "Void".to_string(),
+        return_type: TypeExpr::Named("Void".to_string()),
         body: vec![syn(Stmt::SetField {
           name: "message".to_string(),
           value: syn(Expr::Ident("message".to_string())),
@@ -16015,7 +16118,7 @@ fn remote_actor_error_class_item() -> Item {
       AstFunction {
         name: "message".to_string(),
         params: Vec::new(),
-        return_type: "String".to_string(),
+        return_type: TypeExpr::Named("String".to_string()),
         body: vec![syn(Stmt::Expr(syn(Expr::InstanceVar(
           "message".to_string(),
         ))))],
@@ -16063,7 +16166,7 @@ fn contract_violation_class_item() -> Item {
     derive: None,
     fields: vec![Param {
       name: "message".to_string(),
-      ty: "String".to_string(),
+      ty: TypeExpr::Named("String".to_string()),
       default: None,
     }],
     methods: vec![
@@ -16071,10 +16174,10 @@ fn contract_violation_class_item() -> Item {
         name: "initialize".to_string(),
         params: vec![Param {
           name: "message".to_string(),
-          ty: "String".to_string(),
+          ty: TypeExpr::Named("String".to_string()),
           default: None,
         }],
-        return_type: "Void".to_string(),
+        return_type: TypeExpr::Named("Void".to_string()),
         body: vec![syn(Stmt::SetField {
           name: "message".to_string(),
           value: syn(Expr::Ident("message".to_string())),
@@ -16090,7 +16193,7 @@ fn contract_violation_class_item() -> Item {
       AstFunction {
         name: "message".to_string(),
         params: Vec::new(),
-        return_type: "String".to_string(),
+        return_type: TypeExpr::Named("String".to_string()),
         body: vec![syn(Stmt::Expr(syn(Expr::InstanceVar(
           "message".to_string(),
         ))))],
@@ -16248,13 +16351,13 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
   let mut harness_stmts = vec![
     syn(Stmt::Let {
       name: "passed".to_string(),
-      ty: "Int64".to_string(),
+      ty: TypeExpr::Named("Int64".to_string()),
       value: syn(Expr::Int(0)),
       is_var: true,
     }),
     syn(Stmt::Let {
       name: "failed".to_string(),
-      ty: "Int64".to_string(),
+      ty: TypeExpr::Named("Int64".to_string()),
       value: syn(Expr::Int(0)),
       is_var: true,
     }),
@@ -16265,7 +16368,7 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
     items.push(Item::Function(AstFunction {
       name: fn_name.clone(),
       params: Vec::new(),
-      return_type: "Void".to_string(),
+      return_type: TypeExpr::Named("Void".to_string()),
       body,
       block_param: None,
       splat_param: None,
@@ -17927,7 +18030,7 @@ mod tests {
   fn let_point(name: &str, args: Vec<Spanned<Expr>>) -> Spanned<Stmt> {
     Spanned::synthetic(Stmt::Let {
       name: name.to_string(),
-      ty: "Point".to_string(),
+      ty: TypeExpr::Named("Point".to_string()),
       value: new_point(args),
       is_var: false,
     })
@@ -18022,10 +18125,10 @@ mod tests {
       let_point("p", vec![ident("x")]),
       Spanned::synthetic(Stmt::Let {
         name: "f".to_string(),
-        ty: "Proc".to_string(),
+        ty: TypeExpr::Named("Proc".to_string()),
         value: Spanned::synthetic(Expr::Lambda {
           params: vec![],
-          return_type: "Void".to_string(),
+          return_type: TypeExpr::Named("Void".to_string()),
           body: vec![Spanned::synthetic(Stmt::Expr(ident("p")))],
         }),
         is_var: false,

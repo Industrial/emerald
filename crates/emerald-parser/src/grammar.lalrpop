@@ -1,7 +1,7 @@
 use crate::ast::{
   ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant,
   ExternBlock, ExternFn, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
-  RescueClause, Spanned, Stmt, TypeParam,
+  RescueClause, Spanned, Stmt, TypeExpr, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -205,7 +205,7 @@ FuncDef: Function = {
   // matching plan 59's `extern fn` spelling exactly. A mandatory `"do"`
   // now separates the signature from `body` — the same disambiguating
   // role `"do"` plays on `if`/`while` below.
-  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeName> <contracts:ContractClause*> "do" <body:Stmt*> "end" => {
+  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> <contracts:ContractClause*> "do" <body:Stmt*> "end" => {
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     for (is_requires, c) in contracts {
@@ -255,7 +255,7 @@ InterfaceDef: InterfaceDef = {
   // Plan 71: `"fn"`/`":"` replace `"def"`/`"->"` here too — no `"do"`
   // added, since an interface method has no body at all (this
   // production ends directly at `"end"`, nothing to disambiguate).
-  "interface" <name:Ident> "fn" <method_name:Ident> "(" <params:Params> ")" ":" <return_type:TypeName> "end" => {
+  "interface" <name:Ident> "fn" <method_name:Ident> "(" <params:Params> ")" ":" <return_type:TypeExpr> "end" => {
     InterfaceDef { name, method_name, params, return_type }
   }
 };
@@ -279,7 +279,7 @@ ExternBlockDef: ExternBlock = {
 // shared `Params`/`Param` production verbatim, the same reuse
 // `ClassField`/`InterfaceDef` already make.
 ExternFnDecl: ExternFn = {
-  "fn" <name:Ident> "(" <params:Params> ")" ":" <return_type:TypeName> => {
+  "fn" <name:Ident> "(" <params:Params> ")" ":" <return_type:TypeExpr> => {
     ExternFn { name, params, return_type }
   }
 };
@@ -316,14 +316,14 @@ EnumVariants: Vec<EnumVariant> = {
 // At least one payload field, required unconditionally — no bare,
 // nullary tag variants in this plan (Decision log).
 EnumVariant: EnumVariant = {
-  <name:Ident> "(" <fields:TypeNameList> ")" => EnumVariant { name, fields },
+  <name:Ident> "(" <fields:EnumFieldTypes> ")" => EnumVariant { name, fields },
 };
 
-// Left-recursive, trailing-comma list of `TypeName` — safe left
+// Left-recursive, trailing-comma list of `TypeExpr` — safe left
 // recursion since it's always closed by a known `")"`, the same
 // reasoning `Args`/`Params` already rely on.
-TypeNameList: Vec<String> = {
-  <mut v:(<TypeName> ",")*> <last:TypeName?> => {
+EnumFieldTypes: Vec<TypeExpr> = {
+  <mut v:(<TypeExpr> ",")*> <last:TypeExpr?> => {
     match last {
       None => v,
       Some(t) => { v.push(t); v }
@@ -350,13 +350,32 @@ TypeParamList: Vec<TypeParam> = {
 };
 
 TypeParam: TypeParam = {
-  <name:Ident> ":" <bound:Ident> => TypeParam { name, bound: Some(bound) },
+  // Plan 88's Decision log: `[T: Bound1 + Bound2 + ...]` — a real bound
+  // SET (conjunction), reusing the already-declared `"+"` terminal
+  // (arithmetic addition's own token) the same way `SuperclassClause`
+  // already reuses `"<"` — no new token needed, and there's no FIRST-set
+  // ambiguity to disambiguate: a bound name is always a bare `Ident`
+  // here, never itself a `+`-expression.
+  <name:Ident> ":" <bounds:BoundList> => TypeParam { name, bounds },
   // Plan 58's Decision log: the bound-less alternative — `class Box[T]`'s
-  // own headline case. `TypeParam.bound` widened to `Option<String>`
-  // precisely to admit this; sema (not the grammar) still rejects a
-  // bound-less type parameter on a top-level generic FUNCTION with its
-  // own "generic functions require a bound" diagnostic, unchanged.
-  <name:Ident> => TypeParam { name, bound: None },
+  // own headline case. `TypeParam.bounds` widened to a real `Vec<String>`
+  // precisely to admit both this (empty) case and plan 88's multi-bound
+  // case; sema (not the grammar) still rejects a bound-less type
+  // parameter on a top-level generic FUNCTION with its own "generic
+  // functions require a bound" diagnostic, unchanged.
+  <name:Ident> => TypeParam { name, bounds: Vec::new() },
+};
+
+// At least one bound, `+`-separated — mirrors every other separator-
+// delimited list in this grammar (right-recursive, safe since it's
+// always closed by a known `"]"`/`","` from the enclosing `TypeParamList`).
+BoundList: Vec<String> = {
+  <b:Ident> => vec![b],
+  <b:Ident> "+" <rest:BoundList> => {
+    let mut v = vec![b];
+    v.extend(rest);
+    v
+  },
 };
 
 // Plan 40's Decision log: operator-named methods are legal only inside
@@ -388,7 +407,7 @@ MethodDef: Function = {
   // never a silent accept.
   // Plan 71: `"fn"`/`":"`/mandatory `"do"` replace `"def"`/`"->"` here
   // exactly the same way `FuncDef` above changes.
-  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeName> "do" <body:Stmt*> "end" => Function {
+  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> "do" <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
@@ -449,12 +468,12 @@ FuncParams: (Vec<Param>, Option<Param>) = {
 };
 
 FuncParam: Param = {
-  <name:Ident> ":" <ty:TypeName> => Param { name, ty, default: None },
+  <name:Ident> ":" <ty:TypeExpr> => Param { name, ty, default: None },
   // Plan 39's Decision log: `DefaultLit` admits only literal tokens —
   // never an `Expr::Ident` — so `def f(x: Int64, y: Int64 = x)` (a
   // default referencing another parameter) is a parse error here, at
   // the grammar level, not a sema diagnostic.
-  <name:Ident> ":" <ty:TypeName> "=" <d:DefaultLit> => Param { name, ty, default: Some(d) },
+  <name:Ident> ":" <ty:TypeExpr> "=" <d:DefaultLit> => Param { name, ty, default: Some(d) },
 };
 
 DefaultLit: Spanned<Expr> = {
@@ -466,7 +485,7 @@ DefaultLit: Spanned<Expr> = {
 };
 
 SplatParam: Param = {
-  "*" <name:Ident> ":" <ty:TypeName> => Param { name, ty, default: None },
+  "*" <name:Ident> ":" <ty:TypeExpr> => Param { name, ty, default: None },
 };
 
 // Plan 39: a mandatory-first-element, right-recursive `name: Expr` list
@@ -526,7 +545,7 @@ Stmt: Spanned<Stmt> = {
   // `case`/`match` arm's pattern bindings, a `rescue` clause's own
   // exception variable) has no `var` slot at all, so `emerald-sema`
   // treats all of those as unconditionally immutable (Decision log).
-  <l:@L> <is_var:"var"?> <name:Ident> ":" <ty:TypeName> "=" <value:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Let { name, ty, value, is_var: is_var.is_some() } },
+  <l:@L> <is_var:"var"?> <name:Ident> ":" <ty:TypeExpr> "=" <value:Expr> <r:@R> => Spanned { span: (l, r), node: Stmt::Let { name, ty, value, is_var: is_var.is_some() } },
   // Plan 71: `"do"` is now mandatory right after `cond` — a bare `if
   // cond` `... end` with no `"do"` is a real parse error, not an
   // accepted alternate form (Sable design brief §44/§50: `do...end` is
@@ -1040,7 +1059,7 @@ StmtPrimaryExpr: Spanned<Expr> = {
 DoBlock: Spanned<Expr> = {
   <l:@L> "do" "|" <params:Params> "|" <body:Stmt*> "end" <r:@R> => Spanned { span: (l, r), node: Expr::Lambda {
     params,
-    return_type: "Void".to_string(),
+    return_type: TypeExpr::Named("Void".to_string()),
     body,
   }},
 };
@@ -1652,74 +1671,101 @@ Params: Vec<Param> = {
 };
 
 Param: Param = {
-  <name:Ident> ":" <ty:TypeName> => Param { name, ty, default: None }
+  <name:Ident> ":" <ty:TypeExpr> => Param { name, ty, default: None }
 };
 
-// `Array` is a reserved keyword (same LALR(1) reason `puts`/`new` were
-// reserved in plans 07/08): the literal `"Array"` token is tokenized
-// distinctly from the generic `Ident` regex, so this alternative and the
-// bare-`Ident` one below never compete for the same lookahead token.
-// `Param.ty`/`Function.return_type` stay a plain `String` — a compound
-// name like `"Array[Int64]"` is grammar-level concatenation, not a
-// structured type AST node yet (see plan 09's Decision log).
-// `Proc` is reserved the same way (plan 10): a bare, unparameterized
-// annotation — `Type::Proc`'s actual signature is recovered sema-side
-// from the `Expr::Lambda` it's bound to, not from this string (plan 10's
-// Decision log — no `Proc[(Int64) -> Int64]` compound grammar).
-// `Hash` is reserved the same way `Array` is (plan 25) — `K`/`V` stay
-// plain `Ident`s, same `Int64`-key-only restriction this plan's
-// Decision log applies at the sema level; the grammar itself doesn't
-// need to enforce that narrowing (it's just a name here, same as
-// `Array[Elem]`'s own compound-string convention, plan 09's Decision
-// log).
-TypeName: String = {
-  <name:Ident> => name,
-  "Array" "[" <elem:Ident> "]" => format!("Array[{elem}]"),
-  "Hash" "[" <k:Ident> "," <v:Ident> "]" => format!("Hash[{k}, {v}]"),
-  // Plan 42's Decision log: `Pair[K, V]` — the identical compound-
-  // string convention `Hash[K, V]` above already uses. Never source-
+// Plan 88's Decision log: `TypeName: String`'s old grammar-level
+// string-concatenation convention replaced outright by a real,
+// recursive `TypeExpr` AST node (`ast.rs`'s own doc comment) — every
+// production below that used to format a flat compound string now
+// builds a real `TypeExpr::Generic`/`Tuple`/`Func` node instead, so a
+// nested shape (`Array[Array[Int64]]`, `Proc[Array[Int64], Int64]`, a
+// generic method returning `Hash[K, Array[V]]`) parses correctly: each
+// bracket slot below now accepts a full recursive `TypeExpr`, not just
+// a bare `Ident` the way `Array[Elem]`/`Hash[K, V]`/`Pair[K, V]`/
+// `Result[T, E]` each did before this plan.
+//
+// `Array`/`Hash`/`Pair`/`Result` stay reserved keywords (same LALR(1)
+// reason `puts`/`new` were reserved in plans 07/08) — distinct tokens
+// from the generic `Ident` regex, so there's no FIRST-set overlap with
+// the general `<name:Ident> "[" ... "]"` alternative at the bottom,
+// which is what actually subsumes all four into `TypeExpr::Generic`
+// (and, for that matter, `Option[T]` and any other user-declared
+// generic class/enum instantiation) as one general case rather than
+// four hand-rolled ones.
+//
+// `Proc` is reserved the same way (plan 10) — a bare, unparameterized
+// `Proc` (no bracket clause) still parses to `TypeExpr::Named("Proc")`,
+// so the pre-existing lambda-literal-inference path (a `Let`'s declared
+// `Proc` type recovering its real signature from a co-located `Expr::
+// Lambda`) keeps working completely unchanged. Plan 88 ALSO gives `Proc`
+// a genuine written, parameterized form: `Proc[Args..., Ret]` — the
+// same bracket convention `Hash[K, V]` already established, chosen over
+// reusing a `fn(Args): Ret` declaration-syntax spelling in type
+// position specifically because it needed zero new grammar productions
+// or tokens (it's the same `<name> "[" <args:TypeExprList> "]"` shape
+// every other compound type here already uses) and reads consistently
+// alongside `Array[T]`/`Hash[K, V]`/every other bracketed generic this
+// language has — the LAST element of the bracketed list is the return
+// type, every element before it is a parameter type (`Proc[Ret]` is a
+// zero-parameter Proc returning `Ret`, `Proc[A, Ret]` one parameter,
+// and so on), built directly into `TypeExpr::Func` at parse time via
+// the `=>?` fallible action below (fallible only because `TypeExprList`
+// itself is grammatically guaranteed non-empty — `.pop()` never
+// actually fails — but LALRPOP has no infallible "guaranteed non-empty
+// Vec" action shape to spell that any other way).
+TypeExpr: TypeExpr = {
+  <name:Ident> => TypeExpr::Named(name),
+  "Array" "[" <elem:TypeExpr> "]" => TypeExpr::Generic("Array".to_string(), vec![elem]),
+  "Hash" "[" <k:TypeExpr> "," <v:TypeExpr> "]" => TypeExpr::Generic("Hash".to_string(), vec![k, v]),
+  // Plan 42's Decision log: `Pair[K, V]` — the identical bracket
+  // convention `Hash[K, V]` above already uses. Never source-
   // constructible as a VALUE (only `Hash[K,V].each`'s own generated
   // Proc argument ever produces one), but its TYPE annotation must
   // still parse — it's the only way to declare a `Hash.each` Proc's
   // own parameter type.
-  "Pair" "[" <k:Ident> "," <v:Ident> "]" => format!("Pair[{k}, {v}]"),
-  // Plan 53's Decision log: `Result[T, E]`, the identical `,`-split
-  // compound-string convention `Hash[K, V]` already uses — `resolve_type`
-  // is the thing that turns this into a real `Type::Result`.
-  "Result" "[" <t:Ident> "," <e:Ident> "]" => format!("Result[{t}, {e}]"),
-  "Proc" => "Proc".to_string(),
-  // Plan 39's Decision log: `"(" T1 "," T2 [, ...] ")"`, mirroring
-  // `Array[Elem]`/`Hash[K, V]`'s own compound-string convention
-  // (formatted as e.g. `"(Int64, Int64)"`). Added as a grammar-wide
-  // `TypeName` alternative, not gated to only the return-type
+  "Pair" "[" <k:TypeExpr> "," <v:TypeExpr> "]" => TypeExpr::Generic("Pair".to_string(), vec![k, v]),
+  // Plan 53's Decision log: `Result[T, E]`, the identical bracket
+  // convention `Hash[K, V]` already ships — `resolve_type` is the thing
+  // that turns this into a real `Type::Result`.
+  "Result" "[" <t:TypeExpr> "," <e:TypeExpr> "]" => TypeExpr::Generic("Result".to_string(), vec![t, e]),
+  "Proc" => TypeExpr::Named("Proc".to_string()),
+  // Plan 88: `Proc[Args..., Ret]` — see this production's own header
+  // comment for the chosen convention and why.
+  "Proc" "[" <args:TypeExprList> "]" =>? {
+    let mut args = args;
+    let ret = args.pop().expect("TypeExprList is grammatically non-empty");
+    Ok(TypeExpr::Func(args, Box::new(ret)))
+  },
+  // Plan 39's Decision log: `"(" T1 "," T2 [, ...] ")"` — a real
+  // `TypeExpr::Tuple`, not a formatted string. Added as a grammar-wide
+  // `TypeExpr` alternative, not gated to only the return-type
   // position — the actual restriction (only a function's declared
   // return type may ever be a tuple) lives entirely in sema's
   // `resolve_return_type` vs. the shared `resolve_type` (used for
-  // every param/field/`Let` annotation, which never resolves this
-  // shape and falls through to its `unknown type` catch-all).
-  "(" <parts:TupleTypeNames> ")" => format!("({})", parts.join(", ")),
+  // every param/field/`Let` annotation, which has no `Tuple` branch at
+  // all and rejects this shape outright).
+  "(" <parts:TupleTypeExprs> ")" => TypeExpr::Tuple(parts),
   // Plan 58's Decision log: a general `<Ident> "[" ... "]"` compound
   // form for a user-declared generic class (`Stack[Int64]`,
   // `Box[Box[Int64]]`) — distinct from the four hardcoded-keyword
   // forms above (`Array`/`Hash`/`Pair`/`Result` are reserved terminals,
   // never matched by the plain `Ident` regex, so there is no FIRST-set
   // overlap to disambiguate: LALR(1) picks this alternative purely by
-  // whether a `[` follows the identifier). Deliberately accepts a full
-  // recursive `TypeName` per type argument (`GenericTypeArgs`), NOT the
-  // narrower bare-`Ident`-only convention the four hardcoded forms use
-  // above — `Box[Box[Int64]]` must parse as a single compound string
-  // for this plan's own recursive-instantiation hazard to ever reach
-  // sema at all (see the plan's own Decision log).
-  <name:Ident> "[" <args:GenericTypeArgs> "]" => format!("{name}[{}]", args.join(", ")),
+  // whether a `[` follows the identifier). Also the production that
+  // subsumes `Option[T]` (never reserved — an ordinary `Ident` matching
+  // a compiler-synthesized enum name in `classes`).
+  <name:Ident> "[" <args:TypeExprList> "]" => TypeExpr::Generic(name, args),
 };
 
-// Plan 58: one-or-more comma-separated `TypeName`s (unlike
-// `TupleTypeNames`'s "at least two" — a single-type-parameter generic
-// class, `Stack[Int64]`, is the common case). Right-recursive, mirroring
+// Plan 58: one-or-more comma-separated `TypeExpr`s (unlike
+// `TupleTypeExprs`'s "at least two" — a single-type-parameter generic
+// class, `Stack[Int64]`, is the common case, and `Proc[Ret]`'s own
+// zero-parameter shape needs exactly one). Right-recursive, mirroring
 // every other separator-delimited list in this grammar.
-GenericTypeArgs: Vec<String> = {
-  <t:TypeName> => vec![t],
-  <t:TypeName> "," <rest:GenericTypeArgs> => {
+TypeExprList: Vec<TypeExpr> = {
+  <t:TypeExpr> => vec![t],
+  <t:TypeExpr> "," <rest:TypeExprList> => {
     let mut v = vec![t];
     v.extend(rest);
     v
@@ -1729,9 +1775,9 @@ GenericTypeArgs: Vec<String> = {
 // At least two element types (a 1-tuple isn't a meaningful multi-return
 // shape) — same mandatory-first-element, right-recursive idiom as
 // `MultiAssignNames`/`YieldArgs` elsewhere in this grammar.
-TupleTypeNames: Vec<String> = {
-  <first:TypeName> "," <last:TypeName> => vec![first, last],
-  <first:TypeName> "," <rest:TupleTypeNames> => {
+TupleTypeExprs: Vec<TypeExpr> = {
+  <first:TypeExpr> "," <last:TypeExpr> => vec![first, last],
+  <first:TypeExpr> "," <rest:TupleTypeExprs> => {
     let mut v = vec![first];
     v.extend(rest);
     v

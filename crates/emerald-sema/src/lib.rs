@@ -14,7 +14,8 @@
 
 use emerald_parser::{
   ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
-  Function, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart, TypeParam,
+  Function, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt, StringPart, TypeExpr,
+  TypeParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -63,9 +64,15 @@ pub enum Type {
   /// (`class Box[T] ... end`), unlike a generic FUNCTION's
   /// (`GenericFunctionSig.bound` stays a plain `String`; a bound-less
   /// function type parameter is still rejected at registration time).
-  /// A method call on a `bound: None`-typed value is rejected outright
-  /// — there is no interface to resolve the call against.
-  Generic(String, Option<String>),
+  /// A method call on a `bounds: []`-typed value is rejected outright
+  /// — there is no interface to resolve the call against. Plan 88's
+  /// Decision log: widened from a single `Option<String>` bound to a
+  /// real bound SET (`[T: Bound1 + Bound2]`'s own conjunction) — a
+  /// method call on a `Generic`-typed receiver now resolves against
+  /// whichever bound in the set actually declares the method named,
+  /// and a type argument must conform to EVERY bound in the set to be
+  /// accepted at a generic call/instantiation site.
+  Generic(String, Vec<String>),
   /// A fixed-arity anonymous tuple (plan 39's Decision log) — valid
   /// ONLY as a function's declared return type, never a parameter
   /// type, a field type, a `Let`'s local type, an array element type,
@@ -227,6 +234,20 @@ struct ClassInfo {
   /// `implements`/`enum_variants` stay their defaults, since `ActorDef`
   /// has no grammar path to produce any of them.
   is_actor: bool,
+  /// Plan 88's Decision log: a class method (or generic-class-template
+  /// method) declaring its OWN `[U]`/`[U: Bound]` type parameter — one
+  /// level of generics on top of whatever the class itself may already
+  /// have — registers here instead of the ordinary `methods` table:
+  /// its params/return type can't be resolved into one fixed
+  /// `FunctionSig` at class-registration time, since `U` is only known
+  /// at each call site. Reuses plan 41/58's existing top-level generic-
+  /// function/class monomorphization STRATEGY (register a raw,
+  /// unresolved signature; resolve/check it fresh at every call site
+  /// that supplies a concrete type argument) rather than inventing a
+  /// second, separate generics mechanism — see `GenericMethodSig`'s own
+  /// doc comment for exactly how it differs from `GenericFunctionSig`.
+  /// Empty for every class with no generic method at all.
+  generic_methods: HashMap<String, GenericMethodSig>,
 }
 
 /// One `interface`'s single required method, kept as raw, unresolved
@@ -238,8 +259,8 @@ struct ClassInfo {
 #[derive(Debug, Clone)]
 struct InterfaceInfo {
   method_name: String,
-  params_raw: Vec<(String, String)>,
-  return_type_raw: String,
+  params_raw: Vec<(String, TypeExpr)>,
+  return_type_raw: TypeExpr,
 }
 
 /// A top-level generic function's registration (plan 41's Decision
@@ -251,9 +272,44 @@ struct InterfaceInfo {
 #[derive(Debug, Clone)]
 struct GenericFunctionSig {
   type_param: String,
-  bound: String,
-  params_raw: Vec<(String, String)>,
-  return_type_raw: String,
+  bounds: Vec<String>,
+  params_raw: Vec<(String, TypeExpr)>,
+  return_type_raw: TypeExpr,
+}
+
+/// A class method's own `[U]`/`[U: Bound]` type parameter (plan 88's
+/// Decision log) — `ClassInfo.generic_methods`'s own doc comment
+/// explains why this exists as a registry separate from `methods`.
+///
+/// Deliberately NOT a reuse of `GenericFunctionSig` despite the
+/// obvious structural overlap: `GenericFunctionSig.params_raw`/
+/// `return_type_raw` only ever need a single, WHOLE-STRING equality
+/// check against the type parameter's own bare name (`raw ==
+/// &g.type_param`, `infer_expr_type`'s top-level-generic-function
+/// `Expr::Call` arm) — a top-level generic function's own type
+/// parameter can only ever appear as a BARE parameter type (`fn
+/// identity[T: Bound](x: T): T`), never nested inside a compound shape.
+/// A generic METHOD's own type parameter routinely appears nested
+/// (`f: Proc[T, U]`, the plan's own worked example, where the class's
+/// `T` is already concrete by the time this signature is built, and
+/// only the method's own `U` remains free) — this needs real
+/// structural unification against the argument's actual `Type`
+/// (`infer_type_param_binding` below), not a whole-string compare.
+/// `params_raw`/`return_type_raw` here are ALREADY class-level-
+/// substituted (built via `substitute_type_params` against whichever
+/// concrete/symbolic `T` the enclosing class instantiation supplies) —
+/// only this struct's own `type_param` name remains genuinely free.
+#[derive(Debug, Clone)]
+struct GenericMethodSig {
+  type_param: String,
+  /// Empty for an unbounded method type parameter (plan 88's Decision
+  /// log: unlike a top-level generic FUNCTION, which still requires at
+  /// least one bound, a generic METHOD may be genuinely unbounded — the
+  /// plan's own worked example, `map[U](f: Proc[T, U]): Array[U])`, has
+  /// no bound on `U` at all).
+  bounds: Vec<String>,
+  params_raw: Vec<(String, TypeExpr)>,
+  return_type_raw: TypeExpr,
 }
 
 /// Bundles the two registries a generic-aware type check needs beyond
@@ -267,10 +323,137 @@ struct GenericsCtx<'a> {
   generic_sigs: &'a HashMap<String, GenericFunctionSig>,
 }
 
-/// Resolves a type name against `spec/TYPE_SYSTEM.md`'s primitives, then
-/// against declared classes. Errors on any unrecognized name rather than
+/// Type names never reified as a real `Type::Class`/`Type::Enum`
+/// instantiation-under-a-mangled-name — each has its own dedicated,
+/// hardcoded `Type` variant instead (`resolve_type`'s own `Generic`
+/// arm below). Shared with `mangle_type_expr` so both stay in sync.
+const NATIVE_GENERIC_NAMES: [&str; 4] = ["Array", "Hash", "Pair", "Result"];
+
+/// Resolves a `TypeExpr` — the parser's real, recursive type-expression
+/// AST (plan 88's Decision log) — against `spec/TYPE_SYSTEM.md`'s
+/// primitives, then against declared classes, consuming the AST's own
+/// structure directly and recursively rather than parsing a formatted
+/// string. Errors on any unrecognized/malformed shape rather than
 /// silently accepting it.
-fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type, Diagnostic> {
+fn resolve_type(
+  texpr: &TypeExpr,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Type, Diagnostic> {
+  match texpr {
+    TypeExpr::Named(name) => resolve_named_type(name, classes),
+    // Plan 88: `Array[Elem]`/`Hash[K, V]`/`Pair[K, V]`/`Result[T, E]`
+    // are no longer their own hand-rolled grammar alternatives with
+    // their own flat-string format — they're just `TypeExpr::Generic`
+    // instances of the one general case, arity-checked here instead of
+    // by the grammar. Each recurses on its own argument `TypeExpr`
+    // directly, so `Array[Array[Int64]]`/`Hash[K, Array[V]]` etc. now
+    // genuinely nest — the actual point of this plan's own AST change.
+    TypeExpr::Generic(name, args) if name == "Array" => match args.as_slice() {
+      [elem] => Ok(Type::Array(Box::new(resolve_type(elem, classes)?))),
+      _ => Err(Diagnostic::new(
+        format!(
+          "`Array` takes exactly one type argument, found {}",
+          args.len()
+        ),
+        (0, 0),
+      )),
+    },
+    TypeExpr::Generic(name, args) if name == "Hash" => match args.as_slice() {
+      [k, v] => Ok(Type::Hash(
+        Box::new(resolve_type(k, classes)?),
+        Box::new(resolve_type(v, classes)?),
+      )),
+      _ => Err(Diagnostic::new(
+        format!(
+          "`Hash` takes exactly two type arguments, found {}",
+          args.len()
+        ),
+        (0, 0),
+      )),
+    },
+    TypeExpr::Generic(name, args) if name == "Pair" => match args.as_slice() {
+      [k, v] => Ok(Type::Pair(
+        Box::new(resolve_type(k, classes)?),
+        Box::new(resolve_type(v, classes)?),
+      )),
+      _ => Err(Diagnostic::new(
+        format!(
+          "`Pair` takes exactly two type arguments, found {}",
+          args.len()
+        ),
+        (0, 0),
+      )),
+    },
+    TypeExpr::Generic(name, args) if name == "Result" => match args.as_slice() {
+      [t, e] => Ok(Type::Result(
+        Box::new(resolve_type(t, classes)?),
+        Box::new(resolve_type(e, classes)?),
+      )),
+      _ => Err(Diagnostic::new(
+        format!(
+          "`Result` takes exactly two type arguments, found {}",
+          args.len()
+        ),
+        (0, 0),
+      )),
+    },
+    // Plan 88: `Proc[Args..., Ret]` resolves DIRECTLY to a real,
+    // written `Type::Proc` — no adjacent `Expr::Lambda` needed at all.
+    // Every element is itself a full `TypeExpr`, so `Proc[Array[Int64],
+    // Int64]` round-trips through this AST and resolves correctly.
+    TypeExpr::Func(params, ret) => {
+      let params = params
+        .iter()
+        .map(|p| resolve_type(p, classes))
+        .collect::<Result<Vec<_>, _>>()?;
+      let ret = resolve_type(ret, classes)?;
+      Ok(Type::Proc(params, Box::new(ret)))
+    }
+    // Plan 58's Decision log: a generic-class instantiation (`Stack[
+    // Int64]`) resolves to `Type::Class(mangled)` iff its mangled name
+    // (`mangle_type_expr`) is already registered in `classes` — by the
+    // time any caller reaches `resolve_type`, `check_program`'s own
+    // collect+instantiate pass has already monomorphized every
+    // instantiation actually written in the program, so a mangled name
+    // absent here means the type argument itself didn't resolve (a
+    // real, disclosed simplification: this path reports the SAME
+    // "unknown type" diagnostic as the ordinary case below, rather than
+    // re-deriving which specific type argument failed).
+    // Plan 73's Decision log: a generic-ENUM instantiation (`Option[
+    // Int64]`) mangles exactly the same way a generic-class one does —
+    // the two share one mangled-name-keyed `classes` registry (plan
+    // 52's own disclosed adaptation) — but must resolve to `Type::Enum`,
+    // never `Type::Class`, the same split the ordinary (non-generic)
+    // enum-vs-class check above already makes.
+    TypeExpr::Generic(name, _) => {
+      let mangled = mangle_type_expr(texpr);
+      match classes.get(&mangled) {
+        Some(info) if info.enum_variants.is_some() => Ok(Type::Enum(mangled)),
+        Some(_) => Ok(Type::Class(mangled)),
+        None => Err(Diagnostic::new(
+          format!("unknown type `{name}[...]`"),
+          (0, 0),
+        )),
+      }
+    }
+    // Legal ONLY as a function's declared return type
+    // (`resolve_return_type`'s own dedicated handling below) — every
+    // other annotation position (params, fields, `Let`) reaches
+    // `resolve_type` directly, which has no meaning for a bare tuple
+    // shape.
+    TypeExpr::Tuple(_) => Err(Diagnostic::new(
+      format!("tuple type `{texpr}` is only allowed as a function's declared return type"),
+      (0, 0),
+    )),
+  }
+}
+
+/// `resolve_type`'s own `TypeExpr::Named` case — a plain identifier,
+/// checked against primitives, then declared classes/modules/enums.
+fn resolve_named_type(
+  name: &str,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Type, Diagnostic> {
   match name {
     "Int64" => Ok(Type::Int64),
     "Float64" => Ok(Type::Float64),
@@ -285,6 +468,13 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     // comment) means no METHOD dispatches on it, not that it can't be
     // named.
     "CString" => Ok(Type::CString),
+    // A bare `Proc` annotation carries no signature (see `Type::Proc`'s
+    // doc comment) — reached only when `Proc` is written with no
+    // bracket clause at all; the pre-existing lambda-literal-inference
+    // path (`check_stmt`'s `Let` special case) overwrites this opaque
+    // placeholder with the real signature recovered from the bound
+    // `Expr::Lambda` before anything else ever observes it.
+    "Proc" => Ok(Type::Proc(Vec::new(), Box::new(Type::Void))),
     // Plan 52's Decision log: checked before the ordinary `Type::Class`
     // branch below — an enum shares the same `classes` registry
     // (Decision log's disclosed adaptation) but must resolve to
@@ -300,87 +490,195 @@ fn resolve_type(name: &str, classes: &HashMap<String, ClassInfo>) -> Result<Type
     // module name is excluded here so `x: MathUtils = ...` correctly
     // falls through to the `unknown type` error below, not `Type::Class`.
     other if classes.get(other).is_some_and(|c| !c.is_module) => Ok(Type::Class(other.to_string())),
-    // The grammar hands compound array annotations over as a plain
-    // `"Array[Elem]"` string (plan 09's Decision log — no structured
-    // type-annotation AST node yet), so this is where it turns into
-    // `Type::Array`. Recurses on `Elem` so `Array[Array[Int64]]` works
-    // for free, even though nothing exercises it yet.
-    other if other.starts_with("Array[") && other.ends_with(']') => {
-      let elem_name = &other["Array[".len()..other.len() - 1];
-      let elem_ty = resolve_type(elem_name, classes)?;
-      Ok(Type::Array(Box::new(elem_ty)))
-    }
-    // `"Hash[K, V]"` — same compound-string convention as `Array[Elem]`
-    // above; the grammar's `HashPair` production always formats it with
-    // exactly `", "` between `K` and `V` (`grammar.lalrpop`'s `TypeName`
-    // rule), so a single `", "` split is unambiguous here.
-    other if other.starts_with("Hash[") && other.ends_with(']') => {
-      let inner = &other["Hash[".len()..other.len() - 1];
-      let (k_name, v_name) = inner.split_once(", ").ok_or_else(|| {
-        Diagnostic::new(format!("malformed Hash type annotation `{other}`"), (0, 0))
-      })?;
-      let k_ty = resolve_type(k_name, classes)?;
-      let v_ty = resolve_type(v_name, classes)?;
-      Ok(Type::Hash(Box::new(k_ty), Box::new(v_ty)))
-    }
-    // Plan 53's Decision log: `"Result[T, E]"` — the identical `,
-    // `-split convention `Hash[K, V]` above already ships.
-    other if other.starts_with("Result[") && other.ends_with(']') => {
-      let inner = &other["Result[".len()..other.len() - 1];
-      let (t_name, e_name) = inner.split_once(", ").ok_or_else(|| {
-        Diagnostic::new(
-          format!("malformed Result type annotation `{other}`"),
-          (0, 0),
-        )
-      })?;
-      let t_ty = resolve_type(t_name, classes)?;
-      let e_ty = resolve_type(e_name, classes)?;
-      Ok(Type::Result(Box::new(t_ty), Box::new(e_ty)))
-    }
-    // Plan 42's Decision log: `"Pair[K, V]"` — the identical `, `-split
-    // convention `Hash[K, V]`/`Result[T, E]` above already ship.
-    other if other.starts_with("Pair[") && other.ends_with(']') => {
-      let inner = &other["Pair[".len()..other.len() - 1];
-      let (k_name, v_name) = inner.split_once(", ").ok_or_else(|| {
-        Diagnostic::new(format!("malformed Pair type annotation `{other}`"), (0, 0))
-      })?;
-      let k_ty = resolve_type(k_name, classes)?;
-      let v_ty = resolve_type(v_name, classes)?;
-      Ok(Type::Pair(Box::new(k_ty), Box::new(v_ty)))
-    }
-    // A bare `Proc` annotation carries no signature (see `Type::Proc`'s
-    // doc comment) — this opaque placeholder is only ever reached outside
-    // `check_stmt`'s `Let` special case (which instead stores the real
-    // signature straight from the bound `Expr::Lambda`), e.g. if `Proc`
-    // were used as a function parameter/return type, which this plan
-    // doesn't exercise.
-    "Proc" => Ok(Type::Proc(Vec::new(), Box::new(Type::Void))),
-    // Plan 58's Decision log: a generic-class instantiation (`"Stack[
-    // Int64]"`) resolves to `Type::Class(mangled)` iff its mangled name
-    // (`mangle_type_name`) is already registered in `classes` — by the
-    // time any caller reaches `resolve_type`, `check_program`'s own
-    // collect+instantiate pass has already monomorphized every
-    // instantiation actually written in the program, so a mangled name
-    // absent here means the type argument itself didn't resolve (a
-    // real, disclosed simplification: this path reports the SAME
-    // "unknown type" diagnostic as the ordinary case below, rather than
-    // re-deriving which specific type argument failed).
-    // Plan 73's Decision log: a generic-ENUM instantiation (`"Option[
-    // Int64]"`) mangles exactly the same way a generic-class one does —
-    // the two share one mangled-name-keyed `classes` registry (plan
-    // 52's own disclosed adaptation) — but must resolve to `Type::Enum`,
-    // never `Type::Class`, the same split the ordinary (non-generic)
-    // enum-vs-class check above already makes.
-    other if parse_generic_instantiation(other).is_some() => {
-      let mangled = mangle_type_name(other);
-      match classes.get(&mangled) {
-        Some(info) if info.enum_variants.is_some() => Ok(Type::Enum(mangled)),
-        Some(_) => Ok(Type::Class(mangled)),
-        None => Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0))),
-      }
-    }
     other => Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0))),
   }
+}
+
+/// Plan 88: `"Stack[Int64]"` -> `"Stack$Int64"`, recursively (`"Stack[
+/// Box[Int64]]"` -> `"Stack$Box$Int64"`) — the `TypeExpr`-native
+/// replacement for the old string-splitting `mangle_type_name`, doubling
+/// as both the synthesized `Type::Class` name AND codegen's `{ClassName}
+/// _{method}` mangling prefix (Decision log), so nothing downstream
+/// needs to know a mangled name came from a generic instantiation
+/// rather than an ordinary source-declared class. `Array`/`Hash`/
+/// `Pair`/`Result` are never mangled this way — each has its own
+/// dedicated `Type` variant instead (`NATIVE_GENERIC_NAMES`) — so a
+/// `TypeExpr` containing one renders via its own `Display` unchanged,
+/// exactly matching the pre-plan-88 behavior this replaces.
+fn mangle_type_expr(t: &TypeExpr) -> String {
+  match t {
+    TypeExpr::Generic(base, args) if !NATIVE_GENERIC_NAMES.contains(&base.as_str()) => {
+      let mangled_args: Vec<String> = args.iter().map(mangle_type_expr).collect();
+      format!("{base}${}", mangled_args.join("$"))
+    }
+    other => other.to_string(),
+  }
+}
+
+/// Plan 88: whole-tree type-parameter substitution — a real, recursive
+/// `TypeExpr`-to-`TypeExpr` rewrite replacing every `subst`-keyed
+/// `Named` leaf, genuinely simpler than the byte-scanning identifier-run
+/// substitution it replaces (`substitute_type_params`'s own pre-plan-88
+/// implementation had to hand-roll word-boundary detection over a flat
+/// string; walking a real tree needs none of that). Used by generic
+/// CLASS instantiation (`resolve_substituted_type`) and by generic
+/// METHOD registration (a method's own params/return, substituted
+/// against the ENCLOSING class's type arguments before the method's own
+/// free type parameter is registered into `GenericMethodSig`).
+fn substitute_type_params(raw: &TypeExpr, subst: &HashMap<&str, &TypeExpr>) -> TypeExpr {
+  match raw {
+    TypeExpr::Named(name) => subst
+      .get(name.as_str())
+      .map(|t| (*t).clone())
+      .unwrap_or_else(|| raw.clone()),
+    TypeExpr::Generic(base, args) => TypeExpr::Generic(
+      base.clone(),
+      args
+        .iter()
+        .map(|a| substitute_type_params(a, subst))
+        .collect(),
+    ),
+    TypeExpr::Tuple(parts) => TypeExpr::Tuple(
+      parts
+        .iter()
+        .map(|p| substitute_type_params(p, subst))
+        .collect(),
+    ),
+    TypeExpr::Func(params, ret) => TypeExpr::Func(
+      params
+        .iter()
+        .map(|p| substitute_type_params(p, subst))
+        .collect(),
+      Box::new(substitute_type_params(ret, subst)),
+    ),
+  }
+}
+
+/// Plan 88: whole-tree scan — true if `name` appears as a standalone
+/// `Named` leaf anywhere inside `ty`. The real-tree replacement for the
+/// byte-scanning `type_references_any` this plan removes; used by
+/// `check_generic_class_body` to recognize a field/param/return type
+/// referencing the enclosing generic class's own type parameter.
+fn type_references_any(ty: &TypeExpr, names: &HashSet<&str>) -> bool {
+  match ty {
+    TypeExpr::Named(name) => names.contains(name.as_str()),
+    TypeExpr::Generic(_, args) => args.iter().any(|a| type_references_any(a, names)),
+    TypeExpr::Tuple(parts) => parts.iter().any(|p| type_references_any(p, names)),
+    TypeExpr::Func(params, ret) => {
+      params.iter().any(|p| type_references_any(p, names)) || type_references_any(ret, names)
+    }
+  }
+}
+
+/// A resolved `Type`'s own `TypeExpr` re-encoding — the reverse
+/// direction of `resolve_type`, needed only by `infer_type_param_binding`
+/// /the generic-method call-site substitution it feeds: once a method's
+/// own free type parameter (`U`) is bound to a concrete `Type` inferred
+/// from an argument, that concrete `Type` needs to re-enter `substitute_
+/// type_params`'s ordinary `TypeExpr`-to-`TypeExpr` substitution
+/// machinery to resolve the REST of the signature (which may reference
+/// `U` nested inside another compound shape, e.g. the plan's own worked
+/// example's `Array[U]` return type). Best-effort for the handful of
+/// `Type` shapes that can't round-trip through a source-level name at
+/// all (`Type::Generic`/`Type::Supervisor`) — never actually reached in
+/// practice, since neither is ever a legal generic-method type argument.
+fn type_to_type_expr(t: &Type) -> TypeExpr {
+  match t {
+    Type::Int64 => TypeExpr::Named("Int64".to_string()),
+    Type::Float64 => TypeExpr::Named("Float64".to_string()),
+    Type::String => TypeExpr::Named("String".to_string()),
+    Type::Boolean => TypeExpr::Named("Boolean".to_string()),
+    Type::Void => TypeExpr::Named("Void".to_string()),
+    Type::Symbol => TypeExpr::Named("Symbol".to_string()),
+    Type::CString => TypeExpr::Named("CString".to_string()),
+    Type::Class(name) | Type::Enum(name) | Type::Generic(name, _) => TypeExpr::Named(name.clone()),
+    Type::Array(e) => TypeExpr::Generic("Array".to_string(), vec![type_to_type_expr(e)]),
+    Type::Hash(k, v) => TypeExpr::Generic(
+      "Hash".to_string(),
+      vec![type_to_type_expr(k), type_to_type_expr(v)],
+    ),
+    Type::Pair(k, v) => TypeExpr::Generic(
+      "Pair".to_string(),
+      vec![type_to_type_expr(k), type_to_type_expr(v)],
+    ),
+    Type::Result(t, e) => TypeExpr::Generic(
+      "Result".to_string(),
+      vec![type_to_type_expr(t), type_to_type_expr(e)],
+    ),
+    Type::Proc(params, ret) => TypeExpr::Func(
+      params.iter().map(type_to_type_expr).collect(),
+      Box::new(type_to_type_expr(ret)),
+    ),
+    Type::Tuple(parts) => TypeExpr::Tuple(parts.iter().map(type_to_type_expr).collect()),
+    Type::Supervisor(_) => TypeExpr::Named("Supervisor".to_string()),
+  }
+}
+
+/// Plan 88: structural unification — finds what concrete `Type` a
+/// generic method's own free type parameter (`param_name`, e.g. `U`)
+/// would have to bind to for `raw` (the method's OWN, already class-
+/// substituted declared type, e.g. `Proc[Int64, U]`) to match `actual`
+/// (the real, inferred `Type` of the argument actually passed, e.g.
+/// `Type::Proc([Type::Int64], Type::Int64)`). `None` when `param_name`
+/// doesn't appear in `raw` at all, or when `raw`'s own shape doesn't
+/// structurally match `actual` closely enough to say. Positional only
+/// (first match wins within one call) — the caller
+/// (`infer_expr_type`'s generic-method `MethodCall` dispatch) is
+/// responsible for checking every parameter agrees on the SAME binding,
+/// the same consistency check `infer_expr_type`'s existing top-level-
+/// generic-function `Expr::Call` arm already performs for its own
+/// (simpler, bare-identifier-only) case.
+fn infer_type_param_binding(raw: &TypeExpr, actual: &Type, param_name: &str) -> Option<Type> {
+  match raw {
+    TypeExpr::Named(name) if name == param_name => Some(actual.clone()),
+    TypeExpr::Named(_) => None,
+    TypeExpr::Generic(base, args) => match (base.as_str(), actual) {
+      ("Array", Type::Array(e)) => infer_type_param_binding(args.first()?, e, param_name),
+      ("Hash", Type::Hash(k, v)) => infer_type_param_binding(args.first()?, k, param_name)
+        .or_else(|| infer_type_param_binding(args.get(1)?, v, param_name)),
+      ("Pair", Type::Pair(k, v)) => infer_type_param_binding(args.first()?, k, param_name)
+        .or_else(|| infer_type_param_binding(args.get(1)?, v, param_name)),
+      ("Result", Type::Result(t, e)) => infer_type_param_binding(args.first()?, t, param_name)
+        .or_else(|| infer_type_param_binding(args.get(1)?, e, param_name)),
+      _ => None,
+    },
+    TypeExpr::Tuple(parts) => match actual {
+      Type::Tuple(ts) if ts.len() == parts.len() => parts
+        .iter()
+        .zip(ts)
+        .find_map(|(p, t)| infer_type_param_binding(p, t, param_name)),
+      _ => None,
+    },
+    TypeExpr::Func(params, ret) => match actual {
+      Type::Proc(aparams, aret) if aparams.len() == params.len() => params
+        .iter()
+        .zip(aparams)
+        .find_map(|(p, a)| infer_type_param_binding(p, a, param_name))
+        .or_else(|| infer_type_param_binding(ret, aret, param_name)),
+      _ => None,
+    },
+  }
+}
+
+/// Resolves `raw` (a generic method's own already class-substituted
+/// declared type) to a concrete `Type`, with its own free type
+/// parameter (`param_name`) bound to `concrete` — the call-site half of
+/// `infer_type_param_binding`'s unification. Reuses the ordinary
+/// `TypeExpr`-to-`TypeExpr` `substitute_type_params` plus `resolve_type`
+/// rather than a bespoke `TypeExpr`-to-`Type` walk, so a `param_name`
+/// nested arbitrarily deep (inside a user generic class's own type
+/// argument, say) resolves exactly the same way any other substituted
+/// type would.
+fn resolve_with_type_param(
+  raw: &TypeExpr,
+  param_name: &str,
+  concrete: &Type,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Type, Diagnostic> {
+  let concrete_texpr = type_to_type_expr(concrete);
+  let mut subst: HashMap<&str, &TypeExpr> = HashMap::new();
+  subst.insert(param_name, &concrete_texpr);
+  resolve_type(&substitute_type_params(raw, &subst), classes)
 }
 
 const GENERIC_INSTANTIATION_DEPTH_LIMIT: usize = 32;
@@ -393,19 +691,71 @@ const GENERIC_INSTANTIATION_DEPTH_LIMIT: usize = 32;
 /// `next: Node[T]`), recursively instantiates it first so `resolve_type`
 /// finds its mangled name already present in `classes`.
 fn resolve_substituted_type(
-  raw: &str,
-  subst: &HashMap<&str, &str>,
+  raw: &TypeExpr,
+  subst: &HashMap<&str, &TypeExpr>,
   generic_classes: &HashMap<String, &ClassDef>,
   classes: &mut HashMap<String, ClassInfo>,
   in_progress: &mut Vec<String>,
 ) -> Result<Type, Diagnostic> {
   let substituted = substitute_type_params(raw, subst);
-  if let Some((base, args)) = parse_generic_instantiation(&substituted) {
-    if generic_classes.contains_key(base) {
-      instantiate_generic_class(base, &args, generic_classes, classes, in_progress)?;
+  if let TypeExpr::Generic(base, args) = &substituted {
+    if generic_classes.contains_key(base.as_str()) {
+      instantiate_generic_class(base, args, generic_classes, classes, in_progress)?;
     }
   }
   resolve_type(&substituted, classes)
+}
+
+/// Checks a single type argument against a single bound (one entry of a
+/// type parameter's `bounds` set — plan 88's Decision log widened this
+/// from a single optional bound to a real conjunctive set, so this is
+/// now called once per bound, ALL of which must pass). Shared verbatim
+/// between generic-class (`build_generic_class_info`) and generic-enum
+/// (`build_generic_enum_info`) instantiation, which otherwise duplicated
+/// this exact check.
+fn check_generic_arg_bound(
+  arg_class_name: &str,
+  bound: &str,
+  arg_display: &TypeExpr,
+  type_param_name: &str,
+  owner_kind: &str,
+  owner_name: &str,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<(), Diagnostic> {
+  let conforms = classes
+    .get(arg_class_name)
+    .is_some_and(|info| info.implements.as_deref() == Some(bound));
+  if conforms {
+    Ok(())
+  } else {
+    Err(Diagnostic::new(
+      format!(
+        "`{arg_display}` does not implement `{bound}`, required by generic {owner_kind} `{owner_name}`'s type parameter `{type_param_name}`"
+      ),
+      (0, 0),
+    ))
+  }
+}
+
+/// Resolves a generic instantiation's own type ARGUMENT to the mangled
+/// class name it should be checked for interface conformance against —
+/// monomorphizing it first if it's itself a nested user-generic-class
+/// instantiation, falling back to a plain name/mangled string otherwise.
+fn resolve_conformance_arg_name(
+  arg: &TypeExpr,
+  generic_classes: &HashMap<String, &ClassDef>,
+  classes: &mut HashMap<String, ClassInfo>,
+  in_progress: &mut Vec<String>,
+) -> Result<String, Diagnostic> {
+  if let TypeExpr::Generic(abase, aargs) = arg {
+    if generic_classes.contains_key(abase.as_str()) {
+      return instantiate_generic_class(abase, aargs, generic_classes, classes, in_progress);
+    }
+  }
+  match arg {
+    TypeExpr::Named(name) => Ok(name.clone()),
+    other => Ok(mangle_type_expr(other)),
+  }
 }
 
 /// Plan 58: builds the monomorphized `ClassInfo` for `base_name<
@@ -418,34 +768,27 @@ fn resolve_substituted_type(
 fn build_generic_class_info(
   base_name: &str,
   c: &ClassDef,
-  type_args: &[&str],
-  subst: &HashMap<&str, &str>,
+  type_args: &[TypeExpr],
+  subst: &HashMap<&str, &TypeExpr>,
   generic_classes: &HashMap<String, &ClassDef>,
   classes: &mut HashMap<String, ClassInfo>,
   in_progress: &mut Vec<String>,
 ) -> Result<ClassInfo, Diagnostic> {
   for (tp, arg) in c.type_params.iter().zip(type_args.iter()) {
-    let Some(bound) = &tp.bound else { continue };
-    let arg_class_name = if let Some((abase, aargs)) = parse_generic_instantiation(arg) {
-      if generic_classes.contains_key(abase) {
-        instantiate_generic_class(abase, &aargs, generic_classes, classes, in_progress)?
-      } else {
-        mangle_type_name(arg)
-      }
-    } else {
-      (*arg).to_string()
-    };
-    let conforms = classes
-      .get(&arg_class_name)
-      .is_some_and(|info| info.implements.as_deref() == Some(bound.as_str()));
-    if !conforms {
-      return Err(Diagnostic::new(
-        format!(
-          "`{arg}` does not implement `{bound}`, required by generic class `{base_name}`'s type parameter `{}`",
-          tp.name
-        ),
-        (0, 0),
-      ));
+    if tp.bounds.is_empty() {
+      continue;
+    }
+    let arg_class_name = resolve_conformance_arg_name(arg, generic_classes, classes, in_progress)?;
+    for bound in &tp.bounds {
+      check_generic_arg_bound(
+        &arg_class_name,
+        bound,
+        arg,
+        &tp.name,
+        "class",
+        base_name,
+        classes,
+      )?;
     }
   }
 
@@ -456,15 +799,19 @@ fn build_generic_class_info(
   }
 
   let mut methods = HashMap::new();
+  let mut generic_methods = HashMap::new();
   for m in &c.methods {
+    // Plan 88's Decision log: a method's OWN type parameter (`map[U]`)
+    // is a second, independent generic dimension on top of whatever
+    // `c`'s own `type_params` already substituted here — registered
+    // into `generic_methods` (resolved per call site, `ClassInfo`'s own
+    // doc comment) instead of being pre-resolved into one fixed
+    // `FunctionSig`, lifting the old blanket "generic methods are not
+    // supported" rejection this branch used to raise unconditionally.
     if !m.type_params.is_empty() {
-      return Err(Diagnostic::new(
-        format!(
-          "generic methods are not supported yet (`{base_name}#{}`)",
-          m.name
-        ),
-        (0, 0),
-      ));
+      let sig = generic_method_signature(base_name, m, subst, classes)?;
+      generic_methods.insert(m.name.clone(), sig);
+      continue;
     }
     let params = m
       .params
@@ -503,6 +850,64 @@ fn build_generic_class_info(
     implements: c.implements.clone(),
     enum_variants: None,
     is_actor: false,
+    generic_methods,
+  })
+}
+
+/// Plan 88: registers one class method's own `[U]`/`[U: Bound]` type
+/// parameter into a `GenericMethodSig` — shared by both `build_generic_
+/// class_info` (a generic class TEMPLATE's own methods, `subst` maps
+/// the class's own type parameters to their concrete instantiation
+/// arguments) and `build_flattened_class_info` (an ordinary, non-
+/// generic class, `subst` is empty). Exactly one type parameter is
+/// required — a second is rejected here the same way a top-level
+/// generic function's own registration already rejects more than one
+/// (`GenericFunctionSig`'s own precedent) — but, unlike a top-level
+/// function, a bound is NOT required (`GenericMethodSig.bounds`'s own
+/// doc comment: the plan's own worked example, `map[U]`, is genuinely
+/// unbounded).
+fn generic_method_signature(
+  class_name: &str,
+  m: &Function,
+  subst: &HashMap<&str, &TypeExpr>,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<GenericMethodSig, Diagnostic> {
+  if m.type_params.len() != 1 {
+    return Err(Diagnostic::new(
+      format!(
+        "generic method `{class_name}#{}` declares {} type parameters — multiple type parameters are not supported",
+        m.name,
+        m.type_params.len()
+      ),
+      (0, 0),
+    ));
+  }
+  let tp = &m.type_params[0];
+  // A method's own free type parameter must never collide with a name
+  // `subst` already binds (the enclosing class's own type parameter) —
+  // otherwise `substitute_type_params` below would silently substitute
+  // it away, leaving nothing left for call-site unification to bind.
+  if subst.contains_key(tp.name.as_str()) {
+    return Err(Diagnostic::new(
+      format!(
+        "generic method `{class_name}#{}`'s type parameter `{}` shadows the enclosing class's own type parameter of the same name",
+        m.name, tp.name
+      ),
+      (0, 0),
+    ));
+  }
+  let _ = classes; // reserved for a future bound-conformance pre-check; call sites re-check anyway.
+  let params_raw = m
+    .params
+    .iter()
+    .map(|p| (p.name.clone(), substitute_type_params(&p.ty, subst)))
+    .collect();
+  let return_type_raw = substitute_type_params(&m.return_type, subst);
+  Ok(GenericMethodSig {
+    type_param: tp.name.clone(),
+    bounds: tp.bounds.clone(),
+    params_raw,
+    return_type_raw,
   })
 }
 
@@ -532,30 +937,19 @@ fn build_generic_class_info(
 /// it just keeps growing `in_progress` until the depth bound rejects it.
 fn instantiate_generic_class(
   base_name: &str,
-  type_args: &[&str],
+  type_args: &[TypeExpr],
   generic_classes: &HashMap<String, &ClassDef>,
   classes: &mut HashMap<String, ClassInfo>,
   in_progress: &mut Vec<String>,
 ) -> Result<String, Diagnostic> {
-  let mangled_args: Vec<String> = type_args.iter().map(|a| mangle_type_name(a)).collect();
+  let mangled_args: Vec<String> = type_args.iter().map(mangle_type_expr).collect();
   let mangled = format!("{base_name}${}", mangled_args.join("$"));
 
   if classes.contains_key(&mangled) {
     return Ok(mangled);
   }
   if in_progress.last().map(String::as_str) == Some(mangled.as_str()) {
-    classes.insert(
-      mangled.clone(),
-      ClassInfo {
-        fields: HashMap::new(),
-        methods: HashMap::new(),
-        is_module: false,
-        superclass: None,
-        implements: None,
-        enum_variants: None,
-        is_actor: false,
-      },
-    );
+    classes.insert(mangled.clone(), empty_class_info(false));
     return Ok(mangled);
   }
   if in_progress.len() >= GENERIC_INSTANTIATION_DEPTH_LIMIT {
@@ -583,11 +977,11 @@ fn instantiate_generic_class(
     ));
   }
 
-  let subst: HashMap<&str, &str> = c
+  let subst: HashMap<&str, &TypeExpr> = c
     .type_params
     .iter()
     .map(|tp| tp.name.as_str())
-    .zip(type_args.iter().copied())
+    .zip(type_args.iter())
     .collect();
 
   in_progress.push(mangled.clone());
@@ -607,6 +1001,23 @@ fn instantiate_generic_class(
   Ok(mangled)
 }
 
+/// A placeholder `ClassInfo` used only for `instantiate_generic_class`/
+/// `instantiate_generic_enum`'s own self-reference hazard (their own
+/// doc comments) — every field left at its empty/default value, since
+/// the real one overwrites it once the enclosing call finishes.
+fn empty_class_info(is_enum: bool) -> ClassInfo {
+  ClassInfo {
+    fields: HashMap::new(),
+    methods: HashMap::new(),
+    is_module: false,
+    superclass: None,
+    implements: None,
+    enum_variants: if is_enum { Some(Vec::new()) } else { None },
+    is_actor: false,
+    generic_methods: HashMap::new(),
+  }
+}
+
 /// Plan 73: `Option[T]`'s own monomorphization — the first GENERIC enum
 /// this compiler ships, extending plan 41/58's exact generic-class
 /// strategy (`instantiate_generic_class`/`build_generic_class_info`
@@ -621,31 +1032,20 @@ fn instantiate_generic_class(
 /// `check_case`/`find_all_variants` need no separate registry at all.
 fn instantiate_generic_enum(
   base_name: &str,
-  type_args: &[&str],
+  type_args: &[TypeExpr],
   generic_classes: &HashMap<String, &ClassDef>,
   generic_enums: &HashMap<String, &EnumDef>,
   classes: &mut HashMap<String, ClassInfo>,
   in_progress: &mut Vec<String>,
 ) -> Result<String, Diagnostic> {
-  let mangled_args: Vec<String> = type_args.iter().map(|a| mangle_type_name(a)).collect();
+  let mangled_args: Vec<String> = type_args.iter().map(mangle_type_expr).collect();
   let mangled = format!("{base_name}${}", mangled_args.join("$"));
 
   if classes.contains_key(&mangled) {
     return Ok(mangled);
   }
   if in_progress.last().map(String::as_str) == Some(mangled.as_str()) {
-    classes.insert(
-      mangled.clone(),
-      ClassInfo {
-        fields: HashMap::new(),
-        methods: HashMap::new(),
-        is_module: false,
-        superclass: None,
-        implements: None,
-        enum_variants: Some(Vec::new()),
-        is_actor: false,
-      },
-    );
+    classes.insert(mangled.clone(), empty_class_info(true));
     return Ok(mangled);
   }
   if in_progress.len() >= GENERIC_INSTANTIATION_DEPTH_LIMIT {
@@ -673,11 +1073,11 @@ fn instantiate_generic_enum(
     ));
   }
 
-  let subst: HashMap<&str, &str> = e
+  let subst: HashMap<&str, &TypeExpr> = e
     .type_params
     .iter()
     .map(|tp| tp.name.as_str())
-    .zip(type_args.iter().copied())
+    .zip(type_args.iter())
     .collect();
 
   in_progress.push(mangled.clone());
@@ -709,44 +1109,47 @@ fn instantiate_generic_enum(
 fn build_generic_enum_info(
   base_name: &str,
   e: &EnumDef,
-  type_args: &[&str],
-  subst: &HashMap<&str, &str>,
+  type_args: &[TypeExpr],
+  subst: &HashMap<&str, &TypeExpr>,
   generic_classes: &HashMap<String, &ClassDef>,
   generic_enums: &HashMap<String, &EnumDef>,
   classes: &mut HashMap<String, ClassInfo>,
   in_progress: &mut Vec<String>,
 ) -> Result<ClassInfo, Diagnostic> {
   for (tp, arg) in e.type_params.iter().zip(type_args.iter()) {
-    let Some(bound) = &tp.bound else { continue };
-    let arg_class_name = if let Some((abase, aargs)) = parse_generic_instantiation(arg) {
-      if generic_classes.contains_key(abase) {
-        instantiate_generic_class(abase, &aargs, generic_classes, classes, in_progress)?
-      } else if generic_enums.contains_key(abase) {
+    if tp.bounds.is_empty() {
+      continue;
+    }
+    let arg_class_name = if let TypeExpr::Generic(abase, aargs) = arg {
+      if generic_classes.contains_key(abase.as_str()) {
+        instantiate_generic_class(abase, aargs, generic_classes, classes, in_progress)?
+      } else if generic_enums.contains_key(abase.as_str()) {
         instantiate_generic_enum(
           abase,
-          &aargs,
+          aargs,
           generic_classes,
           generic_enums,
           classes,
           in_progress,
         )?
       } else {
-        mangle_type_name(arg)
+        mangle_type_expr(arg)
       }
+    } else if let TypeExpr::Named(name) = arg {
+      name.clone()
     } else {
-      (*arg).to_string()
+      mangle_type_expr(arg)
     };
-    let conforms = classes
-      .get(&arg_class_name)
-      .is_some_and(|info| info.implements.as_deref() == Some(bound.as_str()));
-    if !conforms {
-      return Err(Diagnostic::new(
-        format!(
-          "`{arg}` does not implement `{bound}`, required by generic enum `{base_name}`'s type parameter `{}`",
-          tp.name
-        ),
-        (0, 0),
-      ));
+    for bound in &tp.bounds {
+      check_generic_arg_bound(
+        &arg_class_name,
+        bound,
+        arg,
+        &tp.name,
+        "enum",
+        base_name,
+        classes,
+      )?;
     }
   }
 
@@ -755,13 +1158,13 @@ fn build_generic_enum_info(
     let mut field_types = Vec::new();
     for f in &v.fields {
       let substituted = substitute_type_params(f, subst);
-      if let Some((base, args)) = parse_generic_instantiation(&substituted) {
-        if generic_classes.contains_key(base) {
-          instantiate_generic_class(base, &args, generic_classes, classes, in_progress)?;
-        } else if generic_enums.contains_key(base) {
+      if let TypeExpr::Generic(base, args) = &substituted {
+        if generic_classes.contains_key(base.as_str()) {
+          instantiate_generic_class(base, args, generic_classes, classes, in_progress)?;
+        } else if generic_enums.contains_key(base.as_str()) {
           instantiate_generic_enum(
             base,
-            &args,
+            args,
             generic_classes,
             generic_enums,
             classes,
@@ -782,6 +1185,7 @@ fn build_generic_enum_info(
     implements: None,
     enum_variants: Some(variants),
     is_actor: false,
+    generic_methods: HashMap::new(),
   })
 }
 
@@ -794,7 +1198,7 @@ fn build_generic_enum_info(
 /// nested bodies. A generic class TEMPLATE's own raw field/method types
 /// are deliberately skipped — those are handled via substitution inside
 /// `build_generic_class_info` instead, not collected here.
-fn collect_generic_instantiation_typenames(program: &Program) -> Vec<String> {
+fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
   let mut out = Vec::new();
   for item in &program.items {
     match item {
@@ -865,13 +1269,15 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<String> {
   out
 }
 
-fn push_generic_typename(ty: &str, out: &mut Vec<String>) {
-  if parse_generic_instantiation(ty).is_some() {
-    out.push(ty.to_string());
+fn push_generic_typename(ty: &TypeExpr, out: &mut Vec<TypeExpr>) {
+  if let TypeExpr::Generic(base, _) = ty {
+    if !NATIVE_GENERIC_NAMES.contains(&base.as_str()) {
+      out.push(ty.clone());
+    }
   }
 }
 
-fn collect_typenames_in_stmt(stmt: &Spanned<Stmt>, out: &mut Vec<String>) {
+fn collect_typenames_in_stmt(stmt: &Spanned<Stmt>, out: &mut Vec<TypeExpr>) {
   match &stmt.node {
     Stmt::Let { ty, .. } => push_generic_typename(ty, out),
     Stmt::If {
@@ -963,45 +1369,34 @@ fn check_generic_class_body(
   classes: &HashMap<String, ClassInfo>,
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
-  let type_param_names: HashSet<&str> = c.type_params.iter().map(|tp| tp.name.as_str()).collect();
-  let generic_ty = |name: &str| -> Option<Type> {
-    c.type_params
-      .iter()
-      .find(|tp| tp.name == name)
-      .map(|tp| Type::Generic(tp.name.clone(), tp.bound.clone()))
-  };
-  // Plan 58's Decision log: a COMPOUND type string referencing this
-  // class's own type parameter (`Node[T]`'s own `succ: Node[T]` field)
-  // can't resolve via the ordinary registry during template-checking —
-  // it isn't monomorphized yet, and won't be until a real instantiation
-  // exists. Treated as an opaque, not-yet-instantiated `Type::Class`
-  // placeholder so the template's own field/param/return type at least
-  // records a real type shape (real, disclosed simplification: a
-  // method body that then tries to call a method ON such a value
-  // FROM WITHIN the template itself is a real, disclosed gap — not
-  // exercised by this plan's own worked example).
-  let resolve_maybe_generic = |ty: &str| -> Result<Type, Diagnostic> {
-    if let Some(t) = generic_ty(ty) {
-      return Ok(t);
-    }
-    match resolve_type(ty, classes) {
-      Ok(t) => Ok(t),
-      Err(e) => {
-        if type_references_any(ty, &type_param_names) {
-          Ok(Type::Class(ty.to_string()))
-        } else {
-          Err(e)
-        }
-      }
-    }
-  };
+  let no_method_type_params: Vec<TypeParam> = Vec::new();
+  let resolve_maybe_generic =
+    |ty: &TypeExpr, method_type_params: &[TypeParam]| -> Result<Type, Diagnostic> {
+      resolve_maybe_generic_type(ty, &c.type_params, method_type_params, classes)
+    };
 
   let mut self_fields: HashMap<String, Type> = HashMap::new();
   for field in &c.fields {
-    self_fields.insert(field.name.clone(), resolve_maybe_generic(&field.ty)?);
+    self_fields.insert(
+      field.name.clone(),
+      resolve_maybe_generic(&field.ty, &no_method_type_params)?,
+    );
   }
 
   for m in &c.methods {
+    // Plan 88's Decision log: a method's OWN `[U]`/`[U: Bound]` type
+    // parameter is a real, disclosed gap here — its BODY is never
+    // template-checked against the symbolic `U` (mirroring this
+    // function's own pre-existing "opaque `Type::Class` placeholder"
+    // simplification for a compound self-referencing field/param/
+    // return type, immediately above); only call-site argument/return-
+    // type checking is fully implemented (`infer_expr_type`'s
+    // `generic_methods` dispatch). Skipped here entirely rather than
+    // risk a confusing, spurious "unknown type `U`" diagnostic from a
+    // body-check this compiler can't yet perform meaningfully.
+    if !m.type_params.is_empty() {
+      continue;
+    }
     let mut env = HashMap::new();
     // Plan 72's Decision log: a generic class template's own method
     // parameters are immutable by construction, the same as an
@@ -1010,9 +1405,12 @@ fn check_generic_class_body(
     // it.
     let mut mutable_locals: HashSet<String> = HashSet::new();
     for p in &m.params {
-      env.insert(p.name.clone(), resolve_maybe_generic(&p.ty)?);
+      env.insert(
+        p.name.clone(),
+        resolve_maybe_generic(&p.ty, &no_method_type_params)?,
+      );
     }
-    let declared_return = resolve_maybe_generic(&m.return_type)?;
+    let declared_return = resolve_maybe_generic(&m.return_type, &no_method_type_params)?;
     check_block(
       &m.body,
       &mut env,
@@ -1141,74 +1539,45 @@ fn check_enum_variant_construction(
   Ok(true)
 }
 
-/// Splits `s` on top-level `,` only — a nested `Array[...]`/`Hash[...]`/
-/// `(...)` element's own internal comma(s) don't count as a split
-/// point. Needed because a tuple's own compound-string element list
-/// (`"(Int64, Int64)"`, or in principle `"(Hash[Int64, Int64], Int64)"`)
-/// can itself contain a compound type whose *own* convention already
-/// uses `", "` — `Hash[K, V]`'s existing single `split_once(", ")` only
-/// ever needs to handle exactly two parts with no nesting risk, but a
-/// tuple's arbitrary-length element list does.
-fn split_top_level_commas(s: &str) -> Vec<&str> {
-  let mut parts = Vec::new();
-  let mut depth = 0i32;
-  let mut start = 0usize;
-  for (i, b) in s.bytes().enumerate() {
-    match b {
-      b'[' | b'(' => depth += 1,
-      b']' | b')' => depth -= 1,
-      b',' if depth == 0 => {
-        parts.push(s[start..i].trim());
-        start = i + 1;
+/// Shared by `check_generic_class_body`'s own field/param/return-type
+/// resolution — a type appearing directly as a bare `class_type_params`/
+/// `method_type_params` name resolves to `Type::Generic`; anything else
+/// falls through to the ordinary `resolve_type`, with a COMPOUND type
+/// referencing either type-parameter set (`Node[T]`'s own `succ: Node[
+/// T]` field) treated as an opaque, not-yet-instantiated `Type::Class`
+/// placeholder (this function's own pre-existing "real, disclosed
+/// simplification" — see `check_generic_class_body`'s own doc comment
+/// for the full rationale, unchanged by plan 88 beyond widening `bound`
+/// to `bounds` and accepting a second, method-level type-parameter set).
+fn resolve_maybe_generic_type(
+  ty: &TypeExpr,
+  class_type_params: &[TypeParam],
+  method_type_params: &[TypeParam],
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Type, Diagnostic> {
+  if let TypeExpr::Named(name) = ty {
+    if let Some(tp) = method_type_params
+      .iter()
+      .chain(class_type_params.iter())
+      .find(|tp| &tp.name == name)
+    {
+      return Ok(Type::Generic(tp.name.clone(), tp.bounds.clone()));
+    }
+  }
+  match resolve_type(ty, classes) {
+    Ok(t) => Ok(t),
+    Err(e) => {
+      let names: HashSet<&str> = class_type_params
+        .iter()
+        .chain(method_type_params.iter())
+        .map(|tp| tp.name.as_str())
+        .collect();
+      if type_references_any(ty, &names) {
+        Ok(Type::Class(ty.to_string()))
+      } else {
+        Err(e)
       }
-      _ => {}
     }
-  }
-  parts.push(s[start..].trim());
-  parts
-}
-
-/// Plan 58: parses a generic-class-instantiation type-name string like
-/// `"Stack[Int64]"` into its base name and type-argument list — the
-/// general `<Ident> "[" <TypeName-list> "]"` grammar form (`grammar.
-/// lalrpop`'s new `TypeName` alternative), distinguished from the 4
-/// hardcoded compound forms (`Array[Elem]`, `Hash[K, V]`, `Pair[K, V]`,
-/// `Result[T, E]`) purely by base-name exclusion — those 4 names are
-/// reserved keywords in the grammar, never producible as a user class
-/// name, so there's no real ambiguity. Returns `None` for anything that
-/// isn't this shape (a bare name, one of the 4 reserved forms, or a
-/// malformed `[...]`).
-fn parse_generic_instantiation(ty: &str) -> Option<(&str, Vec<&str>)> {
-  let open = ty.find('[')?;
-  if !ty.ends_with(']') {
-    return None;
-  }
-  let base = &ty[..open];
-  if matches!(base, "Array" | "Hash" | "Pair" | "Result") {
-    return None;
-  }
-  let inner = &ty[open + 1..ty.len() - 1];
-  let args = split_top_level_commas(inner);
-  if args.is_empty() || args.iter().any(|a| a.is_empty()) {
-    return None;
-  }
-  Some((base, args))
-}
-
-/// Plan 58: `"Stack[Int64]"` -> `"Stack$Int64"`, recursively (`"Stack[
-/// Box[Int64]]"` -> `"Stack$Box$Int64"`) — doubles as both the
-/// synthesized `Type::Class` name AND codegen's `{ClassName}_{method}`
-/// mangling prefix (Decision log), so nothing downstream needs to know
-/// a mangled name came from a generic instantiation rather than an
-/// ordinary source-declared class. A non-generic-instantiation string
-/// (a plain class name, a primitive) passes through unchanged.
-fn mangle_type_name(ty: &str) -> String {
-  match parse_generic_instantiation(ty) {
-    Some((base, args)) => {
-      let mangled_args: Vec<String> = args.iter().map(|a| mangle_type_name(a)).collect();
-      format!("{base}${}", mangled_args.join("$"))
-    }
-    None => ty.to_string(),
   }
 }
 
@@ -1244,82 +1613,25 @@ fn type_annotation_string(ty: &Type) -> Option<String> {
   }
 }
 
-/// Plan 58: whole-token identifier-run substitution — replaces every
-/// standalone occurrence of a type-parameter name in `raw` with its
-/// concrete substitution, without also matching a type-parameter name
-/// that happens to appear as a substring of a longer identifier (e.g.
-/// substituting `T` must never touch `Total`). `raw` is a type-name
-/// string in this codebase's compound-string convention, so the only
-/// "word" characters that ever appear are ASCII alphanumerics/`_`
-/// (identifiers), with `[`, `]`, `,`, and ` ` as the only separators.
-fn substitute_type_params(raw: &str, subst: &HashMap<&str, &str>) -> String {
-  let mut out = String::with_capacity(raw.len());
-  let bytes = raw.as_bytes();
-  let mut i = 0;
-  while i < bytes.len() {
-    let b = bytes[i];
-    if b.is_ascii_alphabetic() || b == b'_' {
-      let start = i;
-      while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-      }
-      let word = &raw[start..i];
-      out.push_str(subst.get(word).copied().unwrap_or(word));
-    } else {
-      out.push(bytes[i] as char);
-      i += 1;
-    }
-  }
-  out
-}
-
-/// Plan 58: whole-token identifier-run scan — true if any name in
-/// `names` appears as a standalone identifier anywhere inside `ty`
-/// (the same word-boundary discipline `substitute_type_params` uses,
-/// read-only). Used by `check_generic_class_body` to recognize a
-/// compound type string that references this class's own type
-/// parameter (`Node[T]`'s own `succ: Node[T]`) without needing to
-/// actually substitute anything.
-fn type_references_any(ty: &str, names: &HashSet<&str>) -> bool {
-  let bytes = ty.as_bytes();
-  let mut i = 0;
-  while i < bytes.len() {
-    if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-      let start = i;
-      while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-      }
-      if names.contains(&ty[start..i]) {
-        return true;
-      }
-    } else {
-      i += 1;
-    }
-  }
-  false
-}
-
-/// Resolves a `def`'s declared return-type annotation only — the one
-/// place a `"(" T1 "," T2 ")"`-shaped tuple annotation gains real
-/// meaning (plan 39's Decision log). Every other annotation site
-/// (params, fields, `Let`) keeps calling the shared `resolve_type`
-/// directly, which has no tuple branch at all and falls through to its
-/// `unknown type` catch-all for this exact shape — the same "grammar
-/// permits it everywhere, only one specific resolution path gives it
-/// real meaning" precedent `resolve_type`'s own bare `"Proc"` case
-/// already established.
+/// Resolves a function's declared return-type annotation only — the one
+/// place a `TypeExpr::Tuple` annotation gains real meaning (plan 39's
+/// Decision log). Every other annotation site (params, fields, `Let`)
+/// keeps calling the shared `resolve_type` directly, which rejects a
+/// bare tuple shape outright — the same "grammar permits it everywhere,
+/// only one specific resolution path gives it real meaning" precedent
+/// `resolve_type`'s own bare `"Proc"` case already established.
 fn resolve_return_type(
-  name: &str,
+  texpr: &TypeExpr,
   classes: &HashMap<String, ClassInfo>,
 ) -> Result<Type, Diagnostic> {
-  if let Some(inner) = name.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-    let elem_types = split_top_level_commas(inner)
-      .into_iter()
+  if let TypeExpr::Tuple(parts) = texpr {
+    let elem_types = parts
+      .iter()
       .map(|part| resolve_type(part, classes))
       .collect::<Result<Vec<_>, _>>()?;
     return Ok(Type::Tuple(elem_types));
   }
-  resolve_type(name, classes)
+  resolve_type(texpr, classes)
 }
 
 /// Plan 59's Decision log: an `unsafe extern "C" { ... }` fn's own
@@ -1334,7 +1646,16 @@ fn resolve_return_type(
 /// never a parameter type (mirroring `ret_kind_for_type`/
 /// `value_kind_for_type`'s own return-vs-param asymmetry elsewhere in
 /// this codebase).
-fn resolve_extern_type(name: &str, is_return_position: bool) -> Result<Type, Diagnostic> {
+fn resolve_extern_type(texpr: &TypeExpr, is_return_position: bool) -> Result<Type, Diagnostic> {
+  let Some(name) = texpr.as_named() else {
+    return Err(Diagnostic::new(
+      format!(
+        "`{texpr}` is not a supported extern \"C\" type — only Int64, Float64, String, CString{} are marshalable across the FFI boundary",
+        if is_return_position { ", and Void (return only)" } else { "" }
+      ),
+      (0, 0),
+    ));
+  };
   match name {
     "Int64" => Ok(Type::Int64),
     "Float64" => Ok(Type::Float64),
@@ -1471,6 +1792,12 @@ fn build_flattened_class_info(
   let mut fields: HashMap<String, Type> = HashMap::new();
   let mut field_owner: HashMap<String, String> = HashMap::new();
   let mut methods: HashMap<String, FunctionSig> = HashMap::new();
+  let mut generic_methods: HashMap<String, GenericMethodSig> = HashMap::new();
+  // Plan 88's Decision log: an ordinary (non-generic) class has no type
+  // parameter of its own to substitute — an empty `subst` map makes
+  // `generic_method_signature` a no-op class-level substitution,
+  // leaving only the method's own free type parameter symbolic.
+  let no_class_subst: HashMap<&str, &TypeExpr> = HashMap::new();
   for class_name in &chain {
     let c = class_defs
       .get(class_name.as_str())
@@ -1508,6 +1835,20 @@ fn build_flattened_class_info(
           (0, 0),
         ));
       }
+      // Plan 88's Decision log: a method's own non-empty `type_params`
+      // routes to `generic_methods` instead of ever reaching
+      // `function_signature` (whose own "generic methods are not
+      // supported yet" rejection still stands for MODULE methods and
+      // top-level functions — only the class-method path routes around
+      // it here). No override-signature-match check applies to a
+      // generic method — an override with a genuinely different
+      // signature is a real, disclosed gap, matching this same
+      // function's existing lack of ANY generic-aware override check.
+      if !m.type_params.is_empty() {
+        let sig = generic_method_signature(class_name, m, &no_class_subst, classes)?;
+        generic_methods.insert(m.name.clone(), sig);
+        continue;
+      }
       let sig = function_signature(m, classes)?;
       // `initialize` is exempt from the invariant-signature override
       // check: every class's constructor is inherently class-specific
@@ -1539,6 +1880,7 @@ fn build_flattened_class_info(
     implements: class_defs[name].implements.clone(),
     enum_variants: None,
     is_actor: false,
+    generic_methods,
   })
 }
 
@@ -1574,6 +1916,7 @@ fn module_info(
     implements: None,
     enum_variants: None,
     is_actor: false,
+    generic_methods: HashMap::new(),
   })
 }
 
@@ -1636,6 +1979,7 @@ fn actor_info(a: &ActorDef, classes: &HashMap<String, ClassInfo>) -> Result<Clas
     implements: None,
     enum_variants: None,
     is_actor: true,
+    generic_methods: HashMap::new(),
   })
 }
 
@@ -2548,7 +2892,7 @@ fn infer_expr_type(
         .collect::<Result<Vec<_>, _>>()?;
       let mut concrete: Option<Type> = None;
       for (i, (_, raw)) in g.params_raw.iter().enumerate() {
-        if raw != &g.type_param {
+        if raw.as_named() != Some(g.type_param.as_str()) {
           continue;
         }
         let Some(actual) = arg_types.get(i) else {
@@ -2585,11 +2929,12 @@ fn infer_expr_type(
           expr.span,
         )
       })?;
+      let bounds_display = g.bounds.join(" + ");
       let Type::Class(concrete_class) = &concrete else {
         return Err(Diagnostic::new(
           format!(
-            "type parameter `{}` in call to `{name}` resolved to non-class type {concrete:?} — only a class implementing `{}` is a legal generic argument",
-            g.type_param, g.bound
+            "type parameter `{}` in call to `{name}` resolved to non-class type {concrete:?} — only a class implementing `{bounds_display}` is a legal generic argument",
+            g.type_param
           ),
           expr.span,
         ));
@@ -2597,20 +2942,30 @@ fn infer_expr_type(
       let class_info = classes
         .get(concrete_class)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{concrete_class}`"), expr.span))?;
-      if class_info.implements.as_deref() != Some(g.bound.as_str()) {
-        return Err(Diagnostic::new(
-          format!(
-            "`{concrete_class}` does not implement `{}`, required by generic function `{name}`'s type parameter `{}`",
-            g.bound, g.type_param
-          ),
-          expr.span,
-        ));
+      // Plan 88's Decision log: `bounds` widened to a real conjunctive
+      // set — EVERY bound must be satisfied, not just one. A class
+      // still only ever declares ONE `implements` clause (unchanged,
+      // out of this plan's scope), so a multi-bound requirement is
+      // only ever satisfiable when that single bound set has exactly
+      // one entry — a real, disclosed structural limit, not a bug: see
+      // `check_generic_arg_bound`'s own identical per-bound check for
+      // generic classes/enums.
+      for bound in &g.bounds {
+        if class_info.implements.as_deref() != Some(bound.as_str()) {
+          return Err(Diagnostic::new(
+            format!(
+              "`{concrete_class}` does not implement `{bound}`, required by generic function `{name}`'s type parameter `{}`",
+              g.type_param
+            ),
+            expr.span,
+          ));
+        }
       }
       let effective_params = g
         .params_raw
         .iter()
         .map(|(_, raw)| {
-          if raw == &g.type_param {
+          if raw.as_named() == Some(g.type_param.as_str()) {
             Ok(concrete.clone())
           } else {
             resolve_type(raw, classes)
@@ -2627,7 +2982,7 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
-      if g.return_type_raw == g.type_param {
+      if g.return_type_raw.as_named() == Some(g.type_param.as_str()) {
         Ok(concrete)
       } else {
         resolve_type(&g.return_type_raw, classes)
@@ -3192,20 +3547,19 @@ fn infer_expr_type(
       let Expr::Ident(recv_name) = &recv.node else {
         unreachable!()
       };
-      let Some(Type::Generic(type_param, bound)) = env.get(recv_name) else {
+      let Some(Type::Generic(type_param, bounds)) = env.get(recv_name) else {
         unreachable!()
       };
       // Plan 58's Decision log: a method call on an UNBOUNDED type
-      // parameter (`class Box[T] ... end`'s own `T`, `bound: None`) is
+      // parameter (`class Box[T] ... end`'s own `T`, `bounds: []`) is
       // rejected outright here — there is no interface to resolve the
-      // call against. This is the one real behavior change `Type::
-      // Generic`'s `Option<String>` widening needed: every generic
-      // FUNCTION reaching this arm already carries `Some(bound)`
-      // (`check_generic_function_body`'s own construction, unchanged),
-      // so this rejection is unreachable from plan 41's own surface —
-      // it only ever fires for a generic CLASS's bound-less type
-      // parameter, this plan's own real, disclosed narrowing.
-      let Some(bound) = bound else {
+      // call against. Plan 88 widens `bounds` to a real conjunctive
+      // set — the interface actually dispatched against is whichever
+      // bound in the set declares a method of this name (a generic
+      // function's own bound set is always exactly one entry today,
+      // `check_generic_function_body`'s own construction, unchanged —
+      // this only matters once a real multi-bound generic CLASS exists).
+      if bounds.is_empty() {
         return Err(Diagnostic::new(
           format!(
             "cannot call a method on unbounded type parameter `{type_param}` — declare a bound, e.g. `Stack[T: Comparable]`, to call methods on values of type `{type_param}`"
@@ -3213,29 +3567,29 @@ fn infer_expr_type(
           expr.span,
         ));
       };
-      let iface = gctx.interfaces.get(bound).ok_or_else(|| {
-        Diagnostic::new(
-          format!(
-            "internal error: unknown interface `{bound}` bounding type parameter `{type_param}`"
-          ),
-          expr.span,
-        )
-      })?;
-      if *method != iface.method_name {
-        return Err(Diagnostic::new(
-          format!(
-            "type parameter `{type_param}` (bounded by `{bound}`) has no method `{method}` — only `{}` is available",
-            iface.method_name
-          ),
-          expr.span,
-        ));
-      }
-      let self_ty = Type::Generic(type_param.clone(), Some(bound.clone()));
+      let iface = bounds
+        .iter()
+        .find_map(|b| {
+          gctx
+            .interfaces
+            .get(b)
+            .filter(|iface| &iface.method_name == method)
+        })
+        .ok_or_else(|| {
+          Diagnostic::new(
+            format!(
+              "type parameter `{type_param}` (bounded by `{}`) has no method `{method}`",
+              bounds.join(" + ")
+            ),
+            expr.span,
+          )
+        })?;
+      let self_ty = Type::Generic(type_param.clone(), bounds.clone());
       let expected = iface
         .params_raw
         .iter()
         .map(|(_, raw)| {
-          if raw == "Self" {
+          if raw.as_named() == Some("Self") {
             Ok(self_ty.clone())
           } else {
             resolve_type(raw, classes)
@@ -3252,7 +3606,7 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
-      if iface.return_type_raw == "Self" {
+      if iface.return_type_raw.as_named() == Some("Self") {
         Ok(self_ty)
       } else {
         resolve_type(&iface.return_type_raw, classes)
@@ -3470,6 +3824,105 @@ fn infer_expr_type(
           gctx,
         )?;
         return Ok(Type::Void);
+      }
+      // Plan 88's Decision log: a generic method (`map[U](f: Proc[T,
+      // U]): Array[U])`) is dispatched here, BEFORE the ordinary
+      // `info.methods.get(method)` lookup below (a class can't declare
+      // both an ordinary and a generic method of the same name — the
+      // registration passes route a method into exactly one of
+      // `methods`/`generic_methods`, never both). Infers the method's
+      // own free type parameter by structurally unifying each declared
+      // (already class-substituted) parameter type against the actual
+      // argument's inferred `Type` (`infer_type_param_binding`),
+      // requires every parameter that mentions it to agree on the same
+      // binding (mirroring the top-level generic-function call site's
+      // own identical consistency check above), then resolves the
+      // REST of the signature — including a compound return type like
+      // `Array[U]` — with that binding substituted in
+      // (`resolve_with_type_param`).
+      if let Some(g) = info.generic_methods.get(method) {
+        let arg_types = args
+          .iter()
+          .map(|a| infer_expr_type(a, env, sigs, classes, self_fields, gctx))
+          .collect::<Result<Vec<_>, _>>()?;
+        if arg_types.len() != g.params_raw.len() {
+          return Err(Diagnostic::new(
+            format!(
+              "`{method}` expects {} argument(s), found {}",
+              g.params_raw.len(),
+              arg_types.len()
+            ),
+            expr.span,
+          ));
+        }
+        let mut concrete: Option<Type> = None;
+        for (i, (_, raw)) in g.params_raw.iter().enumerate() {
+          let Some(binding) = infer_type_param_binding(raw, &arg_types[i], &g.type_param) else {
+            continue;
+          };
+          match &concrete {
+            None => concrete = Some(binding),
+            Some(c) if c != &binding => {
+              return Err(Diagnostic::new(
+                format!(
+                  "type parameter `{}` resolved inconsistently in call to `{class_name}#{method}`: `{c:?}` at an earlier argument, `{binding:?}` at argument {}",
+                  g.type_param,
+                  i + 1
+                ),
+                args[i].span,
+              ));
+            }
+            Some(_) => {}
+          }
+        }
+        let concrete = concrete.ok_or_else(|| {
+          Diagnostic::new(
+            format!(
+              "internal error: generic method `{class_name}#{method}` never uses its own type parameter `{}`",
+              g.type_param
+            ),
+            expr.span,
+          )
+        })?;
+        for bound in &g.bounds {
+          let Type::Class(concrete_class) = &concrete else {
+            return Err(Diagnostic::new(
+              format!(
+                "type parameter `{}` in call to `{class_name}#{method}` resolved to non-class type {concrete:?} — only a class implementing `{bound}` is a legal argument here",
+                g.type_param
+              ),
+              expr.span,
+            ));
+          };
+          let concrete_info = classes.get(concrete_class).ok_or_else(|| {
+            Diagnostic::new(format!("undefined class `{concrete_class}`"), expr.span)
+          })?;
+          if concrete_info.implements.as_deref() != Some(bound.as_str()) {
+            return Err(Diagnostic::new(
+              format!(
+                "`{concrete_class}` does not implement `{bound}`, required by generic method `{class_name}#{method}`'s type parameter `{}`",
+                g.type_param
+              ),
+              expr.span,
+            ));
+          }
+        }
+        let effective_params = g
+          .params_raw
+          .iter()
+          .map(|(_, raw)| resolve_with_type_param(raw, &g.type_param, &concrete, classes))
+          .collect::<Result<Vec<_>, _>>()?;
+        check_args(
+          method,
+          args,
+          &effective_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return resolve_with_type_param(&g.return_type_raw, &g.type_param, &concrete, classes);
       }
       let sig = info.methods.get(method).ok_or_else(|| {
         Diagnostic::new(
@@ -3867,7 +4320,7 @@ fn infer_hash_lit_type(
 /// a body/return-type mismatch on the lambda itself.
 fn infer_lambda_type(
   params: &[Param],
-  _return_type: &str,
+  _return_type: &TypeExpr,
   body: &[Spanned<Stmt>],
   env: &HashMap<String, Type>,
   sigs: &HashMap<String, FunctionSig>,
@@ -4789,7 +5242,7 @@ fn check_stmt(
         ..
       },
       is_var,
-    } if parse_generic_instantiation(ty).is_some_and(|(base, _)| base == class_name.as_str()) => {
+    } if matches!(ty, TypeExpr::Generic(base, _) if base == class_name) => {
       let declared = resolve_type(ty, classes)?;
       let Type::Class(mangled) = &declared else {
         unreachable!("resolve_type's generic-instantiation branch always returns Type::Class");
@@ -5568,7 +6021,7 @@ fn check_begin(
   )?;
   for rescue in rescues {
     if let Some(class_name) = &rescue.class_name {
-      let rescue_ty = resolve_type(class_name, classes)?;
+      let rescue_ty = resolve_type(&TypeExpr::Named(class_name.clone()), classes)?;
       if !matches!(rescue_ty, Type::Class(_)) {
         // `RescueClause` carries no span of its own (ast.rs never wraps
         // it in `Spanned` — see plan 22's own scope note); an honest
@@ -8364,7 +8817,7 @@ fn check_method_body(
   // (non-tuple-aware) `resolve_type` call below, which would otherwise
   // reject this shape with a generic "unknown type" diagnostic instead
   // of this explicit, named one.
-  if m.return_type.starts_with('(') {
+  if matches!(m.return_type, TypeExpr::Tuple(_)) {
     return Err(Diagnostic::new(
       format!(
         "tuple return types are not supported on methods yet (`{class_name}#{}`)",
@@ -8721,7 +9174,7 @@ fn check_yields_against_block(
         check_yields_against_block(body, expected, env, sigs, classes, gctx)?;
         for rescue in rescues {
           if let Some(class_name) = &rescue.class_name {
-            if let Ok(t) = resolve_type(class_name, classes) {
+            if let Ok(t) = resolve_type(&TypeExpr::Named(class_name.clone()), classes) {
               env.insert(rescue.var.clone(), t);
             }
           }
@@ -8828,6 +9281,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           implements: c.implements.clone(),
           enum_variants: None,
           is_actor: false,
+          generic_methods: HashMap::new(),
         },
       );
     }
@@ -8842,6 +9296,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           implements: None,
           enum_variants: None,
           is_actor: false,
+          generic_methods: HashMap::new(),
         },
       );
     }
@@ -8856,6 +9311,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           implements: None,
           enum_variants: None,
           is_actor: true,
+          generic_methods: HashMap::new(),
         },
       );
     }
@@ -8974,6 +9430,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           implements: c.implements.clone(),
           enum_variants: None,
           is_actor: false,
+          generic_methods: HashMap::new(),
         },
       );
     }
@@ -8988,6 +9445,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           implements: None,
           enum_variants: None,
           is_actor: false,
+          generic_methods: HashMap::new(),
         },
       );
     }
@@ -9002,6 +9460,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           implements: None,
           enum_variants: None,
           is_actor: true,
+          generic_methods: HashMap::new(),
         },
       );
     }
@@ -9028,7 +9487,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     variants: vec![
       EnumVariant {
         name: "Some".to_string(),
-        fields: vec!["T".to_string()],
+        fields: vec![TypeExpr::Named("T".to_string())],
       },
       EnumVariant {
         name: "None".to_string(),
@@ -9037,7 +9496,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     ],
     type_params: vec![TypeParam {
       name: "T".to_string(),
-      bound: None,
+      bounds: Vec::new(),
     }],
   };
   // Plan 73: enums, like classes above, split into a generic-TEMPLATE
@@ -9097,6 +9556,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           implements: None,
           enum_variants: Some(Vec::new()),
           is_actor: false,
+          generic_methods: HashMap::new(),
         },
       );
       enum_defs.push(e);
@@ -9185,19 +9645,15 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // just below (a function signature may itself reference one, e.g.
   // `def make() -> Stack[Int64]`).
   for ty in collect_generic_instantiation_typenames(program) {
-    if let Some((base, args)) = parse_generic_instantiation(&ty) {
-      if generic_classes.contains_key(base) {
+    if let TypeExpr::Generic(base, args) = &ty {
+      if generic_classes.contains_key(base.as_str()) {
         let mut in_progress = Vec::new();
-        if let Err(d) = instantiate_generic_class(
-          base,
-          &args,
-          &generic_classes,
-          &mut classes,
-          &mut in_progress,
-        ) {
+        if let Err(d) =
+          instantiate_generic_class(base, args, &generic_classes, &mut classes, &mut in_progress)
+        {
           diags.push(d);
         }
-      } else if generic_enums.contains_key(base) {
+      } else if generic_enums.contains_key(base.as_str()) {
         // Plan 73: the identical discovery mechanism above, extended to
         // a generic ENUM — `Option[Int64]` written anywhere as a `Let`/
         // param/return/field type annotation triggers its own
@@ -9206,7 +9662,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         let mut in_progress = Vec::new();
         if let Err(d) = instantiate_generic_enum(
           base,
-          &args,
+          args,
           &generic_classes,
           &generic_enums,
           &mut classes,
@@ -9228,7 +9684,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     let mut in_progress = Vec::new();
     if let Err(d) = instantiate_generic_enum(
       "Option",
-      &["String"],
+      &[TypeExpr::Named("String".to_string())],
       &generic_classes,
       &generic_enums,
       &mut classes,
@@ -9274,16 +9730,15 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         bad_generic_fns.insert(f.name.clone());
       } else {
         let tp = &f.type_params[0];
-        // Plan 58's Decision log: `TypeParam.bound` widened to
-        // `Option<String>` for generic CLASSES' own bound-less case
-        // (`class Box[T]`), but a top-level generic FUNCTION still
-        // requires one — `GenericFunctionSig.bound` itself stays a
-        // plain `String`, unchanged; a bound-less type parameter here
-        // is now rejected by this sema-level diagnostic instead of
-        // structurally by the grammar (the same "grammar admits a
-        // superset, sema narrows" discipline this codebase already
-        // uses elsewhere).
-        let Some(bound) = tp.bound.clone() else {
+        // Plan 58's Decision log: `TypeParam.bounds` widened to a real
+        // set for generic CLASSES' own bound-less case (`class Box[T]`)
+        // and plan 88's multi-bound case, but a top-level generic
+        // FUNCTION still requires AT LEAST ONE bound — a bound-less
+        // type parameter here is rejected by this sema-level diagnostic
+        // instead of structurally by the grammar (the same "grammar
+        // admits a superset, sema narrows" discipline this codebase
+        // already uses elsewhere).
+        if tp.bounds.is_empty() {
           diags.push(Diagnostic::new(
             format!(
               "generic function `{}` declares type parameter `{}` with no bound — generic functions require a bound (e.g. `[T: Comparable]`); an unbounded type parameter is only supported on a generic CLASS",
@@ -9298,7 +9753,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           f.name.clone(),
           GenericFunctionSig {
             type_param: tp.name.clone(),
-            bound,
+            bounds: tp.bounds.clone(),
             params_raw: f
               .params
               .iter()
@@ -9460,6 +9915,17 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           continue;
         };
         for m in &c.methods {
+          // Plan 88's Decision log: a generic method (routed into
+          // `info.generic_methods`, never `info.methods`) is skipped
+          // here — the same real, disclosed body-checking gap
+          // `check_generic_class_body` already documents for a generic
+          // CLASS template's own generic methods, extended to an
+          // ordinary (non-generic) class's generic method too. Only
+          // call-site argument/return-type checking is implemented
+          // (`infer_expr_type`'s `generic_methods` dispatch).
+          if !m.type_params.is_empty() {
+            continue;
+          }
           if let Err(d) = check_method_body(&c.name, m, &sigs, &classes, &info.fields, &gctx) {
             diags.push(d);
           }
@@ -9521,7 +9987,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         let synthetic = Function {
           name: "test".to_string(),
           params: Vec::new(),
-          return_type: "Void".to_string(),
+          return_type: TypeExpr::Named("Void".to_string()),
           body: body.clone(),
           block_param: None,
           splat_param: None,
@@ -9592,17 +10058,22 @@ fn check_interface_conformance(
       (0, 0),
     )
   })?;
+  // Plan 88: `Self` substitution is now a real, recursive `TypeExpr`
+  // tree rewrite (`substitute_type_params`) rather than a whole-string
+  // equality check — a compound interface method signature referencing
+  // `Self` nested inside another shape (`Array[Self]`, say) now
+  // substitutes correctly too, though no interface in this compiler
+  // actually writes one yet.
+  let self_texpr = TypeExpr::Named(class_name.to_string());
+  let mut self_subst: HashMap<&str, &TypeExpr> = HashMap::new();
+  self_subst.insert("Self", &self_texpr);
   let expected_params = iface
     .params_raw
     .iter()
-    .map(|(_, raw)| resolve_type(if raw == "Self" { class_name } else { raw }, classes))
+    .map(|(_, raw)| resolve_type(&substitute_type_params(raw, &self_subst), classes))
     .collect::<Result<Vec<_>, _>>()?;
   let expected_return = resolve_type(
-    if iface.return_type_raw == "Self" {
-      class_name
-    } else {
-      &iface.return_type_raw
-    },
+    &substitute_type_params(&iface.return_type_raw, &self_subst),
     classes,
   )?;
   let Some(actual) = info.methods.get(&iface.method_name) else {
@@ -9659,15 +10130,15 @@ fn check_generic_function_body(
   }
   let mut env = HashMap::new();
   for p in &f.params {
-    let t = if p.ty == g.type_param {
-      Type::Generic(g.type_param.clone(), Some(g.bound.clone()))
+    let t = if p.ty.as_named() == Some(g.type_param.as_str()) {
+      Type::Generic(g.type_param.clone(), g.bounds.clone())
     } else {
       resolve_type(&p.ty, classes)?
     };
     env.insert(p.name.clone(), t);
   }
-  let declared_return = if f.return_type == g.type_param {
-    Type::Generic(g.type_param.clone(), Some(g.bound.clone()))
+  let declared_return = if f.return_type.as_named() == Some(g.type_param.as_str()) {
+    Type::Generic(g.type_param.clone(), g.bounds.clone())
   } else {
     resolve_type(&f.return_type, classes)?
   };
@@ -10746,12 +11217,15 @@ mod tests {
   #[test]
   fn rejects_a_tuple_typed_let_annotation_as_an_unknown_type() {
     // `resolve_type` (used for every Let/param/field annotation) gets
-    // no `"(...)"` branch — only `resolve_return_type` does. A tuple
-    // is valid only as a function's declared return type.
+    // no `TypeExpr::Tuple` branch — only `resolve_return_type` does. A
+    // tuple is valid only as a function's declared return type. Plan
+    // 88's Decision log: now a real, `TypeExpr`-aware diagnostic naming
+    // the tuple shape directly, not the old generic "unknown type"
+    // fallback the flat-string convention had to settle for.
     let src = "x: (Int64, Int64) = 1\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("a tuple type is not valid on a Let binding");
-    assert!(errs[0].message.to_lowercase().contains("unknown type"));
+    assert!(errs[0].message.to_lowercase().contains("tuple type"));
   }
 
   #[test]
@@ -10922,14 +11396,83 @@ mod tests {
       .contains("multiple type parameters are not supported"));
   }
 
+  // Plan 88's Decision log: generic methods on a class are now real,
+  // lifted from this exact "generic methods are not supported yet"
+  // rejection (this test's own pre-plan-88 name/body, replaced rather
+  // than deleted, since it's the direct proof the restriction is gone)
+  // — reusing plan 41/58's existing top-level generic-function bare-
+  // identifier-position monomorphization convention, extended to a
+  // per-CLASS method table (`ClassInfo.generic_methods`).
+  const GENERIC_METHOD_EXAMPLE: &str = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Widget\n  implements Comparable\n  read id: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n  end\n\n  fn compare_to(other: Widget): Int64 do\n    @id - other.id\n  end\nend\n\nclass Gadget\n  implements Comparable\n  read id: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n  end\n\n  fn compare_to(other: Gadget): Int64 do\n    @id - other.id\n  end\nend\n\nclass Box\n  fn initialize: Void do\n  end\n\n  fn pick[T: Comparable](a: T, b: T): T do\n    if a.compare_to(b) >= 0 do\n      return a\n    end\n    return b\n  end\nend\n\nbox: Box = Box.new()\nw1: Widget = Widget.new(1)\nw2: Widget = Widget.new(2)\npicked_widget: Widget = box.pick(w1, w2)\n\ng1: Gadget = Gadget.new(3)\ng2: Gadget = Gadget.new(4)\npicked_gadget: Gadget = box.pick(g1, g2)\n";
+
   #[test]
-  fn rejects_generic_methods_on_a_class() {
-    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Box\n  fn pick[T: Comparable](a: T, b: T): T do\n    a\n  end\nend\n";
+  fn a_generic_method_type_checks_and_monomorphizes_for_two_distinct_type_arguments() {
+    let program = emerald_parser::parse(GENERIC_METHOD_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn a_generic_method_call_whose_concrete_type_does_not_implement_the_bound_is_rejected() {
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass NotComparable\n  read id: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n  end\nend\n\nclass Box\n  fn initialize: Void do\n  end\n\n  fn pick[T: Comparable](a: T, b: T): T do\n    if a.compare_to(b) >= 0 do\n      return a\n    end\n    return b\n  end\nend\n\nbox: Box = Box.new()\nn1: NotComparable = NotComparable.new(1)\nn2: NotComparable = NotComparable.new(2)\nboom: NotComparable = box.pick(n1, n2)\n";
     let program = emerald_parser::parse(src).expect("should parse");
-    let errs = check_program(&program).expect_err("generic methods are not supported");
+    let errs = check_program(&program).expect_err("NotComparable does not implement Comparable");
     assert!(errs
       .iter()
-      .any(|d| d.message.contains("generic methods are not supported")));
+      .any(|d| d.message.contains("does not implement")));
+  }
+
+  #[test]
+  fn a_multi_bound_generic_function_rejects_a_type_argument_satisfying_only_one_bound() {
+    // Plan 88's Decision log: `[T: Comparable + Cloneable]` — a real
+    // bound SET (absorbing plan 75's scope). `OnlyComparable` satisfies
+    // the FIRST bound but not the second, so this must still be
+    // rejected — every bound in the set is required, not just one.
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\ninterface Cloneable\n  fn duplicate(other: Self): Int64\nend\n\nclass OnlyComparable\n  implements Comparable\n  read id: Int64\n\n  fn initialize(id: Int64): Void do\n    @id = id\n  end\n\n  fn compare_to(other: OnlyComparable): Int64 do\n    @id - other.id\n  end\nend\n\nfn pick[T: Comparable + Cloneable](a: T, b: T): T do\n  if a.compare_to(b) >= 0 do\n    return a\n  end\n  return b\nend\n\no1: OnlyComparable = OnlyComparable.new(1)\no2: OnlyComparable = OnlyComparable.new(2)\nboom: OnlyComparable = pick(o1, o2)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("OnlyComparable does not implement Cloneable, the second bound");
+    assert!(errs
+      .iter()
+      .any(|d| d.message.contains("does not implement `Cloneable`")));
+  }
+
+  #[test]
+  fn nested_proc_type_annotation_resolves_to_a_real_structured_proc_type() {
+    // Plan 88's own worked proof: `Proc[Array[Int64], Int64]` — a
+    // written Proc annotation with NO adjacent `Expr::Lambda` anywhere
+    // (a plain function parameter) — resolves directly to a real,
+    // structurally nested `Type::Proc`, round-tripping through parsing
+    // (`TypeExpr::Func`) and `resolve_type` correctly. Genuinely
+    // impossible before this plan: `Proc` had no written, parameterized
+    // form at all (plan 10's own decision log), and even if it had,
+    // the old flat-string convention couldn't nest `Array[Int64]`
+    // inside another compound type's own bracket slot.
+    let src =
+      "fn apply(f: Proc[Array[Int64], Int64], xs: Array[Int64]): Int64 do\n  f.call(xs)\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    let classes = HashMap::new();
+    let resolved = resolve_type(&f.params[0].ty, &classes).expect("should resolve");
+    assert_eq!(
+      resolved,
+      Type::Proc(
+        vec![Type::Array(Box::new(Type::Int64))],
+        Box::new(Type::Int64)
+      )
+    );
+  }
+
+  #[test]
+  fn a_generic_method_declaring_two_type_parameters_is_rejected_at_registration_time() {
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Box\n  fn initialize: Void do\n  end\n\n  fn bad[T: Comparable, U: Comparable](a: T, b: U): T do\n    a\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("two type parameters are not supported");
+    assert!(errs.iter().any(|d| d
+      .message
+      .contains("multiple type parameters are not supported")));
   }
 
   // Plan 43 (nullable types and safe navigation) — replaced outright by
@@ -11452,7 +11995,14 @@ mod tests {
   #[test]
   fn resolve_type_parses_result_t_e_directly() {
     let classes = HashMap::new();
-    let ty = resolve_type("Result[Int64, String]", &classes).expect("should resolve");
+    let texpr = TypeExpr::Generic(
+      "Result".to_string(),
+      vec![
+        TypeExpr::Named("Int64".to_string()),
+        TypeExpr::Named("String".to_string()),
+      ],
+    );
+    let ty = resolve_type(&texpr, &classes).expect("should resolve");
     assert_eq!(
       ty,
       Type::Result(Box::new(Type::Int64), Box::new(Type::String))
@@ -12265,7 +12815,7 @@ mod tests {
     c.methods.push(Function {
       name: "get_x".to_string(),
       params: Vec::new(),
-      return_type: "Int64".to_string(),
+      return_type: TypeExpr::Named("Int64".to_string()),
       body: vec![Spanned::synthetic(Stmt::Return(Some(Spanned::synthetic(
         Expr::Int(0),
       ))))],

@@ -30,7 +30,7 @@ mod interpolate;
 pub use ast::{
   expand_derives, ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef,
   EnumVariant, Expr, ExternBlock, ExternFn, Function, InterfaceDef, Item, ModuleDef, Param,
-  Program, RescueClause, Spanned, Stmt, StringPart, TypeParam,
+  Program, RescueClause, Spanned, Stmt, StringPart, TypeExpr, TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -459,7 +459,7 @@ fn hoist_enumerable_blocks(
   name: &str,
   source: &str,
 ) -> Result<(), ParseError> {
-  let top_level_fn_returns: std::collections::HashMap<String, String> = program
+  let top_level_fn_returns: std::collections::HashMap<String, ast::TypeExpr> = program
     .items
     .iter()
     .filter_map(|item| match item {
@@ -496,8 +496,8 @@ fn hoist_enumerable_blocks(
             unreachable!("has_trailing_block already matched Expr::Lambda")
           };
           let return_type = match method_name.as_str() {
-            "select" | "filter" | "count" => "Boolean".to_string(),
-            "each" | "each_with_index" => "Void".to_string(),
+            "select" | "filter" | "count" => ast::TypeExpr::Named("Boolean".to_string()),
+            "each" | "each_with_index" => ast::TypeExpr::Named("Void".to_string()),
             "map" | "reduce" | "inject" => {
               infer_block_result_type(&params, &body, &top_level_fn_returns).ok_or_else(|| {
                 hoist_error(
@@ -529,7 +529,7 @@ fn hoist_enumerable_blocks(
             span: old.span,
             node: Stmt::Let {
               name: fresh,
-              ty: "Proc".to_string(),
+              ty: ast::TypeExpr::Named("Proc".to_string()),
               // A compiler-synthesized temporary (never itself the
               // target of a source-level reassignment) — `false` matches
               // the immutable-by-default rule the same way any other
@@ -576,12 +576,10 @@ fn hoist_error(name: &str, source: &str, span: (usize, usize), message: String) 
 fn infer_block_result_type(
   params: &[Param],
   body: &[Spanned<Stmt>],
-  top_level_fn_returns: &std::collections::HashMap<String, String>,
-) -> Option<String> {
-  let param_types: std::collections::HashMap<&str, &str> = params
-    .iter()
-    .map(|p| (p.name.as_str(), p.ty.as_str()))
-    .collect();
+  top_level_fn_returns: &std::collections::HashMap<String, ast::TypeExpr>,
+) -> Option<ast::TypeExpr> {
+  let param_types: std::collections::HashMap<&str, &ast::TypeExpr> =
+    params.iter().map(|p| (p.name.as_str(), &p.ty)).collect();
   let tail = match body.last().map(|s| &s.node) {
     Some(Stmt::Expr(e)) => e,
     Some(Stmt::Return(Some(e))) => e,
@@ -596,54 +594,53 @@ fn infer_block_result_type(
 /// returns `None` rather than a guess.
 fn infer_simple_expr_type(
   expr: &Expr,
-  param_types: &std::collections::HashMap<&str, &str>,
-  top_level_fn_returns: &std::collections::HashMap<String, String>,
-) -> Option<String> {
+  param_types: &std::collections::HashMap<&str, &ast::TypeExpr>,
+  top_level_fn_returns: &std::collections::HashMap<String, ast::TypeExpr>,
+) -> Option<ast::TypeExpr> {
   match expr {
-    Expr::Int(_) => Some("Int64".to_string()),
-    Expr::Float(_) => Some("Float64".to_string()),
-    Expr::StringLit(_) | Expr::Interpolate(_) => Some("String".to_string()),
-    Expr::Bool(_) => Some("Boolean".to_string()),
-    Expr::Ident(n) => param_types.get(n.as_str()).map(|t| t.to_string()),
+    Expr::Int(_) => Some(ast::TypeExpr::Named("Int64".to_string())),
+    Expr::Float(_) => Some(ast::TypeExpr::Named("Float64".to_string())),
+    Expr::StringLit(_) | Expr::Interpolate(_) => Some(ast::TypeExpr::Named("String".to_string())),
+    Expr::Bool(_) => Some(ast::TypeExpr::Named("Boolean".to_string())),
+    Expr::Ident(n) => param_types.get(n.as_str()).map(|t| (*t).clone()),
     Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) | Expr::Rem(a, b) => {
       let ta = infer_simple_expr_type(&a.node, param_types, top_level_fn_returns)?;
       let tb = infer_simple_expr_type(&b.node, param_types, top_level_fn_returns)?;
       (ta == tb).then_some(ta)
     }
     Expr::Neg(a) => infer_simple_expr_type(&a.node, param_types, top_level_fn_returns),
-    Expr::Compare(..) | Expr::And(..) | Expr::Or(..) | Expr::Not(_) => Some("Boolean".to_string()),
-    Expr::Call(fn_name, _) => top_level_fn_returns
-      .get(fn_name.as_str())
-      .map(|t| t.to_string()),
+    Expr::Compare(..) | Expr::And(..) | Expr::Or(..) | Expr::Not(_) => {
+      Some(ast::TypeExpr::Named("Boolean".to_string()))
+    }
+    Expr::Call(fn_name, _) => top_level_fn_returns.get(fn_name.as_str()).cloned(),
     // `p.key`/`p.value` on a block param explicitly typed `Pair[K, V]`
     // (`Hash[K,V]`'s own `.each`/`.map`/`.reduce`/`.each_with_index`
     // block parameter shape) — the one `MethodCall` receiver+method
-    // combination this small inferencer covers, since `Pair[K, V]`'s
-    // own compound type-name string (`grammar.lalrpop`'s `TypeName`
-    // rule) already carries `K`/`V` in plain text, no real type
-    // resolution needed to read them back out.
+    // combination this small inferencer covers. Plan 88: `Pair[K, V]`
+    // is now a real `TypeExpr::Generic("Pair", [K, V])` node, so
+    // reading `K`/`V` back out is a direct structural match — no
+    // string-splitting inverse of a `format!` needed any more (the old
+    // `parse_pair_type_parts` this replaces).
     Expr::MethodCall(recv, method, call_args)
       if call_args.is_empty() && (method == "key" || method == "value") =>
     {
       let Expr::Ident(recv_name) = &recv.node else {
         return None;
       };
-      let (k, v) = parse_pair_type_parts(param_types.get(recv_name.as_str())?)?;
-      Some(if method == "key" { k } else { v })
+      let ast::TypeExpr::Generic(base, args) = param_types.get(recv_name.as_str())? else {
+        return None;
+      };
+      if base != "Pair" || args.len() != 2 {
+        return None;
+      }
+      Some(if method == "key" {
+        args[0].clone()
+      } else {
+        args[1].clone()
+      })
     }
     _ => None,
   }
-}
-
-/// Parses a `Pair[K, V]` compound type-name string (`grammar.lalrpop`'s
-/// own `"Pair" "[" <k:Ident> "," <v:Ident> "]" => format!("Pair[{k}, \
-/// {v}]")` production) back into its `(K, V)` parts — the exact inverse
-/// of that `format!`, kept in sync with it deliberately (both live in
-/// this one crate).
-fn parse_pair_type_parts(ty: &str) -> Option<(String, String)> {
-  let inner = ty.strip_prefix("Pair[")?.strip_suffix(']')?;
-  let (k, v) = inner.split_once(", ")?;
-  Some((k.to_string(), v.to_string()))
 }
 
 pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
@@ -1409,10 +1406,10 @@ mod tests {
         name: "+".to_string(),
         params: vec![Param {
           name: "other".to_string(),
-          ty: "Vector2".to_string(),
+          ty: ast::TypeExpr::Named("Vector2".to_string()),
           default: None,
         }],
-        return_type: "Vector2".to_string(),
+        return_type: ast::TypeExpr::Named("Vector2".to_string()),
         body: vec![s(Stmt::Expr(s(Expr::Ident("self".to_string()))))],
         block_param: None,
         splat_param: None,
@@ -1913,7 +1910,10 @@ mod tests {
       program.items[0],
       Item::Stmt(s(Stmt::Let {
         name: "arr".into(),
-        ty: "Array[Int64]".into(),
+        ty: ast::TypeExpr::Generic(
+          "Array".to_string(),
+          vec![ast::TypeExpr::Named("Int64".to_string())]
+        ),
         value: s(Expr::ArrayNew(Box::new(s(Expr::Int(5))))),
         is_var: false,
       }))
@@ -1927,7 +1927,10 @@ mod tests {
       program.items[1],
       Item::Stmt(s(Stmt::Let {
         name: "arr".into(),
-        ty: "Array[Int64]".into(),
+        ty: ast::TypeExpr::Generic(
+          "Array".to_string(),
+          vec![ast::TypeExpr::Named("Int64".to_string())]
+        ),
         value: s(Expr::ArrayNew(Box::new(s(Expr::Ident("n".into()))))),
         is_var: false,
       }))
@@ -2036,7 +2039,7 @@ mod tests {
       f.params,
       vec![Param {
         name: "n".to_string(),
-        ty: "Int64".to_string(),
+        ty: ast::TypeExpr::Named("Int64".to_string()),
         default: None
       }]
     );
@@ -2077,10 +2080,10 @@ mod tests {
           s(Expr::Lambda {
             params: vec![Param {
               name: "i".to_string(),
-              ty: "Int64".to_string(),
+              ty: ast::TypeExpr::Named("Int64".to_string()),
               default: None
             }],
-            return_type: "Void".to_string(),
+            return_type: ast::TypeExpr::Named("Void".to_string()),
             body: vec![s(Stmt::Expr(s(Expr::Call(
               "puts".to_string(),
               vec![s(Expr::Ident("i".to_string()))]
@@ -2207,12 +2210,12 @@ mod tests {
       vec![
         Param {
           name: "x".to_string(),
-          ty: "Int64".to_string(),
+          ty: ast::TypeExpr::Named("Int64".to_string()),
           default: None
         },
         Param {
           name: "y".to_string(),
-          ty: "Int64".to_string(),
+          ty: ast::TypeExpr::Named("Int64".to_string()),
           default: None
         },
       ]
@@ -2659,7 +2662,7 @@ mod tests {
       iface.params,
       vec![Param {
         name: "other".to_string(),
-        ty: "Self".to_string(),
+        ty: ast::TypeExpr::Named("Self".to_string()),
         default: None,
       }]
     );
@@ -2685,7 +2688,7 @@ mod tests {
       max_fn.type_params,
       vec![TypeParam {
         name: "T".to_string(),
-        bound: Some("Comparable".to_string()),
+        bounds: vec!["Comparable".to_string()],
       }]
     );
   }
@@ -2703,7 +2706,7 @@ mod tests {
       c.type_params,
       vec![TypeParam {
         name: "T".to_string(),
-        bound: None,
+        bounds: Vec::new(),
       }]
     );
   }
@@ -2719,7 +2722,7 @@ mod tests {
       c.type_params,
       vec![TypeParam {
         name: "T".to_string(),
-        bound: Some("Comparable".to_string()),
+        bounds: vec!["Comparable".to_string()],
       }]
     );
   }
@@ -2736,7 +2739,7 @@ mod tests {
       stack.type_params,
       vec![TypeParam {
         name: "T".to_string(),
-        bound: None,
+        bounds: Vec::new(),
       }]
     );
     let items_field = stack
@@ -2767,6 +2770,99 @@ mod tests {
       panic!("expected `b`'s Let statement");
     };
     assert_eq!(ty, "Box[Box[Int64]]");
+  }
+
+  // Plan 88 (structured type expressions).
+
+  #[test]
+  fn array_of_array_parses_as_a_genuinely_nested_generic_type_expr() {
+    // Before this plan, `Array[Elem]`'s own grammar alternative only
+    // accepted a bare `Ident` per bracket slot — `Array[Array[Int64]]`
+    // was a real parse error, not just an unexercised sema case, since
+    // `Array[Int64]` isn't an `Ident`. This is the concrete, minimal
+    // proof that gap is closed: `TypeExpr::Generic` now nests for real.
+    let src = "x: Array[Array[Int64]] = [[1, 2], [3]]\n";
+    let program = parse(src).expect("Array[Array[Int64]] should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      *ty,
+      TypeExpr::Generic(
+        "Array".to_string(),
+        vec![TypeExpr::Generic(
+          "Array".to_string(),
+          vec![TypeExpr::Named("Int64".to_string())]
+        )]
+      )
+    );
+  }
+
+  #[test]
+  fn proc_bracket_annotation_parses_into_a_real_func_type_expr() {
+    // Plan 88's Decision log: `Proc[Args..., Ret]` — the last bracketed
+    // element is the return type, every element before it is a
+    // parameter type. Zero-parameter shape (`Proc[Ret]`) below and a
+    // nested-parameter shape further down.
+    let program = parse("f: Proc[Int64] = 0\n").expect("Proc[Ret] should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      *ty,
+      TypeExpr::Func(Vec::new(), Box::new(TypeExpr::Named("Int64".to_string())))
+    );
+  }
+
+  #[test]
+  fn nested_proc_type_annotation_round_trips_through_parsing() {
+    // The plan's own worked proof: a Proc whose PARAMETER type is
+    // itself `Array[Int64]` — genuinely impossible to spell at all
+    // under the old flat-string `TypeName` convention (no written Proc
+    // annotation existed at all before this plan).
+    let src = "f: Proc[Array[Int64], Int64] = do |xs: Array[Int64]| xs[0] end\n";
+    let program = parse(src).expect("Proc[Array[Int64], Int64] should parse");
+    let Item::Stmt(Spanned {
+      node: Stmt::Let { ty, .. },
+      ..
+    }) = &program.items[0]
+    else {
+      panic!("expected a Let statement");
+    };
+    assert_eq!(
+      *ty,
+      TypeExpr::Func(
+        vec![TypeExpr::Generic(
+          "Array".to_string(),
+          vec![TypeExpr::Named("Int64".to_string())]
+        )],
+        Box::new(TypeExpr::Named("Int64".to_string()))
+      )
+    );
+  }
+
+  #[test]
+  fn multi_bound_type_parameter_parses_into_a_real_bound_set() {
+    let src = "fn largest[T: Comparable + Cloneable](values: Array[T]): T do\n  values[0]\nend\n";
+    let program = parse(src).expect("multi-bound type parameter should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function");
+    };
+    assert_eq!(
+      f.type_params,
+      vec![TypeParam {
+        name: "T".to_string(),
+        bounds: vec!["Comparable".to_string(), "Cloneable".to_string()],
+      }]
+    );
   }
 
   #[test]
@@ -2966,7 +3062,7 @@ mod tests {
       program.items[0],
       Item::Stmt(s(Stmt::Let {
         name: "x".to_string(),
-        ty: "Symbol".to_string(),
+        ty: ast::TypeExpr::Named("Symbol".to_string()),
         value: s(Expr::SymbolLit("foo".to_string())),
         is_var: false,
       }))
@@ -2981,7 +3077,7 @@ mod tests {
       program.items[0],
       Item::Stmt(s(Stmt::Let {
         name: "x".to_string(),
-        ty: "Int64".to_string(),
+        ty: ast::TypeExpr::Named("Int64".to_string()),
         value: s(Expr::Int(1)),
         is_var: false,
       }))
@@ -3029,7 +3125,7 @@ mod tests {
       program.items[0],
       Item::Stmt(s(Stmt::Let {
         name: "content".to_string(),
-        ty: "String".to_string(),
+        ty: ast::TypeExpr::Named("String".to_string()),
         is_var: false,
         value: s(Expr::MethodCall(
           Box::new(s(Expr::Ident("File".to_string()))),
@@ -3670,7 +3766,7 @@ mod tests {
       eq.params,
       vec![Param {
         name: "other".to_string(),
-        ty: "Point".to_string(),
+        ty: ast::TypeExpr::Named("Point".to_string()),
         default: None
       }]
     );

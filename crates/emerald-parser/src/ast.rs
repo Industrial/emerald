@@ -72,10 +72,172 @@ impl<T: PartialEq> PartialEq<T> for Spanned<T> {
   }
 }
 
+/// Plan 88's Decision log: a real, recursive type-expression AST,
+/// replacing the old `TypeName: String` grammar production's flat,
+/// pre-formatted-string convention (`"Array[Int64]"`, `"Hash[K, V]"`)
+/// — that convention could only ever represent one level of nesting
+/// (the grammar's own `Array`/`Hash`/`Pair`/`Result` alternatives each
+/// accepted a bare `Ident` per bracket slot, never another `TypeName`),
+/// so `Proc[Array[Int64], Int64]` or a generic method returning
+/// `Hash[K, Array[V]]` simply couldn't be written at all. Four cases
+/// are enough for every type-annotation position this compiler has:
+///
+/// - `Named` — a plain class/interface/primitive/type-parameter name
+///   (`Int64`, `MyClass`, `T`), and also a BARE `Proc`/`Array`/... with
+///   no bracket clause (`Proc`'s own bare form still exists, so the
+///   pre-existing lambda-literal-inference path — a `Let`'s declared
+///   `Proc` type recovering its real signature from a co-located
+///   `Expr::Lambda` — keeps working completely unchanged).
+/// - `Generic` — a name plus a bracketed, comma-separated argument
+///   list, each itself a full `TypeExpr` — subsumes `Array[T]`,
+///   `Hash[K, V]`, `Pair[K, V]`, `Result[T, E]`, `Option[T]`, and any
+///   user-declared generic class/enum instantiation (`Stack[Int64]`,
+///   `Box[Box[Int64]]`) as one general case, rather than each needing
+///   its own hand-rolled grammar alternative and string format.
+/// - `Tuple` — `(T1, T2, ...)`, legal only as a function's declared
+///   return type (`resolve_return_type`'s own restriction, unchanged).
+/// - `Func` — `Proc`'s real, written, parameterized form (see
+///   `TypeExpr`'s own grammar production for the chosen `Proc[Args...,
+///   Ret]` spelling and why) — a parameter list plus a return type,
+///   both full `TypeExpr`s, so `Proc[Array[Int64], Int64]` round-trips
+///   through this AST exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypeExpr {
+  Named(String),
+  Generic(String, Vec<TypeExpr>),
+  Tuple(Vec<TypeExpr>),
+  Func(Vec<TypeExpr>, Box<TypeExpr>),
+}
+
+impl TypeExpr {
+  /// `Some(name)` only for a bare `Named` — used at the handful of call
+  /// sites (`Self` substitution, `"Proc"`/type-parameter-name
+  /// comparisons) that only ever cared about a plain identifier, never
+  /// a compound shape.
+  pub fn as_named(&self) -> Option<&str> {
+    match self {
+      TypeExpr::Named(n) => Some(n.as_str()),
+      _ => None,
+    }
+  }
+}
+
+/// A real, disclosed test-ergonomics convenience: this whole crate's
+/// pre-existing test suite (predating this plan) asserts a parsed
+/// type's shape against a plain string literal (`assert_eq!(p.ty,
+/// "Array[Int64]")`) — a reasonable idiom this plan doesn't want to
+/// force hundreds of mechanical rewrites onto for zero behavioral
+/// gain. Comparing via `Display`'s own canonical rendering (which
+/// reproduces the exact old flat-string convention for every
+/// pre-existing shape, and correctly extends it to genuinely nested
+/// ones) keeps every such assertion meaningful and source-compatible.
+/// Never used by any non-test production code path in this workspace
+/// — `resolve_type` and friends match on `TypeExpr`'s real structure
+/// directly, never through this string bridge.
+#[allow(clippy::cmp_owned)]
+impl PartialEq<str> for TypeExpr {
+  fn eq(&self, other: &str) -> bool {
+    self.to_string() == other
+  }
+}
+
+#[allow(clippy::cmp_owned)]
+impl PartialEq<&str> for TypeExpr {
+  fn eq(&self, other: &&str) -> bool {
+    self.to_string() == *other
+  }
+}
+
+#[allow(clippy::cmp_owned)]
+impl PartialEq<TypeExpr> for str {
+  fn eq(&self, other: &TypeExpr) -> bool {
+    other.to_string() == self
+  }
+}
+
+#[allow(clippy::cmp_owned)]
+impl PartialEq<String> for TypeExpr {
+  fn eq(&self, other: &String) -> bool {
+    &self.to_string() == other
+  }
+}
+
+#[allow(clippy::cmp_owned)]
+impl PartialEq<TypeExpr> for String {
+  fn eq(&self, other: &TypeExpr) -> bool {
+    other.to_string() == *self
+  }
+}
+
+/// The construction-side half of the same test-ergonomics convenience
+/// `PartialEq<str>` above documents — lets this crate's pre-existing
+/// test fixtures keep building a `Param`/`Function` literal's plain
+/// (non-compound) type via `"Int64".into()`/`"Int64".to_string().
+/// into()` rather than `TypeExpr::Named("Int64".to_string())` at every
+/// call site. Never used by any production parsing/resolution path —
+/// the grammar always constructs a `TypeExpr` directly via its own
+/// real variants, never through this conversion.
+impl From<&str> for TypeExpr {
+  fn from(name: &str) -> Self {
+    TypeExpr::Named(name.to_string())
+  }
+}
+
+impl From<String> for TypeExpr {
+  fn from(name: String) -> Self {
+    TypeExpr::Named(name)
+  }
+}
+
+/// Renders a `TypeExpr` back into this compiler's existing flat,
+/// human-readable type-name convention (`"Array[Int64]"`, `"Hash[K,
+/// V]"`, `"(A, B)"`) — genuinely recursive, unlike the old grammar-level
+/// string-concatenation it replaces, so a nested shape like `"Proc[
+/// Array[Int64], Int64]"` now formats correctly too. Used only for
+/// diagnostics and for the handful of legacy string-keyed registries
+/// (mangled generic-instantiation names) that predate this plan and are
+/// out of this plan's own scope to redesign — never as an intermediate
+/// re-parsed representation (`resolve_type` consumes `TypeExpr`
+/// directly and recursively, never this string).
+impl std::fmt::Display for TypeExpr {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      TypeExpr::Named(name) => write!(f, "{name}"),
+      TypeExpr::Generic(name, args) => {
+        write!(f, "{name}[")?;
+        for (i, a) in args.iter().enumerate() {
+          if i > 0 {
+            write!(f, ", ")?;
+          }
+          write!(f, "{a}")?;
+        }
+        write!(f, "]")
+      }
+      TypeExpr::Tuple(parts) => {
+        write!(f, "(")?;
+        for (i, p) in parts.iter().enumerate() {
+          if i > 0 {
+            write!(f, ", ")?;
+          }
+          write!(f, "{p}")?;
+        }
+        write!(f, ")")
+      }
+      TypeExpr::Func(params, ret) => {
+        write!(f, "Proc[")?;
+        for p in params {
+          write!(f, "{p}, ")?;
+        }
+        write!(f, "{ret}]")
+      }
+    }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
   pub name: String,
-  pub ty: String,
+  pub ty: TypeExpr,
   /// Plan 39's Decision log: `Some(_)` only for a `def` function
   /// parameter declared with a trailing `= <literal>` — always `None`
   /// for a class field, a lambda parameter, or a block parameter (the
@@ -187,7 +349,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
     }
     ancestors.reverse();
 
-    let mut fields: HashMap<String, String> = HashMap::new();
+    let mut fields: HashMap<String, TypeExpr> = HashMap::new();
     for anc in &ancestors {
       for f in &anc.fields {
         fields.insert(f.name.clone(), f.ty.clone());
@@ -222,7 +384,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
             .any(|m| m.name == field && m.params.is_empty())
         })
     };
-    let missing_accessors: Vec<(String, String)> = field_names
+    let missing_accessors: Vec<(String, TypeExpr)> = field_names
       .iter()
       .filter(|f| !has_accessor(f))
       .map(|f| (f.clone(), fields[f].clone()))
@@ -248,10 +410,10 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
       name: "==".to_string(),
       params: vec![Param {
         name: "other".to_string(),
-        ty: class_name.clone(),
+        ty: TypeExpr::Named(class_name.clone()),
         default: None,
       }],
-      return_type: "Boolean".to_string(),
+      return_type: TypeExpr::Named("Boolean".to_string()),
       body: vec![Spanned::synthetic(Stmt::Return(Some(body_expr)))],
       block_param: None,
       splat_param: None,
@@ -388,7 +550,7 @@ pub enum Expr {
   /// dispatched `.call`).
   Lambda {
     params: Vec<Param>,
-    return_type: String,
+    return_type: TypeExpr,
     body: Vec<Spanned<Stmt>>,
   },
   /// `true`/`false` (plan 25's Decision log) — a real `Boolean` value,
@@ -511,7 +673,7 @@ pub enum Expr {
 pub enum Stmt {
   Let {
     name: String,
-    ty: String,
+    ty: TypeExpr,
     value: Spanned<Expr>,
     /// Plan 72's Decision log: `true` only when this declaration spelled
     /// the `var` keyword (`var name: Type = expr`) — a binding declared
@@ -708,7 +870,7 @@ pub struct Contract {
 pub struct Function {
   pub name: String,
   pub params: Vec<Param>,
-  pub return_type: String,
+  pub return_type: TypeExpr,
   pub body: Vec<Spanned<Stmt>>,
   /// `&blk` in the parameter list (plan 34's Decision log) — a bare
   /// name, not a `Param`: unlike an ordinary parameter, its type can't
@@ -793,7 +955,16 @@ pub struct Function {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
   pub name: String,
-  pub bound: Option<String>,
+  /// `[T: Bound1 + Bound2 + ...]` (plan 88's Decision log) — widened
+  /// from a single `Option<String>` to a real bound SET: an empty
+  /// `Vec` is the bound-less case (`class Box[T] ... end`'s own
+  /// headline case, unchanged), and every entry must be satisfied
+  /// (conjunction, never disjunction) for a concrete type argument to
+  /// be accepted. A top-level generic FUNCTION's own registration still
+  /// requires at least one bound (`emerald-sema`'s own diagnostic,
+  /// unchanged) — only the COUNT of bounds a single type parameter may
+  /// carry widens here, not whether one is required at all.
+  pub bounds: Vec<String>,
 }
 
 /// `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
@@ -808,7 +979,7 @@ pub struct InterfaceDef {
   pub name: String,
   pub method_name: String,
   pub params: Vec<Param>,
-  pub return_type: String,
+  pub return_type: TypeExpr,
 }
 
 /// A class declaration: fields (reusing `Param`'s `{name, ty}` shape —
@@ -859,7 +1030,7 @@ pub struct ClassDef {
 pub struct ExternFn {
   pub name: String,
   pub params: Vec<Param>,
-  pub return_type: String,
+  pub return_type: TypeExpr,
 }
 
 /// `unsafe extern "C" { fn ... ... }` (plan 59's Decision log) — `abi`
@@ -893,7 +1064,7 @@ pub struct ModuleDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumVariant {
   pub name: String,
-  pub fields: Vec<String>,
+  pub fields: Vec<TypeExpr>,
 }
 
 /// `enum Shape = Circle(Float64) | Square(Float64) | ...` (plan 52's
