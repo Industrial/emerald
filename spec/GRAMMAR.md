@@ -140,6 +140,7 @@ end
 | Ruby grammar area | Status | Emerald form / reason |
 |---|---|---|
 | `fn name(params): T do ... end` | MODIFY | Every parameter requires a type annotation; the method requires an explicit return-type annotation, a trailing `: T` (superseded from `-> T` by the Sable-alignment grammar cutover, `history/2026-09-19T110000Z-plan-71-grammar-unification-fn-and-do-end.md`). This is inception §6's headline example, in its current spelling. |
+| Ownership-annotated parameters (`own T`, `borrow T`, `borrow var T`) | ADD (plan 83) | Not part of Ruby's own grammar (Ruby has no static ownership/borrow system) — a real, disclosed addition prefixing an ordinary parameter's declared type, per `spec/OWNERSHIP.md` §2. `own T` transfers the argument's binding to the callee (the caller may not use it again — `emerald-sema`'s generalization of plan 56's existing cross-actor consumed-binding check). `borrow T` is a shared, read-only reference; `borrow var T` (reusing plan 72's existing `var` keyword, not a second mutability spelling) is an exclusive, mutable reference. Legal only as a function/method PARAMETER's own type in v1 — `emerald-sema` rejects all three anywhere else (a field, a `Let`, a return type) with a real diagnostic, and additionally rejects `borrow`/`borrow var` specifically as a RETURN type (`spec/OWNERSHIP.md` §2/§10's rule 4: the only region a returned `borrow` could name is the returning function's own call-frame region, destroyed at that exact return). Enforced via lexical-scope liveness checking, not flow-sensitive/NLL analysis (`spec/OWNERSHIP.md` §8) — a `borrow`'s live range is its entire enclosing function/method body. `emerald-codegen` compiles all three exactly like the plain underlying `T` today (a real, disclosed, temporary passthrough — plan 84 owns real zero-cost borrow/own codegen). |
 | Default parameter values (`def f(x = 1)`) | KEEP | Default expression's type must match the parameter's declared type. |
 | Keyword parameters (`def f(x:, y: 1)`) | KEEP | Same annotation requirement as positional parameters; see `SEMANTICS.md` §3 (Methods) for whether they're retained project-wide. |
 | Splat parameters (`def f(*xs)`) | UNDECIDED | Requires deciding `xs`'s static element type and arity checking — tracked in `SEMANTICS.md` §3; not required for inception §17's first three milestones. |
@@ -156,6 +157,22 @@ end
 ```ruby
 fn add(a: Int64, b: Int64): Int64 do
   a + b
+end
+```
+
+**Example (ADD: `own`/`borrow`/`borrow var` parameters, plan 83, `spec/OWNERSHIP.md` §2's own worked examples):**
+```ruby
+fn process(data: borrow Data): Void do
+  puts data.length
+end
+
+fn mutate(data: borrow var Data): Void do
+  data.append("x")
+end
+
+fn consume(data: own Data): Void do
+  puts data.length
+  # `data` cannot be used again by the caller after this call returns.
 end
 ```
 

@@ -1874,6 +1874,22 @@ TypeExpr: TypeExpr = {
   // subsumes `Option[T]` (never reserved — an ordinary `Ident` matching
   // a compiler-synthesized enum name in `classes`).
   <name:Ident> "[" <args:TypeExprList> "]" => TypeExpr::Generic(name, args),
+  // Plan 83's Decision log (`spec/OWNERSHIP.md` §2): `own`/`borrow`/
+  // `borrow var` prefix an ordinary `TypeExpr` — reachable everywhere
+  // `TypeExpr` itself is (params, return types, fields, `Let`s), the
+  // same "grammar stays general, sema narrows" split this file already
+  // uses throughout (`emerald-sema` rejects every position but a
+  // function/method parameter with a real, named diagnostic, never a
+  // parse error). `"borrow" "var"` is listed before the bare `"borrow"`
+  // alternative so LALR(1) can commit to the mutable form the moment it
+  // sees the reserved `"var"` token immediately follow `"borrow"` —
+  // both `own`/`borrow` are new reserved keywords, the same LALR(1)
+  // "a literal token wins over the general `Ident` regex" convention
+  // `var`/`fn`/`class`/... already rely on (this file's own `match {}`
+  // header, `_` catch-all).
+  "own" <inner:TypeExpr> => TypeExpr::Own(Box::new(inner)),
+  "borrow" "var" <inner:TypeExpr> => TypeExpr::Borrow(Box::new(inner), true),
+  "borrow" <inner:TypeExpr> => TypeExpr::Borrow(Box::new(inner), false),
 };
 
 // Plan 58: one-or-more comma-separated `TypeExpr`s (unlike

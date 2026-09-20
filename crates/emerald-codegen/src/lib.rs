@@ -137,6 +137,101 @@ fn set_newtype_underlying(program: &Program) {
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
+/// Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own rescoping of
+/// plan 84): recursively strips an `own`/`borrow`/`borrow var` wrapper
+/// anywhere it appears inside a `TypeExpr` tree, leaving every other
+/// shape untouched. This is the ONE disclosed codegen passthrough point
+/// this plan builds — every downstream codegen call site (`value_kind_
+/// for_type`, `param_local_classes`, `bind_params`, and every other
+/// place that resolves a parameter's/return's declared `TypeExpr`) sees
+/// only ALREADY-STRIPPED types by the time it ever runs, because
+/// `strip_ownership_annotations_in_items` (below) rewrites the whole
+/// program's `Function`/method signatures once, up front, in
+/// `compile_to_object_impl` — so none of those call sites need their
+/// own individual `Own`/`Borrow` handling at all. `value_kind_for_type`
+/// still carries its own defensive `Own`/`Borrow` arm (recursing the
+/// same way) purely so it stays a real, exhaustive match if some future
+/// caller ever feeds it an unstripped `TypeExpr` directly — not because
+/// any call site in this compiled path actually reaches it unstripped
+/// today.
+fn strip_ownership_in_type_expr(ty: &TypeExpr) -> TypeExpr {
+  match ty {
+    TypeExpr::Own(inner) | TypeExpr::Borrow(inner, _) => strip_ownership_in_type_expr(inner),
+    TypeExpr::Named(_) => ty.clone(),
+    TypeExpr::Generic(name, args) => TypeExpr::Generic(
+      name.clone(),
+      args.iter().map(strip_ownership_in_type_expr).collect(),
+    ),
+    TypeExpr::Tuple(parts) => {
+      TypeExpr::Tuple(parts.iter().map(strip_ownership_in_type_expr).collect())
+    }
+    TypeExpr::Func(params, ret) => TypeExpr::Func(
+      params.iter().map(strip_ownership_in_type_expr).collect(),
+      Box::new(strip_ownership_in_type_expr(ret)),
+    ),
+  }
+}
+
+/// Strips every parameter's (and, if present, the splat parameter's)
+/// declared type plus the return type of one `Function` — every
+/// `Function` this compiler has, whether a top-level `fn`, a class/
+/// actor method, or a module method, shares this exact same AST shape,
+/// so one helper covers all of them (`strip_ownership_annotations_in_
+/// item`'s own per-`Item`-kind dispatch below is what reaches each).
+fn strip_ownership_in_function(f: &mut AstFunction) {
+  for p in &mut f.params {
+    p.ty = strip_ownership_in_type_expr(&p.ty);
+  }
+  if let Some(p) = &mut f.splat_param {
+    p.ty = strip_ownership_in_type_expr(&p.ty);
+  }
+  f.return_type = strip_ownership_in_type_expr(&f.return_type);
+}
+
+fn strip_ownership_annotations_in_item(item: &mut Item) {
+  match item {
+    Item::Function(f) => strip_ownership_in_function(f),
+    Item::Class(c) => {
+      for m in &mut c.methods {
+        strip_ownership_in_function(m);
+      }
+    }
+    Item::Actor(a) => {
+      for m in &mut a.methods {
+        strip_ownership_in_function(m);
+      }
+    }
+    Item::Module(m) => {
+      for meth in &mut m.methods {
+        strip_ownership_in_function(meth);
+      }
+    }
+    // `export fn ...`/`export class ...` (plan 76) wraps another `Item`
+    // of one of the four kinds just handled above — recurse into it the
+    // same way `desugar_asserts_in_items`'s own sibling passes already
+    // must (this file's own established "an `Export` is transparent to
+    // every whole-program AST rewrite" convention).
+    Item::Export(inner) => strip_ownership_annotations_in_item(inner),
+    // Every other `Item` kind (`Enum`, `Newtype`, `Interface`, `Extern`,
+    // `Stmt`, `Require`) has no `Function`-shaped parameter/return-type
+    // annotation of its own an `own`/`borrow`/`borrow var` could ever
+    // appear on (an `Interface`'s own required-method signatures are
+    // never lowered to LLVM at all — conformance is checked entirely in
+    // `emerald-sema`), so there is nothing for this pass to strip there.
+    _ => {}
+  }
+}
+
+/// Top-level entry point, called once from `compile_to_object_impl`
+/// before anything else in this file ever looks at `items` — see
+/// `strip_ownership_in_type_expr`'s own doc comment for the full
+/// rationale.
+fn strip_ownership_annotations_in_items(items: &mut [Item]) {
+  for item in items {
+    strip_ownership_annotations_in_item(item);
+  }
+}
+
 fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
   match ty {
     TypeExpr::Named(name) => match name.as_str() {
@@ -188,6 +283,19 @@ fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
     // flat-string convention's `_ => ValKind::Ptr` arm gave this
     // unreachable-in-practice shape.
     TypeExpr::Tuple(_) => ValKind::Ptr,
+    // Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own rescoping of
+    // plan 84): a REAL, DISCLOSED, TEMPORARY PASSTHROUGH — `own T`/
+    // `borrow T`/`borrow var T` all get EXACTLY the same LLVM storage
+    // kind as bare `T` today, with no new codegen machinery of any
+    // kind (no raw-pointer borrow representation, no `own`-consumption
+    // invalidation codegen). This is deliberate and narrow: plan 83's
+    // own scope is sema-only liveness *checking*; plan 84 owns REAL
+    // zero-cost `borrow`-as-raw-pointer codegen and `own`-parameter
+    // invalidation codegen and will replace this exact arm. Recursing
+    // into the wrapped type is what makes a program sema ACCEPTS
+    // compile and run identically to the same program with the
+    // wrapper stripped, today.
+    TypeExpr::Own(inner) | TypeExpr::Borrow(inner, _) => value_kind_for_type(inner),
   }
 }
 
@@ -246,6 +354,11 @@ fn substitute_type_params(raw: &TypeExpr, subst: &HashMap<&str, &TypeExpr>) -> T
         .collect(),
       Box::new(substitute_type_params(ret, subst)),
     ),
+    // Plan 83: mirrors `emerald-sema`'s identically-named helper exactly.
+    TypeExpr::Own(inner) => TypeExpr::Own(Box::new(substitute_type_params(inner, subst))),
+    TypeExpr::Borrow(inner, is_var) => {
+      TypeExpr::Borrow(Box::new(substitute_type_params(inner, subst)), *is_var)
+    }
   }
 }
 
@@ -16069,6 +16182,20 @@ fn compile_to_object_impl(
   if program_uses_contracts(&items) {
     ensure_contract_violation_class(&mut items);
   }
+  // Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own rescoping of
+  // plan 84): strips every `own`/`borrow`/`borrow var` wrapper off
+  // every function/method parameter and return-type annotation,
+  // program-wide, before anything else in this file ever looks at
+  // `items` — the single, disclosed codegen PASSTHROUGH point (see
+  // `strip_ownership_annotations_in_items`'s own doc comment for the
+  // full rationale). `emerald_sema::check_program` has already fully
+  // enforced the four ownership-liveness rules against the ORIGINAL,
+  // annotated AST by the time any `emerald_codegen::compile_to_object*`
+  // entry point ever runs (`emerald-driver`'s own fixed pipeline
+  // order) — from here on, `own Data`/`borrow Data`/`borrow var Data`
+  // compile EXACTLY like a bare `Data` parameter, with no new codegen
+  // machinery of any kind.
+  strip_ownership_annotations_in_items(&mut items);
   let owned_program = Program { items };
   let program = &owned_program;
 

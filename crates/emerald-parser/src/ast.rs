@@ -107,6 +107,27 @@ pub enum TypeExpr {
   Generic(String, Vec<TypeExpr>),
   Tuple(Vec<TypeExpr>),
   Func(Vec<TypeExpr>, Box<TypeExpr>),
+  /// `own T` (plan 83, `spec/OWNERSHIP.md` §2) — the callee takes
+  /// ownership of the argument; the caller's binding is consumed and a
+  /// later use is a compile error (`emerald-sema`'s generalization of
+  /// plan 56's existing `is_cross_actor_send`-style consumed-binding
+  /// check, from "only checked at a cross-actor send" to "checked at
+  /// every `own`-typed call argument"). Legal only as a function/method
+  /// parameter's own type in v1 — `emerald-sema` rejects it anywhere
+  /// else (return type, field, `Let`) with a real diagnostic. Wraps the
+  /// underlying `TypeExpr` rather than a plain type name so `own
+  /// Array[Int64]` and similar compound underlying types round-trip
+  /// through this AST exactly like every other wrapper here.
+  Own(Box<TypeExpr>),
+  /// `borrow T` / `borrow var T` (plan 83, `spec/OWNERSHIP.md` §2) — a
+  /// shared read-only reference (`false`) or an exclusive mutable
+  /// reference (`true`, spelled with plan 72's existing `var` keyword
+  /// rather than a second mutability spelling). Legal only as a
+  /// function/method parameter's own type in v1, and never as a
+  /// function's return type (§2: "no function can return a `borrow`
+  /// whose validity outlives the specific region it names" — see
+  /// `emerald-sema`'s own region-liveness check for exactly why).
+  Borrow(Box<TypeExpr>, bool),
 }
 
 impl TypeExpr {
@@ -230,6 +251,9 @@ impl std::fmt::Display for TypeExpr {
         }
         write!(f, "{ret}]")
       }
+      TypeExpr::Own(inner) => write!(f, "own {inner}"),
+      TypeExpr::Borrow(inner, false) => write!(f, "borrow {inner}"),
+      TypeExpr::Borrow(inner, true) => write!(f, "borrow var {inner}"),
     }
   }
 }

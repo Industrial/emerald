@@ -206,6 +206,76 @@ struct FunctionSig {
   /// into the raw `Program` — the same "carry it alongside the
   /// signature" precedent `requires` above already set for plan 62.
   is_pure: bool,
+  /// Plan 83's Decision log (`spec/OWNERSHIP.md` §2/§10): `params[i]`'s
+  /// own `own`/`borrow`/`borrow var` annotation, parallel to `params`/
+  /// `param_names` — `None` for a plain (unannotated) parameter, always
+  /// `None` for every pre-plan-83 declaration. Deliberately NOT folded
+  /// into `Type` itself (`params[i]` stays the exact same plain
+  /// `Type::Class("Data")` an `own Data`/`borrow Data`/`borrow var
+  /// Data` parameter always resolved to) — every existing type-equality/
+  /// assignability check in this file keeps working unchanged; only
+  /// `check_ownership_call_args`'s own liveness pass below ever reads
+  /// this field.
+  param_ownership: Vec<Option<Ownership>>,
+}
+
+/// `own` / `borrow` / `borrow var` (plan 83, `spec/OWNERSHIP.md` §2) —
+/// kept as its own small side-channel enum, never a `Type` variant (see
+/// `FunctionSig.param_ownership`'s own doc comment for why). Only a
+/// function/method PARAMETER may ever carry one in v1 — `strip_param_
+/// ownership` is the only place that ever produces `Some`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+  Own,
+  Borrow,
+  BorrowVar,
+}
+
+/// A call target's resolved `FunctionSig.param_ownership`, borrowed —
+/// `None` when the target itself couldn't be resolved (an unknown
+/// function/method, or a receiver shape this compiler can't cheaply
+/// re-derive a static class for). Named purely to keep `check_own_
+/// consuming_value`'s own local binding readable (clippy's `type_
+/// complexity` lint on the bare three-element tuple otherwise).
+type ParamOwnership<'a> = Option<&'a [Option<Ownership>]>;
+
+/// Peels at most one leading `own`/`borrow`/`borrow var` wrapper off a
+/// PARAMETER's declared `TypeExpr` — legal only here (every param-type-
+/// resolution call site: `function_signature`, `function_signature_
+/// with_subst`, `check_function_body`, `check_method_body`, `rebuild_
+/// purity_env`), never inside the shared `resolve_type` itself, which
+/// rejects `TypeExpr::Own`/`Borrow` outright everywhere else (return
+/// types, fields, `Let`s, nested generic arguments) — the same "one
+/// dedicated resolution path gives a wrapper shape real meaning, the
+/// shared path rejects it" precedent `resolve_return_type`'s own
+/// `TypeExpr::Tuple` special-case already established for tuples.
+fn strip_param_ownership(ty: &TypeExpr) -> (Option<Ownership>, &TypeExpr) {
+  match ty {
+    TypeExpr::Own(inner) => (Some(Ownership::Own), inner),
+    TypeExpr::Borrow(inner, true) => (Some(Ownership::BorrowVar), inner),
+    TypeExpr::Borrow(inner, false) => (Some(Ownership::Borrow), inner),
+    other => (None, other),
+  }
+}
+
+/// Resolves a parameter's declared type to the plain `Type` every
+/// ordinary type-check in this file already expects — stripping an
+/// `own`/`borrow`/`borrow var` wrapper first (see `strip_param_
+/// ownership`'s own doc comment) so `own Data`/`borrow Data`/`borrow
+/// var Data` all resolve to the exact same `Type::Class("Data")` a bare
+/// `Data` parameter already does. This is plan 83's own disclosed
+/// codegen/type-checking PASSTHROUGH (`spec/OWNERSHIP.md` §10's own
+/// rescoping of plan 84): only the four liveness rules `check_
+/// ownership_call_args`/`check_borrow_scopes` implement below ever
+/// observe the ownership annotation itself; every other type-check in
+/// this compiler treats the three annotated forms identically to the
+/// bare underlying type, today.
+fn param_plain_type(
+  ty: &TypeExpr,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<Type, Diagnostic> {
+  let (_, inner) = strip_param_ownership(ty);
+  resolve_type(inner, classes)
 }
 
 /// Shared by classes and modules (plan 12's Decision log — modules reuse
@@ -388,6 +458,28 @@ fn resolve_type(
   classes: &HashMap<String, ClassInfo>,
 ) -> Result<Type, Diagnostic> {
   match texpr {
+    // Plan 83's Decision log (`spec/OWNERSHIP.md` §2/§6): `own`/
+    // `borrow`/`borrow var` are legal ONLY as a function/method
+    // parameter's own declared type — every other `TypeExpr` position
+    // (a field, a `Let`, a return type, nested inside a generic/tuple/
+    // Proc argument) reaches this shared `resolve_type` directly and is
+    // rejected here, the same "grammar stays general, this one shared
+    // resolution path rejects the shape sema doesn't give real meaning
+    // to here" precedent this function's own `TypeExpr::Tuple` omission
+    // already established (`resolve_return_type`'s doc comment). The
+    // one dedicated path that DOES give `own`/`borrow` real meaning —
+    // `param_plain_type`, called only from a parameter-type-resolution
+    // site — strips the wrapper via `strip_param_ownership` before ever
+    // reaching this function, so a legal parameter annotation never
+    // hits this arm at all.
+    TypeExpr::Own(_) | TypeExpr::Borrow(_, _) => Err(Diagnostic::new(
+      format!(
+        "ownership: `{texpr}` is only valid as a function or method parameter's own declared \
+         type (spec/OWNERSHIP.md §2) — not as a field, a `Let`, a return type, or nested inside \
+         another type"
+      ),
+      (0, 0),
+    )),
     TypeExpr::Named(name) => resolve_named_type(name, classes),
     // Plan 88: `Array[Elem]`/`Hash[K, V]`/`Pair[K, V]`/`Result[T, E]`
     // are no longer their own hand-rolled grammar alternatives with
@@ -618,6 +710,14 @@ fn substitute_type_params(raw: &TypeExpr, subst: &HashMap<&str, &TypeExpr>) -> T
         .collect(),
       Box::new(substitute_type_params(ret, subst)),
     ),
+    // Plan 83: recurses into the wrapped type the same way every other
+    // single-child wrapper here does — a generic method parameter typed
+    // `own T`/`borrow T`/`borrow var T` still needs `T` substituted
+    // against the enclosing class's own type arguments.
+    TypeExpr::Own(inner) => TypeExpr::Own(Box::new(substitute_type_params(inner, subst))),
+    TypeExpr::Borrow(inner, is_var) => {
+      TypeExpr::Borrow(Box::new(substitute_type_params(inner, subst)), *is_var)
+    }
   }
 }
 
@@ -634,6 +734,7 @@ fn type_references_any(ty: &TypeExpr, names: &HashSet<&str>) -> bool {
     TypeExpr::Func(params, ret) => {
       params.iter().any(|p| type_references_any(p, names)) || type_references_any(ret, names)
     }
+    TypeExpr::Own(inner) | TypeExpr::Borrow(inner, _) => type_references_any(inner, names),
   }
 }
 
@@ -728,6 +829,14 @@ fn infer_type_param_binding(raw: &TypeExpr, actual: &Type, param_name: &str) -> 
         .or_else(|| infer_type_param_binding(ret, aret, param_name)),
       _ => None,
     },
+    // Plan 83: transparent for unification purposes — `actual` is
+    // always the plain underlying `Type` either way (this plan's own
+    // disclosed passthrough; `Type` never carries an `own`/`borrow`
+    // wrapper of its own), so a generic method parameter typed `own T`/
+    // `borrow T`/`borrow var T` still infers `T`'s binding correctly.
+    TypeExpr::Own(inner) | TypeExpr::Borrow(inner, _) => {
+      infer_type_param_binding(inner, actual, param_name)
+    }
   }
 }
 
@@ -884,10 +993,24 @@ fn build_generic_class_info(
       generic_methods.insert(m.name.clone(), sig);
       continue;
     }
+    // Plan 83: strip a legal `own`/`borrow`/`borrow var` wrapper before
+    // this generic class's own substitution/instantiation machinery
+    // ever sees the parameter's type — `resolve_substituted_type`
+    // bottoms out in the shared `resolve_type`, which rejects the
+    // wrapper outright (see its own doc comment); only a parameter
+    // position should ever reach it stripped.
+    let param_ownership: Vec<Option<Ownership>> = m
+      .params
+      .iter()
+      .map(|p| strip_param_ownership(&p.ty).0)
+      .collect();
     let params = m
       .params
       .iter()
-      .map(|p| resolve_substituted_type(&p.ty, subst, generic_classes, classes, in_progress))
+      .map(|p| {
+        let (_, inner) = strip_param_ownership(&p.ty);
+        resolve_substituted_type(inner, subst, generic_classes, classes, in_progress)
+      })
       .collect::<Result<Vec<_>, _>>()?;
     let return_type =
       resolve_substituted_type(&m.return_type, subst, generic_classes, classes, in_progress)?;
@@ -909,6 +1032,7 @@ fn build_generic_class_info(
         splat_elem,
         requires: m.requires.clone(),
         is_pure: m.is_pure,
+        param_ownership,
       },
     );
   }
@@ -1726,6 +1850,34 @@ fn resolve_return_type(
   texpr: &TypeExpr,
   classes: &HashMap<String, ClassInfo>,
 ) -> Result<Type, Diagnostic> {
+  // Plan 83's Decision log (`spec/OWNERSHIP.md` §2, §10's rule 4): a
+  // `borrow`/`borrow var` return type is rejected here, unconditionally
+  // — before falling through to the shared `resolve_type` below (whose
+  // own `TypeExpr::Borrow` arm would otherwise report the generic
+  // "not valid here" message, not this rule's own specific reasoning).
+  // Verified this session: the ONLY region-creation/-destruction
+  // trigger this codebase ships today (plan 51, `emerald-codegen`'s
+  // function-entry/-exit codegen) is per-call-frame — `emerald_region_
+  // create` on entry, `emerald_region_destroy` on every exit path,
+  // unconditionally, for the function currently returning. The only
+  // region a returned `borrow` could possibly name is therefore this
+  // exact function's own frame region, destroyed at the exact moment
+  // this function returns — strictly before the borrow's own lexical
+  // scope (which, if returned, extends into the CALLER) could still be
+  // live to observe it. `own T` has no equivalent problem (ownership
+  // transfers to the caller the same way a freshly constructed value
+  // already does today), so only `Borrow` is rejected here.
+  if let TypeExpr::Borrow(_, _) = texpr {
+    return Err(Diagnostic::new(
+      format!(
+        "ownership: a function/method cannot return `{texpr}` — the region a returned `borrow` \
+         would need to name is this function's own call-frame region (plan 51), destroyed by \
+         `emerald_region_destroy` at this exact function's return, strictly before the borrow's \
+         lexical scope (extending into the caller) could still be live; see spec/OWNERSHIP.md §2"
+      ),
+      (0, 0),
+    ));
+  }
   if let TypeExpr::Tuple(parts) = texpr {
     let elem_types = parts
       .iter()
@@ -1809,8 +1961,13 @@ fn function_signature(
   let params = f
     .params
     .iter()
-    .map(|p| resolve_type(&p.ty, classes))
+    .map(|p| param_plain_type(&p.ty, classes))
     .collect::<Result<Vec<_>, _>>()?;
+  let param_ownership = f
+    .params
+    .iter()
+    .map(|p| strip_param_ownership(&p.ty).0)
+    .collect();
   let return_type = resolve_return_type(&f.return_type, classes)?;
   let param_names = f.params.iter().map(|p| p.name.clone()).collect();
   let defaults = f.params.iter().map(|p| p.default.clone()).collect();
@@ -1828,6 +1985,7 @@ fn function_signature(
     splat_elem,
     requires: f.requires.clone(),
     is_pure: f.is_pure,
+    param_ownership,
   })
 }
 
@@ -1854,11 +2012,19 @@ fn function_signature_with_subst(
       (0, 0),
     ));
   }
-  let params = f
+  let substituted_param_types: Vec<TypeExpr> = f
     .params
     .iter()
-    .map(|p| resolve_type(&substitute_type_params(&p.ty, subst), classes))
+    .map(|p| substitute_type_params(&p.ty, subst))
+    .collect();
+  let params = substituted_param_types
+    .iter()
+    .map(|ty| param_plain_type(ty, classes))
     .collect::<Result<Vec<_>, _>>()?;
+  let param_ownership = substituted_param_types
+    .iter()
+    .map(|ty| strip_param_ownership(ty).0)
+    .collect();
   let return_type = resolve_return_type(&substitute_type_params(&f.return_type, subst), classes)?;
   let param_names = f.params.iter().map(|p| p.name.clone()).collect();
   let defaults = f.params.iter().map(|p| p.default.clone()).collect();
@@ -1876,6 +2042,7 @@ fn function_signature_with_subst(
     splat_elem,
     requires: f.requires.clone(),
     is_pure: f.is_pure,
+    param_ownership,
   })
 }
 
@@ -6471,11 +6638,12 @@ fn check_implicit_return(
 fn check_message_safety(
   body: &[Spanned<Stmt>],
   env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
 ) -> Result<(), Diagnostic> {
   for stmt in body {
-    check_message_safety_stmt(stmt, env, classes, moved)?;
+    check_message_safety_stmt(stmt, env, sigs, classes, moved)?;
   }
   Ok(())
 }
@@ -6490,13 +6658,14 @@ fn check_message_safety(
 fn check_loop_body(
   body: &[Spanned<Stmt>],
   env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
 ) -> Result<(), Diagnostic> {
   let mut first_pass = moved.clone();
-  check_message_safety(body, env, classes, &mut first_pass)?;
+  check_message_safety(body, env, sigs, classes, &mut first_pass)?;
   let mut second_pass = first_pass.clone();
-  check_message_safety(body, env, classes, &mut second_pass)?;
+  check_message_safety(body, env, sigs, classes, &mut second_pass)?;
   moved.extend(second_pass);
   Ok(())
 }
@@ -6504,12 +6673,21 @@ fn check_loop_body(
 fn check_message_safety_stmt(
   stmt: &Spanned<Stmt>,
   env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
 ) -> Result<(), Diagnostic> {
   match &stmt.node {
+    // Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own-consumption
+    // rule): `check_own_consuming_value`, not a bare `expr_moved_read`
+    // — generalizes plan 56's actor-send-only own-argument check to
+    // ANY call whose target has an `own`-marked parameter, reusing
+    // `check_message_arg`'s own existing bucket classification for
+    // each such position (see that function's own doc comment for the
+    // exact, disclosed scope: a call appearing DIRECTLY as one of
+    // these statement kinds' own value expression, not nested deeper).
     Stmt::Let { value, .. } | Stmt::SetField { value, .. } | Stmt::Assign { value, .. } => {
-      expr_moved_read(value, moved)
+      check_own_consuming_value(value, env, sigs, classes, moved)
     }
     Stmt::SetIndex {
       array,
@@ -6518,23 +6696,25 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(array, moved)?;
       expr_moved_read(index, moved)?;
-      expr_moved_read(value, moved)
+      check_own_consuming_value(value, env, sigs, classes, moved)
     }
     Stmt::MultiAssign { values, .. } => {
       for v in values {
-        expr_moved_read(v, moved)?;
+        check_own_consuming_value(v, env, sigs, classes, moved)?;
       }
       Ok(())
     }
-    Stmt::Return(Some(e)) | Stmt::Raise(e) => expr_moved_read(e, moved),
+    Stmt::Return(Some(e)) | Stmt::Raise(e) => {
+      check_own_consuming_value(e, env, sigs, classes, moved)
+    }
     Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => Ok(()),
     Stmt::Yield(args) => {
       for a in args {
-        expr_moved_read(a, moved)?;
+        check_own_consuming_value(a, env, sigs, classes, moved)?;
       }
       Ok(())
     }
-    Stmt::Expr(e) => check_message_safety_expr_stmt(e, env, classes, moved),
+    Stmt::Expr(e) => check_message_safety_expr_stmt(e, env, sigs, classes, moved),
     Stmt::If {
       cond,
       then_branch,
@@ -6542,10 +6722,10 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(cond, moved)?;
       let mut then_moved = moved.clone();
-      check_message_safety(then_branch, env, classes, &mut then_moved)?;
+      check_message_safety(then_branch, env, sigs, classes, &mut then_moved)?;
       let mut else_moved = moved.clone();
       if let Some(else_b) = else_branch {
-        check_message_safety(else_b, env, classes, &mut else_moved)?;
+        check_message_safety(else_b, env, sigs, classes, &mut else_moved)?;
       }
       moved.extend(then_moved);
       moved.extend(else_moved);
@@ -6553,20 +6733,20 @@ fn check_message_safety_stmt(
     }
     Stmt::While { cond, body } => {
       expr_moved_read(cond, moved)?;
-      check_loop_body(body, env, classes, moved)
+      check_loop_body(body, env, sigs, classes, moved)
     }
     Stmt::For { elements, body, .. } => {
       for e in elements {
         expr_moved_read(e, moved)?;
       }
-      check_loop_body(body, env, classes, moved)
+      check_loop_body(body, env, sigs, classes, moved)
     }
     Stmt::ForRange {
       start, end, body, ..
     } => {
       expr_moved_read(start, moved)?;
       expr_moved_read(end, moved)?;
-      check_loop_body(body, env, classes, moved)
+      check_loop_body(body, env, sigs, classes, moved)
     }
     Stmt::Case {
       scrutinee,
@@ -6577,12 +6757,12 @@ fn check_message_safety_stmt(
       let mut union = HashMap::new();
       for (_, arm_body) in arms {
         let mut arm_moved = moved.clone();
-        check_message_safety(arm_body, env, classes, &mut arm_moved)?;
+        check_message_safety(arm_body, env, sigs, classes, &mut arm_moved)?;
         union.extend(arm_moved);
       }
       if let Some(else_b) = else_body {
         let mut else_moved = moved.clone();
-        check_message_safety(else_b, env, classes, &mut else_moved)?;
+        check_message_safety(else_b, env, sigs, classes, &mut else_moved)?;
         union.extend(else_moved);
       }
       moved.extend(union);
@@ -6594,11 +6774,11 @@ fn check_message_safety_stmt(
       ensure,
     } => {
       let mut body_moved = moved.clone();
-      check_message_safety(body, env, classes, &mut body_moved)?;
+      check_message_safety(body, env, sigs, classes, &mut body_moved)?;
       let mut union = body_moved;
       for r in rescues {
         let mut r_moved = moved.clone();
-        check_message_safety(&r.body, env, classes, &mut r_moved)?;
+        check_message_safety(&r.body, env, sigs, classes, &mut r_moved)?;
         union.extend(r_moved);
       }
       moved.extend(union);
@@ -6606,7 +6786,7 @@ fn check_message_safety_stmt(
       // `moved` as it now stands post-union, the same conservative
       // posture branches get.
       if let Some(ensure_b) = ensure {
-        check_message_safety(ensure_b, env, classes, moved)?;
+        check_message_safety(ensure_b, env, sigs, classes, moved)?;
       }
       Ok(())
     }
@@ -6618,9 +6798,9 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(scrutinee, moved)?;
       let mut ok_moved = moved.clone();
-      check_message_safety(ok_body, env, classes, &mut ok_moved)?;
+      check_message_safety(ok_body, env, sigs, classes, &mut ok_moved)?;
       let mut err_moved = moved.clone();
-      check_message_safety(err_body, env, classes, &mut err_moved)?;
+      check_message_safety(err_body, env, sigs, classes, &mut err_moved)?;
       moved.extend(ok_moved);
       moved.extend(err_moved);
       Ok(())
@@ -6636,6 +6816,7 @@ fn check_message_safety_stmt(
 fn check_message_safety_expr_stmt(
   e: &Spanned<Expr>,
   env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
 ) -> Result<(), Diagnostic> {
@@ -6647,7 +6828,14 @@ fn check_message_safety_expr_stmt(
             // Plan 56's own existing liveness check runs first,
             // completely unchanged — plan 60's own wire-safety
             // predicate (Design decision 2) is a second, independent
-            // check layered on AFTER it, never in place of it.
+            // check layered on AFTER it, never in place of it. Every
+            // named-local message argument is already treated as
+            // consumed here regardless of the receiving actor method's
+            // own `own`/`borrow`/`borrow var` annotations (plan 56
+            // predates plan 83 and is stricter already — see §5's own
+            // "coexist, don't subsume" note in `spec/OWNERSHIP.md`), so
+            // `check_own_consuming_value` below is never reached for an
+            // actor send.
             check_message_arg(arg, i, method, env, moved)?;
             check_wire_safety(arg, i, method, env, classes)?;
           }
@@ -6656,7 +6844,79 @@ fn check_message_safety_expr_stmt(
       }
     }
   }
-  expr_moved_read(e, moved)
+  check_own_consuming_value(e, env, sigs, classes, moved)
+}
+
+/// Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own-consumption
+/// rule): generalizes plan 56's actor-send-only own-argument check —
+/// `check_message_safety_expr_stmt`'s adjacent actor-receiver branch
+/// immediately above — "from only checked at a cross-actor send to
+/// checked at every `own`-typed call argument" (§2's own words),
+/// reusing `check_message_arg`'s existing four-bucket classification
+/// UNCHANGED for each `own`-marked parameter position; every other
+/// (non-`own`) argument position still gets the ordinary recursive
+/// `expr_moved_read` read-only check. Resolves the call's target
+/// signature from `sigs` (a free function) or, for a `Expr::MethodCall`
+/// with a locally-typed receiver, from that class's own `methods`
+/// table — mirrors `check_message_safety_expr_stmt`'s own "`Ident`
+/// receiver found in `env`" resolution exactly, so a receiver shape
+/// this compiler can't cheaply re-derive a static class for (a field, a
+/// nested call result, ...) simply finds no signature and falls back to
+/// the ordinary read-only walk, the same conservative-safe default
+/// every other unrecognized shape in this pass already gets.
+///
+/// A REAL, DISCLOSED narrowing versus a fully general expression-
+/// position walk: only a call appearing DIRECTLY as one of `check_
+/// message_safety_stmt`'s own value-bearing statement positions (a
+/// `Let`/`SetField`/`Assign`/`SetIndex`/`MultiAssign`/`Return`/`Raise`/
+/// `Yield` argument) or as a bare `Stmt::Expr` is recognized — an
+/// `own`-consuming call nested one level deeper (inside another call's
+/// own argument, or an arithmetic/comparison operand) is not detected
+/// here, matching this file's own established "state the narrowing
+/// plainly" convention (`expr_moved_read`'s own `Expr::Lambda`/`Expr::
+/// Supervise` doc comments are the precedent this follows).
+fn check_own_consuming_value(
+  e: &Spanned<Expr>,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  moved: &mut HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
+  let (name, args, ownership): (&str, &[Spanned<Expr>], ParamOwnership) = match &e.node {
+    Expr::Call(name, args) => (
+      name.as_str(),
+      args.as_slice(),
+      sigs.get(name).map(|s| s.param_ownership.as_slice()),
+    ),
+    Expr::MethodCall(recv, method, args) => {
+      expr_moved_read(recv, moved)?;
+      let recv_ty = match &recv.node {
+        Expr::Ident(n) if n == "self" => None,
+        Expr::Ident(n) => env.get(n),
+        _ => None,
+      };
+      let ownership = match recv_ty {
+        Some(Type::Class(cn)) => classes
+          .get(cn)
+          .and_then(|c| c.methods.get(method))
+          .map(|s| s.param_ownership.as_slice()),
+        _ => None,
+      };
+      (method.as_str(), args.as_slice(), ownership)
+    }
+    _ => return expr_moved_read(e, moved),
+  };
+  let Some(ownership) = ownership else {
+    return expr_moved_read(e, moved);
+  };
+  for (i, arg) in args.iter().enumerate() {
+    if ownership.get(i) == Some(&Some(Ownership::Own)) {
+      check_message_arg(arg, i, name, env, moved)?;
+    } else {
+      expr_moved_read(arg, moved)?;
+    }
+  }
+  Ok(())
 }
 
 /// `leaf-payload-classification`'s four buckets, in the order the
@@ -6713,8 +6973,15 @@ fn check_message_arg(
       if let Some(&send_span) = moved.get(name) {
         return Err(Diagnostic::new(
           format!(
-            "message-safety: local `{name}` cannot be used again — it was already sent to an \
-             actor (byte offset {}) and message payloads are a one-way transfer",
+            // Plan 83's Decision log: this same `moved` map now also
+            // records an `own`-argument consumption (`check_own_
+            // consuming_value`), not only an actor message send — the
+            // wording stays accurate for either real cause rather than
+            // unconditionally claiming "sent to an actor" for a plain
+            // `own T` call that never touches an actor at all.
+            "message-safety: local `{name}` cannot be used again — it was already consumed by a \
+             one-way transfer (an actor message send or an `own` argument, byte offset {}), and \
+             neither kind of transfer can be read from again afterward",
             send_span.0
           ),
           arg.span,
@@ -6853,9 +7120,13 @@ fn expr_moved_read(
     Expr::Ident(name) => {
       if let Some(&send_span) = moved.get(name) {
         return Err(Diagnostic::new(
+          // Plan 83's Decision log: see `check_message_arg`'s own
+          // identical Ident-bucket comment for why this wording covers
+          // an `own`-argument consumption too, not only an actor send.
           format!(
-            "message-safety: local `{name}` cannot be used again — it was already sent to an \
-             actor (byte offset {}) and message payloads are a one-way transfer",
+            "message-safety: local `{name}` cannot be used again — it was already consumed by a \
+             one-way transfer (an actor message send or an `own` argument, byte offset {}), and \
+             neither kind of transfer can be read from again afterward",
             send_span.0
           ),
           expr.span,
@@ -6965,6 +7236,382 @@ fn expr_moved_read(
   }
 }
 
+/// Plan 83's Decision log (`spec/OWNERSHIP.md` §8, §10's rules 1/2): one
+/// binding's `borrow`/`borrow var` call-argument history, tracked across
+/// a whole function/method body. Per §8, a `borrow`'s live range is its
+/// ENTIRE ENCLOSING LEXICAL SCOPE, not "from creation to last use"
+/// (Rust's pre-2018, pre-NLL model, explicitly chosen over anything
+/// flow-sensitive) — this plan takes that one step further, deliberately:
+/// rather than re-deriving each nested `if`/`while`/`case`/`begin`
+/// block's own precise boundary as a separate scope (the exact
+/// fork/union bookkeeping `check_message_safety`'s `moved` map needs for
+/// ITS OWN, different, "is this specific path still live" question),
+/// every borrow/borrow-var event anywhere in one function/method body is
+/// tracked in ONE shared scope for this check — a real, disclosed
+/// FURTHER conservative narrowing on top of §8's own already-conservative
+/// lexical model (this will reject some nested-independent-branch shapes
+/// a precise per-block scope would accept, e.g. a `borrow` in an `if`
+/// arm and a `borrow var` in its `else` arm, which can never actually
+/// coexist at runtime) — never an UNDER-approximation, so it never
+/// accepts a program the real per-block rule would reject. Chosen for
+/// this plan's own scope (plain lexical-scope liveness, explicitly NOT
+/// flow-sensitive) over the more precise per-block version because the
+/// latter needs the same fork/union machinery `check_message_safety`
+/// already has for a genuinely different reason (moved-ness), and
+/// duplicating that machinery a second time for borrow-liveness was
+/// judged not worth it against this plan's own "simplest available
+/// lexical rule" framing (§8's own explicit "reject some obviously-sound
+/// programs" acceptance).
+#[derive(Debug, Clone, Default)]
+struct BorrowState {
+  borrow_span: Option<(usize, usize)>,
+  borrow_var_span: Option<(usize, usize)>,
+}
+
+/// Records one new `borrow`/`borrow var` call-argument event for
+/// `name`, checking it against whatever this same binding's history
+/// already holds — rules 1 and 2 of `spec/OWNERSHIP.md` §10, in the
+/// order stated there: rule 1 (a second live `borrow var`) checked
+/// before rule 2 (a `borrow` coexisting with a live `borrow var`) is a
+/// distinction that only matters when BOTH would fire on the exact same
+/// new event, which never happens (one is keyed on a new `BorrowVar`
+/// event, the other's two directions are keyed on either a new `Borrow`
+/// event against a live `borrow var`, or a new `BorrowVar` event against
+/// a live `borrow`) — so the two rules never actually race here.
+fn record_borrow_event(
+  name: &str,
+  kind: Ownership,
+  span: (usize, usize),
+  state: &mut HashMap<String, BorrowState>,
+) -> Result<(), Diagnostic> {
+  let entry = state.entry(name.to_string()).or_default();
+  match kind {
+    Ownership::Borrow => {
+      if let Some(bv_span) = entry.borrow_var_span {
+        return Err(Diagnostic::new(
+          format!(
+            "ownership: `{name}` cannot be borrowed here — it is already borrowed exclusively \
+             (`borrow var`, byte offset {}) within this same lexical scope, and a `borrow` cannot \
+             coexist with a live `borrow var` of the same binding (spec/OWNERSHIP.md §10)",
+            bv_span.0
+          ),
+          span,
+        ));
+      }
+      entry.borrow_span = Some(span);
+      Ok(())
+    }
+    Ownership::BorrowVar => {
+      if let Some(prev) = entry.borrow_var_span {
+        return Err(Diagnostic::new(
+          format!(
+            "ownership: `{name}` cannot be borrowed exclusively (`borrow var`) here — it already \
+             has a live exclusive borrow (byte offset {}) within this same lexical scope, and more \
+             than one live `borrow var` of the same binding is rejected (spec/OWNERSHIP.md §10)",
+            prev.0
+          ),
+          span,
+        ));
+      }
+      if let Some(b_span) = entry.borrow_span {
+        return Err(Diagnostic::new(
+          format!(
+            "ownership: `{name}` cannot be borrowed exclusively (`borrow var`) here — it is \
+             already borrowed (`borrow`, byte offset {}) within this same lexical scope, and a \
+             `borrow var` cannot coexist with a live `borrow` of the same binding \
+             (spec/OWNERSHIP.md §10)",
+            b_span.0
+          ),
+          span,
+        ));
+      }
+      entry.borrow_var_span = Some(span);
+      Ok(())
+    }
+    Ownership::Own => Ok(()),
+  }
+}
+
+/// Top-level entry point for rules 1/2 — walks every statement in
+/// `body` (recursing into every nested block: `if`/`while`/`for`/
+/// `case`/`begin`/`match_result`, matching `check_message_safety`'s own
+/// traversal shape), tracking `state` as ONE shared map for the whole
+/// call (see `BorrowState`'s own doc comment for why this is
+/// deliberately not scoped per nested block).
+fn check_borrow_scopes(
+  body: &[Spanned<Stmt>],
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  state: &mut HashMap<String, BorrowState>,
+) -> Result<(), Diagnostic> {
+  for stmt in body {
+    check_borrow_scopes_stmt(stmt, env, sigs, classes, state)?;
+  }
+  Ok(())
+}
+
+fn check_borrow_scopes_stmt(
+  stmt: &Spanned<Stmt>,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  state: &mut HashMap<String, BorrowState>,
+) -> Result<(), Diagnostic> {
+  match &stmt.node {
+    Stmt::Let { value, .. } | Stmt::SetField { value, .. } | Stmt::Assign { value, .. } => {
+      collect_borrow_events_expr(value, env, sigs, classes, state)
+    }
+    Stmt::SetIndex {
+      array,
+      index,
+      value,
+    } => {
+      collect_borrow_events_expr(array, env, sigs, classes, state)?;
+      collect_borrow_events_expr(index, env, sigs, classes, state)?;
+      collect_borrow_events_expr(value, env, sigs, classes, state)
+    }
+    Stmt::MultiAssign { values, .. } => {
+      for v in values {
+        collect_borrow_events_expr(v, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Stmt::Return(Some(e)) | Stmt::Raise(e) => {
+      collect_borrow_events_expr(e, env, sigs, classes, state)
+    }
+    Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => Ok(()),
+    Stmt::Yield(args) => {
+      for a in args {
+        collect_borrow_events_expr(a, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Stmt::Expr(e) => collect_borrow_events_expr(e, env, sigs, classes, state),
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => {
+      collect_borrow_events_expr(cond, env, sigs, classes, state)?;
+      check_borrow_scopes(then_branch, env, sigs, classes, state)?;
+      if let Some(else_b) = else_branch {
+        check_borrow_scopes(else_b, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Stmt::While { cond, body } => {
+      collect_borrow_events_expr(cond, env, sigs, classes, state)?;
+      check_borrow_scopes(body, env, sigs, classes, state)
+    }
+    Stmt::For { elements, body, .. } => {
+      for e in elements {
+        collect_borrow_events_expr(e, env, sigs, classes, state)?;
+      }
+      check_borrow_scopes(body, env, sigs, classes, state)
+    }
+    Stmt::ForRange {
+      start, end, body, ..
+    } => {
+      collect_borrow_events_expr(start, env, sigs, classes, state)?;
+      collect_borrow_events_expr(end, env, sigs, classes, state)?;
+      check_borrow_scopes(body, env, sigs, classes, state)
+    }
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => {
+      collect_borrow_events_expr(scrutinee, env, sigs, classes, state)?;
+      for (_, arm_body) in arms {
+        check_borrow_scopes(arm_body, env, sigs, classes, state)?;
+      }
+      if let Some(else_b) = else_body {
+        check_borrow_scopes(else_b, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => {
+      check_borrow_scopes(body, env, sigs, classes, state)?;
+      for r in rescues {
+        check_borrow_scopes(&r.body, env, sigs, classes, state)?;
+      }
+      if let Some(ensure_b) = ensure {
+        check_borrow_scopes(ensure_b, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Stmt::MatchResult {
+      scrutinee,
+      ok_body,
+      err_body,
+      ..
+    } => {
+      collect_borrow_events_expr(scrutinee, env, sigs, classes, state)?;
+      check_borrow_scopes(ok_body, env, sigs, classes, state)?;
+      check_borrow_scopes(err_body, env, sigs, classes, state)
+    }
+  }
+}
+
+/// Recurses into every expression position (mirroring `expr_moved_read`'s
+/// own traversal shape exactly) looking for a `Call`/`MethodCall` whose
+/// resolved target signature marks a parameter `borrow`/`borrow var` —
+/// for each such position whose argument is a plain named local
+/// (`Expr::Ident`), records the event via `record_borrow_event`. Every
+/// other argument shape (a field, an index, a nested call result, a
+/// literal) isn't a trackable BINDING for this liveness bookkeeping at
+/// all (there's no name to key `state` on) and is simply recursed into
+/// like any other sub-expression instead — a real, disclosed narrowing
+/// mirroring `check_message_arg`'s own bucket-3-only recording, applied
+/// here to reads instead of moves.
+fn collect_borrow_events_expr(
+  expr: &Spanned<Expr>,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  state: &mut HashMap<String, BorrowState>,
+) -> Result<(), Diagnostic> {
+  match &expr.node {
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::Bool(_)
+    | Expr::InstanceVar(_) => Ok(()),
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b) => {
+      collect_borrow_events_expr(a, env, sigs, classes, state)?;
+      collect_borrow_events_expr(b, env, sigs, classes, state)
+    }
+    Expr::Compare(a, _, b) => {
+      collect_borrow_events_expr(a, env, sigs, classes, state)?;
+      collect_borrow_events_expr(b, env, sigs, classes, state)
+    }
+    Expr::Neg(a)
+    | Expr::Not(a)
+    | Expr::BitNot(a)
+    | Expr::ArrayNew(a)
+    | Expr::Ok(a)
+    | Expr::Err(a)
+    | Expr::Try(a)
+    | Expr::Comptime(a) => collect_borrow_events_expr(a, env, sigs, classes, state),
+    Expr::Call(name, args) => {
+      let ownership = sigs.get(name).map(|s| s.param_ownership.clone());
+      collect_borrow_call_args(args, ownership.as_deref(), env, sigs, classes, state)
+    }
+    Expr::New(_, args) | Expr::Spawn(_, args) => {
+      for a in args {
+        collect_borrow_events_expr(a, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        collect_borrow_events_expr(v, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Expr::MethodCall(recv, method, args) | Expr::SafeCall(recv, method, args) => {
+      collect_borrow_events_expr(recv, env, sigs, classes, state)?;
+      let recv_ty = match &recv.node {
+        Expr::Ident(n) if n == "self" => None,
+        Expr::Ident(n) => env.get(n),
+        _ => None,
+      };
+      let ownership = match recv_ty {
+        Some(Type::Class(cn)) => classes
+          .get(cn)
+          .and_then(|c| c.methods.get(method))
+          .map(|s| s.param_ownership.clone()),
+        _ => None,
+      };
+      collect_borrow_call_args(args, ownership.as_deref(), env, sigs, classes, state)
+    }
+    Expr::Coalesce(a, b) => {
+      collect_borrow_events_expr(a, env, sigs, classes, state)?;
+      collect_borrow_events_expr(b, env, sigs, classes, state)
+    }
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for e in elems {
+        collect_borrow_events_expr(e, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        collect_borrow_events_expr(k, env, sigs, classes, state)?;
+        collect_borrow_events_expr(v, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(e) = p {
+          collect_borrow_events_expr(e, env, sigs, classes, state)?;
+        }
+      }
+      Ok(())
+    }
+    // Same real, disclosed gap `expr_moved_read` already states for
+    // both of these — a lambda/`supervise` body is a nested `Stmt` list
+    // this plan's own worked examples never exercise from inside one.
+    Expr::Lambda { .. } | Expr::Supervise(_) => Ok(()),
+    Expr::Remote { addr, name, .. } => {
+      collect_borrow_events_expr(addr, env, sigs, classes, state)?;
+      collect_borrow_events_expr(name, env, sigs, classes, state)
+    }
+    Expr::Locate { key, args, .. } => {
+      collect_borrow_events_expr(key, env, sigs, classes, state)?;
+      for a in args {
+        collect_borrow_events_expr(a, env, sigs, classes, state)?;
+      }
+      Ok(())
+    }
+  }
+}
+
+/// Shared by `Expr::Call`'s and `Expr::MethodCall`'s own arms above —
+/// records a `borrow`/`borrow var` event for every `own`-marked... no,
+/// every BORROW-marked argument position that is a plain `Expr::Ident`,
+/// then recurses into every argument regardless (a borrowed argument's
+/// own sub-structure, and every non-borrow-marked argument, still needs
+/// its own nested calls found).
+fn collect_borrow_call_args(
+  args: &[Spanned<Expr>],
+  ownership: Option<&[Option<Ownership>]>,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  state: &mut HashMap<String, BorrowState>,
+) -> Result<(), Diagnostic> {
+  for (i, arg) in args.iter().enumerate() {
+    if let (Some(kinds), Expr::Ident(name)) = (ownership, &arg.node) {
+      if let Some(Some(k @ (Ownership::Borrow | Ownership::BorrowVar))) = kinds.get(i) {
+        record_borrow_event(name, *k, arg.span, state)?;
+      }
+    }
+    collect_borrow_events_expr(arg, env, sigs, classes, state)?;
+  }
+  Ok(())
+}
+
 /// Plan 63's `leaf-sema-purity-check`: identifies one `pure`-claimed
 /// top-level function (`Function`) or one `pure`-claimed method
 /// (`Method(class_or_module_name, method_name)`) — the call graph's
@@ -7014,7 +7661,9 @@ fn rebuild_purity_env(
 ) -> (HashMap<String, Type>, Type) {
   let mut env = HashMap::new();
   for p in &f.params {
-    if let Ok(t) = resolve_type(&p.ty, classes) {
+    // Plan 83: `param_plain_type`, matching `check_function_body`'s/
+    // `check_method_body`'s own identical param-env-building call.
+    if let Ok(t) = param_plain_type(&p.ty, classes) {
       env.insert(p.name.clone(), t);
     }
   }
@@ -8992,7 +9641,13 @@ fn check_function_body(
   // reassign a parameter.
   let mut mutable_locals: HashSet<String> = HashSet::new();
   for p in &f.params {
-    env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
+    // Plan 83: `param_plain_type`, not a bare `resolve_type` — strips a
+    // legal `own`/`borrow`/`borrow var` wrapper first (see its own doc
+    // comment). The body's ordinary type-check env binds the same
+    // plain underlying type either way (this plan's own disclosed
+    // codegen/type-checking passthrough); `check_ownership_call_args`
+    // below is what actually enforces the four liveness rules.
+    env.insert(p.name.clone(), param_plain_type(&p.ty, classes)?);
   }
   // Plan 39: a splat parameter is bound inside the body as a real
   // `Array[Elem]` — call sites pack it into one at each call site (the
@@ -9032,7 +9687,13 @@ fn check_function_body(
   // ordinary type-check has already succeeded, reusing its final `env`
   // read-only.
   let mut moved = HashMap::new();
-  check_message_safety(&f.body, &env, classes, &mut moved)
+  check_message_safety(&f.body, &env, sigs, classes, &mut moved)?;
+  // Plan 83 (`spec/OWNERSHIP.md` §10's rules 1/2) — a second, separate,
+  // read-only pass over the same already-checked body, exactly mirroring
+  // `check_message_safety`'s own "run once the body's ordinary type-check
+  // has already succeeded" posture.
+  let mut borrow_state = HashMap::new();
+  check_borrow_scopes(&f.body, &env, sigs, classes, &mut borrow_state)
 }
 
 fn check_method_body(
@@ -9098,7 +9759,9 @@ fn check_method_body(
   // parameter is unconditionally immutable inside its own body.
   let mut mutable_locals: HashSet<String> = HashSet::new();
   for p in &m.params {
-    env.insert(p.name.clone(), resolve_type(&p.ty, classes)?);
+    // Plan 83: see `check_function_body`'s identical `param_plain_type`
+    // call for the full rationale.
+    env.insert(p.name.clone(), param_plain_type(&p.ty, classes)?);
   }
   let declared_return = resolve_type(&m.return_type, classes)?;
   check_block(
@@ -9129,7 +9792,11 @@ fn check_method_body(
   // actor's own method sending to ANOTHER actor) gets the exact same
   // check.
   let mut moved = HashMap::new();
-  check_message_safety(&m.body, &env, classes, &mut moved)
+  check_message_safety(&m.body, &env, sigs, classes, &mut moved)?;
+  // Plan 83 — see `check_function_body`'s identical call for the full
+  // rationale.
+  let mut borrow_state = HashMap::new();
+  check_borrow_scopes(&m.body, &env, sigs, classes, &mut borrow_state)
 }
 
 /// Plan 34: for every bare top-level statement call to a `block_param`-
@@ -10182,6 +10849,12 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           // is even grammatically reachable on an `ExternFn`, so this
           // is always `false`, never read from user source.
           is_pure: false,
+          // Plan 83/85: `own`/`borrow`-typed FFI parameters are plan
+          // 85's own scope (`spec/OWNERSHIP.md` §7), not this plan's —
+          // `resolve_extern_type` already rejects the wrapper outright
+          // (its `as_named()` call returns `None` for both), so every
+          // extern fn parameter that reaches here is always unannotated.
+          param_ownership: vec![None; f.params.len()],
         },
       );
     }
@@ -13745,6 +14418,199 @@ mod tests {
       errs
         .iter()
         .any(|d| d.message.contains("Meters") && d.message.contains("already declared")),
+      "{errs:?}"
+    );
+  }
+
+  // Plan 83 (`spec/OWNERSHIP.md` §10): `own`/`borrow`/`borrow var`
+  // lexical-scope liveness checking. `check_message_safety`/`check_
+  // borrow_scopes` only ever run inside a function/method BODY (the
+  // same real, disclosed scope plan 56's own tests above already work
+  // around) — every scenario below wraps its interesting statements in
+  // `fn run: Void do ... end` + a trailing `run()` call, exactly
+  // mirroring `message_safety_program`'s own convention immediately
+  // above.
+  fn ownership_program(fns: &str, run_body: &str) -> String {
+    format!(
+      "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn bump: Void do\n    @value = @value + 1\n  end\nend\n\n{fns}\nfn run: Void do\n{run_body}end\n\nrun()\n"
+    )
+  }
+
+  // --- Rule 1: more than one live `borrow var` of the same binding ---
+
+  #[test]
+  fn accepts_a_single_borrow_var_of_a_binding() {
+    let src = ownership_program(
+      "fn increment(c: borrow var Counter): Void do\n  c.bump\nend\n",
+      "  counter: Counter = Counter.new(10)\n  increment(counter)\n  puts counter.value\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_two_live_borrow_vars_of_the_same_binding() {
+    let src = ownership_program(
+      "fn increment(c: borrow var Counter): Void do\n  c.bump\nend\n",
+      "  counter: Counter = Counter.new(10)\n  increment(counter)\n  increment(counter)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a second live `borrow var` of the same binding must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("ownership")
+        && d.message.contains("counter")
+        && d.message.contains("borrow var")),
+      "diagnostic must name the binding and the rule: {errs:?}"
+    );
+  }
+
+  // --- Rule 2: a `borrow` coexisting with a live `borrow var` ---
+
+  #[test]
+  fn accepts_two_shared_borrows_of_the_same_binding() {
+    let src = ownership_program(
+      "fn report(c: borrow Counter): Void do\n  puts c.value\nend\n",
+      "  counter: Counter = Counter.new(10)\n  report(counter)\n  report(counter)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "two shared, read-only borrows of the same binding never conflict"
+    );
+  }
+
+  #[test]
+  fn rejects_a_borrow_coexisting_with_a_live_borrow_var() {
+    let src = ownership_program(
+      "fn report(c: borrow Counter): Void do\n  puts c.value\nend\nfn increment(c: borrow var Counter): Void do\n  c.bump\nend\n",
+      "  counter: Counter = Counter.new(10)\n  report(counter)\n  increment(counter)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a `borrow` cannot coexist with a live `borrow var` of the same binding");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains("counter")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_borrow_var_coexisting_with_a_live_borrow_the_other_order() {
+    // The symmetric direction: `borrow` recorded first, `borrow var`
+    // attempted second — `record_borrow_event`'s own `Ownership::
+    // BorrowVar` arm is what this exercises (the accept-case tests
+    // above only ever exercise its `Ownership::Borrow` arm).
+    let src = ownership_program(
+      "fn report(c: borrow Counter): Void do\n  puts c.value\nend\nfn increment(c: borrow var Counter): Void do\n  c.bump\nend\n",
+      "  counter: Counter = Counter.new(10)\n  increment(counter)\n  report(counter)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a `borrow var` cannot coexist with a live `borrow` of the same binding");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains("counter")),
+      "{errs:?}"
+    );
+  }
+
+  // --- Rule 3: use of a binding after it's passed as an `own` argument ---
+
+  #[test]
+  fn accepts_an_own_argument_not_used_again() {
+    let src = ownership_program(
+      "fn consume(c: own Counter): Void do\n  puts c.value\nend\n",
+      "  counter: Counter = Counter.new(10)\n  consume(counter)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_use_of_a_binding_after_its_passed_as_an_own_argument() {
+    let src = ownership_program(
+      "fn consume(c: own Counter): Void do\n  puts c.value\nend\n",
+      "  counter: Counter = Counter.new(10)\n  consume(counter)\n  puts counter.value\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`counter` was already consumed by `own` — reading it again must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains("counter")),
+      "plan 83 reuses plan 56's own consumed-binding mechanism verbatim, so the diagnostic \
+       carries that mechanism's own \"message-safety\" wording even for a non-actor `own` call: \
+       {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_use_of_a_binding_after_its_passed_as_an_own_argument_to_a_method() {
+    // The `Expr::MethodCall` half of `check_own_consuming_value`'s own
+    // dispatch — the test immediately above only exercises the
+    // `Expr::Call` (free function) half.
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\nend\n\nclass Sink\n  fn initialize: Void do\n  end\n\n  fn eat(c: own Counter): Void do\n    puts c.value\n  end\nend\n\nfn run: Void do\n  counter: Counter = Counter.new(10)\n  sink: Sink = Sink.new()\n  sink.eat(counter)\n  puts counter.value\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`counter` was already consumed by an `own` METHOD argument — rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains("counter")),
+      "{errs:?}"
+    );
+  }
+
+  // --- Rule 4: a `borrow` whose named region is destroyed while its ---
+  // --- lexical scope is still live (concretely: a function/method  ---
+  // --- cannot return `borrow`/`borrow var`, per resolve_return_type) ---
+
+  #[test]
+  fn accepts_a_borrow_parameter_with_an_ordinary_return_type() {
+    let src = ownership_program(
+      "fn report(c: borrow Counter): Int64 do\n  c.value\nend\n",
+      "  counter: Counter = Counter.new(10)\n  puts report(counter)\n",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "a `borrow` PARAMETER with a plain return type must not be rejected by rule 4"
+    );
+  }
+
+  #[test]
+  fn rejects_a_function_returning_borrow() {
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\nend\n\nfn get_ref(c: borrow Counter): borrow Counter do\n  c\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "a function returning `borrow T` must be rejected — its only possible region \
+                    (this function's own call-frame region) is destroyed at this exact return",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains("return")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_a_method_returning_borrow_var() {
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\nend\n\nclass Holder\n  c: Counter\n\n  fn initialize(c: Counter): Void do\n    @c = c\n  end\n\n  fn get_mut_ref: borrow var Counter do\n    @c\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a METHOD returning `borrow var T` must be rejected the same way a function is");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains("return")),
       "{errs:?}"
     );
   }
