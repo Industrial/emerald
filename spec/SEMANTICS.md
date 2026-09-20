@@ -228,6 +228,79 @@ summarized here for completeness against inception §19's question list:
 
 ---
 
+## 11. Multi-file compilation and module visibility
+
+Plan 23 (`multi-file-compilation`) shipped `require <path>`: a compile-time
+AST splice, not a runtime load — `emerald-cli`'s `require.rs`/
+`emerald-driver`'s `require_graph.rs` parse the target file, recursively
+resolve its own `require`s (canonical-path deduped, cycle-rejected), and
+merge its items into one flat `Program` before `emerald-sema`/
+`emerald-codegen` ever run. Originally, every item in that merged `Program`
+was fully, globally visible to every other item, with zero access control.
+
+Plan 76 (`import-export-module-visibility`) adds real, checked
+symbol-level visibility on top of that, without replacing it:
+
+1. **Backward compatibility, precisely stated.** A file with zero `export`
+   declarations anywhere in it still exports **everything** — plan 23's
+   original, fully unrestricted behavior, unchanged, for every `.em` file
+   written before this plan existed. A file switches to
+   explicit-export-only **for itself alone** the moment it writes its
+   first `export` — every other, non-exporting file in the same program is
+   completely unaffected, including files that `require` the newly-
+   restrictive one.
+2. **What `require <path>` grants.** Everything *visible* in the target
+   file: everything, if it has no `export` declarations; everything it
+   exports, if it does. A `require` of a file that does restrict its
+   exports does NOT transitively forward whatever that file can itself
+   see through its own further `require`s/`import`s — an exporting file is
+   a real visibility firewall, not a transparent relay. A `require` of a
+   file with no exports at all, by contrast, DOES forward transitively
+   (recreating plan 23's original global-namespace behavior exactly, since
+   that is the only shape a program with zero `export` declarations
+   anywhere can produce).
+3. **What `import <path> { Name, Name2 }` grants.** Exactly the named
+   symbols, and only those — even if the target file exports more names
+   than were actually listed. Every named symbol is validated at
+   compile time: it must be a real top-level declaration in the target
+   file, and, if that file restricts its exports, must be in its export
+   set. Naming a nonexistent or unexported symbol is a real, immediate
+   compile error (file:line:col, the symbol's name, the file it isn't
+   exported from) — never a deferred, confusing "unknown function"
+   diagnostic once the import silently contributed nothing.
+4. **What gets compiled vs. what may be referenced are different
+   questions.** `export`/`import` never remove a declaration from the
+   compiled program — a required file's own private helper functions are
+   still compiled in (an exported function may call them internally).
+   `export` only restricts which *names* a *different* file's own source
+   is allowed to reference directly (a bare call, `.new`/`.spawn`, a
+   module-static call, ...); it is not a dead-code elimination mechanism.
+5. **Interaction with plan 49's `--jobs`-parallel multi-file compilation.**
+   `emerald-driver::require_graph` enforces the identical rules as
+   `emerald-cli::require` (both share `emerald_parser::visibility`'s
+   AST-walking primitives), run once, immediately after the whole
+   require/import graph is built and confirmed acyclic — before any
+   parallel parse/typecheck/codegen work is scheduled onto worker threads.
+   An `import` edge counts as a real leveling dependency exactly like
+   `require` (Kahn's-algorithm ordering waits on it too).
+6. **Interaction with plan 46's package manager (`emerald.toml`).** No
+   special-casing needed or added: a `path`/`git` dependency resolves to
+   an ordinary file on disk the same way any other `require`d/`import`ed
+   file does — visibility is a property of the require/import graph, not
+   of how a given node in that graph was fetched. A package's own
+   `export`s are exactly as enforced for a `require deps/<name>/<entry>`
+   as for a same-directory `require`.
+7. **A real, disclosed scope limitation.** The cross-file reference check
+   walks ordinary statement/expression bodies (calls, `.new`/`.spawn`/
+   `.remote`/`.locate`, module-static calls, lambda bodies, nested control
+   flow) — it does not walk `TypeExpr` positions (a parameter's declared
+   type, a return type, a class field's type). A function whose
+   *signature* names an unexported class from another file, but whose
+   *body* never constructs or calls anything cross-file, is not caught by
+   this check today.
+
+---
+
 ## Cross-references
 
 - Grammar-level consequences of these decisions (which rows are `KEEP` vs

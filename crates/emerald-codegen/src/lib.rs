@@ -932,7 +932,19 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
           collect_typenames_in_stmt(s, &mut out);
         }
       }
-      Item::Enum(_) | Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
+      // Plan 76's `import-export-module-visibility`: both require-
+      // resolution call sites (`emerald-cli::require`, `emerald_driver::
+      // require_graph`) strip `Item::Export` and resolve away
+      // `Item::Import` before any `Program` reaches `emerald-codegen` —
+      // the same "resolved away before codegen" precedent `Item::
+      // Require` immediately below already has.
+      Item::Enum(_)
+      | Item::Interface(_)
+      | Item::Require(_)
+      | Item::Import { .. }
+      | Item::Export(_)
+      | Item::Error
+      | Item::Extern(_) => {}
     }
   }
   out
@@ -1760,6 +1772,13 @@ fn collect_symbols_in_stmt(stmt: &Spanned<Stmt>, table: &mut HashMap<String, i64
 fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
   let mut table = HashMap::new();
   for item in &program.items {
+    // Plan 76: unwrap once (the grammar never nests `export`) so an
+    // exported declaration's own body is walked identically to a
+    // non-exported one.
+    let mut item: &Item = item;
+    while let Item::Export(inner) = item {
+      item = inner;
+    }
     match item {
       Item::Function(f) => {
         for s in &f.body {
@@ -1804,6 +1823,10 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
         }
       }
       Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
+      // Plan 76: `import path { Names }` names no body of its own.
+      Item::Import { .. } => {}
+      // Unreachable: unwrapped by the `while let` loop above this match.
+      Item::Export(_) => unreachable!("Item::Export is unwrapped before this match"),
     }
   }
   table
@@ -15184,6 +15207,13 @@ fn declare_user_functions<'ctx>(
 ) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
   let mut user_func_ids = HashMap::new();
   for item in &program.items {
+    // Plan 76: unwrap once (the grammar never nests `export`) so an
+    // exported function/class/module/actor is declared exactly like a
+    // non-exported one.
+    let mut item: &Item = item;
+    while let Item::Export(inner) = item {
+      item = inner;
+    }
     match item {
       Item::Function(f) if comptime_only_fns.contains(&f.name) => {}
       // Plan 34: a `block_param`-declaring function is never compiled
@@ -15282,6 +15312,12 @@ fn declare_user_functions<'ctx>(
       // descriptive `Err` instead of silently compiling an incomplete
       // program.
       Item::Require(_) => {}
+      // Plan 76: same "unresolved cross-file reference, rejected by
+      // `compile_to_object`'s own prologue before this runs" reasoning
+      // as `Item::Require` immediately above.
+      Item::Import { .. } => {}
+      // Unreachable: unwrapped by the `while let` loop above this match.
+      Item::Export(_) => unreachable!("Item::Export is unwrapped before this match"),
       // Plan 47: never actually reached — `compile_to_object`'s own
       // prologue rejects any `Program` still containing an
       // `Item::Test` before this runs at all. Plan 80: `Item::
@@ -16625,6 +16661,13 @@ fn compile_to_object_impl(
   };
 
   for item in &program.items {
+    // Plan 76: unwrap once (the grammar never nests `export`) so an
+    // exported function/class/module/actor's body is defined exactly
+    // like a non-exported one.
+    let mut item: &Item = item;
+    while let Item::Export(inner) = item {
+      item = inner;
+    }
     match item {
       // Plan 61: never declared in `user_func_ids` above either — see
       // `declare_user_functions`'s matching arm.
@@ -16752,6 +16795,17 @@ fn compile_to_object_impl(
           "codegen: unresolved `require {path}` — internal driver bug (require.rs's resolution step should have stripped this before codegen)"
         ));
       }
+      // Plan 76: same "internal driver bug" reasoning as `Item::
+      // Require` immediately above — `require.rs`/`require_graph.rs`
+      // both resolve/validate an `import` and splice its target file's
+      // items in before codegen ever runs.
+      Item::Import { path, .. } => {
+        return Err(format!(
+          "codegen: unresolved `import {path}` — internal driver bug (require.rs's resolution step should have stripped this before codegen)"
+        ));
+      }
+      // Unreachable: unwrapped by the `while let` loop above this match.
+      Item::Export(_) => unreachable!("Item::Export is unwrapped before this match"),
       // Plan 47: never actually reached — `compile_to_object`'s own
       // prologue rejects any `Program` still containing an
       // `Item::Test` before this runs at all. Plan 80: `Item::
@@ -16958,6 +17012,16 @@ fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
       // inside an `Item::Enum`.
       Item::Enum(_) => {}
       Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
+      // Plan 76: an exported declaration's own body still gets
+      // `assert`/`assert_eq` desugaring — recurse into the unwrapped
+      // inner item via a one-element slice.
+      Item::Export(inner) => {
+        if desugar_asserts_in_items(std::slice::from_mut(inner.as_mut())) {
+          rewrote = true;
+        }
+      }
+      // Plan 76: names no body of its own — nothing to desugar.
+      Item::Import { .. } => {}
     }
   }
   rewrote

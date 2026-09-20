@@ -143,3 +143,17 @@ fn doc_comments_em_prints_expected_sequence() {
     "42\n7\n42\n7\n14\n36\n500\n"
   );
 }
+
+// Plan 76's `import-export-module-visibility`. A multi-file example
+// (like `parallel/`/`packages/`) — `compile_and_run` only ever passes
+// `examples/<example>` straight to `emerald-cli`, so a subdirectory
+// entry point works unchanged; `main.em`'s own bare `require greeter`
+// is what makes `run_legacy`'s pre-existing `requires_present` check
+// (`main.rs`) route this through the real multi-file resolver.
+#[test]
+fn module_visibility_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("module_visibility/main.em"),
+    "Hello, Emerald!\n7\n"
+  );
+}

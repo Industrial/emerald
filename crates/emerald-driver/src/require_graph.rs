@@ -22,9 +22,25 @@
 
 use crate::cache::{raw_hash, CacheKey};
 use crate::DriverError;
-use emerald_parser::{Function, Item};
+use emerald_parser::{visibility, Function, Item};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Plan 76's `import-export-module-visibility`: a `require`/`import`
+/// edge's own kind — mirrors `emerald-cli::require`'s identical
+/// `EdgeKind` (both share `emerald_parser::visibility`'s AST-walking
+/// primitives but keep their own graph-shaped orchestration around
+/// them, see that module's own doc comment for why). A bare `require`
+/// grants everything the target file makes visible (everything, if it
+/// declares no `export` at all; everything exported, if it does); an
+/// `import path { Names }` grants exactly `Names`, already validated
+/// against the target's own declarations/export set at graph-build
+/// time (`visit`'s own `Item::Import` arm).
+#[derive(Debug, Clone)]
+enum EdgeKind {
+  Require,
+  Import(Vec<String>),
+}
 
 /// One item from a file's own source, or a resolved (canonical-path)
 /// require edge in its original source position — keeping requires
@@ -50,8 +66,21 @@ pub struct GraphNode {
   pub hash: CacheKey,
   entries: Vec<NodeEntry>,
   /// Direct dependencies, canonical paths, first-occurrence order,
-  /// deduped — the edges `compute_levels` ranks.
+  /// deduped — the edges `compute_levels` ranks. Plan 76: an `import`
+  /// edge counts as a real dependency here too, exactly like `require`
+  /// — the imported symbols must exist (and be leveled/compiled first)
+  /// regardless of which form pulled them in.
   pub requires: Vec<PathBuf>,
+  /// Plan 76's `import-export-module-visibility`: this file's own,
+  /// unflattened, `Item::Export`/`Item::Import`-intact items — kept
+  /// alongside `entries` (which strips/resolves both) purely for
+  /// `emerald_parser::visibility::find_violations`'s own walk, run
+  /// once for the whole graph by `check_visibility` right after
+  /// `build_require_graph`'s own DFS finishes.
+  raw_items: Vec<Item>,
+  own_names: HashSet<String>,
+  export_names: Option<HashSet<String>>,
+  edges: Vec<(PathBuf, EdgeKind)>,
 }
 
 #[derive(Debug)]
@@ -68,10 +97,128 @@ pub fn build_require_graph(entry: &Path) -> Result<RequireGraph, DriverError> {
   let mut nodes = HashMap::new();
   let mut in_progress = Vec::new();
   let canonical_entry = visit(entry, &mut in_progress, &mut nodes)?;
+  check_visibility(&nodes)?;
   Ok(RequireGraph {
     entry: canonical_entry,
     nodes,
   })
+}
+
+/// Plan 76's `import-export-module-visibility`: the graph-shaped
+/// counterpart of `emerald-cli::require::check_visibility` — same
+/// algorithm (whole-program name -> defining-file map, a memoized
+/// `compute_visible` per file, `visibility::find_violations`'s shared
+/// walk), applied to this crate's own `GraphNode`s instead of
+/// `emerald-cli`'s `FileNode`s. Run once, right after `visit`'s DFS
+/// finishes building the whole graph — every one of plan 49's
+/// `--jobs`-parallel entry points goes through `build_require_graph`
+/// first, so this fires before any parallel parse/typecheck/codegen
+/// work is ever scheduled.
+fn check_visibility(nodes: &HashMap<PathBuf, GraphNode>) -> Result<(), DriverError> {
+  let mut all_names: HashMap<String, PathBuf> = HashMap::new();
+  for (path, node) in nodes {
+    for name in &node.own_names {
+      all_names.insert(name.clone(), path.clone());
+    }
+  }
+
+  let mut visible_cache: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+  let mut errors = Vec::new();
+  for (path, node) in nodes {
+    let visible = compute_visible(path, nodes, &mut visible_cache);
+    let foreign = visibility::foreign_names_excluding(&all_names, path);
+    for v in visibility::find_violations(&node.raw_items, &foreign, &visible) {
+      errors.push(format_violation(path, &node.source, &v));
+    }
+  }
+
+  if errors.is_empty() {
+    Ok(())
+  } else {
+    errors.sort();
+    Err(DriverError::Require(errors.join("\n")))
+  }
+}
+
+/// See `emerald-cli::require::compute_visible`'s identical doc comment
+/// — same algorithm, `GraphNode` in place of `FileNode`.
+fn compute_visible(
+  path: &Path,
+  nodes: &HashMap<PathBuf, GraphNode>,
+  cache: &mut HashMap<PathBuf, HashSet<String>>,
+) -> HashSet<String> {
+  if let Some(v) = cache.get(path) {
+    return v.clone();
+  }
+  let node = &nodes[path];
+  let mut visible = HashSet::new();
+  for (target, kind) in &node.edges {
+    let target_node = &nodes[target];
+    match &target_node.export_names {
+      None => {
+        visible.extend(target_node.own_names.iter().cloned());
+        visible.extend(compute_visible(target, nodes, cache));
+      }
+      Some(set) => match kind {
+        EdgeKind::Require => visible.extend(set.iter().cloned()),
+        EdgeKind::Import(names) => visible.extend(names.iter().cloned()),
+      },
+    }
+  }
+  cache.insert(path.to_path_buf(), visible.clone());
+  visible
+}
+
+fn format_violation(path: &Path, source: &str, v: &visibility::VisibilityError) -> String {
+  let (line, col) = line_col(source, v.span.0);
+  format!(
+    "{}:{line}:{col}: `{}` is not visible here — it is defined in `{}`, which restricts its exports and does not export `{}`",
+    path.display(),
+    v.name,
+    v.defining_file.display(),
+    v.name
+  )
+}
+
+fn line_col(source: &str, offset: usize) -> (usize, usize) {
+  let mut line = 1;
+  let mut col = 1;
+  for ch in source[..offset.min(source.len())].chars() {
+    if ch == '\n' {
+      line += 1;
+      col = 1;
+    } else {
+      col += 1;
+    }
+  }
+  (line, col)
+}
+
+/// `import path { Names }`'s own eager validation — mirrors
+/// `emerald-cli::require::validate_import` exactly.
+fn validate_import(
+  target: &Path,
+  names: &[String],
+  nodes: &HashMap<PathBuf, GraphNode>,
+) -> Result<(), DriverError> {
+  let target_node = &nodes[target];
+  for n in names {
+    if !target_node.own_names.contains(n) {
+      return Err(DriverError::Require(format!(
+        "cannot import `{n}` from `{}`: no such top-level declaration",
+        target.display()
+      )));
+    }
+    if let Some(exported) = &target_node.export_names {
+      if !exported.contains(n) {
+        return Err(DriverError::Require(format!(
+          "cannot import `{n}` from `{}`: not exported (add `export` before its declaration in that file)",
+          target.display()
+        )));
+      }
+    }
+  }
+  Ok(())
 }
 
 fn visit(
@@ -97,6 +244,9 @@ fn visit(
   let name = canonical.to_string_lossy().to_string();
   let program = emerald_parser::parse_named(&source, &name).map_err(DriverError::Parse)?;
 
+  let own_names = visibility::own_names(&program.items);
+  let export_names = visibility::export_names(&program.items);
+
   in_progress.push(canonical.clone());
   let dir = canonical
     .parent()
@@ -104,7 +254,9 @@ fn visit(
     .unwrap_or_else(|| PathBuf::from("."));
 
   let mut entries = Vec::with_capacity(program.items.len());
+  let mut raw_items = Vec::with_capacity(program.items.len());
   let mut requires = Vec::new();
+  let mut edges = Vec::new();
   for item in program.items {
     match item {
       Item::Require(rel) => {
@@ -113,9 +265,31 @@ fn visit(
         if !requires.contains(&target_canonical) {
           requires.push(target_canonical.clone());
         }
+        edges.push((target_canonical.clone(), EdgeKind::Require));
         entries.push(NodeEntry::Require(target_canonical));
+        raw_items.push(Item::Require(rel));
       }
-      other => entries.push(NodeEntry::Item(other)),
+      // Plan 76's `import-export-module-visibility`: an `import` edge
+      // is a real dependency for leveling purposes too (`requires`),
+      // validated eagerly against the target's own declarations/export
+      // set (`validate_import`) — a real, immediate error naming the
+      // symbol and file, not a deferred "unknown function" sema
+      // diagnostic.
+      Item::Import { path: rel, names } => {
+        let target = dir.join(format!("{rel}.em"));
+        let target_canonical = visit(&target, in_progress, nodes)?;
+        validate_import(&target_canonical, &names, nodes)?;
+        if !requires.contains(&target_canonical) {
+          requires.push(target_canonical.clone());
+        }
+        edges.push((target_canonical.clone(), EdgeKind::Import(names.clone())));
+        entries.push(NodeEntry::Require(target_canonical));
+        raw_items.push(Item::Import { path: rel, names });
+      }
+      other => {
+        raw_items.push(other.clone());
+        entries.push(NodeEntry::Item(visibility::strip_export(other)));
+      }
     }
   }
   in_progress.pop();
@@ -128,6 +302,10 @@ fn visit(
       hash,
       entries,
       requires,
+      raw_items,
+      own_names,
+      export_names,
+      edges,
     },
   );
   Ok(canonical)

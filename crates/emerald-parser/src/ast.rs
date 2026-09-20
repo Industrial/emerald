@@ -1198,6 +1198,37 @@ pub enum Item {
   /// it as a no-op, codegen returns a descriptive `Err` rather than
   /// silently ignoring it.
   Require(String),
+  /// `export` modifier on a top-level declaration (plan 76's Decision
+  /// log, `import-export-module-visibility`) — wraps `Function`/
+  /// `ClassDef`/`ModuleDef`/`ActorDef`/`EnumDef`/`InterfaceDef` rather
+  /// than adding an `exported: bool` field to each of those six
+  /// structs, so every pre-existing exhaustive match over `Item`'s
+  /// other variants needs only one new arm (`Item::Export(inner) =>
+  /// <dispatch to inner's own kind>`) instead of six new struct fields
+  /// threaded through generic instantiation, derive expansion, and
+  /// every constructor already in this workspace.
+  /// `emerald_parser::visibility::strip_exports` unwraps this before
+  /// `emerald-sema`/`emerald-codegen` ever see a `Program` — they
+  /// check/compile an exported declaration identically to a
+  /// non-exported one; only cross-file *visibility* differs
+  /// (`emerald_parser::visibility::find_violations`, consumed by
+  /// `emerald-cli`'s `require.rs` and `emerald-driver`'s
+  /// `require_graph.rs`, plan 76's two require-resolution call sites).
+  Export(Box<Item>),
+  /// `import <path> { Name, Name2 }` (plan 76's Decision log) — an
+  /// explicit-import-list alternative to a bare `require <path>`
+  /// (which still pulls in everything *visible*: everything, if the
+  /// required file has no `export` declarations at all, or everything
+  /// exported, if it does — see `emerald_parser::visibility`'s own doc
+  /// comment for the full backward-compatibility rule). `path` reuses
+  /// `Item::Require`'s own `RequirePath` grammar verbatim. `names` is
+  /// never empty — `import path {}` is a real parse error (the grammar
+  /// requires at least one `Ident` inside the braces), not a silent
+  /// no-op.
+  Import {
+    path: String,
+    names: Vec<String>,
+  },
   /// `test "description" do ... end` (plan 47's Decision log) — a
   /// narrow, self-contained grammar addition (its own `"do" Stmt*
   /// "end"` production, not plan 34's general `do |params| ... end`

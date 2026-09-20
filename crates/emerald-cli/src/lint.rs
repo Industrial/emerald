@@ -628,6 +628,13 @@ fn lint_program(program: &Program, source: &str) -> Vec<Finding> {
   }
 
   for item in &program.items {
+    // Plan 76's `import-export-module-visibility`: lint an exported
+    // declaration's own body exactly like a non-exported one — unwrap
+    // once (the grammar never nests `export`) before dispatching below.
+    let mut item: &Item = item;
+    while let Item::Export(inner) = item {
+      item = inner;
+    }
     match item {
       Item::Function(f) => lint_scope_body(&f.body, &mut findings),
       Item::Class(c) => {
@@ -653,8 +660,11 @@ fn lint_program(program: &Program, source: &str) -> Vec<Finding> {
       | Item::Extern(_)
       | Item::Enum(_)
       | Item::Require(_)
+      | Item::Import { .. }
       | Item::Stmt(_)
       | Item::Error => {}
+      // Unreachable: unwrapped by the `while let` loop above this match.
+      Item::Export(_) => unreachable!("Item::Export is unwrapped before this match"),
     }
   }
 

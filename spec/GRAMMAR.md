@@ -311,6 +311,40 @@ methods, not separate syntax):
 
 ---
 
+## 14. Modules: `require` / `import` / `export`
+
+Not part of Ruby's own grammar (Ruby's `require`/`require_relative` load
+files at runtime; Emerald's is a compile-time AST splice) — a real,
+disclosed addition beyond this document's own "inventory of Ruby's syntax"
+framing, added by plan 23 (`require`) and plan 76 (`import`/`export`,
+`import-export-module-visibility`).
+
+| Form | Status | Emerald form / reason |
+|---|---|---|
+| `require <path>` | KEEP (plan 23) | A bare, unquoted, `/`-separated path (`require deps/mathutils/lib`), `.em` implied, always relative to the containing file. Top-level only — a `require` inside a function/`if`/`while` body is a real parse error. Splices the target file's top-level items in place at compile time (`emerald-cli`'s `require.rs`/`emerald-driver`'s `require_graph.rs`); see `SEMANTICS.md` §11 for what it makes visible. |
+| `export` (declaration modifier) | KEEP (plan 76) | A leading keyword directly before a top-level `fn`/`class`/`interface`/`module`/`enum`/`actor` declaration — `export fn greet(): Void do ... end`, `export class Point ... end`. Not usable on a bare top-level statement, `require`/`import` itself, or `test`/`property`/`benchmark`/`unsafe extern` (none of those declares a nameable symbol `export` could attach visibility to). |
+| `import <path> { Name, Name2, ... }` | KEEP (plan 76) | An explicit-import-list alternative/complement to a bare `require` — pulls in only the named symbols' *visibility* (their definitions are still compiled in, same as `require`; only which names this file may reference differs — see `SEMANTICS.md` §11). `path` reuses `require`'s own bare path syntax verbatim. The name list requires at least one entry — `import path {}` is a real parse error, not a silent no-op. |
+
+**Example (KEEP: `export`/`import`, plan 76):**
+```ruby
+# mathutils.em
+export fn add(a: Int64, b: Int64): Int64 do
+  a + b
+end
+
+fn internal_helper(): Int64 do  # not exported — invisible to other files
+  0
+end
+```
+```ruby
+# main.em
+import mathutils { add }
+
+puts add(3, 5)
+```
+
+---
+
 ## Cross-references
 
 - Every `UNDECIDED` row above is answered, deferred, or locked in

@@ -73,6 +73,21 @@ Item: Item = {
   // from `Stmt`/`Stmt*`, so `require` inside a function/`if`/`while`
   // body is a real parse error, not silently accepted.
   "require" <path:RequirePath> => Item::Require(path),
+  // Plan 76's Decision log (`import-export-module-visibility`): a
+  // leading `export` keyword before a top-level `fn`/`class`/
+  // `interface`/`module`/`enum`/`actor` declaration — reuses each of
+  // those six existing productions verbatim via `ExportableItem`
+  // rather than re-deriving them, and wraps the result in
+  // `Item::Export` (see that variant's own doc comment for why a
+  // wrapper, not a struct field).
+  "export" <inner:ExportableItem> => Item::Export(Box::new(inner)),
+  // `import <path> { Name, Name2, ... }` (plan 76's Decision log) — an
+  // explicit-import-list alternative/complement to bare `require`,
+  // reachable only here at the top level, exactly like `require`
+  // itself. `RequirePath` is reused verbatim (identical `foo/bar`
+  // syntax); `ImportNameList` requires at least one name — `import
+  // path {}` is a real parse error, not a silent empty import.
+  "import" <path:RequirePath> "{" <names:ImportNameList> "}" => Item::Import { path, names },
   // Plan 47's Decision log: `test "..." do ... end` gets its own
   // narrow production (a real, new "do" terminal) — not plan 34's
   // general `{ |params| body }` block syntax, which explicitly
@@ -95,6 +110,33 @@ Item: Item = {
 RequirePath: String = {
   <first:Ident> => first,
   <first:Ident> "/" <rest:RequirePath> => format!("{first}/{rest}"),
+};
+
+// Plan 76's Decision log: exactly the six top-level declaration kinds
+// `export` may prefix — a bare `Stmt`, `require`, `test`/`property`/
+// `benchmark`, or an `unsafe extern` block can never be exported
+// (there is no top-level *name* for `export` to attach visibility to),
+// so this is deliberately its own, narrower production rather than
+// reusing `Item` wholesale.
+ExportableItem: Item = {
+  <f:FuncDef> => Item::Function(f),
+  <c:ClassDef> => Item::Class(c),
+  <a:ActorDef> => Item::Actor(a),
+  <m:ModuleDef> => Item::Module(m),
+  <i:InterfaceDef> => Item::Interface(i),
+  <e:EnumDef> => Item::Enum(e),
+};
+
+// `{ Name, Name2, ... }` — reuses `Ident`, comma-separated, at least
+// one entry (plan 76's Decision log: an empty `import path {}` is a
+// real parse error, not a silent no-op import).
+ImportNameList: Vec<String> = {
+  <first:Ident> => vec![first],
+  <first:Ident> "," <rest:ImportNameList> => {
+    let mut names = vec![first];
+    names.extend(rest);
+    names
+  },
 };
 
 // A class body's field declarations reuse the `Param` rule directly

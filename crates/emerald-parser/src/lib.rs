@@ -6,6 +6,7 @@
 //! `grammar.lalrpop`.
 
 pub mod ast;
+pub mod visibility;
 
 // Bugfix (first-ever `git push` this session — pre-push's `check-docs`
 // gate had never actually run before, no remote existed): `clippy::all`
@@ -216,6 +217,13 @@ fn collect_doc_comments(source: &str) -> std::collections::HashMap<usize, String
 /// all, unlike `rewrite_assert_locations`'s own whole-program walk.
 fn fill_contract_text(items: &mut [Item], source: &str) {
   for item in items {
+    // Plan 76: `export fn ... end` still needs its own `requires`/
+    // `ensures` clauses filled in — unwrap one level of `Item::Export`
+    // before the identical `Item::Function` check below.
+    let item = match item {
+      Item::Export(inner) => inner.as_mut(),
+      other => other,
+    };
     if let Item::Function(f) = item {
       for c in f.requires.iter_mut().chain(f.ensures.iter_mut()) {
         let (start, end) = c.expr.span;
@@ -250,6 +258,13 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
         }
       }
       Item::Interface(_) | Item::Require(_) | Item::Error | Item::Enum(_) | Item::Extern(_) => {}
+      // Plan 76: an exported declaration is rewritten identically to a
+      // non-exported one — `export` is a visibility concern only, not
+      // a different declaration shape.
+      Item::Export(inner) => {
+        rewrite_assert_locations(std::slice::from_mut(inner.as_mut()), name, source)
+      }
+      Item::Import { .. } => {}
       Item::Stmt(s) => rewrite_stmt(s, name, source),
       // Plan 80: `property`/`benchmark` bodies get the identical
       // whole-body walk `test` already gets — same AST shape, same

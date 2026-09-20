@@ -1283,7 +1283,29 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
           collect_typenames_in_stmt(s, &mut out);
         }
       }
-      Item::Enum(_) | Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
+      // Plan 76's `import-export-module-visibility`: `emerald-cli`'s
+      // `require.rs`/`emerald-driver`'s `require_graph.rs` both call
+      // `emerald_parser::visibility::strip_exports` before a `Program`
+      // ever reaches `emerald-sema`'s `check_program`, exactly the same
+      // "resolved away before sema" precedent `Item::Require` itself
+      // already has immediately below — real generic-instantiation
+      // typenames inside an exported declaration's body are still
+      // collected via that declaration's own unwrapped `Item::Function`/
+      // `Item::Class`/... arm above, never through this one. A
+      // disclosed gap: `emerald-lsp`'s live-typing `check_program(&Program)`
+      // path can hand this a `Program` that still contains a raw,
+      // unstripped `Item::Export`/`Item::Import` (a file being typed,
+      // never round-tripped through `require.rs`) — that case collects
+      // nothing for the exported declaration until the file is saved
+      // and recompiled through the ordinary CLI path, mirroring
+      // `Item::Require`'s own pre-existing identical gap.
+      Item::Enum(_)
+      | Item::Interface(_)
+      | Item::Require(_)
+      | Item::Import { .. }
+      | Item::Export(_)
+      | Item::Error
+      | Item::Extern(_) => {}
     }
   }
   out
@@ -9012,6 +9034,13 @@ fn check_block_call_sites(
 ) -> Vec<Diagnostic> {
   let mut diags = Vec::new();
   for item in &program.items {
+    // Plan 76: an exported declaration's own body is scanned exactly
+    // like a non-exported one — unwrap once (the grammar never nests
+    // `export`) before dispatching on the real declaration kind below.
+    let mut item: &Item = item;
+    while let Item::Export(inner) = item {
+      item = inner;
+    }
     match item {
       Item::Function(f) => {
         scan_block_call_sites(&f.body, sigs, classes, func_defs, gctx, &mut diags)
@@ -9037,6 +9066,11 @@ fn check_block_call_sites(
       // is a real, disclosed gap this plan names rather than papering
       // over.
       Item::Require(_) => {}
+      // Plan 76: `import path { Names }` names no body of its own —
+      // nothing here can contain a `yield` site either.
+      Item::Import { .. } => {}
+      // Unreachable: unwrapped by the `while let` loop above.
+      Item::Export(_) => unreachable!("Item::Export is unwrapped before this match"),
       // Plan 47: a `test` body is checked exactly like a free
       // function's — it can contain a block-attaching call site too.
       // Plan 80: `property`/`benchmark` bodies get the identical
@@ -10006,12 +10040,30 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   let comptime_fns: HashSet<String> = program
     .items
     .iter()
-    .filter_map(|item| match item {
-      Item::Function(f) if f.is_comptime => Some(f.name.clone()),
-      _ => None,
+    .filter_map(|item| {
+      // Plan 76: an exported `comptime` function is still a `comptime`
+      // function — unwrap one level before the same check below.
+      let item = match item {
+        Item::Export(inner) => inner.as_ref(),
+        other => other,
+      };
+      match item {
+        Item::Function(f) if f.is_comptime => Some(f.name.clone()),
+        _ => None,
+      }
     })
     .collect();
   for item in &program.items {
+    // Plan 76: unwrap once (the grammar never nests `export`) before
+    // dispatching on the real declaration kind below — an exported
+    // declaration is registered/checked identically to a non-exported
+    // one; only cross-file *visibility* differs (enforced separately,
+    // in `emerald-cli`'s `require.rs`/`emerald-driver`'s
+    // `require_graph.rs`, before a `Program` ever reaches here).
+    let mut item: &Item = item;
+    while let Item::Export(inner) = item {
+      item = inner;
+    }
     match item {
       Item::Function(f) if !f.type_params.is_empty() => {
         if bad_generic_fns.contains(&f.name) {
@@ -10134,6 +10186,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // Plan 52: an enum has no body of its own to check beyond the
       // registration-time checks already performed above.
       Item::Enum(_) => {}
+      // Plan 76: `import path { Names }` names no body of its own to
+      // check — mirrors `Item::Require`'s own no-op arm above.
+      Item::Import { .. } => {}
+      // Unreachable: unwrapped by the `while let` loop above this match.
+      Item::Export(_) => unreachable!("Item::Export is unwrapped before this match"),
       // Plan 26's Decision log: `emerald_parser::parse`/`parse_named`
       // returns `Ok(program)` only when zero errors were recovered —
       // `program.items` then contains no `Item::Error` by construction,
