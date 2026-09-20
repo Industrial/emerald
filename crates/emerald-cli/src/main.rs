@@ -12,6 +12,9 @@
 
 mod bench_runner;
 mod deps;
+mod doc_runner;
+mod format_runner;
+mod lint;
 mod lockfile;
 mod manifest;
 mod repl;
@@ -133,6 +136,23 @@ fn main() {
     // are byte-for-byte the same code path.
     Some("property") => test_runner::run(&args),
     Some("benchmark") => bench_runner::run(&args),
+    // Plan 77's `doc-comments-and-emerald-doc`: `emerald doc <file.em>|<dir>`
+    // — parses only (never compiles/runs), then renders whatever `##` doc
+    // comments the parse captured. See `doc_runner`'s own doc comment for
+    // the output format.
+    Some("doc") => doc_runner::run(&args),
+    // Plan 79's `canonical-linter`: `emerald lint <file.em>|<dir>` — parses
+    // only, never compiles/runs/type-checks, and reports style/quality
+    // findings from the AST shape alone. See `lint`'s own module doc
+    // comment for the rule set.
+    Some("lint") => lint::run(&args),
+    // Plan 78's `canonical-formatter`: `emerald format <file.em>|<dir>` —
+    // parses (`emerald_parser::parse_named`, same entry point every other
+    // subcommand here uses) and re-emits canonically-formatted Emerald
+    // source, in place. See `emerald_fmt`'s own crate doc comment for the
+    // chosen pure-AST-pretty-printer approach and its disclosed
+    // comment-loss limitation.
+    Some("format") => format_runner::run(&args),
     Some("repl") => repl::run(&args),
     Some("update") => {
       eprintln!(
