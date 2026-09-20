@@ -115,6 +115,95 @@ fn line_at(source: &str, offset: usize) -> usize {
     .count()
 }
 
+/// Plan 77's Decision log (`##` doc comments, design brief §36) — a
+/// PRE-parse pass, unlike `fill_contract_text`/`rewrite_assert_
+/// locations` below (both POST-parse, since they only rewrite fields
+/// on an already-built `Program`). This one has to run first: LALRPOP's
+/// own `match {}` block (`grammar.lalrpop`) skips every `#`/`##` line
+/// as insignificant whitespace before the grammar ever sees a single
+/// token, so there is no place inside a grammar *action* to ask "is
+/// there a blank line between this comment and the next real token" —
+/// that question can only be answered by scanning the raw source text
+/// directly, which is exactly what this function does, once, up front.
+///
+/// Returns a `byte offset -> doc text` map: the key is the byte offset
+/// of the first non-whitespace character on the line immediately
+/// following a contiguous `##`-line run — which is precisely the
+/// offset `@L` reports for a declaration's own leading token when one
+/// starts a line right there. `grammar.lalrpop`'s `FuncDef`/`MethodDef`/
+/// `ClassDef`/`InterfaceDef`/`ModuleDef`/`EnumDef`/`ActorDef` productions
+/// each capture their own `<l:@L>` and look up `docs.get(&l)` — the
+/// lookup only ever succeeds when a `##` run truly, immediately (no
+/// blank line, no other content) precedes that exact production, so
+/// grammar-side association falls out of this one shared map for free,
+/// no per-production bookkeeping needed beyond the lookup itself.
+///
+/// A run breaks (and does NOT attach to whatever follows) the moment
+/// the very next line either is blank or is anything other than a
+/// `##` line — including an ordinary `#`-only comment line: that line's
+/// own first non-comment character never equals any real token's `@L`
+/// (comments are lexer-skipped, so no production's leading token can
+/// ever start exactly on a `#`), so the map entry silently goes unused
+/// rather than misattaching to whatever declaration follows two lines
+/// down. This is a deliberate, load-bearing consequence of keying by
+/// exact byte offset rather than by "next non-blank line", not an
+/// oversight — covered by `doc_comment_separated_by_an_ordinary_
+/// comment_is_not_attached` below.
+fn collect_doc_comments(source: &str) -> std::collections::HashMap<usize, String> {
+  let mut docs = std::collections::HashMap::new();
+
+  // `(line_text, byte_offset_of_line_start)` for every line in `source`,
+  // splitting on `\n` exactly like `grammar.lalrpop`'s own `##[^\n]*`/
+  // `#[^\n]*` comment patterns do (so a line's captured text never
+  // includes a trailing `\r` under CRLF line endings — an existing,
+  // disclosed limitation this pass inherits unchanged from the
+  // grammar's own comment regex, not a new one).
+  let mut lines: Vec<(&str, usize)> = Vec::new();
+  let mut offset = 0usize;
+  for line in source.split('\n') {
+    lines.push((line, offset));
+    offset += line.len() + 1;
+  }
+
+  let mut i = 0;
+  while i < lines.len() {
+    let (line, _) = lines[i];
+    if !line.trim_start().starts_with("##") {
+      i += 1;
+      continue;
+    }
+
+    // Collect the whole contiguous `##` run starting at `i`.
+    let mut text_lines: Vec<String> = Vec::new();
+    let mut j = i;
+    while j < lines.len() {
+      let trimmed = lines[j].0.trim_start();
+      if !trimmed.starts_with("##") {
+        break;
+      }
+      let content = &trimmed[2..];
+      text_lines.push(content.strip_prefix(' ').unwrap_or(content).to_string());
+      j += 1;
+    }
+
+    // `j` now indexes the first line after the run (or `lines.len()` at
+    // EOF). Attach only when that line is real, non-blank content —
+    // never across a blank line, and never (per the doc comment above)
+    // usefully across an intervening `#`-only comment line either.
+    if j < lines.len() {
+      let (next_line, next_offset) = lines[j];
+      if !next_line.trim().is_empty() {
+        let indent = next_line.len() - next_line.trim_start().len();
+        docs.insert(next_offset + indent, text_lines.join("\n"));
+      }
+    }
+
+    i = j;
+  }
+
+  docs
+}
+
 /// Plan 62's Decision log: mirrors `rewrite_assert_locations`'s own
 /// technique exactly — a small, targeted post-parse pass over the
 /// freshly-built `Program`, not a generic `Spanned` walk. Slices
@@ -698,7 +787,12 @@ fn infer_simple_expr_type(
 
 pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
   let mut recovered = Vec::new();
-  let result = grammar::grammar::ProgramParser::new().parse(&mut recovered, src);
+  // Plan 77: computed once, up front, over the raw source — see
+  // `collect_doc_comments`'s own doc comment for why this has to
+  // happen before the grammar ever runs, not after like `fill_
+  // contract_text`/`rewrite_assert_locations` below.
+  let docs = collect_doc_comments(src);
+  let result = grammar::grammar::ProgramParser::new().parse(&mut recovered, &docs, src);
   let mut errors: Vec<ParseError> = recovered
     .into_iter()
     .map(|e| to_parse_error(e.error, name, src))
@@ -1471,6 +1565,7 @@ mod tests {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       }
     );
   }
@@ -1853,6 +1948,120 @@ mod tests {
       panic!("expected a puts call, got {:?}", program.items[0]);
     };
     assert_eq!(args[0], Expr::StringLit("a#b".to_string()));
+  }
+
+  // Plan 77 (`##` doc comments, design brief §36).
+
+  #[test]
+  fn a_single_doc_comment_line_attaches_to_the_function_it_precedes() {
+    let program =
+      parse("## Adds two integers together.\nfn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n")
+        .expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    assert_eq!(f.doc.as_deref(), Some("Adds two integers together."));
+  }
+
+  #[test]
+  fn a_contiguous_run_of_doc_comment_lines_joins_with_newlines() {
+    let src = "## Creates a new user.\n##\n## Returns an error if the email already exists.\nfn create_user(email: String): Int64 do\n  1\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    assert_eq!(
+      f.doc.as_deref(),
+      Some("Creates a new user.\n\nReturns an error if the email already exists.")
+    );
+  }
+
+  #[test]
+  fn an_ordinary_hash_comment_is_never_captured_as_a_doc_comment() {
+    let program =
+      parse("fn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n").expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    assert_eq!(f.doc, None);
+
+    let src = "# an ordinary comment, not a doc comment\nfn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    assert_eq!(f.doc, None);
+  }
+
+  #[test]
+  fn a_doc_comment_separated_by_a_blank_line_is_not_attached() {
+    // A blank line between the `##` run and the declaration means the
+    // doc comment attaches to nothing — not to `add` below, and not to
+    // whatever (if anything) preceded it either.
+    let src = "## This is orphaned by the blank line below.\n\nfn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    assert_eq!(f.doc, None);
+  }
+
+  #[test]
+  fn doc_comment_separated_by_an_ordinary_comment_is_not_attached() {
+    // An ordinary `#` comment between a `##` run and the declaration is
+    // "other content" (design brief §36's own wording) — no blank line
+    // here, but still not immediate, so still not attached.
+    let src = "## This is orphaned by the plain comment below.\n# just a plain comment\nfn add(a: Int64, b: Int64): Int64 do\n  a + b\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Function(f) = &program.items[0] else {
+      panic!("expected a Function item, got {:?}", program.items[0]);
+    };
+    assert_eq!(f.doc, None);
+  }
+
+  #[test]
+  fn a_doc_comment_attaches_to_the_class_and_its_documented_method_only() {
+    let src = "## A 2D point.\nclass Point\n  x: Int64\n\n  ## The x coordinate.\n  fn x_value(): Int64 do\n    @x\n  end\n\n  fn undocumented(): Int64 do\n    @x\n  end\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a Class item, got {:?}", program.items[0]);
+    };
+    assert_eq!(c.doc.as_deref(), Some("A 2D point."));
+    assert_eq!(c.methods[0].name, "x_value");
+    assert_eq!(c.methods[0].doc.as_deref(), Some("The x coordinate."));
+    assert_eq!(c.methods[1].name, "undocumented");
+    assert_eq!(c.methods[1].doc, None);
+  }
+
+  #[test]
+  fn doc_comments_attach_to_module_interface_enum_and_actor_declarations() {
+    let module_src = "## Math helpers.\nmodule MathUtils\n  fn square(n: Int64): Int64 do\n    n * n\n  end\nend\n";
+    let program = parse(module_src).expect("should parse");
+    let Item::Module(m) = &program.items[0] else {
+      panic!("expected a Module item, got {:?}", program.items[0]);
+    };
+    assert_eq!(m.doc.as_deref(), Some("Math helpers."));
+
+    let interface_src = "## Types that can be compared.\ninterface Comparable\n  fn compare_to(other: Self): Int64\nend\n";
+    let program = parse(interface_src).expect("should parse");
+    let Item::Interface(i) = &program.items[0] else {
+      panic!("expected an Interface item, got {:?}", program.items[0]);
+    };
+    assert_eq!(i.doc.as_deref(), Some("Types that can be compared."));
+
+    let enum_src = "## A shape.\nenum Shape = Circle(Float64) | Square(Float64)\n";
+    let program = parse(enum_src).expect("should parse");
+    let Item::Enum(e) = &program.items[0] else {
+      panic!("expected an Enum item, got {:?}", program.items[0]);
+    };
+    assert_eq!(e.doc.as_deref(), Some("A shape."));
+
+    let actor_src = "## Counts things.\nactor Counter\n  value: Int64\n\n  fn initialize(): Void do\n    @value = 0\n  end\nend\n";
+    let program = parse(actor_src).expect("should parse");
+    let Item::Actor(a) = &program.items[0] else {
+      panic!("expected an Actor item, got {:?}", program.items[0]);
+    };
+    assert_eq!(a.doc.as_deref(), Some("Counts things."));
   }
 
   // Plan 71: `case`/`when`/`else` becomes `match`/`do`/`_` — each arm

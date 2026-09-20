@@ -9619,6 +9619,9 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       name: "T".to_string(),
       bounds: Vec::new(),
     }],
+    // Compiler-synthesized, never parsed from source — no `##` comment
+    // position exists for it (plan 77's Decision log).
+    doc: None,
   };
   // Plan 73: enums, like classes above, split into a generic-TEMPLATE
   // registry (never monomorphized without a real instantiation actually
@@ -10122,6 +10125,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           requires: Vec::new(),
           ensures: Vec::new(),
           is_pure: false,
+          doc: None,
         };
         if let Err(d) = check_function_body(&synthetic, &sigs, &classes, &gctx) {
           diags.push(d);
@@ -13059,6 +13063,7 @@ mod tests {
       }],
       ensures: Vec::new(),
       is_pure: false,
+      doc: None,
     });
     let errs = check_program(&program).expect_err("contracts on a method must be rejected");
     assert!(

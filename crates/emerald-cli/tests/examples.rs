@@ -135,3 +135,11 @@ fn enumerable_em_prints_expected_sequence() {
     "0\n1\n2\n3\n4\n10\n2\n15\n3\n15\n1\n10\n60\n2\n3\n"
   );
 }
+
+#[test]
+fn doc_comments_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("doc_comments.em"),
+    "42\n7\n42\n7\n14\n36\n500\n"
+  );
+}

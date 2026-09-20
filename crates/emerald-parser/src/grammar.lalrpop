@@ -12,7 +12,20 @@ use crate::interpolate;
 // actually surfaces recovered errors to the caller (each `!`
 // alternative below implicitly pushes its `ErrorRecovery` here; see
 // `Item`'s own `! => Item::Error` production).
-grammar(errors: &mut Vec<lalrpop_util::ErrorRecovery<usize, lalrpop_util::lexer::Token<'input>, String>>);
+// Plan 77's Decision log: `docs` is a second grammar-level parameter,
+// threaded exactly like `errors` above — a byte-offset -> doc-comment-
+// text map, precomputed by `emerald_parser::collect_doc_comments` over
+// the raw source BEFORE parsing starts (see that function's own doc
+// comment for why: comments are lexer-level whitespace here, skipped
+// before any grammar production ever runs, so "is there a blank line
+// between this `##` run and the declaration it precedes" can't be
+// decided from inside a grammar action at all — only from the raw
+// source text directly). Every declaration production below that wants
+// to accept a doc comment captures its own leading `<l:@L>` and looks
+// up `docs.get(&l)` — `l` lines up exactly with a map key only when a
+// `##` run immediately (no blank line, no other content) precedes that
+// exact token.
+grammar(errors: &mut Vec<lalrpop_util::ErrorRecovery<usize, lalrpop_util::lexer::Token<'input>, String>>, docs: &std::collections::HashMap<usize, String>);
 
 // LALRPOP's `=>?` fallible actions default to a `&'static str` user-error
 // type; the assignment-target check below wants an interpolated message
@@ -93,7 +106,7 @@ ClassDef: ClassDef = {
   // immediately after the class name, before `SuperclassClause?` —
   // reuses `TypeParamClause`/`TypeParamList` (plan 41's own generic-
   // function `[T: Bound]` clause) verbatim, no new grammar production.
-  "class" <name:Ident> <type_params:TypeParamClause?> <superclass:SuperclassClause?> <implements:ImplementsClause?> <derive:DeriveClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
+  <l:@L> "class" <name:Ident> <type_params:TypeParamClause?> <superclass:SuperclassClause?> <implements:ImplementsClause?> <derive:DeriveClause?> <class_fields:ClassField*> <methods:MethodDef*> "end" => {
     let mut fields = Vec::new();
     let mut all_methods = Vec::new();
     for (p, synthesized) in class_fields {
@@ -101,7 +114,7 @@ ClassDef: ClassDef = {
       all_methods.extend(synthesized);
     }
     all_methods.extend(methods);
-    ClassDef { name, superclass, implements, derive, fields, methods: all_methods, type_params: type_params.unwrap_or_default() }
+    ClassDef { name, superclass, implements, derive, fields, methods: all_methods, type_params: type_params.unwrap_or_default(), doc: docs.get(&l).cloned() }
   }
 };
 
@@ -153,6 +166,12 @@ ClassField: (Param, Vec<Function>) = {
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: false,
+      // A synthesized `read` accessor has no `##` comment of its own in
+      // source (the comment, if any, precedes the field's own `Param`
+      // line, a position this production never captures) — `None`,
+      // matching every other compiler-synthesized `Function` literal in
+      // this grammar/`ast.rs`.
+      doc: None,
     };
     (p, vec![accessor])
   },
@@ -169,7 +188,7 @@ SuperclassClause: String = {
 // Namespace-only (plan 12's Decision log) — no fields, just methods.
 // `module` is reserved the same LALR(1) way `class`/`def` already are.
 ModuleDef: ModuleDef = {
-  "module" <name:Ident> <methods:FuncDef*> "end" => ModuleDef { name, methods }
+  <l:@L> "module" <name:Ident> <methods:FuncDef*> "end" => ModuleDef { name, methods, doc: docs.get(&l).cloned() }
 };
 
 // `actor Counter ... end` (plan 54's Decision log) — structurally
@@ -181,7 +200,7 @@ ModuleDef: ModuleDef = {
 // shape. `actor` is reserved the same LALR(1) way `class`/`module`/
 // `def` already are.
 ActorDef: ActorDef = {
-  "actor" <name:Ident> <actor_fields:ClassField*> <methods:MethodDef*> "end" => {
+  <l:@L> "actor" <name:Ident> <actor_fields:ClassField*> <methods:MethodDef*> "end" => {
     let mut fields = Vec::new();
     let mut all_methods = Vec::new();
     for (p, synthesized) in actor_fields {
@@ -189,7 +208,7 @@ ActorDef: ActorDef = {
       all_methods.extend(synthesized);
     }
     all_methods.extend(methods);
-    ActorDef { name, fields, methods: all_methods }
+    ActorDef { name, fields, methods: all_methods, doc: docs.get(&l).cloned() }
   }
 };
 
@@ -219,7 +238,7 @@ FuncDef: Function = {
   // matching plan 59's `extern fn` spelling exactly. A mandatory `"do"`
   // now separates the signature from `body` — the same disambiguating
   // role `"do"` plays on `if`/`while` below.
-  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> <contracts:ContractClause*> "do" <body:Stmt*> "end" => {
+  <l:@L> <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:Ident> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> <contracts:ContractClause*> "do" <body:Stmt*> "end" => {
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     for (is_requires, c) in contracts {
@@ -237,6 +256,11 @@ FuncDef: Function = {
       requires,
       ensures,
       is_pure: is_pure.is_some(),
+      // `l` is captured before `pure`/`comptime`'s own optional
+      // modifiers, matching exactly where `collect_doc_comments`
+      // records a preceding `##` run's target position — a doc comment
+      // above `pure fn foo...`/`comptime fn foo...` attaches correctly.
+      doc: docs.get(&l).cloned(),
     }
   }
 };
@@ -269,8 +293,8 @@ ContractClause: (bool, Contract) = {
 // one) for the method list — a second `fn` before the outer `end` is
 // no longer a parse error.
 InterfaceDef: InterfaceDef = {
-  "interface" <name:Ident> <type_params:TypeParamClause?> <methods:InterfaceMethodDef+> "end" => {
-    InterfaceDef { name, type_params: type_params.unwrap_or_default(), methods }
+  <l:@L> "interface" <name:Ident> <type_params:TypeParamClause?> <methods:InterfaceMethodDef+> "end" => {
+    InterfaceDef { name, type_params: type_params.unwrap_or_default(), methods, doc: docs.get(&l).cloned() }
   }
 };
 
@@ -330,7 +354,7 @@ EnumDef: EnumDef = {
   // same reuse `ClassDef` already makes. `Option[T]` itself is compiler-
   // synthesized (never parsed via this rule), but the grammar admits any
   // user-written `enum Name[T] = ...` too, monomorphized the same way.
-  "enum" <name:Ident> <type_params:TypeParamClause?> "=" <variants:EnumVariants> => EnumDef { name, variants, type_params: type_params.unwrap_or_default() },
+  <l:@L> "enum" <name:Ident> <type_params:TypeParamClause?> "=" <variants:EnumVariants> => EnumDef { name, variants, type_params: type_params.unwrap_or_default(), doc: docs.get(&l).cloned() },
 };
 
 // Mandatory-first-element, right-recursive on "|" — the same
@@ -440,7 +464,7 @@ MethodDef: Function = {
   // never a silent accept.
   // Plan 71: `"fn"`/`":"`/mandatory `"do"` replace `"def"`/`"->"` here
   // exactly the same way `FuncDef` above changes.
-  <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> "do" <body:Stmt*> "end" => Function {
+  <l:@L> <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> "do" <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
@@ -449,6 +473,10 @@ MethodDef: Function = {
     splat_param: parts.1,
     type_params: type_params.unwrap_or_default(),
     is_comptime: comptime.is_some(),
+    // Plan 77: `l` is captured before `pure`/`comptime`'s own optional
+    // modifiers, the identical convention `FuncDef` above uses — a doc
+    // comment above `pure fn foo...` on a method attaches correctly.
+    doc: docs.get(&l).cloned(),
     // Plan 62's Decision log: `requires`/`ensures` are grammatically
     // unreachable on a method at all — no `ContractClause*` slot exists
     // in this production, a stricter cut than `type_params`'s own

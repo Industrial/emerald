@@ -422,6 +422,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: false,
+      doc: None,
     };
 
     let Item::Class(c) = &mut program.items[i] else {
@@ -442,6 +443,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       });
     }
     c.methods.push(eq_fn);
@@ -940,6 +942,20 @@ pub struct Function {
   /// sema narrows" discipline `type_params`/`is_comptime`/`requires`/
   /// `ensures` already established).
   pub is_pure: bool,
+  /// Plan 77's Decision log (`##` doc comments, design brief §36) —
+  /// `Some(text)` only when a contiguous run of `##` lines immediately
+  /// precedes this declaration in source, with no blank line and no
+  /// other content in between (`emerald_parser::collect_doc_comments`'s
+  /// own rule, checked against the raw source text rather than through
+  /// the LALRPOP token stream — comments are lexer-level whitespace,
+  /// skipped before the grammar ever sees them, so blank-line adjacency
+  /// can't be expressed as a grammar production at all). Each `##`
+  /// line's own leading `##` and at most one following space are
+  /// stripped; multiple lines join with `\n`, preserving a deliberate
+  /// blank `##` line (the design brief's own worked example) as an
+  /// empty joined line. `None` for every function/method with no doc
+  /// comment — additive, source-compatible with every prior plan.
+  pub doc: Option<String>,
 }
 
 /// `T: Comparable` inside a generic function's or generic class's `[...]`
@@ -997,6 +1013,10 @@ pub struct InterfaceDef {
   pub name: String,
   pub type_params: Vec<TypeParam>,
   pub methods: Vec<InterfaceMethod>,
+  /// Plan 77's Decision log — see `Function.doc`'s own doc comment for
+  /// the full rule; identical here, keyed off the `"interface"` keyword's
+  /// own position rather than `"fn"`'s.
+  pub doc: Option<String>,
 }
 
 /// A class declaration: fields (reusing `Param`'s `{name, ty}` shape —
@@ -1038,6 +1058,10 @@ pub struct ClassDef {
   /// `classes` table, and it is never monomorphized without a real
   /// concrete instantiation actually written somewhere in the program.
   pub type_params: Vec<TypeParam>,
+  /// Plan 77's Decision log — see `Function.doc`'s own doc comment for
+  /// the full rule; identical here, keyed off the `"class"` keyword's
+  /// own position.
+  pub doc: Option<String>,
 }
 
 /// One `fn <name>(<params>): <ReturnType>` declaration inside an
@@ -1074,6 +1098,10 @@ pub struct ExternBlock {
 pub struct ModuleDef {
   pub name: String,
   pub methods: Vec<Function>,
+  /// Plan 77's Decision log — see `Function.doc`'s own doc comment for
+  /// the full rule; identical here, keyed off the `"module"` keyword's
+  /// own position.
+  pub doc: Option<String>,
 }
 
 /// `Circle(Float64)` inside `enum Shape = Circle(Float64) | ...` (plan
@@ -1110,6 +1138,10 @@ pub struct EnumDef {
   /// `EnumVariant`'s own grammar-level "at least one field" restriction,
   /// which still applies unchanged to every user-written `enum`.
   pub type_params: Vec<TypeParam>,
+  /// Plan 77's Decision log — see `Function.doc`'s own doc comment for
+  /// the full rule; identical here, keyed off the `"enum"` keyword's
+  /// own position.
+  pub doc: Option<String>,
 }
 
 /// `actor Counter ... end` (plan 54's Decision log) — a flat,
@@ -1127,6 +1159,10 @@ pub struct ActorDef {
   pub name: String,
   pub fields: Vec<Param>,
   pub methods: Vec<Function>,
+  /// Plan 77's Decision log — see `Function.doc`'s own doc comment for
+  /// the full rule; identical here, keyed off the `"actor"` keyword's
+  /// own position.
+  pub doc: Option<String>,
 }
 
 /// A single top-level construct: a function definition, a class

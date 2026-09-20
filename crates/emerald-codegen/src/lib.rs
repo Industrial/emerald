@@ -627,6 +627,10 @@ fn instantiate_generic_class_defs(
         fields: Vec::new(),
         methods: Vec::new(),
         type_params: Vec::new(),
+        // A cycle-detection placeholder, never the real monomorphized
+        // result (overwritten below once the real instantiation
+        // finishes) — no meaningful doc comment exists for it.
+        doc: None,
       },
     );
     return mangled;
@@ -704,6 +708,10 @@ fn instantiate_generic_class_defs(
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: m.is_pure,
+      // A monomorphized copy of a real, user-written method — the same
+      // declaration, just with substituted types, so its doc comment
+      // (if any) carries forward unchanged.
+      doc: m.doc.clone(),
     })
     .collect();
 
@@ -719,6 +727,9 @@ fn instantiate_generic_class_defs(
       fields,
       methods,
       type_params: Vec::new(),
+      // A monomorphized copy of a real, user-written class — carries
+      // its doc comment (if any) forward unchanged.
+      doc: c.doc.clone(),
     },
   );
   mangled
@@ -772,6 +783,9 @@ fn instantiate_generic_enum_defs(
         name: mangled.clone(),
         variants: Vec::new(),
         type_params: Vec::new(),
+        // Cycle-detection placeholder, same reasoning as the identical
+        // `ClassDef` sentinel above.
+        doc: None,
       },
     );
     return mangled;
@@ -837,6 +851,9 @@ fn instantiate_generic_enum_defs(
       name: mangled.clone(),
       variants,
       type_params: Vec::new(),
+      // A monomorphized copy of a real, user-written enum — carries its
+      // doc comment (if any) forward unchanged.
+      doc: e.doc.clone(),
     },
   );
   mangled
@@ -2232,6 +2249,7 @@ fn substitute_generic_function(
     requires: f.requires.clone(),
     ensures: f.ensures.clone(),
     is_pure: f.is_pure,
+    doc: f.doc.clone(),
   }
 }
 
@@ -2279,6 +2297,7 @@ fn substitute_function_type_params(
     requires: f.requires.clone(),
     ensures: f.ensures.clone(),
     is_pure: f.is_pure,
+    doc: f.doc.clone(),
   }
 }
 
@@ -16126,6 +16145,9 @@ fn compile_to_object_impl(
         fields: a.fields.clone(),
         methods: a.methods.clone(),
         type_params: Vec::new(),
+        // Same actor declaration, just normalized into `ClassDef`
+        // shape — carries its doc comment forward unchanged.
+        doc: a.doc.clone(),
       }),
       _ => None,
     })
@@ -16214,6 +16236,9 @@ fn compile_to_object_impl(
       name: "T".to_string(),
       bounds: Vec::new(),
     }],
+    // Compiler-synthesized, never parsed from source — same reasoning
+    // as `emerald-sema`'s identical `option_enum_def`.
+    doc: None,
   };
   let mut generic_enum_defs: HashMap<String, &EnumDef> = HashMap::new();
   generic_enum_defs.insert("Option".to_string(), &option_enum_def_cg);
@@ -16345,6 +16370,11 @@ fn compile_to_object_impl(
           requires: Vec::new(),
           ensures: Vec::new(),
           is_pure: false,
+          // `ExternFn` has no `doc` field of its own (plan 77's scope
+          // stops at `fn`/`class`/`method`/`interface`/`module`/`enum`/
+          // `actor` declarations — `unsafe extern "C" { ... }` blocks
+          // are left out, disclosed here rather than silently assumed).
+          doc: None,
         })
         .collect::<Vec<_>>(),
       _ => Vec::new(),
@@ -17097,6 +17127,7 @@ fn assertion_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       },
       AstFunction {
         name: "message".to_string(),
@@ -17112,9 +17143,11 @@ fn assertion_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       },
     ],
     type_params: Vec::new(),
+    doc: None,
   })
 }
 
@@ -17165,6 +17198,7 @@ fn remote_actor_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       },
       AstFunction {
         name: "message".to_string(),
@@ -17180,9 +17214,11 @@ fn remote_actor_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       },
     ],
     type_params: Vec::new(),
+    doc: None,
   })
 }
 
@@ -17240,6 +17276,7 @@ fn contract_violation_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       },
       AstFunction {
         name: "message".to_string(),
@@ -17255,9 +17292,11 @@ fn contract_violation_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        doc: None,
       },
     ],
     type_params: Vec::new(),
+    doc: None,
   })
 }
 
@@ -17308,6 +17347,7 @@ fn send_error_enum_item() -> Item {
         fields: Vec::new(),
       },
     ],
+    doc: None,
   })
 }
 
@@ -17439,6 +17479,9 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: false,
+      // A synthesized `test`/`property` harness function — no `##`
+      // comment position exists for it (plan 77's Decision log).
+      doc: None,
     }));
 
     harness_stmts.push(syn(Stmt::Begin {
@@ -17600,6 +17643,9 @@ pub fn compile_benchmark_harness(program: &Program, out_path: &Path) -> Result<u
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: false,
+      // A synthesized `benchmark` harness function — same reasoning as
+      // the `test`/`property` harness function above.
+      doc: None,
     }));
 
     let start_name = format!("__emerald_bench_start_{i}");
@@ -18483,6 +18529,7 @@ mod tests {
           requires: Vec::new(),
           ensures: Vec::new(),
           is_pure: false,
+          doc: None,
         }),
         Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(
           "repeat".into(),

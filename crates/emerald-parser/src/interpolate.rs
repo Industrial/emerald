@@ -59,9 +59,13 @@ pub fn parse_interpolated_string(decoded: &str) -> Result<Expr, String> {
       // even though `Expr`'s own productions never reach a `!` marker —
       // that's `Item`-only) — a fresh, always-empty `Vec` here, since a
       // malformed `#{...}` span is a real hard error, not recovered.
+      // Plan 77's `docs` map is threaded the same uniform way — always
+      // empty here too, since `Expr`'s own productions never look one
+      // up (only `Item`-level declaration productions do).
       let mut errors = Vec::new();
+      let docs = std::collections::HashMap::new();
       let parsed_expr = grammar::grammar::ExprParser::new()
-        .parse(&mut errors, expr_src)
+        .parse(&mut errors, &docs, expr_src)
         .map_err(|e| {
           format!("invalid expression in string interpolation `#{{{expr_src}}}`: {e}")
         })?;
