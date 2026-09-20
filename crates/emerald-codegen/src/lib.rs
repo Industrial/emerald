@@ -6583,6 +6583,111 @@ fn field_ptr<'ctx>(
   }
 }
 
+/// Plan 74 (enumerable chaining): resolves `recv` down to a plain
+/// `Expr::Ident` receiver `build_method_call`'s own, pre-existing
+/// dispatch already knows how to handle — reusing it completely
+/// unchanged for everything downstream (Array/Hash enumerable dispatch,
+/// `File`/`String`/class-method dispatch, all of it). The overwhelming
+/// common case (`recv` is already a plain named local, or anything
+/// else `build_method_call`'s own existing checks handle some other
+/// way) is a no-op passthrough, with `vars`/`local_array_elem_types`
+/// simply cloned unchanged.
+///
+/// When `recv` is itself a chained `.map`/`.select`/`.filter`/`.sort`
+/// call — the only four enumerable methods whose own result is itself
+/// an `Array[T]` a further enumerable call could legally target
+/// (`emerald-sema`'s own `check_enumerable_call` return-type table) —
+/// this recurses on ITS OWN receiver first (so a chain of any length,
+/// `nums.select do ... end.map do ... end.sort()`, collapses one link
+/// at a time, innermost first), builds that one link via
+/// `build_enumerable_call` DIRECTLY (not `build_expr`'s generic
+/// dispatch, which would discard the produced element `ValKind` this
+/// needs — see `build_array_map`'s own Decision-log addition), and
+/// stashes the result into a synthetic named local: `build_safe_call`'s
+/// own established "synthesize a fresh AST node, reuse the existing
+/// codegen path unchanged" technique, applied here to the identical
+/// underlying problem (a receiver shape with no entry in
+/// `local_array_elem_types`, which is keyed by variable NAME only,
+/// populated at `Let`-binding time from ITS OWN declared type — an
+/// intermediate, unnamed chain link never gets one that way).
+#[allow(clippy::too_many_arguments)]
+fn resolve_chained_enumerable_receiver<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  recv: &Spanned<Expr>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<ResolvedChainReceiver<'ctx>, String> {
+  let Expr::MethodCall(inner_recv, inner_method, inner_args) = &recv.node else {
+    return Ok((recv.clone(), vars.clone(), local_array_elem_types.clone()));
+  };
+  if !matches!(inner_method.as_str(), "map" | "select" | "filter" | "sort") {
+    return Ok((recv.clone(), vars.clone(), local_array_elem_types.clone()));
+  }
+  let (resolved_inner_recv, mut vars2, mut elem_types2) = resolve_chained_enumerable_receiver(
+    context,
+    builder,
+    inner_recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let Expr::Ident(inner_recv_name) = &resolved_inner_recv.node else {
+    return Err(
+      "codegen: method calls are only supported on a plain local-variable receiver".to_string(),
+    );
+  };
+  let (inner_val, _inner_kind, inner_elem) = build_enumerable_call(
+    context,
+    builder,
+    &resolved_inner_recv,
+    inner_recv_name,
+    inner_method,
+    inner_args,
+    &vars2,
+    local_classes,
+    &elem_types2,
+    ctx,
+  )?;
+  let elem_kind = inner_elem.ok_or_else(|| {
+    format!(
+      "codegen: internal error — chained `.{inner_method}` did not produce an Array (sema should have rejected further chaining here)"
+    )
+  })?;
+
+  let synthetic_name = format!("__chain{}_{inner_method}", vars2.len());
+  let ptr_ty = local_llvm_type(context, &ValKind::Ptr);
+  let alloca = builder
+    .build_alloca(ptr_ty, &synthetic_name)
+    .map_err(|e| e.to_string())?;
+  builder
+    .build_store(alloca, inner_val)
+    .map_err(|e| e.to_string())?;
+  vars2.insert(synthetic_name.clone(), (alloca, ValKind::Ptr));
+  elem_types2.insert(synthetic_name.clone(), elem_kind);
+  Ok((
+    Spanned::synthetic(Expr::Ident(synthetic_name)),
+    vars2,
+    elem_types2,
+  ))
+}
+
+/// `resolve_chained_enumerable_receiver`'s own return shape — the
+/// resolved receiver plus the (always owned, possibly chain-link-
+/// extended) `vars`/`local_array_elem_types` maps to use in its place.
+/// A named alias purely to keep clippy's `type_complexity` lint quiet;
+/// no behavior of its own. Declared after the function that uses it
+/// (Rust item order is unconstrained) so the function's own doc comment
+/// above reads first, uninterrupted.
+type ResolvedChainReceiver<'ctx> = (
+  Spanned<Expr>,
+  HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  HashMap<String, ValKind>,
+);
+
 /// `receiver.method(args)`. `.call` on a receiver known to
 /// `ctx.lambda_func_ids` dispatches statically to that lambda's
 /// synthesized function; `Name.method(args)` on a known module name
@@ -6632,6 +6737,25 @@ fn build_method_call<'ctx>(
       }
     }
   }
+
+  // Plan 74 (enumerable chaining): resolve a chained-enumerable-call
+  // receiver (`nums.select do ... end.map do ... end`) down to a plain
+  // Ident first — see `resolve_chained_enumerable_receiver`'s own doc
+  // comment. A no-op passthrough for every other receiver shape (the
+  // overwhelmingly common case: a plain named local).
+  let (resolved_recv, resolved_vars, resolved_local_array_elem_types) =
+    resolve_chained_enumerable_receiver(
+      context,
+      builder,
+      recv,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+  let recv = &resolved_recv;
+  let vars = &resolved_vars;
+  let local_array_elem_types = &resolved_local_array_elem_types;
 
   let Expr::Ident(recv_name) = &recv.node else {
     return Err(
@@ -6760,7 +6884,7 @@ fn build_method_call<'ctx>(
         | "sort"
     )
   {
-    return build_enumerable_call(
+    let (val, kind, _elem_kind) = build_enumerable_call(
       context,
       builder,
       recv,
@@ -6771,7 +6895,8 @@ fn build_method_call<'ctx>(
       local_classes,
       local_array_elem_types,
       ctx,
-    );
+    )?;
+    return Ok((val, kind));
   }
 
   // Plan 45's Decision log: `File` is a separate, hard-coded arm, not
@@ -7215,7 +7340,7 @@ fn build_enumerable_call<'ctx>(
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
-) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+) -> Result<(BasicValueEnum<'ctx>, ValKind, Option<ValKind>), String> {
   let func = builder
     .get_insert_block()
     .ok_or("codegen: internal error — no current block")?
@@ -7240,7 +7365,7 @@ fn build_enumerable_call<'ctx>(
     let count_val = builder
       .build_load(i64_ty, recv_val.into_pointer_value(), "encount")
       .map_err(|e| e.to_string())?;
-    return Ok((count_val, ValKind::Int64));
+    return Ok((count_val, ValKind::Int64, None));
   }
 
   if let Some((k_kind, v_kind)) = local_classes
@@ -7277,6 +7402,7 @@ fn build_enumerable_call<'ctx>(
           local_array_elem_types,
           ctx,
         )
+        .map(|(v, k)| (v, k, None))
       }
       "map" => {
         let [proc_arg] = args else {
@@ -7325,6 +7451,7 @@ fn build_enumerable_call<'ctx>(
           local_array_elem_types,
           ctx,
         )
+        .map(|(v, k)| (v, k, None))
       }
       "each_with_index" => {
         let [proc_arg] = args else {
@@ -7346,6 +7473,7 @@ fn build_enumerable_call<'ctx>(
           local_array_elem_types,
           ctx,
         )
+        .map(|(v, k)| (v, k, None))
       }
       // Plan 70: `.count(proc_name)` — the predicate form (the arity-0
       // O(1) header-read form is handled unconditionally above, before
@@ -7370,6 +7498,7 @@ fn build_enumerable_call<'ctx>(
           local_array_elem_types,
           ctx,
         )
+        .map(|(v, k)| (v, k, None))
       }
       other => Err(format!(
         "codegen: internal error — `.{other}` is not supported on Hash[K, V] (sema should have rejected this)"
@@ -7406,6 +7535,7 @@ fn build_enumerable_call<'ctx>(
         local_array_elem_types,
         ctx,
       )
+      .map(|(v, k)| (v, k, None))
     }
     "map" => {
       let [block] = args else {
@@ -7427,6 +7557,14 @@ fn build_enumerable_call<'ctx>(
         ctx,
       )
     }
+    // Plan 74 (enumerable chaining): `.select`/`.filter` preserve the
+    // receiver's own element type exactly — `emerald-sema`'s own
+    // `check_enumerable_call` returns `Array[elem_ty]` unchanged, never
+    // a transformation of it the way `.map`'s own Proc return type is
+    // — so the produced-element-kind this plan's own further-chained
+    // call needs is just `elem_kind` itself, already known above,
+    // cloned once for the `Some(...)` alongside the (moved) copy this
+    // call itself still needs.
     "select" | "filter" => {
       let [block] = args else {
         return Err(format!(
@@ -7439,12 +7577,13 @@ fn build_enumerable_call<'ctx>(
         func,
         recv,
         block,
-        elem_kind,
+        elem_kind.clone(),
         vars,
         local_classes,
         local_array_elem_types,
         ctx,
       )
+      .map(|(v, k)| (v, k, Some(elem_kind)))
     }
     "reduce" | "inject" => {
       let [initial, block] = args else {
@@ -7465,6 +7604,7 @@ fn build_enumerable_call<'ctx>(
         local_array_elem_types,
         ctx,
       )
+      .map(|(v, k)| (v, k, None))
     }
     "each_with_index" => {
       let [block] = args else {
@@ -7485,6 +7625,7 @@ fn build_enumerable_call<'ctx>(
         local_array_elem_types,
         ctx,
       )
+      .map(|(v, k)| (v, k, None))
     }
     "sum" => build_array_sum(
       context,
@@ -7496,18 +7637,25 @@ fn build_enumerable_call<'ctx>(
       local_classes,
       local_array_elem_types,
       ctx,
-    ),
+    )
+    .map(|(v, k)| (v, k, None)),
+    // Plan 74 (enumerable chaining): `.sort` preserves the receiver's
+    // own element type exactly too (`check_enumerable_call`'s own
+    // `Int64`/`Float64`-only narrowing never changes it) — same
+    // `elem_kind.clone()`-then-`Some(elem_kind)` treatment as
+    // `.select`/`.filter` immediately above, for the identical reason.
     "sort" => build_array_sort(
       context,
       builder,
       func,
       recv,
-      elem_kind,
+      elem_kind.clone(),
       vars,
       local_classes,
       local_array_elem_types,
       ctx,
-    ),
+    )
+    .map(|(v, k)| (v, k, Some(elem_kind))),
     // Plan 70: `.count(proc_name)` — the predicate form (the arity-0
     // O(1) header-read form is handled unconditionally above, before
     // this Hash/Array split, and never reaches here).
@@ -7530,6 +7678,7 @@ fn build_enumerable_call<'ctx>(
         local_array_elem_types,
         ctx,
       )
+      .map(|(v, k)| (v, k, None))
     }
     other => Err(format!(
       "codegen: internal error — unsupported enumerable method `.{other}` (sema should have rejected this)"
@@ -7718,6 +7867,12 @@ fn build_hash_pair_ptr<'ctx>(
 /// `build_array_map` exactly, except each source "element" is a
 /// freshly constructed `Pair[K,V]` (`build_hash_pair_ptr`) rather than
 /// a value loaded straight out of a flat element array.
+///
+/// Plan 74 (enumerable chaining): also surfaces the produced element
+/// `ValKind` as a 3rd return-tuple element, for the identical reason
+/// `build_array_map`'s own Decision-log addition does — the result is
+/// a real `Array[R]` (not a `Hash`), so any further chained enumerable
+/// call on it is the ordinary Array case from here on.
 #[allow(clippy::too_many_arguments)]
 fn build_hash_map<'ctx>(
   context: &'ctx Context,
@@ -7731,7 +7886,7 @@ fn build_hash_map<'ctx>(
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
-) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+) -> Result<(BasicValueEnum<'ctx>, ValKind, Option<ValKind>), String> {
   let (recv_val, _) = build_expr(
     context,
     builder,
@@ -7763,6 +7918,7 @@ fn build_hash_map<'ctx>(
     .map_err(|e| e.to_string())?;
   let out_elems_base = field_ptr(context, builder, out_ptr, 8)?;
 
+  let mut result_elem_kind: Option<ValKind> = None;
   build_count_loop(context, builder, func, count_val, |builder, idx| {
     let pair_ptr = build_hash_pair_ptr(context, builder, h_ptr, idx, &k_kind, &v_kind, ctx)?;
     let (result_val_opt, result_kind) = call_named_proc(
@@ -7787,10 +7943,11 @@ fn build_hash_map<'ctx>(
     builder
       .build_store(dst_ptr, result_val)
       .map_err(|e| e.to_string())?;
+    result_elem_kind = Some(result_kind);
     Ok(())
   })?;
 
-  Ok((out_ptr.into(), ValKind::Ptr))
+  Ok((out_ptr.into(), ValKind::Ptr, result_elem_kind))
 }
 
 /// Plan 70 (enumerable stdlib completion): `h.count(proc_name)` — the
@@ -8013,6 +8170,23 @@ fn build_hash_each_with_index<'ctx>(
 /// "codegen never re-derives a type sema already checked" posture
 /// every other intrinsic here takes), storing each transformed element
 /// in place.
+///
+/// Plan 74 (enumerable chaining): also surfaces the concrete `ValKind`
+/// `R` actually turned out to be, as a 3rd return-tuple element — the
+/// one case among the ten enumerable methods where a further chained
+/// `.select`/`.filter`/`.sort`/`.map` call's own element type isn't
+/// already known from the receiver's own `local_array_elem_types`
+/// entry (that table is keyed by variable NAME, populated at `Let`-
+/// binding time from ITS OWN declared type — an intermediate, unnamed
+/// chain link has no entry there). `call_named_proc`'s own returned
+/// `result_kind` is captured once, from inside `build_count_loop`'s
+/// single codegen-time closure call (its own doc comment: `body` is
+/// invoked exactly once to build the loop's body IR, never re-invoked
+/// per runtime iteration) — exactly the value every element in the
+/// real runtime loop actually gets, since it depends only on the
+/// proc's own static signature, never re-derived by a second, separate
+/// prediction-only pass (which would risk running the proc's own
+/// codegen, and any real side effect it has, more than once).
 #[allow(clippy::too_many_arguments)]
 fn build_array_map<'ctx>(
   context: &'ctx Context,
@@ -8025,7 +8199,7 @@ fn build_array_map<'ctx>(
   local_classes: &HashMap<String, String>,
   local_array_elem_types: &HashMap<String, ValKind>,
   ctx: &Ctx<'_, 'ctx>,
-) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+) -> Result<(BasicValueEnum<'ctx>, ValKind, Option<ValKind>), String> {
   let (recv_val, _) = build_expr(
     context,
     builder,
@@ -8059,6 +8233,7 @@ fn build_array_map<'ctx>(
     .map_err(|e| e.to_string())?;
   let out_elems_base = field_ptr(context, builder, out_ptr, 8)?;
 
+  let mut result_elem_kind: Option<ValKind> = None;
   build_count_loop(context, builder, func, count_val, |builder, idx| {
     let src_ptr = unsafe {
       builder
@@ -8090,10 +8265,11 @@ fn build_array_map<'ctx>(
     builder
       .build_store(dst_ptr, result_val)
       .map_err(|e| e.to_string())?;
+    result_elem_kind = Some(result_kind);
     Ok(())
   })?;
 
-  Ok((out_ptr.into(), ValKind::Ptr))
+  Ok((out_ptr.into(), ValKind::Ptr, result_elem_kind))
 }
 
 /// Plan 42 (enumerable stdlib): `arr.select(proc_name)`/`.filter(...)`
@@ -19835,6 +20011,55 @@ int main(void) {
   fn array_reduce_compiled_linked_and_run_folds_to_the_sum() {
     let src = "adder: Proc = do |acc: Int64, x: Int64| acc + x end\narr: Array[Int64] = [1, 2, 3, 4]\ntotal: Int64 = arr.reduce(0, adder)\nputs total\n";
     assert_eq!(compile_link_run(src), "10\n");
+  }
+
+  // Plan 74 (enumerable chaining): `arr.select do ... end.map do ...
+  // end.sort()` in one expression — plan 70's own `check_enumerable_
+  // call`/`build_enumerable_call` machinery, unmodified in shape, now
+  // composes across links without an intermediate named variable.
+  // `a_chained_enumerable_call_is_rejected_not_miscompiled` above is a
+  // DIFFERENT, still-real rejection (a fully parenthesized chain with
+  // no `do...end` anywhere, e.g. `arr.select(is_even).map(doubler)` —
+  // `ChainCallExpr`'s own grammar production requires at least one
+  // `do...end`-attached link, so that shape never reaches this plan's
+  // own new codegen path at all, and stays a parse error exactly as
+  // before).
+  #[test]
+  fn plan_74_three_link_do_end_chain_select_map_sort_compiles_and_runs_correctly() {
+    let src = "nums: Array[Int64] = [1, 2, 3, 4, 5]\nresult: Array[Int64] =\n  nums\n    .select do |x: Int64| x % 2 == 0 end\n    .map do |x: Int64| x * 10 end\n    .sort()\nputs result[0]\nputs result[1]\n";
+    assert_eq!(compile_link_run(src), "20\n40\n");
+  }
+
+  // A longer, unsorted starting array, chained `.select`/`.map`/`.sort`
+  // together with a SEPARATE, sibling two-link chain ending in `.sum()`
+  // (a scalar, non-Array-producing tail — proving the same receiver
+  // expression can be chained more than one way in the same program,
+  // and that a chain ending in a scalar method still works unchanged).
+  #[test]
+  fn plan_74_three_link_chain_and_a_sibling_two_link_chain_ending_in_sum_both_compile_and_run() {
+    let src = "nums: Array[Int64] = [5, 3, 8, 1, 9, 2]\nresult: Array[Int64] =\n  nums\n    .select do |x: Int64| x > 2 end\n    .map do |x: Int64| x * 2 end\n    .sort()\nputs result[0]\nputs result[1]\nputs result[2]\nputs result[3]\ntotal: Int64 = nums.select do |x: Int64| x > 2 end.sum()\nputs total\n";
+    assert_eq!(compile_link_run(src), "6\n10\n16\n18\n25\n");
+  }
+
+  // A chain that STARTS from a `Hash[K,V].map` result (an `Array[T]`,
+  // not a `Hash`) — proves the synthetic-receiver materialization this
+  // plan adds handles a Hash-origin chain link exactly like an
+  // Array-origin one once `.map` has produced a real `Array[T]`.
+  #[test]
+  fn plan_74_chain_starting_from_a_hash_map_result_compiles_and_runs_correctly() {
+    let src = "names: Hash[Int64, String] = {1 => \"a\", 2 => \"b\", 3 => \"c\"}\nlabelled: Array[Int64] =\n  names\n    .map do |p: Pair[Int64, String]| p.key end\n    .select do |k: Int64| k != 2 end\n    .sort()\nputs labelled[0]\nputs labelled[1]\n";
+    assert_eq!(compile_link_run(src), "1\n3\n");
+  }
+
+  // Plan 70's original non-chained shapes, restated here as a
+  // regression guard tied directly to this plan's own change
+  // (`resolve_chained_enumerable_receiver` must stay a no-op
+  // passthrough for a plain named-local receiver) — every pre-existing
+  // plan 42/70 test above already re-confirms this too, unmodified.
+  #[test]
+  fn plan_74_non_chained_single_enumerable_calls_still_work_unchanged() {
+    let src = "nums: Array[Int64] = [1, 2, 3, 4, 5]\nevens: Array[Int64] = nums.select do |x: Int64| x % 2 == 0 end\ndoubled: Array[Int64] = evens.map do |x: Int64| x * 10 end\nsorted: Array[Int64] = doubled.sort()\nputs sorted[0]\nputs sorted[1]\n";
+    assert_eq!(compile_link_run(src), "20\n40\n");
   }
 
   // Plan 89 (generic-method codegen, interface generics, indirect Proc

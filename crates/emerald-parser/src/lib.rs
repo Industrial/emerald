@@ -483,77 +483,125 @@ fn hoist_enumerable_blocks(
       | Stmt::SetField { value, .. } => Some(value),
       _ => None,
     };
-    let mut hoisted: Option<Item> = None;
+    let mut hoisted: Vec<Item> = Vec::new();
     if let Some(value) = value {
-      if let Expr::MethodCall(_, method, args) = &mut value.node {
-        let method_name = method.clone();
-        let has_trailing_block = matches!(args.last().map(|a| &a.node), Some(Expr::Lambda { .. }));
-        if ENUMERABLE_BLOCK_METHODS.contains(&method_name.as_str()) && has_trailing_block {
-          let old = args
-            .pop()
-            .expect("checked Some above via has_trailing_block");
-          let Expr::Lambda { params, body, .. } = old.node else {
-            unreachable!("has_trailing_block already matched Expr::Lambda")
-          };
-          let return_type = match method_name.as_str() {
-            "select" | "filter" | "count" => ast::TypeExpr::Named("Boolean".to_string()),
-            "each" | "each_with_index" => ast::TypeExpr::Named("Void".to_string()),
-            "map" | "reduce" | "inject" => {
-              infer_block_result_type(&params, &body, &top_level_fn_returns).ok_or_else(|| {
-                hoist_error(
-                  name,
-                  source,
-                  old.span,
-                  format!(
-                    "can't infer this block's result type for `.{method_name}` — as of plan \
-                     71, no surface syntax in this language can state a lambda's return type \
-                     explicitly any more (the old `->(...) -> ReturnType {{ ... }}` lambda \
-                     literal is gone), so there is currently no rewrite that works around this; \
-                     this plan's own block-return-type inference only covers literals, a bare \
-                     block-parameter reference, same-typed arithmetic/comparison/logical \
-                     operators, and a call to an already-declared top-level function — restate \
-                     the block using only those shapes"
-                  ),
-                )
-              })?
-            }
-            _ => unreachable!("ENUMERABLE_BLOCK_METHODS has no other member"),
-          };
-          let fresh = format!("__enum_blk_{counter}");
-          counter += 1;
-          args.push(Spanned {
-            span: old.span,
-            node: Expr::Ident(fresh.clone()),
-          });
-          hoisted = Some(Item::Stmt(Spanned {
-            span: old.span,
-            node: Stmt::Let {
-              name: fresh,
-              ty: ast::TypeExpr::Named("Proc".to_string()),
-              // A compiler-synthesized temporary (never itself the
-              // target of a source-level reassignment) — `false` matches
-              // the immutable-by-default rule the same way any other
-              // unmarked `Let` does.
-              is_var: false,
-              value: Spanned {
-                span: old.span,
-                node: Expr::Lambda {
-                  params,
-                  return_type,
-                  body,
-                },
-              },
-            },
-          }));
-        }
-      }
+      hoist_enumerable_blocks_in_chain(
+        value,
+        name,
+        source,
+        &top_level_fn_returns,
+        &mut counter,
+        &mut hoisted,
+      )?;
     }
-    if let Some(hoisted) = hoisted {
-      new_items.push(hoisted);
-    }
+    new_items.extend(hoisted);
     new_items.push(Item::Stmt(stmt));
   }
   program.items = new_items;
+  Ok(())
+}
+
+/// Plan 74 (enumerable chaining): walks a chain of consecutive
+/// `.method`/`.method do...end` calls (`nums.select do ... end.map do
+/// ... end.sort()`), hoisting each link's own trailing block literal —
+/// exactly the single-call rewrite `hoist_enumerable_blocks` itself
+/// used to perform inline, before this plan, moved out into its own,
+/// recursive function. Recurses into the RECEIVER first (so hoisted
+/// `Let`s end up in the same left-to-right order a hand-written
+/// `__enum_blk_0 = ...; __enum_blk_1 = ...; ...` sequence would use),
+/// then applies this level's own hoist — a non-chained call's receiver
+/// is never itself a `MethodCall`, so the recursive step is a no-op in
+/// that case and this produces byte-for-byte the same rewrite
+/// `hoist_enumerable_blocks`'s own pre-plan-74 single-call body did.
+/// Still deliberately scoped to a `MethodCall` RECEIVER chain only —
+/// `hoist_enumerable_blocks`'s own Decision log (an enumerable call
+/// nested inside a block's own body, an `if`/`while` condition, or any
+/// other position is left untouched) is unchanged; this only widens
+/// "the top-level statement's own value" from a single call to a
+/// chain of them.
+#[allow(clippy::too_many_arguments)]
+fn hoist_enumerable_blocks_in_chain(
+  value: &mut Spanned<Expr>,
+  name: &str,
+  source: &str,
+  top_level_fn_returns: &std::collections::HashMap<String, ast::TypeExpr>,
+  counter: &mut usize,
+  hoisted: &mut Vec<Item>,
+) -> Result<(), ParseError> {
+  let Expr::MethodCall(recv, _, _) = &mut value.node else {
+    return Ok(());
+  };
+  hoist_enumerable_blocks_in_chain(
+    recv.as_mut(),
+    name,
+    source,
+    top_level_fn_returns,
+    counter,
+    hoisted,
+  )?;
+
+  let Expr::MethodCall(_, method, args) = &mut value.node else {
+    unreachable!("just matched Expr::MethodCall above");
+  };
+  let method_name = method.clone();
+  let has_trailing_block = matches!(args.last().map(|a| &a.node), Some(Expr::Lambda { .. }));
+  if ENUMERABLE_BLOCK_METHODS.contains(&method_name.as_str()) && has_trailing_block {
+    let old = args
+      .pop()
+      .expect("checked Some above via has_trailing_block");
+    let Expr::Lambda { params, body, .. } = old.node else {
+      unreachable!("has_trailing_block already matched Expr::Lambda")
+    };
+    let return_type = match method_name.as_str() {
+      "select" | "filter" | "count" => ast::TypeExpr::Named("Boolean".to_string()),
+      "each" | "each_with_index" => ast::TypeExpr::Named("Void".to_string()),
+      "map" | "reduce" | "inject" => infer_block_result_type(&params, &body, top_level_fn_returns)
+        .ok_or_else(|| {
+          hoist_error(
+            name,
+            source,
+            old.span,
+            format!(
+              "can't infer this block's result type for `.{method_name}` — as of plan \
+               71, no surface syntax in this language can state a lambda's return type \
+               explicitly any more (the old `->(...) -> ReturnType {{ ... }}` lambda \
+               literal is gone), so there is currently no rewrite that works around this; \
+               this plan's own block-return-type inference only covers literals, a bare \
+               block-parameter reference, same-typed arithmetic/comparison/logical \
+               operators, and a call to an already-declared top-level function — restate \
+               the block using only those shapes"
+            ),
+          )
+        })?,
+      _ => unreachable!("ENUMERABLE_BLOCK_METHODS has no other member"),
+    };
+    let fresh = format!("__enum_blk_{counter}");
+    *counter += 1;
+    args.push(Spanned {
+      span: old.span,
+      node: Expr::Ident(fresh.clone()),
+    });
+    hoisted.push(Item::Stmt(Spanned {
+      span: old.span,
+      node: Stmt::Let {
+        name: fresh,
+        ty: ast::TypeExpr::Named("Proc".to_string()),
+        // A compiler-synthesized temporary (never itself the
+        // target of a source-level reassignment) — `false` matches
+        // the immutable-by-default rule the same way any other
+        // unmarked `Let` does.
+        is_var: false,
+        value: Spanned {
+          span: old.span,
+          node: Expr::Lambda {
+            params,
+            return_type,
+            body,
+          },
+        },
+      },
+    }));
+  }
   Ok(())
 }
 
@@ -4180,22 +4228,34 @@ mod tests {
     // on, and the whole result is itself a legal receiver for the next
     // `.method` in the chain — three links here, `.select`, `.map`,
     // `.count`, none of them parenthesized.
+    //
+    // Plan 74's own amendment: `hoist_enumerable_blocks` originally
+    // hoisted only the OUTERMOST link's block (the "middle"/"innermost"
+    // assertions below used to expect a raw, un-hoisted `Expr::Lambda`
+    // — real, pre-existing, disclosed scope that plan 74's own
+    // `hoist_enumerable_blocks_in_chain` closes, since `emerald-codegen`'s
+    // `call_named_proc` requires EVERY Proc argument, at every link, to
+    // already be a plain `Expr::Ident` naming a hoisted top-level Proc —
+    // an un-hoisted middle/innermost link would have failed codegen the
+    // same way a bare, never-hoisted block anywhere else already does).
+    // All three links are hoisted now, innermost first (this pass's own
+    // Decision log: recursing into the receiver before this level's own
+    // hoist keeps hoisted `Let`s in natural, left-to-right source order).
     let src = "nums: Array[Int64] = [1, 2, 3]\nresult: Int64 = nums.select do |x: Int64| x > 1 end.map do |x: Int64| x * 2 end.count do |x: Int64| x > 1 end\n";
     let program = parse(src)
       .expect("a do...end chain of three .method calls should parse, each block binding tight to its own call");
-    assert_eq!(program.items.len(), 3);
+    // `nums`, the three hoisted procs (select, map, count, in that
+    // left-to-right order), the `result` statement.
+    assert_eq!(program.items.len(), 5);
     let Item::Stmt(Spanned {
       node: Stmt::Let { name, value, .. },
       ..
-    }) = &program.items[2]
+    }) = &program.items[4]
     else {
-      panic!("expected the `result` Let, got {:?}", program.items[2]);
+      panic!("expected the `result` Let, got {:?}", program.items[4]);
     };
     assert_eq!(name, "result");
-    // Outermost link (`.count`): this is the top-level statement's own
-    // direct value, so `hoist_enumerable_blocks` rewrites its trailing
-    // block into a fresh, named `Proc` `Ident` — see that pass's own
-    // Decision log for why only this outermost link qualifies.
+    // Outermost link (`.count`).
     let Expr::MethodCall(recv2, method2, args2) = &value.node else {
       panic!(
         "expected the outermost `.count` MethodCall, got {:?}",
@@ -4206,9 +4266,8 @@ mod tests {
     assert!(
       matches!(args2.last().map(|a| &a.node), Some(Expr::Ident(n)) if n.starts_with("__enum_blk_"))
     );
-    // Middle link (`.map`): nested inside a receiver, so it keeps its
-    // own raw, un-hoisted `Expr::Lambda` block (out of that pass's
-    // deliberately narrow, top-level-only scope).
+    // Middle link (`.map`) — now ALSO hoisted to a named `Ident`
+    // (plan 74's own fix), not left as a raw `Expr::Lambda`.
     let Expr::MethodCall(recv1, method1, args1) = &recv2.node else {
       panic!(
         "expected the middle `.map` MethodCall, got {:?}",
@@ -4216,12 +4275,11 @@ mod tests {
       );
     };
     assert_eq!(method1, "map");
-    assert!(matches!(
-      args1.last().map(|a| &a.node),
-      Some(Expr::Lambda { .. })
-    ));
+    assert!(
+      matches!(args1.last().map(|a| &a.node), Some(Expr::Ident(n)) if n.starts_with("__enum_blk_"))
+    );
     // Innermost link (`.select`) on the bare `nums` receiver — the base
-    // case of `ChainCallExpr`'s own recursion.
+    // case of `ChainCallExpr`'s own recursion — also hoisted now.
     let Expr::MethodCall(recv0, method0, args0) = &recv1.node else {
       panic!(
         "expected the innermost `.select` MethodCall, got {:?}",
@@ -4230,10 +4288,24 @@ mod tests {
     };
     assert_eq!(method0, "select");
     assert_eq!(recv0.node, Expr::Ident("nums".to_string()));
-    assert!(matches!(
-      args0.last().map(|a| &a.node),
-      Some(Expr::Lambda { .. })
-    ));
+    assert!(
+      matches!(args0.last().map(|a| &a.node), Some(Expr::Ident(n)) if n.starts_with("__enum_blk_"))
+    );
+    // Left-to-right hoisting order: `.select`'s own hoisted `Let`
+    // appears before `.map`'s, which appears before `.count`'s.
+    fn hoisted_name(item: &Item) -> &str {
+      let Item::Stmt(Spanned {
+        node: Stmt::Let { name, .. },
+        ..
+      }) = item
+      else {
+        panic!("expected a hoisted `Let`, got {item:?}");
+      };
+      name.as_str()
+    }
+    assert_eq!(hoisted_name(&program.items[1]), "__enum_blk_0");
+    assert_eq!(hoisted_name(&program.items[2]), "__enum_blk_1");
+    assert_eq!(hoisted_name(&program.items[3]), "__enum_blk_2");
   }
 
   #[test]
