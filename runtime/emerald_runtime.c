@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 /* Plan 55 (scheduler and message passing). Plan 64's Decision log:
  * `wasm32-wasip1` (clang predefines `__wasi__` for this target) ships
  * no `pthread_create` at all — there is exactly one execution context,
@@ -2359,4 +2360,22 @@ int emerald_actor_dispatch(void *ref_ptr, int32_t method_tag,
     return EMERALD_DISPATCH_TIMEOUT;
   }
   return EMERALD_DISPATCH_NODE_UNREACHABLE;
+}
+
+/* Plan 80 (property-and-benchmark-test-syntax), `leaf-benchmark-
+ * runner`: a minimal CPU-time clock, exposed to compiled Emerald code
+ * only through a synthetic `extern "C" fn emerald_bench_now_seconds():
+ * Float64` declaration `emerald-codegen`'s own `compile_benchmark_
+ * harness` injects at codegen time — never a general user-facing
+ * builtin, never reachable from an ordinary `.em` program's own
+ * source text. ISO C89 `clock()` rather than
+ * `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ...)`: portable to both the
+ * native and wasm32-wasi runtime archives this file compiles into
+ * (`CLOCK_PROCESS_CPUTIME_ID` is not implemented by wasi-libc), at the
+ * cost of `CLOCKS_PER_SEC`-limited resolution (typically 1us on
+ * Linux) — matches `benchmarks/REPORT.md`'s own existing methodology
+ * ("Run time is CPU time (user+sys), not wall clock"), acceptable for
+ * a coarse per-`benchmark`-block report, not a precision profiler. */
+double emerald_bench_now_seconds(void) {
+  return (double) clock() / (double) CLOCKS_PER_SEC;
 }

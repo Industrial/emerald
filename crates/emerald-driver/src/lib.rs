@@ -497,6 +497,42 @@ fn codegen_test_stage(
   })
 }
 
+/// Plan 80's `leaf-benchmark-runner`: `compile_test`'s own timing-report
+/// sibling, byte-for-byte the same shape — parses + checks `source`
+/// exactly like `compile`/`compile_test` do, then hands the result to
+/// `emerald_codegen::compile_benchmark_harness` (not `compile_test_
+/// harness`) and links the result. Returns the number of `benchmark`
+/// blocks found.
+pub fn compile_benchmark(
+  source: &str,
+  name: &str,
+  output_path: &Path,
+) -> Result<usize, DriverError> {
+  let obj_path = std::env::temp_dir().join(obj_file_name("emerald_benchmark"));
+  let output_path = output_path.to_path_buf();
+  let pipeline = parse_stage(source.to_string(), name.to_string())
+    .flat_map(check_stage)
+    .flat_map(move |program| codegen_benchmark_stage(program, obj_path))
+    .flat_map(move |(obj_path, count)| {
+      let output_path = output_path.clone();
+      link_stage(obj_path, output_path).flat_map(move |()| {
+        Effect::new(move |_env: &mut ()| -> Result<usize, DriverError> { Ok(count) })
+      })
+    });
+  run_blocking(pipeline, ())
+}
+
+fn codegen_benchmark_stage(
+  program: Program,
+  obj_path: PathBuf,
+) -> Effect<(PathBuf, usize), DriverError, ()> {
+  Effect::new(move |_env: &mut ()| {
+    emerald_codegen::compile_benchmark_harness(&program, &obj_path)
+      .map(|count| (obj_path.clone(), count))
+      .map_err(DriverError::Codegen)
+  })
+}
+
 /// Plan 21's `leaf-symbol-table`: parses `source` and returns
 /// `emerald_sema::collect_symbols`'s best-effort table — sitting
 /// alongside `check`/`compile`, reusing the existing `DriverError::

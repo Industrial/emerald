@@ -20,9 +20,9 @@
 //! change for well-typed Emerald programs.
 
 use emerald_parser::{
-  CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
-  Function as AstFunction, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned,
-  Stmt, StringPart, TypeExpr, TypeParam,
+  CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr, ExternBlock,
+  ExternFn, Function as AstFunction, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause,
+  Spanned, Stmt, StringPart, TypeExpr, TypeParam,
 };
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
@@ -908,7 +908,9 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
         }
       }
       Item::Stmt(s) => collect_typenames_in_stmt(s, &mut out),
-      Item::Test { body, .. } => {
+      // Plan 80: `property`/`benchmark` bodies get the identical walk
+      // `test` bodies already get — same AST shape.
+      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
         for s in body {
           collect_typenames_in_stmt(s, &mut out);
         }
@@ -1766,8 +1768,10 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
       // prologue desugars every `Item::Test` into an `Item::Function`
       // before this runs — handled anyway, the same way a function
       // body is, for robustness against any future caller that skips
-      // that prologue.
-      Item::Test { body, .. } => {
+      // that prologue. Plan 80: `property`/`benchmark` bodies get the
+      // identical treatment — same AST shape, same never-reached-in-
+      // practice reasoning.
+      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
         for s in body {
           collect_symbols_in_stmt(s, &mut table);
         }
@@ -15261,8 +15265,12 @@ fn declare_user_functions<'ctx>(
       Item::Require(_) => {}
       // Plan 47: never actually reached — `compile_to_object`'s own
       // prologue rejects any `Program` still containing an
-      // `Item::Test` before this runs at all.
-      Item::Test { .. } => {}
+      // `Item::Test` before this runs at all. Plan 80: `Item::
+      // Property`/`Item::Benchmark` get the identical rejection (see
+      // that prologue check) and are always stripped by `compile_
+      // test_harness`/`compile_benchmark_harness` before this ever
+      // runs, same as `Item::Test`.
+      Item::Test { .. } | Item::Property { .. } | Item::Benchmark { .. } => {}
       // Plan 52: pure data — no function body to declare an LLVM
       // symbol for.
       Item::Enum(_) => {}
@@ -15808,10 +15816,20 @@ fn compile_to_object_impl(
   // Plan 47's Decision log: a `test "..." do ... end` block only ever
   // compiles through `compile_test_harness` (`emerald test`) — reaching
   // this, the ordinary `emerald <file>`/`emerald build` path, is a
-  // real, described rejection, not a silent no-op or panic.
-  if program.items.iter().any(|i| matches!(i, Item::Test { .. })) {
+  // real, described rejection, not a silent no-op or panic. Plan 80:
+  // `property "..." do ... end` gets the identical rejection (it
+  // compiles through the same `compile_test_harness`, under `emerald
+  // test`), and `benchmark "..." do ... end` gets its own analogous
+  // rejection (`compile_benchmark_harness`, under `emerald benchmark`).
+  if program.items.iter().any(|i| {
+    matches!(
+      i,
+      Item::Test { .. } | Item::Property { .. } | Item::Benchmark { .. }
+    )
+  }) {
     return Err(
-      "top-level test block only valid under `emerald test`, not an ordinary compile".to_string(),
+      "top-level test/property/benchmark block only valid under `emerald test`/`emerald benchmark`, not an ordinary compile"
+        .to_string(),
     );
   }
   let mut items = program.items.clone();
@@ -16706,8 +16724,10 @@ fn compile_to_object_impl(
       }
       // Plan 47: never actually reached — `compile_to_object`'s own
       // prologue rejects any `Program` still containing an
-      // `Item::Test` before this runs at all.
-      Item::Test { .. } => {}
+      // `Item::Test` before this runs at all. Plan 80: `Item::
+      // Property`/`Item::Benchmark` mirror the identical rejection and
+      // stripping — see `declare_user_functions`'s matching arm.
+      Item::Test { .. } | Item::Property { .. } | Item::Benchmark { .. } => {}
       // Plan 52: pure data — no function body to compile.
       Item::Enum(_) => {}
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
@@ -16893,7 +16913,17 @@ fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
         }
       }
       Item::Stmt(s) => desugar_asserts_in_stmt(s, &mut rewrote),
-      Item::Test { body, .. } => desugar_asserts_in_stmts(body, &mut rewrote),
+      // Plan 80: `property`/`benchmark` bodies get the identical
+      // `assert`/`assert_eq` desugaring `test` bodies already get —
+      // same AST shape. Dead code in practice for all three by the
+      // time this runs (`compile_test_harness`/`compile_benchmark_
+      // harness` both strip their own `Item` variant into synthetic
+      // `Item::Function`s before ever calling `compile_to_object`,
+      // exactly like `Item::Test`'s own doc comment already notes) —
+      // kept for match exhaustiveness and defense in depth.
+      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
+        desugar_asserts_in_stmts(body, &mut rewrote)
+      }
       // Plan 52: pure data — no `assert`/`assert_eq` site can appear
       // inside an `Item::Enum`.
       Item::Enum(_) => {}
@@ -17351,12 +17381,23 @@ pub fn ensure_pre_sema_exception_classes(items: &mut Vec<Item>) {
 /// instead of adding any new LLVM-emitting code. The whole synthesized
 /// program is then compiled by the ordinary, unmodified
 /// `compile_to_object` — this function never touches LLVM directly.
+///
+/// Plan 80's Decision log: `Item::Property` blocks are collected into
+/// the exact same `tests` list, indistinguishable from an `Item::Test`
+/// from this point on — this IS the real, disclosed scope of
+/// `property` today (see `Item::Property`'s own doc comment): a
+/// `property` block runs its body exactly once, through this identical
+/// pass/fail mechanism, not across many generated inputs. Real
+/// property-based testing (input generation, shrinking) is not
+/// implemented here.
 pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize, String> {
   let tests: Vec<(String, Vec<Spanned<Stmt>>)> = program
     .items
     .iter()
     .filter_map(|it| match it {
-      Item::Test { description, body } => Some((description.clone(), body.clone())),
+      Item::Test { description, body } | Item::Property { description, body } => {
+        Some((description.clone(), body.clone()))
+      }
       _ => None,
     })
     .collect();
@@ -17365,7 +17406,7 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
   let mut items: Vec<Item> = program
     .items
     .iter()
-    .filter(|it| !matches!(it, Item::Test { .. }))
+    .filter(|it| !matches!(it, Item::Test { .. } | Item::Property { .. }))
     .cloned()
     .collect();
 
@@ -17480,6 +17521,120 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
   let owned_program = Program { items };
   compile_to_object(&owned_program, out_path)?;
   Ok(num_tests)
+}
+
+/// Plan 80's `leaf-benchmark-runner`: `compile_test_harness`'s own
+/// timing-report sibling, not a fork of it — same "synthesize a
+/// harness `Program`, compile it through the ordinary, unmodified
+/// `compile_to_object`" shape, same never-reachable-outside-this-path
+/// restriction (see `compile_to_object_impl`'s own prologue rejection).
+/// Every `Item::Benchmark` body becomes its own top-level `Item::
+/// Function` (`__emerald_benchmark_N`), timed by two calls to a
+/// synthetic `extern "C" fn emerald_bench_now_seconds(): Float64`
+/// (declared here, injected as a fresh `Item::Extern` block — the same
+/// general FFI mechanism plan 59 already built for arbitrary `extern
+/// "C"` declarations, reused rather than adding a new codegen-level
+/// builtin/intrinsic) bracketing the call, printing `BENCHMARK:
+/// <description>` followed by the elapsed CPU-time delta in seconds.
+///
+/// CPU time, not wall clock — `runtime/emerald_runtime.c`'s own
+/// `emerald_bench_now_seconds` uses ISO C89 `clock()`, matching
+/// `benchmarks/REPORT.md`'s own existing methodology ("Run time is CPU
+/// time (user+sys), not wall clock"), which the project's `run_
+/// benchmarks.py` driver already measures via `RUSAGE_CHILDREN` deltas
+/// around each external subprocess — this keeps that same choice of
+/// clock, just measured from inside the compiled program itself rather
+/// than by an external host-side wrapper, since a single `emerald
+/// benchmark <file>.em` run can contain more than one `benchmark`
+/// block and each needs its own separate delta.
+///
+/// A real, disclosed simplification: this runs each `benchmark`
+/// block's body exactly ONCE, not the many-iterations-with-statistics
+/// (mean/min/max/stddev) methodology `benchmarks/run_benchmarks.py`
+/// itself uses — a single-run CPU-time report, not a rigorous
+/// statistical benchmark harness. A benchmark author who wants
+/// multiple-iteration averaging can write their own loop inside the
+/// block; this harness does not loop on their behalf.
+pub fn compile_benchmark_harness(program: &Program, out_path: &Path) -> Result<usize, String> {
+  const BENCH_CLOCK_FN: &str = "emerald_bench_now_seconds";
+
+  let benchmarks: Vec<(String, Vec<Spanned<Stmt>>)> = program
+    .items
+    .iter()
+    .filter_map(|it| match it {
+      Item::Benchmark { description, body } => Some((description.clone(), body.clone())),
+      _ => None,
+    })
+    .collect();
+  let num_benchmarks = benchmarks.len();
+
+  let mut items: Vec<Item> = program
+    .items
+    .iter()
+    .filter(|it| !matches!(it, Item::Benchmark { .. }))
+    .cloned()
+    .collect();
+
+  items.push(Item::Extern(ExternBlock {
+    abi: "C".to_string(),
+    fns: vec![ExternFn {
+      name: BENCH_CLOCK_FN.to_string(),
+      params: Vec::new(),
+      return_type: TypeExpr::Named("Float64".to_string()),
+    }],
+  }));
+
+  let mut harness_stmts = Vec::new();
+
+  for (i, (description, body)) in benchmarks.into_iter().enumerate() {
+    let fn_name = format!("__emerald_benchmark_{i}");
+    items.push(Item::Function(AstFunction {
+      name: fn_name.clone(),
+      params: Vec::new(),
+      return_type: TypeExpr::Named("Void".to_string()),
+      body,
+      block_param: None,
+      splat_param: None,
+      type_params: Vec::new(),
+      is_comptime: false,
+      requires: Vec::new(),
+      ensures: Vec::new(),
+      is_pure: false,
+    }));
+
+    let start_name = format!("__emerald_bench_start_{i}");
+    let end_name = format!("__emerald_bench_end_{i}");
+    harness_stmts.push(syn(Stmt::Let {
+      name: start_name.clone(),
+      ty: TypeExpr::Named("Float64".to_string()),
+      value: syn(Expr::Call(BENCH_CLOCK_FN.to_string(), Vec::new())),
+      is_var: false,
+    }));
+    harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(fn_name, Vec::new())))));
+    harness_stmts.push(syn(Stmt::Let {
+      name: end_name.clone(),
+      ty: TypeExpr::Named("Float64".to_string()),
+      value: syn(Expr::Call(BENCH_CLOCK_FN.to_string(), Vec::new())),
+      is_var: false,
+    }));
+    harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(
+      "puts".to_string(),
+      vec![syn(Expr::StringLit(format!("BENCHMARK: {description}")))],
+    )))));
+    harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(
+      "puts".to_string(),
+      vec![syn(Expr::Sub(
+        Box::new(syn(Expr::Ident(end_name))),
+        Box::new(syn(Expr::Ident(start_name))),
+      ))],
+    )))));
+  }
+
+  items.extend(harness_stmts.into_iter().map(Item::Stmt));
+
+  let owned_program = Program { items };
+  compile_to_object(&owned_program, out_path)?;
+  Ok(num_benchmarks)
 }
 
 #[cfg(test)]

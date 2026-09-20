@@ -162,7 +162,12 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
       }
       Item::Interface(_) | Item::Require(_) | Item::Error | Item::Enum(_) | Item::Extern(_) => {}
       Item::Stmt(s) => rewrite_stmt(s, name, source),
-      Item::Test { body, .. } => rewrite_stmts(body, name, source),
+      // Plan 80: `property`/`benchmark` bodies get the identical
+      // whole-body walk `test` already gets — same AST shape, same
+      // `assert`/`assert_eq` desugaring target.
+      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
+        rewrite_stmts(body, name, source)
+      }
     }
   }
 }

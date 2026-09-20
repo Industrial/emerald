@@ -4,8 +4,13 @@ Every `.em` file here is real, working Emerald source, compiled with
 `emerald-cli`, run, and checked against its exact stdout — durably
 re-verified by `crates/emerald-cli/tests/examples.rs` (`cargo test -p
 emerald-cli --test examples`) on every CI run, not just by hand at
-authoring time. `test_framework.em` is the one exception (see below)
-and is instead verified by `crates/emerald-cli/tests/test_subcommand.rs`.
+authoring time. `test_framework.em`, `property_test.em`, and
+`benchmark_example.em` are the exceptions (see below) — none of the
+three can run through the ordinary `emerald <file>` compile path (it
+rejects a `Program` containing a `test`/`property`/`benchmark` block),
+so all three are instead verified by
+`crates/emerald-cli/tests/test_subcommand.rs`, via `emerald
+test`/`emerald benchmark`.
 
 ```bash
 cargo run -p emerald-cli -- examples/<file>.em -o /tmp/out && /tmp/out
@@ -32,6 +37,8 @@ cargo run -p emerald-cli -- examples/<file>.em -o /tmp/out && /tmp/out
 | `strings.em` | `"...#{expr}..."` interpolation, `String` intrinsics (`.strip`/`.upcase`/`.downcase`/`.length`/`.split_count`/`.to_i`/`.to_f`) | see test |
 | `nullable_safe_nav.em` | `Option[T]`/`Some`/`None`, `obj?.method` safe navigation, `match` | `1`, `0` |
 | `test_framework.em` | `test "..." do ... end`, `assert_eq` — run via `emerald test examples/test_framework.em`, **not** the ordinary compile path (which rejects a `Program` containing a `test` block) | `PASS`/`FAIL`/pass-fail counts, exit 1 (one test is deliberately broken, matching the plan record's own worked example) |
+| `property_test.em` | `property "..." do ... end` (plan 80) — run via `emerald test examples/property_test.em` (or the identical `emerald property` alias); parses/type-checks/compiles exactly like `test`, real, disclosed simplification: runs its body once, not across generated inputs (no input generation/shrinking exists) | `PASS`/`PASS`/pass-fail counts, exit 0 |
+| `benchmark_example.em` | `benchmark "..." do ... end` (plan 80) — run via `emerald benchmark examples/benchmark_example.em`, **not** the ordinary compile path (identical rejection to `test`); measures CPU time (`clock()`) around each block via a synthetic `extern "C"` timing call | computed values (`210000000`, `1000000`) each followed by a `BENCHMARK: <description>` line and an elapsed-seconds `Float64` — the first block's elapsed time is near-instant (LLVM constant-folds it, a real, disclosed limitation matching `benchmarks/REPORT.md`'s own Headline §3), the second's is real, measured, non-instant (heap allocation defeats folding) |
 | `generic_classes.em` | `class Stack[T]`, user-declared generic classes, monomorphized per instantiation (`Stack[Int64]` and `Stack[String]` in one program) | `30`, `20`, `second`, `first` — all 4 lines; the previously-noted "4th line silently dropped" bug was investigated and found not to be a compiler defect (see "Real bugs found") |
 | `c_ffi.em` | `unsafe extern "C" { fn ... }`, calling real libc (`llabs`, `strlen`, `strstr`), `CString`/`String.from_cstring` | `42`, `5`, `world`, `not found` — all 4 lines; the safe-navigation bug previously noted below was fixed (see "Real bugs found") |
 | `counter_actor.em` | `actor Counter`, fields, `.initialize`, ordinary methods on an actor — a shared library file, not run standalone (declares the class only, no top-level statements) | n/a — imported by `host.em`/`client.em` |

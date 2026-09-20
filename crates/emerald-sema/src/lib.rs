@@ -1276,7 +1276,9 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
         }
       }
       Item::Stmt(s) => collect_typenames_in_stmt(s, &mut out),
-      Item::Test { body, .. } => {
+      // Plan 80: `property`/`benchmark` bodies get the identical walk
+      // `test` bodies already get — same AST shape.
+      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
         for s in body {
           collect_typenames_in_stmt(s, &mut out);
         }
@@ -9037,7 +9039,9 @@ fn check_block_call_sites(
       Item::Require(_) => {}
       // Plan 47: a `test` body is checked exactly like a free
       // function's — it can contain a block-attaching call site too.
-      Item::Test { body, .. } => {
+      // Plan 80: `property`/`benchmark` bodies get the identical
+      // treatment — same AST shape as `test`, same check.
+      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
         scan_block_call_sites(body, sigs, classes, func_defs, gctx, &mut diags)
       }
       // Plan 52: an enum is pure data — no method bodies, no block
@@ -10098,7 +10102,14 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // `Void`-return, no-`self`-fields scope — the exact same shape
       // `check_function_body` already gives a free function, so this
       // just synthesizes one rather than duplicating that logic.
-      Item::Test { body, .. } => {
+      // Plan 80: `property`/`benchmark` bodies get the identical
+      // synthetic-function treatment — same AST shape as `test`, same
+      // check. `property`'s own real, disclosed scope narrowing (it
+      // runs its body once, like an ordinary `test`, not across many
+      // generated inputs) lives in `emerald_codegen::compile_test_
+      // harness`'s doc comment, not here — sema treats all three
+      // identically.
+      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
         let synthetic = Function {
           name: "test".to_string(),
           params: Vec::new(),

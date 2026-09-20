@@ -114,6 +114,167 @@ fn a_type_error_is_rejected_before_ever_attempting_the_test_harness() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
+// Plan 80 (property-and-benchmark-test-syntax).
+
+#[test]
+fn property_block_runs_and_asserts_exactly_like_a_test_block() {
+  // `property "..." do ... end` is real, disclosed syntactic sugar for
+  // a single-input `test` (see `Item::Property`'s own doc comment) —
+  // this proves it actually runs through `emerald test`'s real,
+  // compiled harness, not just that it parses/type-checks.
+  let dir = fresh_dir("property-block");
+  let path = dir.join("prop_test.em");
+  std::fs::write(
+    &path,
+    "property \"addition is commutative\" do\n  a: Int64 = 3\n  b: Int64 = 4\n  assert_eq(a + b, b + a)\nend\n\nproperty \"broken on purpose\" do\n  assert_eq(1, 2)\nend\n",
+  )
+  .unwrap();
+
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("test")
+    .arg("prop_test.em")
+    .current_dir(&dir)
+    .output()
+    .unwrap();
+
+  assert_eq!(
+    String::from_utf8_lossy(&output.stdout),
+    "PASS: addition is commutative\nexpected:\n1\nbut got:\n2\nFAIL: broken on purpose: prop_test.em:8\npassed:\n1\nfailed:\n1\n"
+  );
+  assert_eq!(output.status.code(), Some(1));
+
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn emerald_property_subcommand_is_a_real_alias_for_emerald_test() {
+  let dir = fresh_dir("property-subcommand");
+  let path = dir.join("prop_alias.em");
+  std::fs::write(&path, "property \"one\" do\n  assert(true)\nend\n").unwrap();
+
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("property")
+    .arg(&path)
+    .output()
+    .unwrap();
+
+  assert_eq!(
+    String::from_utf8_lossy(&output.stdout),
+    "PASS: one\npassed:\n1\nfailed:\n0\n"
+  );
+  assert_eq!(output.status.code(), Some(0));
+
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn examples_property_test_em_matches_the_documented_transcript() {
+  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("test")
+    .arg("examples/property_test.em")
+    .current_dir(&root)
+    .output()
+    .unwrap();
+
+  assert_eq!(
+    String::from_utf8_lossy(&output.stdout),
+    "PASS: sorting an array preserves its element sum\nPASS: addition is commutative for a fixed pair of integers\npassed:\n2\nfailed:\n0\n"
+  );
+  assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn benchmark_block_compiles_and_reports_a_real_elapsed_time() {
+  // A real, executed proof that `emerald benchmark` actually measures
+  // and reports timing for a genuine workload — not just that it
+  // parses/type-checks. Asserts on the STRUCTURE of the report (two
+  // lines per benchmark: `BENCHMARK: <description>` then a parseable
+  // `Float64` elapsed-seconds value), not an exact number, since wall/
+  // CPU time is inherently machine-dependent.
+  let dir = fresh_dir("benchmark-block");
+  let path = dir.join("bench.em");
+  std::fs::write(
+    &path,
+    "benchmark \"trivial addition\" do\n  x: Int64 = 1 + 1\n  puts x\nend\n",
+  )
+  .unwrap();
+
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("benchmark")
+    .arg(&path)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{output:?}");
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let lines: Vec<&str> = stdout.lines().collect();
+  assert_eq!(lines.len(), 3, "{stdout:?}");
+  assert_eq!(lines[0], "2");
+  assert_eq!(lines[1], "BENCHMARK: trivial addition");
+  lines[2].parse::<f64>().unwrap_or_else(|e| {
+    panic!(
+      "elapsed-time line `{}` should parse as a Float64: {e}",
+      lines[2]
+    )
+  });
+
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn examples_benchmark_example_em_reports_two_real_benchmarks() {
+  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("benchmark")
+    .arg("examples/benchmark_example.em")
+    .current_dir(&root)
+    .output()
+    .unwrap();
+
+  assert!(output.status.success(), "{output:?}");
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let lines: Vec<&str> = stdout.lines().collect();
+  assert_eq!(lines.len(), 6, "{stdout:?}");
+  assert_eq!(lines[0], "210000000");
+  assert_eq!(
+    lines[1],
+    "BENCHMARK: traversing a 20-element array one million times"
+  );
+  lines[2].parse::<f64>().unwrap();
+  assert_eq!(lines[3], "1000000");
+  assert_eq!(
+    lines[4],
+    "BENCHMARK: allocating and summing a 20-element array one million times"
+  );
+  lines[5].parse::<f64>().unwrap();
+}
+
+#[test]
+fn compiling_a_benchmark_block_via_the_ordinary_path_is_a_described_rejection() {
+  let dir = fresh_dir("benchmark-ordinary-path-rejection");
+  let path = dir.join("bench.em");
+  std::fs::write(&path, "benchmark \"x\" do\n  puts 1\nend\n").unwrap();
+  let out_bin = dir.join("out");
+
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg(&path)
+    .arg("-o")
+    .arg(&out_bin)
+    .output()
+    .unwrap();
+
+  assert!(!output.status.success());
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("only valid under `emerald test`/`emerald benchmark`"),
+    "{stderr}"
+  );
+  assert!(!out_bin.exists());
+
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn compiling_the_same_file_via_the_ordinary_path_is_a_described_rejection() {
   let dir = fresh_dir("ordinary-path-rejection");

@@ -10,6 +10,7 @@
 //! invocation (no `emerald.toml` involved) keeps working unchanged for
 //! any other `args[1]`.
 
+mod bench_runner;
 mod deps;
 mod lockfile;
 mod manifest;
@@ -121,6 +122,17 @@ fn main() {
     }
     Some("run") => cmd_run(&args),
     Some("test") => test_runner::run(&args),
+    // Plan 80's Decision log: `property "..." do ... end` compiles and
+    // runs through the exact same `test_runner`/`compile_test_harness`
+    // mechanism `test` blocks already use (see `Item::Property`'s own
+    // doc comment) — a real, disclosed simplification (a `property`
+    // block runs its body once, not across many generated inputs), not
+    // a separate pipeline. `emerald property <file>.em` is offered
+    // alongside `emerald test <file>.em` purely for naming ergonomics
+    // on a file that only declares `property` blocks; both subcommands
+    // are byte-for-byte the same code path.
+    Some("property") => test_runner::run(&args),
+    Some("benchmark") => bench_runner::run(&args),
     Some("repl") => repl::run(&args),
     Some("update") => {
       eprintln!(

@@ -1176,6 +1176,43 @@ pub enum Item {
     description: String,
     body: Vec<Spanned<Stmt>>,
   },
+  /// `property "description" do ... end` (plan 80's Decision log,
+  /// `history/2026-09-08T174011Z-plan-of-plans.md` row 80) — parses and
+  /// type-checks identically to `Item::Test` (same `description`/`body`
+  /// shape, checked by the exact same `emerald-sema` code path). A
+  /// REAL, DISCLOSED SIMPLIFICATION, not full property-based testing:
+  /// Sable's own design brief (`history/2026-09-19T100000Z-sable-
+  /// design-brief.md` §37) names `property "..." do ... end` alongside
+  /// `test`/`benchmark` but says "the exact test API remains open" —
+  /// it gives no generation/shrinking strategy, and building a real
+  /// QuickCheck/proptest-style input generator is a separate, much
+  /// larger research problem this plan explicitly declines to attempt.
+  /// `emerald_codegen::compile_test_harness` runs a `property` block's
+  /// body exactly ONCE, through the identical `begin ... rescue
+  /// AssertionError => e ... end` pass/fail mechanism a `test` block
+  /// gets — today, `property` is syntactic sugar for a single-input
+  /// test, not generative testing across many random inputs. That gap
+  /// is left open for future work, not silently pretended away.
+  Property {
+    description: String,
+    body: Vec<Spanned<Stmt>>,
+  },
+  /// `benchmark "description" do ... end` (plan 80's Decision log) —
+  /// same grammar/AST shape as `Item::Test`/`Item::Property` (a
+  /// deliberate, narrow reuse, not a new mechanism), but codegen wraps
+  /// `body` differently: `emerald_codegen::compile_benchmark_harness`
+  /// times each block's execution (CPU time, via a synthetic `extern
+  /// "C" fn emerald_bench_now_seconds(): Float64` call injected around
+  /// the body — matching `benchmarks/REPORT.md`'s own existing
+  /// methodology, which measures CPU time via `RUSAGE_CHILDREN`
+  /// deltas, not wall clock) rather than asserting pass/fail. Reachable
+  /// only via the `emerald benchmark <file>.em` CLI subcommand, never
+  /// the ordinary `emerald <file>` compile path (mirrors `Item::Test`'s
+  /// identical restriction).
+  Benchmark {
+    description: String,
+    body: Vec<Spanned<Stmt>>,
+  },
   /// A top-level construct LALRPOP's `!` error-recovery mechanism
   /// resynchronized past (plan 26's Decision log) — a real parse error
   /// was recorded for it. Never appears in a `Program` `parse`/

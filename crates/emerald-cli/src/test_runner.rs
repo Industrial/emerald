@@ -3,13 +3,22 @@
 //! parse-then-check gate the ordinary `emerald <file>` path uses
 //! before ever attempting `compile_test_harness`), then runs the
 //! produced binary and propagates its exit code unchanged.
+//!
+//! Plan 80's Decision log: also reached, unchanged, as `emerald
+//! property <file>` — `main.rs` routes both subcommand names here
+//! (see its own doc comment on that dispatch arm) since `property`
+//! compiles through this exact same `compile_test_harness` mechanism,
+//! not a separate one. `args[1]` (not a hardcoded `"test"`) is what the
+//! usage message below names, so it reads correctly under either
+//! invocation.
 
 use std::path::Path;
 use std::process::{self, Command};
 
 pub fn run(args: &[String]) {
+  let command = args.get(1).map(String::as_str).unwrap_or("test");
   let Some(source_path) = args.get(2) else {
-    eprintln!("usage: emerald test <file.em>");
+    eprintln!("usage: emerald {command} <file.em>");
     process::exit(2);
   };
 

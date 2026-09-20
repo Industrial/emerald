@@ -65,6 +65,12 @@ Item: Item = {
   // general `{ |params| body }` block syntax, which explicitly
   // declined a `do...end` form.
   "test" <description:StringLitTok> "do" <body:Stmt*> "end" => Item::Test { description, body },
+  // Plan 80's Decision log: `property`/`benchmark` reuse `test`'s own
+  // narrow production shape verbatim (a real, new "do" terminal per
+  // keyword is unnecessary — `"do"`/`"end"` are already shared
+  // terminals) — not a new grammar mechanism.
+  "property" <description:StringLitTok> "do" <body:Stmt*> "end" => Item::Property { description, body },
+  "benchmark" <description:StringLitTok> "do" <body:Stmt*> "end" => Item::Benchmark { description, body },
   ! => { errors.push(<>); Item::Error },
 };
 
