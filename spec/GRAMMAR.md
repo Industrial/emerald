@@ -345,6 +345,33 @@ puts add(3, 5)
 
 ---
 
+## 15. Domain Types (`newtype`)
+
+Not part of Ruby's own grammar (Ruby has no zero-cost nominal-wrapper
+construct) — a real, disclosed addition beyond this document's own
+"inventory of Ruby's syntax" framing, exactly like `require`/`import`/
+`export` in §14 above. Added by `domain-types-and-units` (plan-of-plans
+row 81), resolving the OPEN, undecided "type aliases and newtypes"
+question the Sable design brief (`history/2026-09-19T100000Z-sable-
+design-brief.md`) explicitly left unfinalized ("How can Sable make
+domain types easy to create without introducing unnecessary
+boilerplate?").
+
+| Form | Status | Emerald form / reason |
+|---|---|---|
+| `newtype Name: Underlying` | KEEP (plan `domain-types-and-units`) | A one-line declaration, no trailing `end` (the same shape `enum Name = ...` already has) — a real, checked, NOMINALLY DISTINCT wrapper around exactly one existing PRIMITIVE type (`Int64`/`Float64`/`String`/`Boolean`/`Symbol` only — a `Class`/`Enum`/`Array`/... underlying type is a real, named `emerald-sema` registration-time diagnostic, not a parse error). Deliberately its own keyword — not `class`, not `struct` (`class` is heap/arena-allocated, plan 50/51's mechanism; `struct` is reserved by §8 above for a different, not-yet-implemented future feature) — so it reads as visually and conceptually distinct from either at a glance. `Name` and `Underlying` share no implicit conversion in either direction: constructing one is always the explicit `Name.new(<underlying value>)`, and unwrapping is always the explicit `.value` — see `TYPE_SYSTEM.md` §9 for the full typing rule and the zero-cost representation guarantee. |
+| Operator overloading on a `newtype` (`Meters + Meters -> Meters`) | DECLINED (this pass) | A real, disclosed decline, not a silent gap: `class`'s existing operator-overloading mechanism (`examples/operator_overloading.em`) compiles every method — including an operator like `fn +`/`fn ==` — with a leading `self` POINTER parameter, because a class instance is always heap/arena-allocated. A `newtype` value has NO pointer at all (that is the entire point of it being zero-cost) — extending operator overloading to it would need a second, genuinely new by-value calling convention for `self`, plus a method-body grammar production `NewtypeDef` doesn't have at all today (`newtype`'s one-line form has no `do ... end` body). That is new machinery, not a small extension of the existing mechanism, so it is explicitly out of scope here rather than attempted half-working. |
+
+**Example (KEEP: a domain type, construct/unwrap round trip):**
+```ruby
+newtype Meters: Float64
+
+d: Meters = Meters.new(100.0)
+puts d.value
+```
+
+---
+
 ## Cross-references
 
 - Every `UNDECIDED` row above is answered, deferred, or locked in

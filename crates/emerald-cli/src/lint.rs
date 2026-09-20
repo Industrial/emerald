@@ -659,6 +659,7 @@ fn lint_program(program: &Program, source: &str) -> Vec<Finding> {
       Item::Interface(_)
       | Item::Extern(_)
       | Item::Enum(_)
+      | Item::Newtype(_)
       | Item::Require(_)
       | Item::Import { .. }
       | Item::Stmt(_)

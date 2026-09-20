@@ -30,8 +30,8 @@ mod interpolate;
 
 pub use ast::{
   expand_derives, ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef,
-  EnumVariant, Expr, ExternBlock, ExternFn, Function, InterfaceDef, Item, ModuleDef, Param,
-  Program, RescueClause, Spanned, Stmt, StringPart, TypeExpr, TypeParam,
+  EnumVariant, Expr, ExternBlock, ExternFn, Function, InterfaceDef, Item, ModuleDef, NewtypeDef,
+  Param, Program, RescueClause, Spanned, Stmt, StringPart, TypeExpr, TypeParam,
 };
 
 /// A parse failure, carrying enough of `lalrpop_util::ParseError`'s own
@@ -257,7 +257,12 @@ fn rewrite_assert_locations(items: &mut [Item], name: &str, source: &str) {
           rewrite_stmts(&mut m.body, name, source);
         }
       }
-      Item::Interface(_) | Item::Require(_) | Item::Error | Item::Enum(_) | Item::Extern(_) => {}
+      Item::Interface(_)
+      | Item::Require(_)
+      | Item::Error
+      | Item::Enum(_)
+      | Item::Newtype(_)
+      | Item::Extern(_) => {}
       // Plan 76: an exported declaration is rewritten identically to a
       // non-exported one — `export` is a visibility concern only, not
       // a different declaration shape.

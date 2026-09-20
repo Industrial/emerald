@@ -1144,6 +1144,41 @@ pub struct EnumDef {
   pub doc: Option<String>,
 }
 
+/// `newtype Meters: Float64` (Sable design brief's own "type aliases and
+/// newtypes" section, `history/2026-09-19T100000Z-sable-design-brief.md`
+/// — explicitly left open/undecided there; the concrete design decision
+/// is made here). A ZERO-COST, nominally distinct wrapper around exactly
+/// one existing PRIMITIVE type — `emerald-sema` resolves `underlying`
+/// and rejects anything other than `Int64`/`Float64`/`String`/`Boolean`/
+/// `Symbol` (a `Class`/`Enum`/`Array`/... underlying type is a real,
+/// disclosed registration-time diagnostic, not silently accepted): those
+/// already have their own representation strategy (`class` is heap/
+/// arena-allocated, plan 50/51's mechanism), and this construct exists
+/// specifically to give unit-safety with NO allocation and NO extra
+/// representation — see `emerald_codegen`'s own doc comment on newtype
+/// lowering for the proof. Deliberately its OWN keyword — not `class`,
+/// not `struct` — so it reads as visually and conceptually distinct from
+/// the heap-allocated mechanism at a glance. A one-line declaration, no
+/// trailing `end`, the same "no block needed" shape `EnumDef` already
+/// has. Construction is `Meters.new(5.0)` — reuses `Expr::New` verbatim
+/// (no grammar change: `<recv:Ident> "." "new" "(" <args:Args> ")"` is
+/// already general over any identifier, so a newtype's name parses
+/// exactly like a class name); `emerald-sema` requires the single
+/// argument's type to match `underlying` EXACTLY, rejecting an implicit
+/// bare-primitive-to-newtype conversion, which is the entire point.
+/// Unwrapping is `.value` — an ordinary zero-arg `MethodCall` dispatch,
+/// checked by `emerald-sema` and compiled by `emerald-codegen` as a pure
+/// type-level identity (the wrapped value's own bits, unchanged).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewtypeDef {
+  pub name: String,
+  pub underlying: TypeExpr,
+  /// Plan 77's Decision log — see `Function.doc`'s own doc comment for
+  /// the full rule; identical here, keyed off the `"newtype"` keyword's
+  /// own position.
+  pub doc: Option<String>,
+}
+
 /// `actor Counter ... end` (plan 54's Decision log) — a flat,
 /// non-inheriting top-level declaration reusing `ClassDef`'s own field/
 /// method syntax verbatim, its own struct rather than `ClassDef` plus a
@@ -1177,6 +1212,10 @@ pub enum Item {
   Actor(ActorDef),
   /// `enum Shape = Circle(Float64) | ...` (plan 52's Decision log).
   Enum(EnumDef),
+  /// `newtype Meters: Float64` — see `NewtypeDef`'s own doc comment for
+  /// the full design (a zero-cost, nominally distinct wrapper around one
+  /// primitive type).
+  Newtype(NewtypeDef),
   /// `interface Comparable ... end` (plan 41's Decision log) — a
   /// general, user-declarable grammar production, not a fourth
   /// hardcoded builtin the way `Array`/`Hash`/`Proc` are.

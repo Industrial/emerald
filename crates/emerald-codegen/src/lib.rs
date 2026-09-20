@@ -89,6 +89,54 @@ enum ValKind {
 /// `ClassInfo` vs. `ClassLayout`).
 const NATIVE_GENERIC_NAMES: [&str; 4] = ["Array", "Hash", "Pair", "Result"];
 
+thread_local! {
+  /// `newtype Meters: Float64` — a deliberately narrow side channel for
+  /// exactly one purpose: `value_kind_for_type` below is a free function
+  /// with no `Ctx`/registry parameter at all, called from 40+ sites
+  /// across this file (function/method signatures, `ClassLayout` field
+  /// building, array-element-type inference, `Stmt::Let`/`bind_params`
+  /// local storage, ...) — many deeply nested with no `Ctx` in scope —
+  /// that must still resolve a newtype name to its own underlying
+  /// primitive's REAL storage kind. Without this, a `Meters`-typed
+  /// param/return/field/array-element would wrongly fall into this
+  /// function's generic `_ => ValKind::Ptr` bucket below, which is a
+  /// genuine miscompile (an LLVM function signature declaring `ptr` for
+  /// a value that's actually an `f64`), not just a missed optimization —
+  /// and would defeat the entire zero-cost claim `newtype` exists to
+  /// make. Threading a `&HashSet`/`&HashMap` parameter through all 40+
+  /// call sites (many of them free functions like `param_kinds`, called
+  /// from further call sites still, with no natural `Ctx` thread) was
+  /// judged not worth the blast radius for a single, narrowly-scoped
+  /// lookup; this thread-local is set EXACTLY ONCE per `compile_to_
+  /// object_impl` call, before any other codegen pass runs, and never
+  /// mutated again for the rest of that call — sound under this
+  /// backend's own pre-existing "one `Context`/compile pass per thread,
+  /// never shared" safety model (`Ctx::escape_stats`'s own doc comment
+  /// states the identical invariant for its `RefCell`, for the same
+  /// reason).
+  static NEWTYPE_UNDERLYING: RefCell<HashMap<String, TypeExpr>> = RefCell::new(HashMap::new());
+}
+
+/// Populates `NEWTYPE_UNDERLYING` for the current compile — see that
+/// thread-local's own doc comment. Called once, at the very top of
+/// `compile_to_object_impl`, from every entry point (`compile_to_
+/// object`/`_with_stats`/`_with_debug_info`/`_scoped`/`_with_target`
+/// all funnel through it) — a fresh `Program` compiled later in the
+/// SAME thread (e.g. `emerald-lsp`'s repeated live-typing checks)
+/// correctly overwrites rather than accumulates stale entries from a
+/// previous, unrelated compile.
+fn set_newtype_underlying(program: &Program) {
+  let map: HashMap<String, TypeExpr> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Newtype(n) => Some((n.name.clone(), n.underlying.clone())),
+      _ => None,
+    })
+    .collect();
+  NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
+}
+
 fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
   match ty {
     TypeExpr::Named(name) => match name.as_str() {
@@ -107,6 +155,17 @@ fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
       // Plan 59's Decision log: `CString` is stored identically to
       // `String` — a bare pointer, no new runtime representation.
       "CString" => ValKind::Str,
+      // `newtype Meters: Float64` — resolves to EXACTLY the underlying
+      // primitive's own storage kind (see `NEWTYPE_UNDERLYING`'s own
+      // doc comment for why this is a thread-local lookup rather than a
+      // threaded parameter). Checked before the generic `_ => ValKind::
+      // Ptr` catch-all immediately below, which would otherwise be
+      // silently, incorrectly wrong for a newtype name specifically
+      // (unlike a real class/enum name, for which `Ptr` IS correct).
+      other if NEWTYPE_UNDERLYING.with(|c| c.borrow().contains_key(other)) => {
+        let underlying = NEWTYPE_UNDERLYING.with(|c| c.borrow()[other].clone());
+        value_kind_for_type(&underlying)
+      }
       // Every other bare name (a class, an enum, a bound-less generic
       // type parameter's own placeholder) shares the generic `Ptr`
       // bucket.
@@ -938,7 +997,12 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
       // `Item::Import` before any `Program` reaches `emerald-codegen` —
       // the same "resolved away before codegen" precedent `Item::
       // Require` immediately below already has.
+      // A newtype's own `underlying` is always a plain primitive
+      // (enforced at `emerald-sema` registration time), never a generic
+      // instantiation — nothing to collect here, mirrors `Item::Enum`'s
+      // identical no-op arm.
       Item::Enum(_)
+      | Item::Newtype(_)
       | Item::Interface(_)
       | Item::Require(_)
       | Item::Import { .. }
@@ -1815,6 +1879,9 @@ fn collect_program_symbols(program: &Program) -> HashMap<String, i64> {
       // Plan 52: an enum's variant fields are raw `TypeName` strings —
       // no `Symbol` literal appears anywhere in an `Item::Enum` itself.
       Item::Enum(_) => {}
+      // A newtype's `underlying` is a bare `TypeExpr` too — no `Symbol`
+      // literal, no body, mirrors `Item::Enum`'s identical no-op arm.
+      Item::Newtype(_) => {}
       Item::Actor(a) => {
         for m in &a.methods {
           for s in &m.body {
@@ -3021,9 +3088,17 @@ fn prealloc_stack_objects<'ctx>(
     let class_name = new_let_classes
       .get(name)
       .expect("every non-escaping name came from collect_new_let_classes");
-    let layout = classes
-      .get(class_name)
-      .ok_or_else(|| format!("codegen: unknown class `{class_name}`"))?;
+    // A newtype's own `.new(...)` (`Meters.new(5.0)`) is never a real
+    // class — `class_name` simply isn't in `classes` (which only ever
+    // holds real `Item::Class` layouts). No allocation of ANY kind
+    // (stack or heap) is ever needed for it — a newtype has the
+    // identical LLVM representation as its own underlying primitive —
+    // so this is skipped here rather than erroring; the ordinary
+    // `Stmt::Let` -> `build_expr` fallthrough handles it directly (see
+    // `build_expr`'s own `Expr::New` newtype-construction arm).
+    let Some(layout) = classes.get(class_name) else {
+      continue;
+    };
     let alloca = builder
       .build_alloca(context.i8_type().array_type(layout.size as u32), name)
       .map_err(|e| e.to_string())?;
@@ -4600,6 +4675,19 @@ struct Ctx<'a, 'ctx> {
   /// binding, reused directly on every subsequent call to the SAME
   /// binding.
   generic_method_instances: &'a RefCell<HashMap<String, (FunctionValue<'ctx>, ValKind)>>,
+  /// Every declared `newtype`'s own name (`{"Meters", "Seconds", ...}`)
+  /// — built once from `program.items`, alongside `classes`/`enums`
+  /// above (this crate's own "no shared sema→codegen structure"
+  /// architecture: an independent re-derivation, not sema's `ClassInfo.
+  /// newtype_underlying`). `Expr::New`'s own newtype-construction arm
+  /// doesn't need this (a `class_name` absent from `ctx.classes` is
+  /// already unambiguous), but `Stmt::Let`'s `local_classes` bookkeeping
+  /// and `build_method_call`'s `.value` unwrap dispatch both do — a
+  /// newtype-typed local otherwise leaves no trace in `local_classes` at
+  /// all (unlike an enum/class/Pair/Hash-typed one), so `.value` would
+  /// have no way to recognize its own receiver as a newtype rather than
+  /// an ordinary (never-declared) method name on some other type.
+  newtypes: &'a HashSet<String>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -5632,7 +5720,20 @@ fn build_expr<'ctx>(
     // default: no separate `!=` overload token). Sema already rejects
     // any other `CompareOp` on a class operand, so reaching this arm
     // with one is an internal-error `Err`, not a panic.
-    Expr::Compare(lhs, op, rhs) if matches!(&lhs.node, Expr::Ident(name) if local_classes.contains_key(name)) =>
+    // `newtype Meters: Float64` — a newtype-typed operand is ALSO
+    // tracked in `local_classes` (see `Ctx::newtypes`'s own doc comment
+    // for why), but has no class `==` method to delegate to at all — it
+    // falls straight through to the ordinary, scalar `Expr::Compare` arm
+    // below instead, which compares by the receiver's own `ValKind`
+    // (exactly `Float64 == Float64` would, since a newtype IS its
+    // underlying primitive at this level). Excluded here explicitly
+    // rather than routed into `build_method_call`'s class-operator
+    // dispatch, which would otherwise fail with "newtype has no method
+    // `==`" for a comparison sema already accepts.
+    Expr::Compare(lhs, op, rhs)
+      if matches!(&lhs.node, Expr::Ident(name) if local_classes
+        .get(name)
+        .is_some_and(|c| !ctx.newtypes.contains(c))) =>
     {
       if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
         return Err(format!(
@@ -5941,6 +6042,24 @@ fn build_expr<'ctx>(
       }
       Ok((result, ret_kind))
     }
+    // `Meters.new(5.0)` — a newtype's own construction. Sema already
+    // guarantees `class_name` names either a real class or a real
+    // newtype whenever an `Expr::New` reaches here (nothing else is
+    // legal); a name absent from `ctx.classes` (which only ever holds
+    // real `Item::Class` layouts) can therefore only be a newtype.
+    // The whole point of `newtype` being zero-cost is that this
+    // compiles to EXACTLY the argument's own already-compiled value —
+    // no allocation, no wrapper struct, byte-identical to compiling
+    // the bare underlying expression alone.
+    Expr::New(class_name, args) if !ctx.classes.contains_key(class_name) => build_expr(
+      context,
+      builder,
+      &args[0],
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    ),
     Expr::New(class_name, args) => {
       let layout = ctx
         .classes
@@ -6886,6 +7005,31 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((loaded, kind));
     }
+  }
+
+  // `m.value` — a newtype's own unwrap accessor (see `Ctx::newtypes`'s
+  // own doc comment for why `local_classes` is what recognizes this
+  // receiver as a newtype). Zero-cost means this compiles to EXACTLY
+  // the receiver's own already-compiled value — no load through any
+  // wrapper, no offset, just `build_expr(recv)` returned unchanged,
+  // which is what makes `.value` a pure compile-time type-level
+  // identity rather than a real runtime operation.
+  if local_classes
+    .get(recv_name)
+    .is_some_and(|s| ctx.newtypes.contains(s))
+  {
+    if method != "value" {
+      return Err(format!("codegen: newtype has no method `{method}`"));
+    }
+    return build_expr(
+      context,
+      builder,
+      recv,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    );
   }
 
   // Plan 42 (enumerable stdlib): `each`/`map`/`select`/`filter`/
@@ -11777,7 +11921,17 @@ fn build_stmt<'a, 'ctx>(
       // like an ordinary one.
       if let Some(resolved) = resolve_local_class_name(ty, ctx.classes) {
         local_classes.insert(name.clone(), resolved);
-      } else if bare_ty == "Supervisor" || ctx.enums.contains_key(&bare_ty) {
+      } else if bare_ty == "Supervisor"
+        || ctx.enums.contains_key(&bare_ty)
+        // `newtype Meters: Float64` — a newtype-typed local otherwise
+        // leaves no trace in `local_classes` at all (it isn't a real
+        // `ctx.classes`/`ctx.enums` entry, unlike everything else this
+        // side-table already tracks) — recorded here the identical way
+        // `"Supervisor"`/an enum name already are, so `build_method_
+        // call`'s `.value` dispatch can recognize this receiver as a
+        // newtype rather than an ordinary (never-declared) method name.
+        || ctx.newtypes.contains(&bare_ty)
+      {
         local_classes.insert(name.clone(), bare_ty.clone());
       } else {
         // Plan 73: a generic-ENUM-instantiation-typed local (`Option[
@@ -13708,6 +13862,12 @@ fn bind_params<'ctx>(
   params: &[Param],
   param_offset: u32,
   classes: &HashMap<String, ClassLayout>,
+  // `newtype Meters: Float64` — see `Ctx::newtypes`'s own doc comment.
+  // A newtype-typed PARAMETER (`fn add(a: Meters, b: Meters): Meters`)
+  // needs the identical `local_classes` bookkeeping a newtype-typed
+  // `Let` local already gets, so `.value` can be called on it from
+  // inside the function body too.
+  newtypes: &HashSet<String>,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
@@ -13725,7 +13885,7 @@ fn bind_params<'ctx>(
       .map_err(|e| e.to_string())?;
     vars.insert(p.name.clone(), (alloca, kind));
     let p_ty_str = p.ty.to_string();
-    if classes.contains_key(&p_ty_str) {
+    if classes.contains_key(&p_ty_str) || newtypes.contains(&p_ty_str) {
       local_classes.insert(p.name.clone(), p_ty_str.clone());
     }
     // Plan 42 (enumerable stdlib): a `Pair[K, V]`-typed parameter
@@ -14021,6 +14181,7 @@ fn define_user_function<'ctx>(
     &effective_params(f),
     0,
     gen_ctx.classes,
+    gen_ctx.newtypes,
     &mut vars,
     &mut local_classes,
     &mut local_array_elem_types,
@@ -14124,6 +14285,7 @@ fn define_method<'ctx>(
     &m.params,
     1,
     gen_ctx.classes,
+    gen_ctx.newtypes,
     &mut vars,
     &mut local_classes,
     &mut local_array_elem_types,
@@ -14228,6 +14390,7 @@ fn define_lambda<'ctx>(
     params,
     1,
     gen_ctx.classes,
+    gen_ctx.newtypes,
     &mut vars,
     &mut local_classes,
     &mut local_array_elem_types,
@@ -15329,6 +15492,13 @@ fn declare_user_functions<'ctx>(
       // Plan 52: pure data — no function body to declare an LLVM
       // symbol for.
       Item::Enum(_) => {}
+      // A newtype declares no method of its own (operator overloading
+      // is explicitly out of scope for this pass — see `NewtypeDef`'s
+      // own doc comment, `ast.rs`, and this crate's newtype-lowering
+      // doc comment for why: every existing class/actor method above
+      // is compiled with a leading `self` POINTER, the exact opposite
+      // representation a zero-cost newtype needs) — nothing to declare.
+      Item::Newtype(_) => {}
       // Plan 26: `emerald_parser::parse`/`parse_named` only ever
       // returns `Ok(program)` with zero recovered errors, meaning no
       // `Item::Error` in `program.items` — codegen never receives one.
@@ -15901,6 +16071,11 @@ fn compile_to_object_impl(
   }
   let owned_program = Program { items };
   let program = &owned_program;
+
+  // `newtype Meters: Float64` — populates `NEWTYPE_UNDERLYING` for this
+  // compile, before `value_kind_for_type` (or anything that calls it) is
+  // ever invoked below. See that thread-local's own doc comment.
+  set_newtype_underlying(program);
 
   // Plan 64's `leaf-target-triple-and-selection` — the one seam this
   // whole file has (Decision log). `Native` keeps the pre-plan-64
@@ -16590,6 +16765,19 @@ fn compile_to_object_impl(
     &actor_arg_decoders,
   );
 
+  // `newtype Meters: Float64` — see `Ctx::newtypes`'s own doc comment
+  // for why `build_method_call`'s `.value` dispatch and `Stmt::Let`'s
+  // `local_classes` bookkeeping both need this name set independently
+  // of `classes`/`enums` above.
+  let newtypes: HashSet<String> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Newtype(n) => Some(n.name.clone()),
+      _ => None,
+    })
+    .collect();
+
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
     classes: &classes,
@@ -16658,6 +16846,7 @@ fn compile_to_object_impl(
     class_defs: &class_defs,
     interface_defs: &interface_defs,
     generic_method_instances: &generic_method_instances_cell,
+    newtypes: &newtypes,
   };
 
   for item in &program.items {
@@ -16814,6 +17003,10 @@ fn compile_to_object_impl(
       Item::Test { .. } | Item::Property { .. } | Item::Benchmark { .. } => {}
       // Plan 52: pure data — no function body to compile.
       Item::Enum(_) => {}
+      // A newtype declares no method of its own to define a body for —
+      // see `declare_user_functions`'s matching arm for the full reason
+      // operator overloading is out of scope here.
+      Item::Newtype(_) => {}
       Item::Error => unreachable!("Item::Error never survives into a returned Ok(Program)"),
       // Plan 59: a real, external symbol declared elsewhere (this
       // pass's own declare step) — no Emerald-side body to compile.
@@ -17011,6 +17204,8 @@ fn desugar_asserts_in_items(items: &mut [Item]) -> bool {
       // Plan 52: pure data — no `assert`/`assert_eq` site can appear
       // inside an `Item::Enum`.
       Item::Enum(_) => {}
+      // A newtype has no body of its own either — mirrors `Item::Enum`.
+      Item::Newtype(_) => {}
       Item::Interface(_) | Item::Require(_) | Item::Error | Item::Extern(_) => {}
       // Plan 76: an exported declaration's own body still gets
       // `assert`/`assert_eq` desugaring — recurse into the unwrapped
@@ -17992,6 +18187,44 @@ mod tests {
   #[test]
   fn array_of_float64_linked_and_run() {
     let src = "arr: Array[Float64] = [1.5, 2.5]\nputs arr[0] + arr[1]\n";
+    assert_eq!(compile_link_run(src), "4\n");
+  }
+
+  // `newtype Meters: Float64` — real, compiled-and-run proof (not just a
+  // sema type-check) that construction/unwrap round-trips through the
+  // identical runtime value, and that a domain type composes with the
+  // rest of the backend (function params/returns, `Array[T]`, `==`)
+  // with zero special-casing visible from the *output* side.
+
+  #[test]
+  fn newtype_construct_and_unwrap_linked_and_run_prints_the_underlying_value() {
+    let src = "newtype Meters: Float64\nm: Meters = Meters.new(5.0)\nputs m.value\n";
+    assert_eq!(compile_link_run(src), "5\n");
+  }
+
+  #[test]
+  fn newtype_valued_function_param_and_return_linked_and_run() {
+    // `.value`'s receiver must be a plain local (this backend's own
+    // pre-existing, disclosed restriction on every method-call
+    // receiver, unrelated to `newtype`) — `doubled` binds `double(d)`'s
+    // own result before unwrapping it.
+    let src = "newtype Meters: Float64\nfn double(m: Meters): Meters do\n  return Meters.new(m.value * 2.0)\nend\nd: Meters = Meters.new(21.0)\ndoubled: Meters = double(d)\nputs doubled.value\n";
+    assert_eq!(compile_link_run(src), "42\n");
+  }
+
+  #[test]
+  fn newtype_equality_linked_and_run() {
+    let src = "newtype Meters: Float64\na: Meters = Meters.new(3.0)\nb: Meters = Meters.new(3.0)\nc: Meters = Meters.new(4.0)\nif a == b do\n  puts 1\nelse\n  puts 0\nend\nif a == c do\n  puts 1\nelse\n  puts 0\nend\n";
+    assert_eq!(compile_link_run(src), "1\n0\n");
+  }
+
+  #[test]
+  fn array_of_newtype_linked_and_run_matches_array_of_its_underlying_primitive() {
+    // The zero-cost claim's own concrete, executed proof: an
+    // `Array[Meters]` built/summed exactly like `array_of_float64_
+    // linked_and_run` above, through `.new`/`.value` at the write/read
+    // sites — same real answer, same representation.
+    let src = "newtype Meters: Float64\narr: Array[Meters] = [Meters.new(1.5), Meters.new(2.5)]\nx: Meters = arr[0]\ny: Meters = arr[1]\nputs x.value + y.value\n";
     assert_eq!(compile_link_run(src), "4\n");
   }
 

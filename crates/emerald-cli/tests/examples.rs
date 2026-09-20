@@ -157,3 +157,9 @@ fn module_visibility_em_prints_expected_sequence() {
     "Hello, Emerald!\n7\n"
   );
 }
+
+// Plan 81's `domain-types-and-units` (`newtype`).
+#[test]
+fn domain_types_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("domain_types.em"), "10.4384\n1\n100\n");
+}

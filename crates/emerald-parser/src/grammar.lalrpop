@@ -1,7 +1,7 @@
 use crate::ast::{
   ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant,
-  ExternBlock, ExternFn, Expr, Function, InterfaceDef, InterfaceMethod, Item, ModuleDef, Param,
-  Program, RescueClause, Spanned, Stmt, TypeExpr, TypeParam,
+  ExternBlock, ExternFn, Expr, Function, InterfaceDef, InterfaceMethod, Item, ModuleDef,
+  NewtypeDef, Param, Program, RescueClause, Spanned, Stmt, TypeExpr, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -67,6 +67,7 @@ Item: Item = {
   <m:ModuleDef> => Item::Module(m),
   <i:InterfaceDef> => Item::Interface(i),
   <e:EnumDef> => Item::Enum(e),
+  <n:NewtypeDef> => Item::Newtype(n),
   <x:ExternBlockDef> => Item::Extern(x),
   <s:Stmt> => Item::Stmt(s),
   // Plan 23: reachable only here, at the top-level `Item` rule — never
@@ -125,6 +126,7 @@ ExportableItem: Item = {
   <m:ModuleDef> => Item::Module(m),
   <i:InterfaceDef> => Item::Interface(i),
   <e:EnumDef> => Item::Enum(e),
+  <n:NewtypeDef> => Item::Newtype(n),
 };
 
 // `{ Name, Name2, ... }` — reuses `Ident`, comma-separated, at least
@@ -397,6 +399,19 @@ EnumDef: EnumDef = {
   // synthesized (never parsed via this rule), but the grammar admits any
   // user-written `enum Name[T] = ...` too, monomorphized the same way.
   <l:@L> "enum" <name:Ident> <type_params:TypeParamClause?> "=" <variants:EnumVariants> => EnumDef { name, variants, type_params: type_params.unwrap_or_default(), doc: docs.get(&l).cloned() },
+};
+
+// `newtype Meters: Float64` — see `NewtypeDef`'s own doc comment (`ast.rs`)
+// for the full design. A one-line declaration, no trailing `end`, the
+// same shape `EnumDef` above already has; `"newtype"` is reserved the
+// same LALR(1) way `class`/`enum`/`interface` already are. `underlying`
+// is a full `TypeExpr` at the grammar level (so a bad underlying type —
+// a class name, `Array[Int64]`, ...) parses fine and is rejected by
+// `emerald-sema` with a real, named diagnostic, not a parse error —
+// the same "grammar stays general, sema narrows" split this grammar
+// already uses throughout (e.g. `derive`'s arbitrary `Ident`).
+NewtypeDef: NewtypeDef = {
+  <l:@L> "newtype" <name:Ident> ":" <underlying:TypeExpr> => NewtypeDef { name, underlying, doc: docs.get(&l).cloned() },
 };
 
 // Mandatory-first-element, right-recursive on "|" — the same

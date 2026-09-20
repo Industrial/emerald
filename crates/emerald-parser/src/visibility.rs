@@ -209,7 +209,7 @@ impl<'a> Checker<'a> {
       Item::Class(c) => self.walk_class(c),
       Item::Module(m) => self.walk_module(m),
       Item::Actor(a) => self.walk_actor(a),
-      Item::Enum(_) | Item::Interface(_) => {}
+      Item::Enum(_) | Item::Interface(_) | Item::Newtype(_) => {}
       Item::Export(inner) => self.walk_item(inner),
       Item::Stmt(s) => {
         let mut locals = std::mem::take(&mut self.top_locals);

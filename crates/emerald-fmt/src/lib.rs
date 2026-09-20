@@ -165,8 +165,8 @@
 
 use emerald_parser::{
   ActorDef, CasePattern, ClassDef, CompareOp, EnumDef, Expr, ExternBlock, Function, InterfaceDef,
-  Item, ModuleDef, Param, ParseError, Program, RescueClause, Spanned, Stmt, StringPart, TypeExpr,
-  TypeParam,
+  Item, ModuleDef, NewtypeDef, Param, ParseError, Program, RescueClause, Spanned, Stmt, StringPart,
+  TypeExpr, TypeParam,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -436,6 +436,7 @@ fn write_item(out: &mut String, item: &Item) {
     Item::Module(m) => write_module(out, m, 0),
     Item::Actor(a) => write_actor(out, a, 0),
     Item::Enum(e) => write_enum(out, e, 0),
+    Item::Newtype(n) => write_newtype(out, n, 0),
     Item::Interface(i) => write_interface(out, i, 0),
     Item::Extern(x) => write_extern(out, x, 0),
     Item::Stmt(s) => write_stmt(out, s, 0),
@@ -739,6 +740,16 @@ fn write_enum(out: &mut String, e: &EnumDef, indent: usize) {
     })
     .collect();
   out.push_str(&variants.join(" | "));
+  out.push('\n');
+}
+
+fn write_newtype(out: &mut String, n: &NewtypeDef, indent: usize) {
+  write_doc(out, &n.doc, indent);
+  push_indent(out, indent);
+  out.push_str("newtype ");
+  out.push_str(&n.name);
+  out.push_str(": ");
+  out.push_str(&n.underlying.to_string());
   out.push('\n');
 }
 

@@ -131,6 +131,12 @@ treat it as current.
   spirit; single-inheritance value types with an ancestor chain add
   layout/dispatch complexity inception §22 rule 9 warns against for no
   clear v1 use case).
+- `newtype Name: Underlying` — a THIRD, distinct user-defined-type kind
+  alongside `class`/`struct` above, wrapping exactly one PRIMITIVE type
+  (§2's `Int64`/`Float64`/`String`/`Boolean`/`Symbol` — never a `class`/
+  `struct`/`Array`/`Hash`/...). See §11 below for the full design: this
+  is the concrete resolution of the "type aliases and newtypes" question
+  the Sable design brief left open/undecided.
 
 ---
 
@@ -225,9 +231,86 @@ instruction, with no runtime type check or box unwrap on the hot path.
 | `nil` | ✗ (compile error) | ✓ |
 | value of a `T` subtype (class) | ✓ | ✓ |
 | value of an unrelated type `U` | ✗ | ✗ |
+| bare `Underlying` value → a `newtype Name: Underlying` | ✗ (compile error — see §11) | ✗ |
+| `newtype Name: Underlying` value → bare `Underlying` | ✗ (compile error — see §11) | ✗ |
+| `newtype A: X` value → `newtype B: X` (same `X`, different domain type) | ✗ (compile error — see §11) | ✗ |
 
 No implicit "same shape, different type" structural assignability — matches
 `GRAMMAR.md`'s no-duck-typing stance (inception §9) and `SEMANTICS.md` §1.
+A `newtype`'s own two rows above are the sharpest instance of this rule in
+the whole type system: `Meters`/`Seconds` share an IDENTICAL runtime
+representation (§11) and are still mutually unassignable, in both
+directions, with no exception.
+
+---
+
+## 11. Domain types (`newtype`)
+
+Resolves the Sable design brief's own "type aliases and newtypes"
+section, explicitly left OPEN/UNDECIDED there ("How can Sable make domain
+types easy to create without introducing unnecessary boilerplate?") —
+added by `domain-types-and-units` (plan-of-plans row 81), the lowest-
+confidence item the brief itself named ("illustrative, not finalized").
+
+**Declaration:** `newtype Name: Underlying` (`GRAMMAR.md` §15) — a real,
+checked, NOMINALLY DISTINCT type, not a type alias. `Underlying` must
+resolve to one of this type system's plain scalar value types —
+`Int64`/`Float64`/`String`/`Boolean`/`Symbol` (§2) — checked at
+registration time; a `class`/`struct`/`enum`/`Array[T]`/`Hash[K,V]`/...
+underlying type is a real, named `emerald-sema` diagnostic, not silently
+accepted. Those already have their own, non-trivial representation
+strategy (a `class` instance is heap/arena-allocated — plan 50/51's
+mechanism); a `newtype` wrapping one could not honestly claim the
+zero-cost guarantee below.
+
+**Construction and unwrapping — both always explicit, never implicit:**
+- `Name.new(<value>)` — `<value>`'s static type must match `Underlying`
+  EXACTLY (no numeric widening, no coercion from any other type,
+  including `Underlying` itself if it happens to be, say, an unrelated
+  `Int64` local of a different intended unit). This is the one and only
+  way to produce a `Name` value from an `Underlying` one.
+- `<name-typed value>.value` — the one and only way to recover the
+  wrapped `Underlying` value back.
+- There is NO implicit conversion in either direction. Passing a bare
+  `Float64` where a function expects `Meters`, or vice versa, is a
+  compile-time type-mismatch error — exactly like passing a `Seconds`
+  where a `Meters` is expected (see the assignability table in §10,
+  which states this as a first-class rule, not a footnote).
+
+**Nominal distinctness:** two `newtype`s wrapping the SAME `Underlying`
+(`Meters`/`Seconds`, both `Float64`) are mutually non-interchangeable —
+the type system tracks each `newtype`'s own declared NAME, not merely its
+underlying representation. Structural equality (`==`) between two values
+of the SAME `newtype` works correctly (ordinary value comparison over the
+shared underlying representation); `Meters == Seconds` is a compile-time
+type-mismatch error, the identical rule any two differently-typed
+operands already get.
+
+**Representation — the zero-cost guarantee:** a `newtype` value compiles
+to the IDENTICAL machine representation as its own `Underlying` value —
+no wrapper struct, no heap allocation, no vtable, no boxing. `Array[
+Meters]` has the exact same packed, contiguous, unboxed representation
+§8 requires of `Array[Float64]` — a tight loop over one runs exactly as
+fast as the other. This is proven, not merely claimed:
+`emerald_codegen`'s own `value_kind_for_type`/`Expr::New`/`.value`
+doc comments give the mechanism (a newtype name resolves to its
+underlying primitive's own `ValKind` — never a new one — and both
+`.new`/`.value` compile to a bare passthrough of the already-compiled
+value, zero extra instructions); `examples/newtype_zero_cost_benchmark.em`
+(run via `emerald benchmark`, plan 80's mechanism) gives the measurement —
+an identical 2,000,000-element write/read workload over `Array[Float64]`
+and `Array[Meters]`, real heap-allocation-per-iteration so LLVM cannot
+fold either loop away. Measured this session (four runs, CPU time via
+`RUSAGE_CHILDREN`, `benchmarks/REPORT.md`'s own established methodology):
+`Array[Float64]` 0.0124s/0.0114s/0.0128s/0.0110s vs. `Array[Meters]`
+0.0121s/0.0107s/0.0123s/0.0105s — the two are statistically
+indistinguishable (`Meters` fell within noise of `Float64` on every run,
+occasionally faster), with no run showing a systematic newtype overhead.
+
+**Operator overloading:** deliberately declined for this pass, not
+silently half-implemented — see `GRAMMAR.md` §15's own table row for the
+concrete reason (`class`'s existing mechanism assumes a heap pointer
+`self`, which a zero-cost `newtype` value never has).
 
 ---
 

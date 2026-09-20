@@ -127,6 +127,27 @@ pub enum Type {
   /// intrinsics above, which are the only ways to ever *produce* or
   /// *consume* one.
   CString,
+  /// `newtype Meters: Float64` (`emerald_parser::NewtypeDef`'s own doc
+  /// comment has the full design). A genuinely distinct nominal type,
+  /// named by its own declaration (first field) exactly like
+  /// `Type::Class`/`Type::Enum` — `Meters` and `Seconds`, both wrapping
+  /// `Float64` (second field), compare UNEQUAL via this enum's ordinary
+  /// derived `PartialEq` (different first field), and neither is equal
+  /// to a bare `Type::Float64` either — nominal distinctness falls out
+  /// of `#[derive(PartialEq, Eq)]` for free, no special-cased equality
+  /// method needed anywhere. `emerald-codegen` lowers this to EXACTLY
+  /// the underlying primitive's own LLVM representation — no wrapper
+  /// struct, no allocation, no vtable (see that crate's own doc comment
+  /// on newtype lowering for the concrete proof) — so this variant only
+  /// ever affects compile-time type-checking, never runtime layout.
+  /// The underlying type is restricted (at registration time, in
+  /// `check_program`) to `Int64`/`Float64`/`String`/`Boolean`/`Symbol`
+  /// only — the language's plain scalar value types, which already have
+  /// no allocation of their own; a `Class`/`Enum`/`Array`/... underlying
+  /// type is rejected with a named diagnostic rather than silently
+  /// accepted, since those already carry their own (non-trivial)
+  /// representation.
+  Newtype(String, Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +272,15 @@ struct ClassInfo {
   /// doc comment for exactly how it differs from `GenericFunctionSig`.
   /// Empty for every class with no generic method at all.
   generic_methods: HashMap<String, GenericMethodSig>,
+  /// `Some(underlying)` only for a `newtype` registered into this SAME
+  /// table (the identical "reuse `classes`, don't add a fourth registry"
+  /// adaptation `enum_variants`'s own doc comment above already
+  /// explains for enums) — `fields`/`methods`/`generic_methods` stay
+  /// empty and `is_module`/`superclass`/`implements`/`is_actor`/
+  /// `enum_variants` stay their defaults for a newtype entry.
+  /// `resolve_named_type` checks this field before falling through to
+  /// `enum_variants`/the ordinary `Type::Class` branch.
+  newtype_underlying: Option<Type>,
 }
 
 /// One required method inside an `interface ... end` body, kept as raw,
@@ -493,6 +523,25 @@ fn resolve_named_type(
     // placeholder with the real signature recovered from the bound
     // `Expr::Lambda` before anything else ever observes it.
     "Proc" => Ok(Type::Proc(Vec::new(), Box::new(Type::Void))),
+    // Checked before the ordinary `enum_variants`/`Type::Class` branches
+    // below — a newtype shares the same `classes` registry (the same
+    // disclosed adaptation `enum_variants`'s own arm below already
+    // makes) but must resolve to `Type::Newtype`, never `Type::Class`.
+    other
+      if classes
+        .get(other)
+        .is_some_and(|c| c.newtype_underlying.is_some()) =>
+    {
+      Ok(Type::Newtype(
+        other.to_string(),
+        Box::new(
+          classes
+            .get(other)
+            .and_then(|c| c.newtype_underlying.clone())
+            .expect("guarded by is_some() above"),
+        ),
+      ))
+    }
     // Plan 52's Decision log: checked before the ordinary `Type::Class`
     // branch below — an enum shares the same `classes` registry
     // (Decision log's disclosed adaptation) but must resolve to
@@ -610,6 +659,10 @@ fn type_to_type_expr(t: &Type) -> TypeExpr {
     Type::Symbol => TypeExpr::Named("Symbol".to_string()),
     Type::CString => TypeExpr::Named("CString".to_string()),
     Type::Class(name) | Type::Enum(name) | Type::Generic(name, _) => TypeExpr::Named(name.clone()),
+    // A newtype's own declared name round-trips through `resolve_named_
+    // type` exactly like `Class`/`Enum` above — the underlying type is
+    // never re-derived from `t`'s second field here.
+    Type::Newtype(name, _) => TypeExpr::Named(name.clone()),
     Type::Array(e) => TypeExpr::Generic("Array".to_string(), vec![type_to_type_expr(e)]),
     Type::Hash(k, v) => TypeExpr::Generic(
       "Hash".to_string(),
@@ -869,6 +922,7 @@ fn build_generic_class_info(
     enum_variants: None,
     is_actor: false,
     generic_methods,
+    newtype_underlying: None,
   })
 }
 
@@ -1033,6 +1087,7 @@ fn empty_class_info(is_enum: bool) -> ClassInfo {
     enum_variants: if is_enum { Some(Vec::new()) } else { None },
     is_actor: false,
     generic_methods: HashMap::new(),
+    newtype_underlying: None,
   }
 }
 
@@ -1204,6 +1259,7 @@ fn build_generic_enum_info(
     enum_variants: Some(variants),
     is_actor: false,
     generic_methods: HashMap::new(),
+    newtype_underlying: None,
   })
 }
 
@@ -1299,8 +1355,12 @@ fn collect_generic_instantiation_typenames(program: &Program) -> Vec<TypeExpr> {
       // nothing for the exported declaration until the file is saved
       // and recompiled through the ordinary CLI path, mirroring
       // `Item::Require`'s own pre-existing identical gap.
+      // A newtype's `underlying` is always a plain primitive (enforced
+      // at registration time in `register_newtypes`), never a generic
+      // instantiation — nothing to collect here.
       Item::Enum(_)
       | Item::Interface(_)
+      | Item::Newtype(_)
       | Item::Require(_)
       | Item::Import { .. }
       | Item::Export(_)
@@ -1639,7 +1699,7 @@ fn type_annotation_string(ty: &Type) -> Option<String> {
     Type::Void => Some("Void".to_string()),
     Type::Symbol => Some("Symbol".to_string()),
     Type::CString => Some("CString".to_string()),
-    Type::Class(name) | Type::Enum(name) => Some(name.clone()),
+    Type::Class(name) | Type::Enum(name) | Type::Newtype(name, _) => Some(name.clone()),
     Type::Array(elem) => type_annotation_string(elem).map(|e| format!("Array[{e}]")),
     Type::Hash(k, v) => {
       let k = type_annotation_string(k)?;
@@ -2009,6 +2069,7 @@ fn build_flattened_class_info(
     enum_variants: None,
     is_actor: false,
     generic_methods,
+    newtype_underlying: None,
   })
 }
 
@@ -2045,6 +2106,7 @@ fn module_info(
     enum_variants: None,
     is_actor: false,
     generic_methods: HashMap::new(),
+    newtype_underlying: None,
   })
 }
 
@@ -2108,6 +2170,7 @@ fn actor_info(a: &ActorDef, classes: &HashMap<String, ClassInfo>) -> Result<Clas
     enum_variants: None,
     is_actor: true,
     generic_methods: HashMap::new(),
+    newtype_underlying: None,
   })
 }
 
@@ -3329,6 +3392,39 @@ fn infer_expr_type(
       let info = classes
         .get(class_name)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
+      // `Meters.new(5.0)` — a newtype's own construction, checked BEFORE
+      // the ordinary class-construction path below (a newtype's
+      // `ClassInfo` entry has an empty `methods` table, so it would
+      // otherwise fall into that path's own "declares no `initialize`"
+      // arm). Deliberately reuses `Expr::New` verbatim rather than a new
+      // grammar production — see `NewtypeDef`'s own doc comment
+      // (`ast.rs`) for why `<recv:Ident> "." "new" "(" <args:Args> ")"`
+      // already parses this for free. The single argument's type must
+      // match `underlying` EXACTLY — no coercion, not even from the
+      // bare primitive itself — which is the entire point: an implicit
+      // bare-primitive-to-newtype conversion is rejected here with a
+      // real, named diagnostic, not silently accepted.
+      if let Some(underlying) = info.newtype_underlying.clone() {
+        if args.len() != 1 {
+          return Err(Diagnostic::new(
+            format!(
+              "`{class_name}.new` is a newtype constructor and takes exactly one argument (its underlying `{underlying:?}` value), found {}",
+              args.len()
+            ),
+            expr.span,
+          ));
+        }
+        let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields, gctx)?;
+        if arg_ty != underlying {
+          return Err(Diagnostic::new(
+            format!(
+              "`{class_name}.new` expects its underlying type `{underlying:?}`, found `{arg_ty:?}` — a newtype never implicitly converts from (or to) its underlying primitive, only via an explicit `.new`/`.value`"
+            ),
+            args[0].span,
+          ));
+        }
+        return Ok(Type::Newtype(class_name.clone(), Box::new(underlying)));
+      }
       if info.is_module {
         return Err(Diagnostic::new(
           format!("cannot `.new` module `{class_name}` — modules are namespaces, not instantiable"),
@@ -3856,6 +3952,31 @@ fn infer_expr_type(
         } else {
           (**v_ty).clone()
         });
+      }
+      // `m.value` — a newtype's own unwrap accessor (`NewtypeDef`'s own
+      // doc comment, `ast.rs`), dispatched the identical way `Pair`'s
+      // `.key`/`.value` immediately above already are: by the receiver's
+      // own inferred type, before the ordinary per-class method table
+      // below (a newtype's `ClassInfo` entry has an empty `methods`
+      // table, so `.value` could never resolve there anyway). An
+      // ordinary zero-arg `MethodCall`, not a new AST shape — codegen
+      // compiles it as a pure type-level identity (the wrapped value's
+      // own bits, unchanged), which is exactly what makes this whole
+      // construct zero-cost.
+      if let Type::Newtype(name, underlying) = &recv_ty {
+        if method != "value" {
+          return Err(Diagnostic::new(
+            format!("newtype `{name}` has no method `{method}` — only `.value` (unwrap)"),
+            expr.span,
+          ));
+        }
+        if !args.is_empty() {
+          return Err(Diagnostic::new(
+            format!("`.value` takes no arguments, found {}", args.len()),
+            expr.span,
+          ));
+        }
+        return Ok((**underlying).clone());
       }
       // Plan 42 (enumerable stdlib): `each`/`map`/`select`/`filter`/
       // `reduce`/`inject`/`each_with_index`/`count`/`sum`/`sort` on an
@@ -9081,6 +9202,10 @@ fn check_block_call_sites(
       // Plan 52: an enum is pure data — no method bodies, no block
       // call sites of any kind.
       Item::Enum(_) => {}
+      // A newtype is pure data too — no method bodies of its own, no
+      // block call sites of any kind (mirrors `Item::Enum`'s identical
+      // no-op arm immediately above).
+      Item::Newtype(_) => {}
       // Plan 54: an actor's methods are ordinary method bodies, exactly
       // like a class's own arm above.
       Item::Actor(a) => {
@@ -9428,6 +9553,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           enum_variants: None,
           is_actor: false,
           generic_methods: HashMap::new(),
+          newtype_underlying: None,
         },
       );
     }
@@ -9443,6 +9569,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           enum_variants: None,
           is_actor: false,
           generic_methods: HashMap::new(),
+          newtype_underlying: None,
         },
       );
     }
@@ -9458,6 +9585,7 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
           enum_variants: None,
           is_actor: true,
           generic_methods: HashMap::new(),
+          newtype_underlying: None,
         },
       );
     }
@@ -9517,6 +9645,79 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
     .collect();
 
   SymbolTable { functions, classes }
+}
+
+/// `newtype Meters: Float64` registers into the SAME `classes` table —
+/// the identical "reuse `classes`, don't add a fourth registry"
+/// adaptation the enum registration pass just below already makes for
+/// itself. A single pass, unlike enums' two: a newtype's `underlying`
+/// is always a plain primitive (never another newtype, class, or enum —
+/// enforced by the allow-list check below), so there is no declaration-
+/// order dependency between newtypes to resolve, and `resolve_type` for
+/// a primitive `TypeExpr::Named` never touches `classes` at all.
+fn register_newtypes(
+  program: &Program,
+  classes: &mut HashMap<String, ClassInfo>,
+  diags: &mut Vec<Diagnostic>,
+) {
+  for item in &program.items {
+    let Item::Newtype(n) = item else { continue };
+    if classes.contains_key(&n.name) {
+      diags.push(Diagnostic::new(
+        format!(
+          "`{}` is already declared as a class, module, actor, or enum",
+          n.name
+        ),
+        (0, 0),
+      ));
+      continue;
+    }
+    let underlying = match resolve_type(&n.underlying, classes) {
+      Ok(t) => t,
+      Err(d) => {
+        diags.push(d);
+        continue;
+      }
+    };
+    // The whole point of `newtype` (Sable design brief's own "type
+    // aliases and newtypes" section) is unit-safety with NO runtime
+    // cost — only allowed here because these five are the language's
+    // plain scalar value types, which already have no allocation of
+    // their own (`emerald-codegen`'s newtype-lowering doc comment has
+    // the concrete zero-cost proof). A `Class`/`Enum`/`Array`/`Hash`/
+    // `Proc`/... underlying type is rejected here, named, rather than
+    // silently accepted — those already carry their own, non-trivial
+    // representation strategy (a class instance is heap/arena-
+    // allocated, plan 50/51's mechanism), which a newtype wrapping it
+    // could not honestly claim to add zero cost on top of.
+    if !matches!(
+      underlying,
+      Type::Int64 | Type::Float64 | Type::String | Type::Boolean | Type::Symbol
+    ) {
+      diags.push(Diagnostic::new(
+        format!(
+          "`newtype {}` may only wrap a primitive value type (Int64, Float64, String, Boolean, or Symbol) to stay zero-cost — found `{}`, which has its own representation",
+          n.name, n.underlying
+        ),
+        (0, 0),
+      ));
+      continue;
+    }
+    classes.insert(
+      n.name.clone(),
+      ClassInfo {
+        fields: HashMap::new(),
+        methods: HashMap::new(),
+        is_module: false,
+        superclass: None,
+        implements: None,
+        enum_variants: None,
+        is_actor: false,
+        generic_methods: HashMap::new(),
+        newtype_underlying: Some(underlying),
+      },
+    );
+  }
 }
 
 pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
@@ -9586,6 +9787,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           enum_variants: None,
           is_actor: false,
           generic_methods: HashMap::new(),
+          newtype_underlying: None,
         },
       );
     }
@@ -9601,6 +9803,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           enum_variants: None,
           is_actor: false,
           generic_methods: HashMap::new(),
+          newtype_underlying: None,
         },
       );
     }
@@ -9616,10 +9819,13 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           enum_variants: None,
           is_actor: true,
           generic_methods: HashMap::new(),
+          newtype_underlying: None,
         },
       );
     }
   }
+  register_newtypes(program, &mut classes, &mut diags);
+
   // Plan 52: enums register into the SAME `classes` table (Decision
   // log's disclosed adaptation) — a first pass inserts every enum's
   // name with a placeholder (empty) variant list, so a variant field
@@ -9715,6 +9921,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           enum_variants: Some(Vec::new()),
           is_actor: false,
           generic_methods: HashMap::new(),
+          newtype_underlying: None,
         },
       );
       enum_defs.push(e);
@@ -10186,6 +10393,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // Plan 52: an enum has no body of its own to check beyond the
       // registration-time checks already performed above.
       Item::Enum(_) => {}
+      // A newtype has no body of its own to check beyond `register_
+      // newtypes`'s own registration-time checks (underlying-type
+      // allow-list, name collision) already performed above — mirrors
+      // `Item::Enum`'s identical no-op arm immediately above.
+      Item::Newtype(_) => {}
       // Plan 76: `import path { Names }` names no body of its own to
       // check — mirrors `Item::Require`'s own no-op arm above.
       Item::Import { .. } => {}
@@ -13381,6 +13593,158 @@ mod tests {
       errs
         .iter()
         .any(|d| d.message.contains("predicate Proc must return Boolean")),
+      "{errs:?}"
+    );
+  }
+
+  // `newtype Meters: Float64` — the domain-types-and-units leaf (plan-
+  // of-plans row 81). See `emerald_parser::NewtypeDef`'s own doc
+  // comment for the full design; these tests cover exactly the
+  // regression surface that design commits to: a correctly-typed value
+  // accepted where expected, an implicit raw-primitive-to-newtype
+  // conversion rejected, a cross-newtype conversion rejected, and the
+  // construct/unwrap round trip.
+
+  #[test]
+  fn newtype_construct_and_unwrap_round_trips_through_its_underlying_primitive() {
+    let src =
+      "newtype Meters: Float64\nm: Meters = Meters.new(5.0)\nv: Float64 = m.value\nputs v\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "`Meters.new(5.0).value` must round-trip back to a plain Float64"
+    );
+  }
+
+  #[test]
+  fn a_domain_typed_value_is_accepted_where_a_matching_domain_type_is_expected() {
+    let src = "newtype Meters: Float64\nfn track_length(distance: Meters): Meters do\n  return distance\nend\nd: Meters = Meters.new(100.0)\nr: Meters = track_length(d)\nputs r.value\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "a `Meters`-typed argument must be accepted by a `Meters`-typed parameter"
+    );
+  }
+
+  #[test]
+  fn newtype_and_underlying_primitive_types_are_mutually_distinct() {
+    // `Meters` and a bare `Float64` — a genuinely distinct nominal type,
+    // not merely a checked range/alias over the same `Type`. Two,
+    // independent real bugs this test would catch: `Type::Newtype`
+    // comparing equal to `Type::Float64` via a hand-written `PartialEq`
+    // (it doesn't — both derive `PartialEq` structurally, and the two
+    // variants are simply different), or `resolve_named_type` resolving
+    // `"Meters"` straight through to `Type::Float64` instead of wrapping
+    // it (it doesn't — `register_newtypes`'s own registration is
+    // checked before the ordinary primitive/class arms).
+    let src = "newtype Meters: Float64\nfn needs_meters(m: Meters): Float64 do\n  m.value\nend\nx: Float64 = 5.0\nputs needs_meters(x)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("an implicit bare-Float64-to-Meters conversion must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("Meters")
+        && (d.message.contains("Float64") || d.message.contains("type mismatch"))),
+      "the diagnostic must name the domain type and the mismatch: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn implicit_raw_primitive_to_newtype_conversion_is_rejected_at_the_new_call_site() {
+    // The entire point of `.new` requiring an EXACT underlying-type
+    // match: a bare Int64 literal must never silently widen/convert
+    // into a Float64-backed newtype's constructor argument.
+    let src = "newtype Meters: Float64\nm: Meters = Meters.new(5)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`Meters.new` must reject an Int64 argument when the underlying type is Float64");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Meters.new") && d.message.contains("Float64")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn cross_domain_type_usage_is_rejected_with_a_clear_diagnostic() {
+    // Two DIFFERENT newtypes over the SAME underlying primitive
+    // (`Meters`/`Seconds`, both `Float64`) must not be interchangeable —
+    // this is the entire reason `Type::Newtype` carries its own
+    // declared name, not just the underlying `Type`.
+    let src = "newtype Meters: Float64\nnewtype Seconds: Float64\nfn track_length(distance: Meters): Float64 do\n  distance.value\nend\ns: Seconds = Seconds.new(9.58)\nputs track_length(s)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("passing a `Seconds` where `Meters` is expected must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Meters") && d.message.contains("Seconds")),
+      "the diagnostic must name both mismatched domain types: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn two_domain_type_values_of_the_same_newtype_compare_structurally_equal() {
+    // `a == b` directly on two `Meters` values (not `a.value == b.value`)
+    // — `Expr::Compare`'s own general fallback (`infer_expr_type`'s
+    // `lt != rt` check, reached for any non-`Type::Class` operand) needs
+    // no newtype-specific code at all: `Type::Newtype`'s derived
+    // `PartialEq` already makes two SAME-newtype values compare equal
+    // structurally, for free.
+    let src = "newtype Meters: Float64\na: Meters = Meters.new(5.0)\nb: Meters = Meters.new(5.0)\nif a == b do\n  puts 1\nelse\n  puts 0\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "comparing two same-newtype values via `==` directly must type-check"
+    );
+  }
+
+  #[test]
+  fn two_different_newtypes_over_the_same_underlying_primitive_reject_direct_equality() {
+    let src = "newtype Meters: Float64\nnewtype Seconds: Float64\na: Meters = Meters.new(5.0)\nb: Seconds = Seconds.new(5.0)\nputs a == b\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`Meters == Seconds` must be rejected even though both wrap Float64");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Meters") && d.message.contains("Seconds")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_newtype_wrapping_a_class_is_rejected_at_registration_since_it_would_not_be_zero_cost() {
+    // The whole point of `newtype` is unit-safety with NO runtime cost —
+    // a `Class`/`Enum`/`Array`/... underlying type already has its own
+    // (non-trivial) representation strategy, so wrapping one could not
+    // honestly claim to add zero cost on top of it (see `register_
+    // newtypes`'s own doc comment).
+    let src = "class Vector2\n  x: Float64\nend\nnewtype Position: Vector2\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a newtype wrapping a class must be rejected, not silently accepted");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("newtype Position") && d.message.contains("zero-cost")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_newtype_name_colliding_with_an_existing_class_is_rejected() {
+    let src = "class Meters\n  x: Float64\nend\nnewtype Meters: Float64\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a newtype name colliding with an already-declared class must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Meters") && d.message.contains("already declared")),
       "{errs:?}"
     );
   }
