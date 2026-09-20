@@ -64,8 +64,20 @@ Revisiting this (reference counting, a tracing collector, or a more
 aggressive escape-analysis/region-inference story) is open post-v1 work;
 inception §12 itself names all three as future options, deliberately
 undecided. **This is no longer only a deferred question — see
-`spec/OWNERSHIP.md` for a real, decided (though not yet implemented)
-design for ownership/borrowing on top of this section's own regions.** `benchmarks/REPORT.md`'s `object_allocation` benchmark gives this
+`spec/OWNERSHIP.md` for a real, decided ownership/borrowing design on top
+of this section's own regions.** SUPERSEDED note (plan 84): that design is
+no longer "not yet implemented" in full — plan 83 shipped the sema-level
+`own`/`borrow`/`borrow var` liveness checker, and plan 84 shipped real
+codegen for it (`own`-parameter transfer and `borrow`/`borrow var`-
+parameter passing, both genuinely zero-cost — see `spec/OWNERSHIP.md`
+§9/§10 and `emerald-codegen`'s own `strip_ownership_in_type_expr`/
+`bind_params` doc comments for the exact mechanism and its one disclosed,
+real, unavoidable cost). This still doesn't close the gap described in
+this section: code that never opts into `own`/`borrow` annotations is
+exactly as unproven/unbounded as described above (`spec/OWNERSHIP.md` §4's
+own "additive, not a replacement" framing) — plan 84 narrows the gap for
+code that opts in, it does not eliminate it for code that doesn't.
+`benchmarks/REPORT.md`'s `object_allocation` benchmark gives this
 a real number: 1,000,000 `emerald_alloc`-backed instances runs measurably
 slower than every other language in that report, including Crystal and
 Ruby's own garbage-collected allocation — the likely mechanism (never

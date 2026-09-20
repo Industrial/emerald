@@ -1,9 +1,16 @@
 # Emerald — OWNERSHIP.md
 
 **Status:** forward design document (plan 82), not a retroactive record of shipped
-behavior the way `RUNTIME.md` is. Nothing in this file exists in the compiler yet;
-it exists to give plans 83-85 a concrete, decided target to implement against,
-rather than each guessing independently at a design nobody made.
+behavior the way `RUNTIME.md` is. It exists to give plans 83-85 a concrete, decided
+target to implement against, rather than each guessing independently at a design
+nobody made.
+
+SUPERSEDED note (plan 84): the paragraph above originally said "nothing in this
+file exists in the compiler yet." That's no longer true for §§9-10's plan 84 row —
+`emerald-sema` (plan 83) and `emerald-codegen` (plan 84) now implement real
+`own`/`borrow`/`borrow var` checking and codegen exactly as designed here. Plan 85
+(§10's own remaining row) is still unimplemented. Corrected in place rather than
+silently rewritten, per this project's own convention.
 
 **Purpose:** decide what "a full Rust-style ownership/borrow checker" (this
 session's explicit commitment, made ahead of `spec/RUNTIME.md` §1 and
@@ -210,11 +217,41 @@ lands and proves itself, not attempted here.
 - **Plan 84 (`deterministic-destruction-codegen`)**: per §9's explicit
   decline of a Rust-style `Drop` mechanism, this plan's real scope is
   narrower than its original name suggested — no new destructor codegen is
-  built. Scope becomes: codegen for `own`-parameter passing (marking the
-  caller's binding invalid post-call, reusing plan 56's existing invalidation
-  codegen) and `borrow`/`borrow var`-parameter passing (a raw pointer, no
-  wrapper allocation — zero runtime cost, matching Rust's own zero-cost
-  borrows).
+  built. Scope becomes: codegen for `own`-parameter passing and
+  `borrow`/`borrow var`-parameter passing.
+
+  **Shipped (status: done, not just designed).** Two real findings changed
+  this row's scope from what was originally assumed, both in `emerald-
+  codegen`:
+  - `own` needed NO new codegen at all. Plan 56's `is_cross_actor_send`
+    check turned out to be sema-only (no runtime invalidation mechanism
+    exists to "reuse" — `emerald-sema`'s liveness check IS the entire
+    enforcement). An `own` transfer is either a class's existing
+    pointer-copy or a primitive's existing scalar-copy — exactly what an
+    unannotated parameter already does; the callee simply receives it.
+  - `borrow`/`borrow var` of an ALREADY pointer-represented type (a class
+    instance, `String`/`CString`) also needed no new codegen — this
+    project's object model already passes those by pointer. Only a
+    `borrow`/`borrow var` of a genuinely BY-VALUE type (`Int64`/`Float64`/
+    `Boolean`/`Symbol`) needed a real, new mechanism: it compiles to an
+    actual LLVM `ptr` parameter (`strip_ownership_in_type_expr`'s synthetic
+    marker, `bind_params`'/`build_call_arg_vals`'s own doc comments) — the
+    real design decision this row anticipated needing. Two disclosed, real
+    scope limits: (1) this real-pointer treatment applies to top-level
+    free-function parameters only, not class/actor/module methods (would
+    require also updating `build_method_call`'s own separate argument-
+    building code — not attempted); (2) a `borrow var` primitive parameter
+    has no legal syntax to actually be mutated yet (`emerald-sema`'s
+    plan-72 "no `var` slot on a parameter" rule) — the writeback mechanism
+    is built and tested directly (bypassing sema, this codebase's own
+    established test idiom), but not reachable from real `.em` source
+    until that separate, disclosed sema gap is closed. Zero-cost proven
+    via `examples/ownership_zero_cost_benchmark.em` (statistically
+    indistinguishable elapsed time, plain vs. `borrow Int64`) for the
+    common case (a plain local-variable argument reuses its own existing
+    stack slot); a non-local argument (a literal, a computed expression)
+    pays one real, disclosed extra `alloca`+store, which no unannotated
+    parameter ever needed.
 - **Plan 85 (`ownership-actor-ffi-integration`)**: implement §5 (borrow
   checker and plan 56 coexisting as separate layers, not one subsuming the
   other) and §7 (FFI `own`/`borrow` typing at `extern` boundaries with

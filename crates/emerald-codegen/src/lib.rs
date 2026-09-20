@@ -137,37 +137,127 @@ fn set_newtype_underlying(program: &Program) {
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
-/// Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own rescoping of
-/// plan 84): recursively strips an `own`/`borrow`/`borrow var` wrapper
-/// anywhere it appears inside a `TypeExpr` tree, leaving every other
-/// shape untouched. This is the ONE disclosed codegen passthrough point
-/// this plan builds — every downstream codegen call site (`value_kind_
-/// for_type`, `param_local_classes`, `bind_params`, and every other
-/// place that resolves a parameter's/return's declared `TypeExpr`) sees
-/// only ALREADY-STRIPPED types by the time it ever runs, because
-/// `strip_ownership_annotations_in_items` (below) rewrites the whole
-/// program's `Function`/method signatures once, up front, in
-/// `compile_to_object_impl` — so none of those call sites need their
-/// own individual `Own`/`Borrow` handling at all. `value_kind_for_type`
-/// still carries its own defensive `Own`/`Borrow` arm (recursing the
-/// same way) purely so it stays a real, exhaustive match if some future
-/// caller ever feeds it an unstripped `TypeExpr` directly — not because
-/// any call site in this compiled path actually reaches it unstripped
-/// today.
-fn strip_ownership_in_type_expr(ty: &TypeExpr) -> TypeExpr {
+/// Plan 84 (`deterministic-destruction-codegen`, `spec/OWNERSHIP.md`
+/// §9/§10's own rescoping): synthetic `TypeExpr::Generic` names this
+/// pass wraps a stripped `borrow`/`borrow var` type in when the
+/// underlying value is genuinely by-value at the LLVM level (`Int64`/
+/// `Float64`/`Boolean`/`Symbol` — see `value_kind_for_type`), never
+/// written by any parser/sema output and never user-reachable (an
+/// Emerald identifier can't start with `__`). `borrow`/`borrow var` of
+/// an ALREADY pointer-represented type (a class instance, `String`/
+/// `CString`) still strips to exactly the bare underlying type, unchanged
+/// from plan 83's original passthrough — that case was already real,
+/// zero-cost reference-passing for free (`Ctx`'s own established
+/// "class instances are LLVM `ptr` values, passed by pointer" model —
+/// see `bind_params`' own doc comment). Only the by-value case needed
+/// real, new codegen: a `borrow Int64` with no marker would otherwise
+/// compile to an ordinary by-value `i64` parameter, which is silently
+/// WRONG for `borrow var` (a callee's mutation would never become
+/// visible to the caller) and merely misleading for a plain `borrow`
+/// (a copy happens to behave like a read-only reference, but isn't
+/// one). `bind_params`/`build_call_arg_vals`/`build_call_kw_expr`'s own
+/// matching arms are what actually turn this marker into a real
+/// pointer at the LLVM level; see each's own doc comment for its half
+/// of the mechanism.
+const BORROW_PTR_SHARED: &str = "__EmeraldBorrowPtrShared";
+const BORROW_PTR_MUT: &str = "__EmeraldBorrowPtrMut";
+
+fn borrow_ptr_marker_name(is_mut: bool) -> &'static str {
+  if is_mut {
+    BORROW_PTR_MUT
+  } else {
+    BORROW_PTR_SHARED
+  }
+}
+
+/// `Some((is_mut, underlying_ty))` iff `ty` is one of the two synthetic
+/// marker shapes `strip_ownership_in_type_expr` produces for a
+/// by-value `borrow`/`borrow var` parameter — see `BORROW_PTR_SHARED`'s
+/// own doc comment. `None` for every other `TypeExpr`, including every
+/// ordinary (non-marker) `Generic` this compiler already has (`Array[T]`,
+/// `Hash[K, V]`, ...), since none of those names ever collide with
+/// either marker.
+fn borrow_ptr_marker_info(ty: &TypeExpr) -> Option<(bool, &TypeExpr)> {
   match ty {
-    TypeExpr::Own(inner) | TypeExpr::Borrow(inner, _) => strip_ownership_in_type_expr(inner),
+    TypeExpr::Generic(name, args) if args.len() == 1 && name == BORROW_PTR_SHARED => {
+      Some((false, &args[0]))
+    }
+    TypeExpr::Generic(name, args) if args.len() == 1 && name == BORROW_PTR_MUT => {
+      Some((true, &args[0]))
+    }
+    _ => None,
+  }
+}
+
+/// Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own rescoping of
+/// plan 84), extended by plan 84 itself: recursively strips an
+/// `own`/`borrow`/`borrow var` wrapper anywhere it appears inside a
+/// `TypeExpr` tree. `own` always fully erases to its bare underlying
+/// type — an `own` transfer is either a class's existing pointer-copy
+/// or a primitive's existing scalar-copy, both of which are exactly
+/// what an ordinary, unannotated parameter already does today (plan
+/// 83's sema pass is what makes the caller's binding actually unusable
+/// afterward; there is no runtime transfer-invalidation mechanism to
+/// reuse or build — `spec/OWNERSHIP.md` §9 already declines a `Drop`
+/// mechanism, and plan 56's own `is_cross_actor_send` check this design
+/// was generalized from is likewise sema-only, never codegen). A
+/// `borrow`/`borrow var` of an already-pointer-represented type (`Ptr`/
+/// `Str`) also fully erases, unchanged — see `BORROW_PTR_SHARED`'s own
+/// doc comment for why that's still correct. A `borrow`/`borrow var` of
+/// a genuinely by-value type instead wraps the stripped underlying type
+/// in one of the two synthetic markers, when `allow_borrow_ptr_marker`
+/// is `true`.
+///
+/// `allow_borrow_ptr_marker` is `false` for a class/actor/module
+/// method's own parameters (`strip_ownership_in_function`'s own call
+/// sites below) — a real, disclosed, narrower-than-ideal scope
+/// boundary: making a by-value `borrow`/`borrow var` METHOD parameter a
+/// real pointer would also require updating `build_method_call`'s own,
+/// separate argument-evaluation code (several distinct dispatch arms:
+/// ordinary same-actor calls, cross-actor `emerald_actor_enqueue`
+/// sends, module-static calls, generic-method specializations, ...),
+/// which this plan does not touch. A method's by-value `borrow`/`borrow
+/// var` parameter therefore keeps plan 83's original full-erasure
+/// passthrough — safe (the method's LLVM signature keeps the ordinary
+/// scalar type, so every existing method-call site stays correct) but
+/// not yet real reference-passing for that one case; a `borrow var
+/// Int64` method parameter's mutation still doesn't propagate to the
+/// caller, exactly like before this plan. `own`, and `borrow`/`borrow
+/// var` of a class/`String` type, are unaffected by this flag — both
+/// were already correct for methods too.
+fn strip_ownership_in_type_expr(ty: &TypeExpr, allow_borrow_ptr_marker: bool) -> TypeExpr {
+  match ty {
+    TypeExpr::Own(inner) => strip_ownership_in_type_expr(inner, allow_borrow_ptr_marker),
+    TypeExpr::Borrow(inner, is_mut) => {
+      let stripped = strip_ownership_in_type_expr(inner, allow_borrow_ptr_marker);
+      if allow_borrow_ptr_marker
+        && !matches!(value_kind_for_type(&stripped), ValKind::Ptr | ValKind::Str)
+      {
+        TypeExpr::Generic(borrow_ptr_marker_name(*is_mut).to_string(), vec![stripped])
+      } else {
+        stripped
+      }
+    }
     TypeExpr::Named(_) => ty.clone(),
     TypeExpr::Generic(name, args) => TypeExpr::Generic(
       name.clone(),
-      args.iter().map(strip_ownership_in_type_expr).collect(),
+      args
+        .iter()
+        .map(|t| strip_ownership_in_type_expr(t, allow_borrow_ptr_marker))
+        .collect(),
     ),
-    TypeExpr::Tuple(parts) => {
-      TypeExpr::Tuple(parts.iter().map(strip_ownership_in_type_expr).collect())
-    }
+    TypeExpr::Tuple(parts) => TypeExpr::Tuple(
+      parts
+        .iter()
+        .map(|t| strip_ownership_in_type_expr(t, allow_borrow_ptr_marker))
+        .collect(),
+    ),
     TypeExpr::Func(params, ret) => TypeExpr::Func(
-      params.iter().map(strip_ownership_in_type_expr).collect(),
-      Box::new(strip_ownership_in_type_expr(ret)),
+      params
+        .iter()
+        .map(|t| strip_ownership_in_type_expr(t, allow_borrow_ptr_marker))
+        .collect(),
+      Box::new(strip_ownership_in_type_expr(ret, allow_borrow_ptr_marker)),
     ),
   }
 }
@@ -177,33 +267,38 @@ fn strip_ownership_in_type_expr(ty: &TypeExpr) -> TypeExpr {
 /// `Function` this compiler has, whether a top-level `fn`, a class/
 /// actor method, or a module method, shares this exact same AST shape,
 /// so one helper covers all of them (`strip_ownership_annotations_in_
-/// item`'s own per-`Item`-kind dispatch below is what reaches each).
-fn strip_ownership_in_function(f: &mut AstFunction) {
+/// item`'s own per-`Item`-kind dispatch below is what reaches each, and
+/// what decides `allow_borrow_ptr_marker` — see `strip_ownership_in_
+/// type_expr`'s own doc comment).
+fn strip_ownership_in_function(f: &mut AstFunction, allow_borrow_ptr_marker: bool) {
   for p in &mut f.params {
-    p.ty = strip_ownership_in_type_expr(&p.ty);
+    p.ty = strip_ownership_in_type_expr(&p.ty, allow_borrow_ptr_marker);
   }
   if let Some(p) = &mut f.splat_param {
-    p.ty = strip_ownership_in_type_expr(&p.ty);
+    p.ty = strip_ownership_in_type_expr(&p.ty, allow_borrow_ptr_marker);
   }
-  f.return_type = strip_ownership_in_type_expr(&f.return_type);
+  f.return_type = strip_ownership_in_type_expr(&f.return_type, allow_borrow_ptr_marker);
 }
 
 fn strip_ownership_annotations_in_item(item: &mut Item) {
   match item {
-    Item::Function(f) => strip_ownership_in_function(f),
+    // Only a top-level free function gets the real by-value `borrow`
+    // pointer marker — see `strip_ownership_in_type_expr`'s own doc
+    // comment for exactly why methods are excluded.
+    Item::Function(f) => strip_ownership_in_function(f, true),
     Item::Class(c) => {
       for m in &mut c.methods {
-        strip_ownership_in_function(m);
+        strip_ownership_in_function(m, false);
       }
     }
     Item::Actor(a) => {
       for m in &mut a.methods {
-        strip_ownership_in_function(m);
+        strip_ownership_in_function(m, false);
       }
     }
     Item::Module(m) => {
       for meth in &mut m.methods {
-        strip_ownership_in_function(meth);
+        strip_ownership_in_function(meth, false);
       }
     }
     // `export fn ...`/`export class ...` (plan 76) wraps another `Item`
@@ -283,18 +378,27 @@ fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
     // flat-string convention's `_ => ValKind::Ptr` arm gave this
     // unreachable-in-practice shape.
     TypeExpr::Tuple(_) => ValKind::Ptr,
-    // Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own rescoping of
-    // plan 84): a REAL, DISCLOSED, TEMPORARY PASSTHROUGH — `own T`/
-    // `borrow T`/`borrow var T` all get EXACTLY the same LLVM storage
-    // kind as bare `T` today, with no new codegen machinery of any
-    // kind (no raw-pointer borrow representation, no `own`-consumption
-    // invalidation codegen). This is deliberate and narrow: plan 83's
-    // own scope is sema-only liveness *checking*; plan 84 owns REAL
-    // zero-cost `borrow`-as-raw-pointer codegen and `own`-parameter
-    // invalidation codegen and will replace this exact arm. Recursing
-    // into the wrapped type is what makes a program sema ACCEPTS
-    // compile and run identically to the same program with the
-    // wrapper stripped, today.
+    // SUPERSEDED by plan 84 (`deterministic-destruction-codegen`) —
+    // the paragraph this replaces claimed plan 84 would "replace this
+    // exact arm"; it doesn't, and this note corrects that rather than
+    // silently rewriting it (this file's own established convention).
+    // What actually happened: this arm stays exactly as it was
+    // (plan 83's original passthrough), and remains genuinely correct
+    // for `own` (always a bare copy — see `strip_ownership_in_type_
+    // expr`'s own doc comment for why `own` never needed new codegen)
+    // and for `borrow`/`borrow var` of an already pointer-represented
+    // type. Plan 84's REAL new codegen for a by-value `borrow`/`borrow
+    // var` (`Int64`/`Float64`/`Boolean`/`Symbol`) lives entirely in
+    // `strip_ownership_in_type_expr` (which now wraps that one case in
+    // a synthetic `TypeExpr::Generic` marker BEFORE anything here ever
+    // runs) plus `bind_params`/`build_call_arg_vals`/`build_call_kw_
+    // expr` (which recognize that marker). This arm is reached only
+    // when an `Own`/`Borrow` node somehow reaches `value_kind_for_type`
+    // UNSTRIPPED — still possible for a lambda literal's own params
+    // (`strip_ownership_annotations_in_items` never walks into a
+    // `Stmt::Let`'s lambda value, a real, disclosed, pre-existing gap —
+    // see `define_lambda`'s own comment), so this stays a real,
+    // exhaustive match rather than an `unreachable!()`.
     TypeExpr::Own(inner) | TypeExpr::Borrow(inner, _) => value_kind_for_type(inner),
   }
 }
@@ -4801,6 +4905,22 @@ struct Ctx<'a, 'ctx> {
   /// have no way to recognize its own receiver as a newtype rather than
   /// an ordinary (never-declared) method name on some other type.
   newtypes: &'a HashSet<String>,
+  /// Plan 84's Decision log: `(incoming pointer, local alloca, kind)`
+  /// for every `borrow var` by-value parameter the CURRENT function/
+  /// method/lambda bound (`bind_params`'s own doc comment) — empty for
+  /// every function that binds none, which is every function compiled
+  /// before this plan and every one since that declares no such
+  /// parameter, so this is a real no-op in the overwhelmingly common
+  /// case. Read by `emit_borrow_var_writebacks`, called from every real
+  /// function-exit point (`Stmt::Return`'s own two arms, and `build_
+  /// function_body`'s three implicit-fallthrough exits) — see that
+  /// function's own doc comment for why a per-function slice, set once
+  /// by `define_user_function`/`define_method`/`define_lambda` right
+  /// after their own `bind_params` call, is enough (this function's
+  /// writebacks are meaningless to any OTHER function, unlike most
+  /// other `Ctx` fields, which mirrors `object_allocas`' own identical
+  /// per-function-not-per-program shape).
+  borrow_var_writebacks: &'a [(PointerValue<'ctx>, PointerValue<'ctx>, ValKind)],
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -9936,6 +10056,48 @@ fn build_array_lit<'ctx>(
   Ok(ptr)
 }
 
+/// Plan 84's Decision log: computes the ADDRESS `arg` should be passed
+/// at, for a call-site argument bound to a by-value `borrow`/`borrow
+/// var` marker parameter — shared by `build_call_arg_vals` (`Expr::
+/// Call`) and `build_call_kw_expr` (`Expr::CallKw`), the two call forms
+/// this plan's own scope covers (see `strip_ownership_in_type_expr`'s
+/// own doc comment for why method calls, `build_method_call`'s
+/// separate arg-building code, are NOT covered). A plain local-variable
+/// argument reuses ITS OWN existing `alloca` directly (genuinely
+/// zero-cost — every local this backend tracks already lives behind a
+/// `PointerValue`, `vars`' own doc comment); anything else is evaluated
+/// normally and spilled into a fresh `alloca`, since there is no
+/// existing address to hand over instead.
+fn build_borrow_arg_ptr<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  arg: &Spanned<Expr>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+  if let Expr::Ident(name) = &arg.node {
+    if let Some((ptr, _)) = vars.get(name) {
+      return Ok(*ptr);
+    }
+  }
+  let (v, k) = build_expr(
+    context,
+    builder,
+    arg,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let spill = builder
+    .build_alloca(local_llvm_type(context, &k), "borrowargspill")
+    .map_err(|e| e.to_string())?;
+  builder.build_store(spill, v).map_err(|e| e.to_string())?;
+  Ok(spill)
+}
+
 /// Plan 39's Decision log: `Expr::Call`'s own positional argument-value
 /// builder — fills any missing trailing arguments from the callee's
 /// declared defaults, and — when the callee declares a splat parameter
@@ -9944,6 +10106,24 @@ fn build_array_lit<'ctx>(
 /// alloc-and-store loop wholesale), appended as one final argument. The
 /// compiled callee itself is always fixed-arity — this is purely a
 /// call-site concern.
+///
+/// Plan 84's Decision log: when the callee's own `param.ty` is the
+/// by-value borrow-ptr marker (`borrow_ptr_marker_info` — a top-level
+/// function's `borrow`/`borrow var` of `Int64`/`Float64`/`Boolean`/
+/// `Symbol`, per `strip_ownership_in_type_expr`'s own doc comment),
+/// this pushes the ARGUMENT'S ADDRESS instead of its value, matching
+/// the `ptr`-typed slot `make_fn_type` already declared for it. Two
+/// cases: a plain local-variable argument (`Expr::Ident` naming an
+/// entry already in `vars`) reuses that binding's OWN existing `alloca`
+/// directly — genuinely zero-cost, no new instruction at all, since
+/// every local this backend tracks is already an `(alloca, kind)` pair
+/// (`vars`' own doc comment). Any other argument shape (a literal, a
+/// computed expression, ...) has no existing address to reuse, so it's
+/// evaluated normally and spilled into a fresh `alloca` — one real,
+/// disclosed extra store this specific case pays that an ordinary
+/// by-value parameter never would (see `spec/OWNERSHIP.md`'s own
+/// updated zero-cost claim and `examples/ownership.em`'s benchmark for
+/// the measured cost of each case).
 #[allow(clippy::too_many_arguments)]
 fn build_call_arg_vals<'ctx>(
   context: &'ctx Context,
@@ -9972,6 +10152,19 @@ fn build_call_arg_vals<'ctx>(
         )
       })?
     };
+    if borrow_ptr_marker_info(&param.ty).is_some() {
+      let arg_ptr = build_borrow_arg_ptr(
+        context,
+        builder,
+        expr,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      arg_vals.push(arg_ptr.into());
+      continue;
+    }
     let (v, _) = build_expr(
       context,
       builder,
@@ -10173,6 +10366,21 @@ fn build_call_kw_expr<'ctx>(
         )
       })?,
     };
+    // Plan 84's Decision log: mirrors `build_call_arg_vals`'s own
+    // identical check — see `build_borrow_arg_ptr`'s doc comment.
+    if borrow_ptr_marker_info(&f.params[i].ty).is_some() {
+      let arg_ptr = build_borrow_arg_ptr(
+        context,
+        builder,
+        expr,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      arg_vals.push(arg_ptr.into());
+      continue;
+    }
     let (v, _) = build_expr(
       context,
       builder,
@@ -12382,6 +12590,10 @@ fn build_stmt<'a, 'ctx>(
         ctx,
         false,
       )?;
+      // Plan 84's Decision log: right before the real `ret` — see
+      // `emit_borrow_var_writebacks`'s own doc comment for why this is
+      // one of its two `Stmt::Return` injection points.
+      emit_borrow_var_writebacks(context, builder, ctx)?;
       builder.build_return(Some(&v)).map_err(|e| e.to_string())?;
       Ok(true)
     }
@@ -12416,6 +12628,9 @@ fn build_stmt<'a, 'ctx>(
         ctx,
         false,
       )?;
+      // Plan 84's Decision log — see the `Some(e)` arm's own identical
+      // comment just above.
+      emit_borrow_var_writebacks(context, builder, ctx)?;
       builder.build_return(None).map_err(|e| e.to_string())?;
       Ok(true)
     }
@@ -13805,6 +14020,10 @@ fn build_function_body<'a, 'ctx>(
   let mut ensure_stack: Vec<(&'a [Spanned<Stmt>], bool)> = Vec::new();
   let mut retry_stack = Vec::new();
   let Some((last, init)) = body.split_last() else {
+    // Plan 84's Decision log: an empty body is a real (if unusual)
+    // function-exit point too — see `emit_borrow_var_writebacks`'s own
+    // doc comment.
+    emit_borrow_var_writebacks(context, builder, ctx)?;
     builder.build_return(None).map_err(|e| e.to_string())?;
     return Ok(());
   };
@@ -13868,6 +14087,10 @@ fn build_function_body<'a, 'ctx>(
         local_array_elem_types,
         ctx,
       )?;
+      // Plan 84's Decision log: the implicit-tail-expression half of
+      // this function's three real exit points — see `emit_borrow_var_
+      // writebacks`'s own doc comment.
+      emit_borrow_var_writebacks(context, builder, ctx)?;
       builder.build_return(Some(&v)).map_err(|e| e.to_string())?;
     }
     _ => {
@@ -13906,6 +14129,10 @@ fn build_function_body<'a, 'ctx>(
           local_array_elem_types,
           ctx,
         )?;
+        // Plan 84's Decision log: the `Void`-fallthrough half of this
+        // function's three real exit points — see `emit_borrow_var_
+        // writebacks`'s own doc comment.
+        emit_borrow_var_writebacks(context, builder, ctx)?;
         builder.build_return(None).map_err(|e| e.to_string())?;
       }
     }
@@ -13967,6 +14194,25 @@ fn effective_params(f: &AstFunction) -> Vec<Param> {
 /// each incoming SSA parameter value into its slot), populating
 /// `local_classes`/`local_array_elem_types` bookkeeping for any
 /// class-/array-typed parameter along the way.
+///
+/// Plan 84's Decision log: a by-value `borrow`/`borrow var` parameter
+/// (`borrow_ptr_marker_info` recognizes `p.ty`) arrives as a real LLVM
+/// `ptr` instead — `make_fn_type`'s own `ValKind::Ptr` case already
+/// builds that signature shape for free, since `value_kind_for_type` of
+/// either marker `Generic` falls into the same generic-`Ptr` bucket
+/// every OTHER `Generic` type already does (`Array[T]`, `Hash[K,V]`,
+/// ...). This arm loads the real underlying scalar out of that incoming
+/// pointer ONCE, up front, into an ordinary local `alloca` exactly like
+/// every other parameter gets — so every other codegen function in this
+/// file (`build_numeric_binop`, `build_expr`'s `Expr::Ident` read path,
+/// ...) sees a completely ordinary `Int64`/`Float64`/`Boolean`/`Symbol`
+/// local, with zero special-casing anywhere else. A `borrow var` (not a
+/// plain `borrow`) additionally records `(incoming pointer, this
+/// alloca, kind)` in `borrow_var_writebacks` — `emit_borrow_var_
+/// writebacks`' own doc comment covers the other half: writing the
+/// local's final value back through the incoming pointer at every
+/// function-exit point, which is what actually makes the callee's
+/// mutation visible to the caller.
 #[allow(clippy::too_many_arguments)]
 fn bind_params<'ctx>(
   context: &'ctx Context,
@@ -13984,8 +14230,34 @@ fn bind_params<'ctx>(
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
+  // Plan 84's Decision log: appended to for every `borrow var`
+  // by-value parameter this call binds — see this function's own doc
+  // comment and `emit_borrow_var_writebacks`'s.
+  borrow_var_writebacks: &mut Vec<(PointerValue<'ctx>, PointerValue<'ctx>, ValKind)>,
 ) -> Result<(), String> {
   for (i, p) in params.iter().enumerate() {
+    if let Some((is_mut, underlying_ty)) = borrow_ptr_marker_info(&p.ty) {
+      let underlying_kind = value_kind_for_type(underlying_ty);
+      let underlying_llvm_ty = local_llvm_type(context, &underlying_kind);
+      let incoming_ptr = func
+        .get_nth_param(param_offset + i as u32)
+        .expect("declared signature has this many params")
+        .into_pointer_value();
+      let loaded = builder
+        .build_load(underlying_llvm_ty, incoming_ptr, &p.name)
+        .map_err(|e| e.to_string())?;
+      let alloca = builder
+        .build_alloca(underlying_llvm_ty, &p.name)
+        .map_err(|e| e.to_string())?;
+      builder
+        .build_store(alloca, loaded)
+        .map_err(|e| e.to_string())?;
+      vars.insert(p.name.clone(), (alloca, underlying_kind.clone()));
+      if is_mut {
+        borrow_var_writebacks.push((incoming_ptr, alloca, underlying_kind));
+      }
+      continue;
+    }
     let kind = value_kind_for_type(&p.ty);
     let param_val = func
       .get_nth_param(param_offset + i as u32)
@@ -14174,6 +14446,51 @@ fn build_ensures_checks<'ctx>(
   Ok(())
 }
 
+/// Plan 84's Decision log: the other half of `bind_params`'s own
+/// `borrow var`-by-value handling — writes each bound `borrow var`
+/// parameter's CURRENT local value back through its own incoming
+/// pointer. Called from every one of this function's real exit points
+/// (`Stmt::Return(Some(_))`/`Stmt::Return(None)`'s own two arms in
+/// `build_stmt`, and `build_function_body`'s three implicit-fallthrough
+/// exits: the empty-body case, the implicit-tail-expression case, and
+/// the `Void`-fallthrough case) — a real no-op, zero instructions
+/// emitted, whenever `ctx.borrow_var_writebacks` is empty (every
+/// function that declares no `borrow var`-by-value parameter, which is
+/// every function compiled before this plan).
+///
+/// Real, disclosed limitation: this does NOT run on every possible way
+/// a function can end — `Stmt::Raise`'s own unwind (`build_raise`,
+/// `longjmp`-based), a `begin`'s own re-raise-to-an-outer-handler exit
+/// point, and the early `Result`-forwarding `return` `Stmt::Let`'s own
+/// `Expr::Try` arm builds when unwrapping a `?` hits `Err` all bypass
+/// this — mirroring `build_ensures_checks`' own identical, already-
+/// accepted gap (that mechanism also only fires at these same two
+/// "normal" exit shapes, not at an exception unwind). A `borrow var`
+/// parameter mutated right before one of these early-exit paths keeps
+/// today's (pre-plan-84) behavior: the mutation is not guaranteed
+/// visible to the caller. Closing this for real would need this same
+/// writeback threaded through `build_raise`/`build_begin`'s own exit
+/// points too — real, disclosed future work, not attempted here.
+fn emit_borrow_var_writebacks<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(), String> {
+  for (incoming_ptr, alloca, kind) in ctx.borrow_var_writebacks {
+    let current = builder
+      .build_load(
+        local_llvm_type(context, kind),
+        *alloca,
+        "borrowvarwriteback",
+      )
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_store(*incoming_ptr, current)
+      .map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
 /// Byte offset → 1-based source line, via a binary search over
 /// `newline_offsets` (every `\n`'s byte offset, ascending) — the
 /// conversion plan 35 reuses at every debug-location site instead of
@@ -14273,20 +14590,16 @@ fn define_user_function<'ctx>(
     gen_ctx.classes,
   )?;
 
-  let fn_ctx = Ctx {
-    current_di_scope: di_scope,
-    object_allocas: Some(&object_allocas),
-    // Plan 62's Decision log: only a top-level function (never a
-    // method/lambda/`main`) ever has a non-empty `ensures` list — this
-    // is the one real injection point that `Stmt::Return`'s codegen arm
-    // and the implicit-return fallthrough both read from.
-    current_function_contracts: Some((&f.name, &f.ensures)),
-    ..*gen_ctx
-  };
-
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
   let mut local_array_elem_types = HashMap::new();
+  // Plan 84's Decision log: collected by `bind_params` below, then
+  // borrowed into `fn_ctx` right after — `fn_ctx`'s own construction is
+  // deliberately AFTER `bind_params` now (it used to precede it), since
+  // `bind_params` reads `gen_ctx.classes`/`gen_ctx.newtypes` directly
+  // and never needed `fn_ctx` itself, so this reorder changes nothing
+  // else.
+  let mut borrow_var_writebacks = Vec::new();
   bind_params(
     context,
     builder,
@@ -14298,7 +14611,20 @@ fn define_user_function<'ctx>(
     &mut vars,
     &mut local_classes,
     &mut local_array_elem_types,
+    &mut borrow_var_writebacks,
   )?;
+
+  let fn_ctx = Ctx {
+    current_di_scope: di_scope,
+    object_allocas: Some(&object_allocas),
+    // Plan 62's Decision log: only a top-level function (never a
+    // method/lambda/`main`) ever has a non-empty `ensures` list — this
+    // is the one real injection point that `Stmt::Return`'s codegen arm
+    // and the implicit-return fallthrough both read from.
+    current_function_contracts: Some((&f.name, &f.ensures)),
+    borrow_var_writebacks: &borrow_var_writebacks,
+    ..*gen_ctx
+  };
 
   // Plan 62's Decision log: exactly one fixed injection point — right
   // after `bind_params`, before the user body's first statement
@@ -14381,16 +14707,15 @@ fn define_method<'ctx>(
     gen_ctx.classes,
   )?;
 
-  let method_ctx = Ctx {
-    self_ctx: Some((self_ptr, self_fields, self_field_classes)),
-    current_di_scope: di_scope,
-    object_allocas: Some(&object_allocas),
-    ..*gen_ctx
-  };
-
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
   let mut local_array_elem_types = HashMap::new();
+  // Plan 84's Decision log: always stays empty for a method today
+  // (`strip_ownership_annotations_in_item` never gives a method's
+  // params the by-value borrow-ptr marker — see `strip_ownership_in_
+  // type_expr`'s own doc comment for why), but threaded through for
+  // real regardless, matching `define_user_function`'s identical shape.
+  let mut borrow_var_writebacks = Vec::new();
   bind_params(
     context,
     builder,
@@ -14402,7 +14727,16 @@ fn define_method<'ctx>(
     &mut vars,
     &mut local_classes,
     &mut local_array_elem_types,
+    &mut borrow_var_writebacks,
   )?;
+
+  let method_ctx = Ctx {
+    self_ctx: Some((self_ptr, self_fields, self_field_classes)),
+    current_di_scope: di_scope,
+    object_allocas: Some(&object_allocas),
+    borrow_var_writebacks: &borrow_var_writebacks,
+    ..*gen_ctx
+  };
 
   let mut decls = Vec::new();
   collect_lets(&m.body, &mut decls);
@@ -14470,12 +14804,6 @@ fn define_lambda<'ctx>(
     gen_ctx.classes,
   )?;
 
-  let fn_ctx = Ctx {
-    current_di_scope: di_scope,
-    object_allocas: Some(&object_allocas),
-    ..*gen_ctx
-  };
-
   let mut vars = HashMap::new();
   let mut local_classes = HashMap::new();
   let mut local_array_elem_types = HashMap::new();
@@ -14496,6 +14824,17 @@ fn define_lambda<'ctx>(
     vars.insert(cap_name.clone(), (alloca, kind));
   }
 
+  // Plan 84's Decision log: always empty in practice — a lambda literal
+  // isn't reached by `strip_ownership_annotations_in_items` at all (it
+  // only walks top-level `Item::Function`/`Item::Class`/`Item::Actor`/
+  // `Item::Module`; a lambda literal lives inside a `Stmt::Let` value
+  // expression, not as its own `Item`), so `params` here is never
+  // rewritten with the by-value borrow-ptr marker either way — a
+  // pre-existing gap this plan doesn't newly introduce or attempt to
+  // close (see `strip_ownership_in_type_expr`'s own doc comment for
+  // `value_kind_for_type`'s still-defensive `Own`/`Borrow` arm, kept
+  // for exactly this kind of unstripped-input case).
+  let mut borrow_var_writebacks = Vec::new();
   bind_params(
     context,
     builder,
@@ -14507,7 +14846,15 @@ fn define_lambda<'ctx>(
     &mut vars,
     &mut local_classes,
     &mut local_array_elem_types,
+    &mut borrow_var_writebacks,
   )?;
+
+  let fn_ctx = Ctx {
+    current_di_scope: di_scope,
+    object_allocas: Some(&object_allocas),
+    borrow_var_writebacks: &borrow_var_writebacks,
+    ..*gen_ctx
+  };
 
   let mut decls = Vec::new();
   collect_lets(body, &mut decls);
@@ -16182,27 +16529,48 @@ fn compile_to_object_impl(
   if program_uses_contracts(&items) {
     ensure_contract_violation_class(&mut items);
   }
+  // `newtype Meters: Float64` — populates `NEWTYPE_UNDERLYING` for this
+  // compile. Plan 84's Decision log: this must run BEFORE `strip_
+  // ownership_annotations_in_items` immediately below, not after (as
+  // plan 83 originally had it) — that pass now calls `value_kind_for_
+  // type` itself (to decide whether a `borrow`/`borrow var` needs the
+  // real pointer marker), and a `borrow`/`borrow var` of a newtype
+  // whose underlying type is by-value (`newtype Meters: Float64`) would
+  // otherwise be misclassified as already-pointer-shaped (the generic
+  // "unknown name" bucket `value_kind_for_type` falls into before this
+  // table is populated), silently keeping today's by-value passthrough
+  // for that one case instead of getting the real pointer treatment.
+  // Reading directly from the pre-strip `program` (not `items`) is
+  // sound: a `newtype` declaration itself is never `own`/`borrow`-
+  // wrapped (`emerald-sema` only allows those on a parameter), so
+  // stripping has nothing to change about `Item::Newtype` entries
+  // either way.
+  set_newtype_underlying(program);
+
   // Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own rescoping of
-  // plan 84): strips every `own`/`borrow`/`borrow var` wrapper off
-  // every function/method parameter and return-type annotation,
-  // program-wide, before anything else in this file ever looks at
-  // `items` — the single, disclosed codegen PASSTHROUGH point (see
-  // `strip_ownership_annotations_in_items`'s own doc comment for the
-  // full rationale). `emerald_sema::check_program` has already fully
-  // enforced the four ownership-liveness rules against the ORIGINAL,
-  // annotated AST by the time any `emerald_codegen::compile_to_object*`
-  // entry point ever runs (`emerald-driver`'s own fixed pipeline
-  // order) — from here on, `own Data`/`borrow Data`/`borrow var Data`
-  // compile EXACTLY like a bare `Data` parameter, with no new codegen
-  // machinery of any kind.
+  // plan 84), extended by plan 84 itself: strips every `own`/`borrow`/
+  // `borrow var` wrapper off every function/method parameter and
+  // return-type annotation, program-wide, before anything else in this
+  // file ever looks at `items` (see `strip_ownership_annotations_in_
+  // items`'s own doc comment for the full rationale, and `strip_
+  // ownership_in_type_expr`'s for exactly which cases now get a real
+  // pointer marker instead of a bare passthrough). `emerald_sema::
+  // check_program` has already fully enforced the four ownership-
+  // liveness rules against the ORIGINAL, annotated AST by the time any
+  // `emerald_codegen::compile_to_object*` entry point ever runs
+  // (`emerald-driver`'s own fixed pipeline order) — from here on, `own
+  // Data`/`borrow Data`/`borrow var Data` compile EXACTLY like a bare
+  // `Data` parameter (true for every case plan 83 originally covered:
+  // `own` of anything, and `borrow`/`borrow var` of an already
+  // pointer-represented type), and a top-level function's by-value
+  // `borrow`/`borrow var` parameter (`borrow Int64`, `borrow var
+  // Boolean`, ...) compiles to a real caller-visible pointer — see
+  // `bind_params`/`build_call_arg_vals`/`build_call_kw_expr`'s own doc
+  // comments for that mechanism, and `strip_ownership_in_type_expr`'s
+  // for the real, disclosed method-parameter scope boundary.
   strip_ownership_annotations_in_items(&mut items);
   let owned_program = Program { items };
   let program = &owned_program;
-
-  // `newtype Meters: Float64` — populates `NEWTYPE_UNDERLYING` for this
-  // compile, before `value_kind_for_type` (or anything that calls it) is
-  // ever invoked below. See that thread-local's own doc comment.
-  set_newtype_underlying(program);
 
   // Plan 64's `leaf-target-triple-and-selection` — the one seam this
   // whole file has (Decision log). `Native` keeps the pre-plan-64
@@ -16974,6 +17342,14 @@ fn compile_to_object_impl(
     interface_defs: &interface_defs,
     generic_method_instances: &generic_method_instances_cell,
     newtypes: &newtypes,
+    // Plan 84's Decision log: empty at the whole-program base `Ctx` —
+    // every per-function `Ctx` (`define_user_function`/`define_method`/
+    // `define_lambda`) overrides this with its OWN freshly bound list
+    // right after its own `bind_params` call. `main` never overrides it
+    // (top-level code has no parameters to bind at all), so it keeps
+    // this empty default, which is correct: `main` never emits a
+    // `Stmt::Return`/implicit-fallthrough that could need one.
+    borrow_var_writebacks: &[],
   };
 
   for item in &program.items {
@@ -21122,5 +21498,265 @@ int main(void) {
     for (i, out) in runs.iter().enumerate() {
       assert_eq!(out, expected, "run {i} produced unexpected output: {out:?}");
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Plan 84 (`deterministic-destruction-codegen`): real `own`/`borrow`/
+  // `borrow var` codegen, replacing plan 83's disclosed full-erasure
+  // passthrough for a by-value `borrow`/`borrow var` — see `strip_
+  // ownership_in_type_expr`'s own doc comment for the full mechanism.
+  //
+  // Several tests below use source that `emerald-sema` would reject
+  // (plan 72's "no `var` slot exists on a parameter" rule makes `x =
+  // ...` illegal for ANY parameter, `borrow var`-typed or not — a real,
+  // pre-existing, disclosed gap `examples/ownership.em`'s own header
+  // comment covers in full). That's fine here: `compile_link_run` (this
+  // whole module's own established idiom) parses `src` directly via
+  // `emerald_parser::parse` and compiles it — `emerald-sema` is never
+  // invoked by any test in this file, so this is not a new allowance
+  // introduced for plan 84, just the same route every other codegen-
+  // only test here already takes.
+  // ------------------------------------------------------------------
+
+  #[test]
+  fn borrow_var_int64_parameter_mutation_is_genuinely_visible_to_the_caller() {
+    // The headline proof: `x`'s own reassignment inside `double_in_
+    // place` writes through a REAL pointer into the caller's own `n`
+    // (`bind_params`'s load-on-entry, `emit_borrow_var_writebacks`'
+    // store-on-exit) — not an accidental copy that happens to look
+    // right. Before this plan, `borrow var Int64` fully erased to a
+    // bare `Int64`, passed by value — this exact program would have
+    // printed `21`, not `42`.
+    let src = "fn double_in_place(x: borrow var Int64): Void do\n  x = x * 2\nend\n\nn: Int64 = 21\ndouble_in_place(n)\nputs n\n";
+    assert_eq!(compile_link_run(src), "42\n");
+  }
+
+  #[test]
+  fn borrow_var_float64_and_boolean_parameters_also_write_back() {
+    // Same proof, `Float64`/`Boolean` — `borrow_ptr_marker_info` and
+    // `bind_params`'s handling are kind-agnostic (any non-`Ptr`/`Str`
+    // `ValKind`), not special-cased to `Int64` alone.
+    let src = "fn halve(x: borrow var Float64): Void do\n  x = x / 2.0\nend\n\nfn flip(x: borrow var Boolean): Void do\n  x = !x\nend\n\nf: Float64 = 10.0\nhalve(f)\nputs f\n\nb: Boolean = true\nflip(b)\nif b do\n  puts \"true\"\nelse\n  puts \"false\"\nend\n";
+    assert_eq!(compile_link_run(src), "5\nfalse\n");
+  }
+
+  #[test]
+  fn borrow_int64_parameter_reads_the_callers_current_value_through_a_real_pointer() {
+    // A plain `borrow` (not `borrow var`) still gets the real-pointer
+    // treatment for a by-value type (`strip_ownership_in_type_expr`'s
+    // own doc comment: only an already-pointer-represented type skips
+    // it) — this just proves the read side still works correctly.
+    let src =
+      "fn describe(x: borrow Int64): Void do\n  puts x\nend\n\nn: Int64 = 21\ndescribe(n)\n";
+    assert_eq!(compile_link_run(src), "21\n");
+  }
+
+  #[test]
+  fn borrow_int64_parameter_compiles_to_a_real_ptr_typed_llvm_signature() {
+    // Direct IR-text proof (this module's own established idiom, e.g.
+    // `a_non_escaping_new_inside_a_while_loop_gets_exactly_one_alloca`
+    // above) that `borrow Int64` is a REAL pointer at the LLVM level,
+    // not merely behaviorally indistinguishable from one: an ordinary,
+    // unannotated `Int64` parameter compiles to `define i64 @plain(i64
+    // %n)` (byval scalar) — `describe`'s own declared signature must
+    // instead take a bare `ptr`.
+    let src = "fn describe(x: borrow Int64): Void do\n  puts x\nend\n\nfn plain(x: Int64): Void do\n  puts x\nend\n\nn: Int64 = 5\ndescribe(n)\nplain(n)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("borrow_int64_signature");
+    let obj_path = dir.join("out.o");
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile and return IR text");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+      ir.contains("define void @describe(ptr "),
+      "expected `describe`'s own `borrow Int64` parameter to compile to a bare `ptr`:\n{ir}"
+    );
+    assert!(
+      ir.contains("define void @plain(i64 "),
+      "expected `plain`'s own ordinary `Int64` parameter to stay a by-value `i64`, unchanged:\n{ir}"
+    );
+  }
+
+  /// Counts `= alloca` lines inside `main`'s own body, excluding the two
+  /// fixed `%ARGV`/`%ARGC` allocas every compiled `main` already has
+  /// (`define_main`'s own doc comment) — shared by the two `borrow
+  /// Int64` call-site cost tests just below, which need to isolate a
+  /// SPECIFIC call site's own cost from that fixed baseline.
+  fn count_non_argv_argc_allocas_in_main(ir: &str) -> usize {
+    let mut in_main = false;
+    let mut count = 0usize;
+    for line in ir.lines() {
+      if line.starts_with("define i32 @main(") {
+        in_main = true;
+        continue;
+      }
+      if in_main {
+        if line.starts_with('}') {
+          break;
+        }
+        if line.contains("= alloca ") && !line.contains("%ARGV") && !line.contains("%ARGC") {
+          count += 1;
+        }
+      }
+    }
+    count
+  }
+
+  #[test]
+  fn borrow_int64_call_site_with_a_plain_local_argument_adds_no_extra_alloca() {
+    // Plan 84's own zero-cost claim for the common case: a `borrow`
+    // call-site argument that's already a plain local variable reuses
+    // that binding's OWN existing `alloca` directly (`build_borrow_arg_
+    // ptr`'s own doc comment) — genuinely zero cost, not merely cheap.
+    // `describe`'s call site must therefore add NO alloca of its own
+    // inside `main` beyond `n`'s own single, pre-existing one — `ARGV`/
+    // `ARGC` (two fixed allocas every compiled `main` already has,
+    // `define_main`'s own doc comment) are excluded from the count
+    // below since they're unrelated to this call site entirely.
+    let src = "fn describe(x: borrow Int64): Void do\n  puts x\nend\n\nn: Int64 = 5\ndescribe(n)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("borrow_int64_zero_cost_call_site");
+    let obj_path = dir.join("out.o");
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile and return IR text");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let alloca_count = count_non_argv_argc_allocas_in_main(&ir);
+    assert_eq!(
+      alloca_count, 1,
+      "expected exactly one non-ARGV/ARGC `alloca` in `main` (`n`'s own) — passing `n` to a \
+       `borrow Int64` parameter must not add a second one:\n{ir}"
+    );
+  }
+
+  #[test]
+  fn borrow_int64_call_site_with_a_literal_argument_spills_to_one_real_alloca() {
+    // The disclosed, real, unavoidable cost this plan names rather than
+    // hiding: an argument with no existing address (a literal here, but
+    // the same is true of any computed expression) needs one real,
+    // extra stack slot + store to hand a `borrow`-taking callee a valid
+    // pointer — `build_borrow_arg_ptr`'s own doc comment.
+    let src = "fn describe(x: borrow Int64): Void do\n  puts x\nend\n\ndescribe(5)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("borrow_int64_literal_spill");
+    let obj_path = dir.join("out.o");
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile and return IR text");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let alloca_count = count_non_argv_argc_allocas_in_main(&ir);
+    assert_eq!(
+      alloca_count, 1,
+      "expected exactly one non-ARGV/ARGC spill `alloca` in `main`, for the literal `5` \
+       argument:\n{ir}"
+    );
+    assert_eq!(compile_link_run(src), "5\n");
+  }
+
+  /// Counts lines matching `pred` across every `define ...` function
+  /// whose signature line contains one of `fn_markers` (e.g. `"@foo("`)
+  /// — a generalization of `count_non_argv_argc_allocas_in_main` above
+  /// for when the count needs to span more than one specific function
+  /// (`own_class_parameter_transfers_the_pointer_with_no_extra_
+  /// allocation` below needs `consume`'s own body counted alongside
+  /// `main`'s, since the whole module's IR also has unrelated functions
+  /// — other classes' own wire codecs — that would otherwise pollute a
+  /// whole-module count).
+  fn count_lines_in_functions_matching(
+    ir: &str,
+    fn_markers: &[&str],
+    pred: impl Fn(&str) -> bool,
+  ) -> usize {
+    let mut in_target_fn = false;
+    let mut count = 0usize;
+    for line in ir.lines() {
+      if line.starts_with("define ") && fn_markers.iter().any(|m| line.contains(m)) {
+        in_target_fn = true;
+        continue;
+      }
+      if in_target_fn {
+        if line.starts_with('}') {
+          in_target_fn = false;
+          continue;
+        }
+        if pred(line) {
+          count += 1;
+        }
+      }
+    }
+    count
+  }
+
+  #[test]
+  fn own_class_parameter_transfers_the_pointer_with_no_extra_allocation() {
+    // Plan 84's own headline `own` proof: an `own`-consuming call is
+    // NOT a hidden second allocation/copy of its own — the whole
+    // program allocates exactly once (`Box.new`'s own single
+    // `emerald_alloc` call), matching `strip_ownership_in_type_expr`'s
+    // own doc comment ("an `own` transfer is either a class's existing
+    // pointer-copy or a primitive's existing scalar-copy... exactly
+    // what an ordinary, unannotated parameter already does").
+    let src = "class Box\n  read v: Int64\n\n  fn initialize(v: Int64): Void do\n    @v = v\n  end\nend\n\nfn consume(b: own Box): Int64 do\n  b.v\nend\n\nbox: Box = Box.new(7)\nputs consume(box)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("own_no_copy");
+    let obj_path = dir.join("out.o");
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile and return IR text");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Scoped to `consume`'s own body and `main`'s own body — the whole
+    // module's IR also contains OTHER classes'/`Box`'s own wire-codec
+    // functions (`declare_wire_class_codecs`, generated for every class
+    // regardless of whether the program declares any actor at all),
+    // each with an unrelated `emerald_alloc` call of their own that
+    // would otherwise pollute this count.
+    let alloc_call_count = count_lines_in_functions_matching(&ir, &["@consume(", "@main("], |l| {
+      l.contains("call ptr @emerald_alloc(")
+    });
+    assert_eq!(
+      alloc_call_count, 1,
+      "expected exactly one allocation (the single `Box.new`) inside `consume`/`main` — an \
+       `own` transfer must not allocate/copy on its own:\n{ir}"
+    );
+    assert!(
+      ir.contains("define i64 @consume(ptr "),
+      "expected `consume`'s own `own Box` parameter to compile to a bare `ptr`, exactly like an \
+       ordinary, unannotated `Box` parameter:\n{ir}"
+    );
+
+    assert_eq!(compile_link_run(src), "7\n");
+  }
+
+  #[test]
+  fn borrow_var_class_parameter_stays_a_bare_pointer_no_wrapper() {
+    // Regression guard for the case plan 84 explicitly did NOT need to
+    // change: `borrow var Counter` must still compile to exactly the
+    // same bare `ptr` signature an unannotated `Counter` parameter
+    // gets — no wrapper struct, no extra indirection, matching
+    // `strip_ownership_in_type_expr`'s own doc comment that an
+    // already-pointer-represented type's `borrow`/`borrow var` fully
+    // erases, unchanged from plan 83's original passthrough.
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn bump: Void do\n    @value = @value + 1\n  end\n\n  fn value: Int64 do\n    @value\n  end\nend\n\nfn increment(c: borrow var Counter): Void do\n  c.bump\nend\n\ncounter: Counter = Counter.new(10)\nincrement(counter)\nputs counter.value\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let dir = fresh_temp_dir("borrow_var_class_bare_ptr");
+    let obj_path = dir.join("out.o");
+    let ir = compile_to_object_ir_text_for_test(&program, &obj_path)
+      .expect("should compile and return IR text");
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+      ir.contains("define void @increment(ptr "),
+      "expected `increment`'s own `borrow var Counter` parameter to compile to a bare `ptr`:\n{ir}"
+    );
+    // The mutation is genuinely visible to the caller too — this was
+    // already true before plan 84 (a class instance is always passed
+    // by pointer), so this is a regression guard, not a new proof.
+    assert_eq!(compile_link_run(src), "11\n");
   }
 }

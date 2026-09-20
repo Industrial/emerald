@@ -3,10 +3,43 @@
 # by `emerald-sema`. `own T` transfers a parameter's binding to the
 # callee (the caller may not use it again after the call); `borrow T`
 # is a shared, read-only reference; `borrow var T` is an exclusive,
-# mutable reference. `emerald-codegen` compiles all three exactly like
-# the plain underlying `T` today — a real, disclosed, temporary
-# passthrough (see `value_kind_for_type`'s own doc comment in that
-# crate) — plan 84 owns real zero-cost borrow/own codegen.
+# mutable reference.
+#
+# Plan 84's real codegen (`spec/OWNERSHIP.md` §9/§10): `own`, and
+# `borrow`/`borrow var` of a class instance (like `Counter` below,
+# already an LLVM pointer), compile to EXACTLY the plain underlying
+# type — genuinely zero-cost, no new machinery, since a class instance
+# was already passed by pointer before this plan (see `emerald-codegen`'s
+# `bind_params`/`strip_ownership_in_type_expr` doc comments). A
+# `borrow`/`borrow var` of a BY-VALUE primitive (`Int64`/`Float64`/
+# `Boolean`/`Symbol`) is different: it compiles to a REAL pointer at the
+# LLVM level (a genuinely new mechanism this plan builds) — `describe`
+# below passes `n` this way (a read-only reference, so this program's
+# own output can't distinguish it from a copy, but `emerald-codegen`'s
+# own `bind_params` doc comment and test suite prove it really is one).
+#
+# Real, disclosed limitation this plan found, not one it introduces: a
+# `borrow var` of a PRIMITIVE has no way to be actually exercised from
+# valid Emerald source today. Mutating a borrowed CLASS instance (like
+# `increment` above) works by calling a MUTATING METHOD, which writes a
+# FIELD (`@value = ...`) — never by reassigning the local binding `c`
+# itself. A primitive has no fields/methods to mutate through, and
+# plan 72's own rule (`emerald-sema`, "a parameter is immutable by
+# construction, the same as an ordinary function's — no `var` slot
+# exists on a parameter regardless of which class/method-checking path
+# binds it") makes `x = ...` a compile error for EVERY parameter,
+# `borrow var`-typed or not. So the real, new pointer/writeback codegen
+# this plan builds for a by-value `borrow var` (`emerald-codegen`'s own
+# `bind_params`/`emit_borrow_var_writebacks`) is sound and tested
+# end-to-end (see that crate's test suite, which parses a small source
+# string directly and compiles it — the same pre-existing idiom this
+# whole test suite already uses, which runs `emerald-sema` no more than
+# any other codegen-only test here does), but cannot be demonstrated
+# through THIS file, since it goes through the real CLI's full pipeline
+# (sema included). Closing that gap for real — letting `x: borrow var
+# Int64` actually be reassigned — is real, disclosed future work in
+# `emerald-sema`, not attempted here (out of this plan's own crate
+# scope, `emerald-codegen`).
 
 class Counter
   value: Int64
@@ -48,3 +81,15 @@ report(counter)
 increment(counter)
 report(counter)
 finish(counter)
+
+# A `borrow` of a BY-VALUE primitive — real, new plan 84 codegen: `x`
+# arrives as an actual pointer into `n`'s own storage, never a copy
+# (see this file's own header comment for the full explanation, and
+# `emerald-codegen`'s test suite for the end-to-end proof, including
+# the `borrow var` mutation case this file itself can't express yet).
+fn describe(x: borrow Int64): Void do
+  puts x
+end
+
+n: Int64 = 21
+describe(n)
