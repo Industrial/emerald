@@ -209,8 +209,11 @@ struct ClassInfo {
   /// `implements Comparable` (plan 41's Decision log) — `None` for
   /// every class that doesn't declare one, always `None` for a module
   /// (the grammar's `ImplementsClause?` is only reachable from
-  /// `ClassDef`).
-  implements: Option<String>,
+  /// `ClassDef`). Plan 89's Decision log widens the tuple's second
+  /// element to `Vec<TypeExpr>` — `implements Iterable[Int64]`'s
+  /// `[Int64]`, binding the interface's own type parameter(s) to
+  /// concrete types; empty for a bare `implements Comparable`.
+  implements: Option<(String, Vec<TypeExpr>)>,
   /// Plan 52's Decision log: `Some(variants)` only for an `enum`
   /// registered into this SAME table — `[(variant_name, field_types)]`
   /// in declaration order. `fields`/`methods` stay empty and
@@ -250,17 +253,32 @@ struct ClassInfo {
   generic_methods: HashMap<String, GenericMethodSig>,
 }
 
-/// One `interface`'s single required method, kept as raw, unresolved
-/// type-name strings (plan 41's Decision log) — `"Self"` isn't
-/// resolvable via `resolve_type` until substituted with either a
+/// One required method inside an `interface ... end` body, kept as raw,
+/// unresolved type-name strings (plan 41's Decision log) — `"Self"`
+/// isn't resolvable via `resolve_type` until substituted with either a
 /// concrete implementing class's name (conformance checking) or the
 /// generic type parameter itself (generic-body checking), so resolving
-/// eagerly at registration time would be premature.
+/// eagerly at registration time would be premature. `type_params` is
+/// this method's OWN `[U]`/`[U: Bound]` clause (plan 89's Decision log
+/// — `fn map[U](f: Proc[T, U]): Array[U]`), empty for an ordinary
+/// required method.
 #[derive(Debug, Clone)]
-struct InterfaceInfo {
+struct InterfaceMethodInfo {
   method_name: String,
+  type_params: Vec<TypeParam>,
   params_raw: Vec<(String, TypeExpr)>,
   return_type_raw: TypeExpr,
+}
+
+/// An `interface`'s own type-parameter clause plus its full required-
+/// method set (plan 89's Decision log widens this from a single
+/// non-generic required method to both a `type_params` clause and a
+/// `Vec` of methods — `interface Iterable[T] ... end` with more than
+/// one `fn` inside).
+#[derive(Debug, Clone)]
+struct InterfaceInfo {
+  type_params: Vec<TypeParam>,
+  methods: Vec<InterfaceMethodInfo>,
 }
 
 /// A top-level generic function's registration (plan 41's Decision
@@ -724,7 +742,7 @@ fn check_generic_arg_bound(
 ) -> Result<(), Diagnostic> {
   let conforms = classes
     .get(arg_class_name)
-    .is_some_and(|info| info.implements.as_deref() == Some(bound));
+    .is_some_and(|info| info.implements.as_ref().map(|(n, _)| n.as_str()) == Some(bound));
   if conforms {
     Ok(())
   } else {
@@ -1729,6 +1747,54 @@ fn function_signature(
   })
 }
 
+/// A substituting variant of `function_signature` — identical except
+/// each param/return/splat type is first rewritten via `substitute_
+/// type_params` against `subst` before `resolve_type`/`resolve_return_
+/// type` ever sees it. An empty `subst` makes this behaviorally
+/// identical to `function_signature` (substituting against an empty map
+/// is a no-op rewrite — `substitute_type_params`'s own base case),
+/// so every existing non-generic-interface call site keeps its old
+/// behavior unchanged. A non-empty `subst` is plan 89's own new case: a
+/// class method whose declared type references its enclosing class's
+/// `implements Iterable[Int64]`-bound interface type parameter (`T`)
+/// directly, with no `[U]` of its own (`build_flattened_class_info`'s
+/// own `interface_type_param_subst` call is what builds `subst` here).
+fn function_signature_with_subst(
+  f: &Function,
+  subst: &HashMap<&str, &TypeExpr>,
+  classes: &HashMap<String, ClassInfo>,
+) -> Result<FunctionSig, Diagnostic> {
+  if !f.type_params.is_empty() {
+    return Err(Diagnostic::new(
+      format!("generic methods are not supported yet (`{}`)", f.name),
+      (0, 0),
+    ));
+  }
+  let params = f
+    .params
+    .iter()
+    .map(|p| resolve_type(&substitute_type_params(&p.ty, subst), classes))
+    .collect::<Result<Vec<_>, _>>()?;
+  let return_type = resolve_return_type(&substitute_type_params(&f.return_type, subst), classes)?;
+  let param_names = f.params.iter().map(|p| p.name.clone()).collect();
+  let defaults = f.params.iter().map(|p| p.default.clone()).collect();
+  let splat_elem = f
+    .splat_param
+    .as_ref()
+    .map(|p| resolve_type(&substitute_type_params(&p.ty, subst), classes))
+    .transpose()?;
+  Ok(FunctionSig {
+    params,
+    return_type,
+    block_param: f.block_param.clone(),
+    param_names,
+    defaults,
+    splat_elem,
+    requires: f.requires.clone(),
+    is_pure: f.is_pure,
+  })
+}
+
 /// Walks `name`'s `superclass` chain via `classes`'s already-registered
 /// `superclass` links (plan 32's Decision log) — this only needs pass
 /// 1's stub registration (names + `superclass`, not yet flattened
@@ -1772,6 +1838,31 @@ fn resolve_chain(
   Ok(chain)
 }
 
+/// Plan 89: builds the substitution map from a generic interface's own
+/// type parameter name(s) to the concrete `TypeExpr`(s) `c`'s own
+/// `implements Interface[Args]` clause binds them to — empty if `c`
+/// declares no `implements` clause, names a non-generic interface (bare
+/// `implements Comparable`), or names an interface that isn't
+/// registered at all. Arity mismatches and an unknown interface name are
+/// left entirely to `check_interface_conformance`'s own diagnostics —
+/// this helper degrades to an empty substitution rather than erroring,
+/// so a bad `implements` clause is reported once, clearly, there,
+/// rather than risking a second, differently-worded failure here.
+fn interface_type_param_subst<'a>(
+  c: &'a ClassDef,
+  interfaces: &'a HashMap<String, InterfaceInfo>,
+) -> HashMap<&'a str, &'a TypeExpr> {
+  let mut subst = HashMap::new();
+  if let Some((iface_name, args)) = &c.implements {
+    if let Some(iface) = interfaces.get(iface_name.as_str()) {
+      for (tp, arg) in iface.type_params.iter().zip(args.iter()) {
+        subst.insert(tp.name.as_str(), arg);
+      }
+    }
+  }
+  subst
+}
+
 /// Builds one class's FLATTENED field/method tables (plan 32's
 /// Decision log) — walks `name`'s chain root-to-leaf via `class_defs`
 /// (the raw `ClassDef`s, keyed by name; independent of processing
@@ -1787,6 +1878,7 @@ fn build_flattened_class_info(
   name: &str,
   class_defs: &HashMap<String, &ClassDef>,
   classes: &HashMap<String, ClassInfo>,
+  interfaces: &HashMap<String, InterfaceInfo>,
 ) -> Result<ClassInfo, Diagnostic> {
   let chain = resolve_chain(name, classes)?;
   let mut fields: HashMap<String, Type> = HashMap::new();
@@ -1798,10 +1890,22 @@ fn build_flattened_class_info(
   // `generic_method_signature` a no-op class-level substitution,
   // leaving only the method's own free type parameter symbolic.
   let no_class_subst: HashMap<&str, &TypeExpr> = HashMap::new();
+  // Plan 89's Decision log: `name`'s own `implements Iterable[Int64]`
+  // clause (if any) binds the interface's own type parameter to a
+  // concrete type for `name`'s OWN declared methods only — never
+  // applied to an ancestor's methods walked further down in this same
+  // loop (`class_name == name` gates it below), since an ancestor's
+  // declaration has no relationship to `name`'s own `implements` at all.
+  let iface_subst = interface_type_param_subst(class_defs[name], interfaces);
   for class_name in &chain {
     let c = class_defs
       .get(class_name.as_str())
       .expect("every name in a resolved chain came from a registered ClassDef");
+    let subst = if class_name == name {
+      &iface_subst
+    } else {
+      &no_class_subst
+    };
     for f in &c.fields {
       if let Some(owner) = field_owner.get(&f.name) {
         return Err(Diagnostic::new(
@@ -1845,11 +1949,11 @@ fn build_flattened_class_info(
       // signature is a real, disclosed gap, matching this same
       // function's existing lack of ANY generic-aware override check.
       if !m.type_params.is_empty() {
-        let sig = generic_method_signature(class_name, m, &no_class_subst, classes)?;
+        let sig = generic_method_signature(class_name, m, subst, classes)?;
         generic_methods.insert(m.name.clone(), sig);
         continue;
       }
-      let sig = function_signature(m, classes)?;
+      let sig = function_signature_with_subst(m, subst, classes)?;
       // `initialize` is exempt from the invariant-signature override
       // check: every class's constructor is inherently class-specific
       // (this plan's own worked example has `Dog::initialize` take an
@@ -2951,7 +3055,7 @@ fn infer_expr_type(
       // `check_generic_arg_bound`'s own identical per-bound check for
       // generic classes/enums.
       for bound in &g.bounds {
-        if class_info.implements.as_deref() != Some(bound.as_str()) {
+        if class_info.implements.as_ref().map(|(n, _)| n.as_str()) != Some(bound.as_str()) {
           return Err(Diagnostic::new(
             format!(
               "`{concrete_class}` does not implement `{bound}`, required by generic function `{name}`'s type parameter `{}`",
@@ -3567,13 +3671,17 @@ fn infer_expr_type(
           expr.span,
         ));
       };
-      let iface = bounds
+      // Plan 89's Decision log: `InterfaceInfo` widened from a single
+      // required method to a full `methods` list — this dispatch now
+      // searches every bound interface's own method set by name,
+      // instead of comparing directly against a single `method_name`.
+      let iface_method = bounds
         .iter()
         .find_map(|b| {
           gctx
             .interfaces
             .get(b)
-            .filter(|iface| &iface.method_name == method)
+            .and_then(|iface| iface.methods.iter().find(|m| &m.method_name == method))
         })
         .ok_or_else(|| {
           Diagnostic::new(
@@ -3585,7 +3693,7 @@ fn infer_expr_type(
           )
         })?;
       let self_ty = Type::Generic(type_param.clone(), bounds.clone());
-      let expected = iface
+      let expected = iface_method
         .params_raw
         .iter()
         .map(|(_, raw)| {
@@ -3606,10 +3714,10 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
-      if iface.return_type_raw.as_named() == Some("Self") {
+      if iface_method.return_type_raw.as_named() == Some("Self") {
         Ok(self_ty)
       } else {
-        resolve_type(&iface.return_type_raw, classes)
+        resolve_type(&iface_method.return_type_raw, classes)
       }
     }
     // Plan 57 (supervision trees): `.child(:name)` on a `Supervisor`-
@@ -3897,7 +4005,7 @@ fn infer_expr_type(
           let concrete_info = classes.get(concrete_class).ok_or_else(|| {
             Diagnostic::new(format!("undefined class `{concrete_class}`"), expr.span)
           })?;
-          if concrete_info.implements.as_deref() != Some(bound.as_str()) {
+          if concrete_info.implements.as_ref().map(|(n, _)| n.as_str()) != Some(bound.as_str()) {
             return Err(Diagnostic::new(
               format!(
                 "`{concrete_class}` does not implement `{bound}`, required by generic method `{class_name}#{method}`'s type parameter `{}`",
@@ -9320,7 +9428,8 @@ pub fn collect_symbols(program: &Program) -> SymbolTable {
   let mut resolved_classes: HashMap<String, ClassInfo> = HashMap::new();
   for item in &program.items {
     if let Item::Class(c) = item {
-      if let Ok(info) = build_flattened_class_info(&c.name, &class_defs, &classes) {
+      if let Ok(info) = build_flattened_class_info(&c.name, &class_defs, &classes, &HashMap::new())
+      {
         classes.insert(c.name.clone(), info.clone());
         resolved_classes.insert(c.name.clone(), info);
       }
@@ -9385,13 +9494,21 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       interfaces.insert(
         idef.name.clone(),
         InterfaceInfo {
-          method_name: idef.method_name.clone(),
-          params_raw: idef
-            .params
+          type_params: idef.type_params.clone(),
+          methods: idef
+            .methods
             .iter()
-            .map(|p| (p.name.clone(), p.ty.clone()))
+            .map(|m| InterfaceMethodInfo {
+              method_name: m.method_name.clone(),
+              type_params: m.type_params.clone(),
+              params_raw: m
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect(),
+              return_type_raw: m.return_type.clone(),
+            })
             .collect(),
-          return_type_raw: idef.return_type.clone(),
         },
       );
     }
@@ -9591,7 +9708,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     // the collect+instantiate pass just below.
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
-        match build_flattened_class_info(&c.name, &class_defs, &classes) {
+        match build_flattened_class_info(&c.name, &class_defs, &classes, &interfaces) {
           Ok(info) => {
             classes.insert(c.name.clone(), info);
           }
@@ -9624,13 +9741,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // registration failed, skip downstream checks" pattern.
   for item in &program.items {
     if let Item::Class(c) = item {
-      if let Some(iface_name) = &c.implements {
+      if c.implements.is_some() {
         let Some(info) = classes.get(&c.name) else {
           continue;
         };
-        if let Err(d) =
-          check_interface_conformance(&c.name, iface_name, info, &interfaces, &classes)
-        {
+        if let Err(d) = check_interface_conformance(&c.name, info, &interfaces, &classes) {
           diags.push(d);
         }
       }
@@ -10042,57 +10157,131 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
 /// raw parameter/return-type strings with `class_name` itself, resolves
 /// the substituted strings, and compares the result *exactly* (invariant,
 /// not covariant — same discipline as plan 32's override check) against
-/// `info.methods.get(&iface.method_name)` — the class's already-
-/// **flattened** method table, so an interface requirement satisfied by
-/// an *inherited* method is accepted for free.
+/// `info.methods.get(...)` — the class's already-**flattened** method
+/// table, so an interface requirement satisfied by an *inherited* method
+/// is accepted for free.
+///
+/// Plan 89's Decision log widens this from a single required method to
+/// the interface's FULL method set, and adds a second substitution
+/// alongside `Self`: every one of the interface's own `type_params`
+/// (`interface Iterable[T]`'s `T`) is bound to whatever concrete type
+/// the class's own `implements Iterable[Int64]` clause supplies, before
+/// either kind of method (ordinary or the method's own further-generic
+/// `[U]`) is checked.
+///
+/// A required method that itself declares a type parameter (`fn map[U]
+/// (f: Proc[T, U]): Array[U]`) is checked structurally against the
+/// class's own `generic_methods` registry (already built with the same
+/// `T` substitution applied — `build_flattened_class_info`'s own
+/// `interface_type_param_subst` call) rather than resolved into a real
+/// `Type` — a real, disclosed simplification: the class's own
+/// implementing method must spell its type parameter identically to the
+/// interface's (`U` here), since no renaming/unification between two
+/// differently-named method type parameters is attempted.
 fn check_interface_conformance(
   class_name: &str,
-  iface_name: &str,
   info: &ClassInfo,
   interfaces: &HashMap<String, InterfaceInfo>,
   classes: &HashMap<String, ClassInfo>,
 ) -> Result<(), Diagnostic> {
-  let iface = interfaces.get(iface_name).ok_or_else(|| {
+  let (iface_name, iface_args) = info
+    .implements
+    .as_ref()
+    .expect("caller only invokes this for a class with implements.is_some()");
+  let iface = interfaces.get(iface_name.as_str()).ok_or_else(|| {
     Diagnostic::new(
       format!("class `{class_name}` declares `implements {iface_name}`, but no interface named `{iface_name}` is declared"),
       (0, 0),
     )
   })?;
-  // Plan 88: `Self` substitution is now a real, recursive `TypeExpr`
-  // tree rewrite (`substitute_type_params`) rather than a whole-string
+  if iface_args.len() != iface.type_params.len() {
+    return Err(Diagnostic::new(
+      format!(
+        "class `{class_name}` declares `implements {iface_name}` with {} type argument(s), but interface `{iface_name}` declares {} type parameter(s)",
+        iface_args.len(),
+        iface.type_params.len()
+      ),
+      (0, 0),
+    ));
+  }
+  // Plan 88: `Self` substitution is a real, recursive `TypeExpr` tree
+  // rewrite (`substitute_type_params`) rather than a whole-string
   // equality check — a compound interface method signature referencing
-  // `Self` nested inside another shape (`Array[Self]`, say) now
-  // substitutes correctly too, though no interface in this compiler
-  // actually writes one yet.
+  // `Self` nested inside another shape (`Array[Self]`, say) substitutes
+  // correctly too. Plan 89 adds the interface's own type parameter(s)
+  // to this same substitution map.
   let self_texpr = TypeExpr::Named(class_name.to_string());
-  let mut self_subst: HashMap<&str, &TypeExpr> = HashMap::new();
-  self_subst.insert("Self", &self_texpr);
-  let expected_params = iface
-    .params_raw
-    .iter()
-    .map(|(_, raw)| resolve_type(&substitute_type_params(raw, &self_subst), classes))
-    .collect::<Result<Vec<_>, _>>()?;
-  let expected_return = resolve_type(
-    &substitute_type_params(&iface.return_type_raw, &self_subst),
-    classes,
-  )?;
-  let Some(actual) = info.methods.get(&iface.method_name) else {
-    return Err(Diagnostic::new(
-      format!(
-        "class `{class_name}` declares `implements {iface_name}` but does not define required method `{}`",
-        iface.method_name
-      ),
-      (0, 0),
-    ));
-  };
-  if actual.params != expected_params || actual.return_type != expected_return {
-    return Err(Diagnostic::new(
-      format!(
-        "class `{class_name}`'s `{}` does not match interface `{iface_name}`'s required signature: expected {expected_params:?} -> {expected_return:?}, found {:?} -> {:?}",
-        iface.method_name, actual.params, actual.return_type
-      ),
-      (0, 0),
-    ));
+  let mut subst: HashMap<&str, &TypeExpr> = HashMap::new();
+  subst.insert("Self", &self_texpr);
+  for (tp, arg) in iface.type_params.iter().zip(iface_args.iter()) {
+    subst.insert(tp.name.as_str(), arg);
+  }
+  for m in &iface.methods {
+    let expected_params_raw: Vec<(String, TypeExpr)> = m
+      .params_raw
+      .iter()
+      .map(|(n, raw)| (n.clone(), substitute_type_params(raw, &subst)))
+      .collect();
+    let expected_return_raw = substitute_type_params(&m.return_type_raw, &subst);
+    if m.type_params.is_empty() {
+      let expected_params = expected_params_raw
+        .iter()
+        .map(|(_, raw)| resolve_type(raw, classes))
+        .collect::<Result<Vec<_>, _>>()?;
+      let expected_return = resolve_type(&expected_return_raw, classes)?;
+      let Some(actual) = info.methods.get(&m.method_name) else {
+        return Err(Diagnostic::new(
+          format!(
+            "class `{class_name}` declares `implements {iface_name}` but does not define required method `{}`",
+            m.method_name
+          ),
+          (0, 0),
+        ));
+      };
+      if actual.params != expected_params || actual.return_type != expected_return {
+        return Err(Diagnostic::new(
+          format!(
+            "class `{class_name}`'s `{}` does not match interface `{iface_name}`'s required signature: expected {expected_params:?} -> {expected_return:?}, found {:?} -> {:?}",
+            m.method_name, actual.params, actual.return_type
+          ),
+          (0, 0),
+        ));
+      }
+    } else {
+      let Some(actual) = info.generic_methods.get(&m.method_name) else {
+        return Err(Diagnostic::new(
+          format!(
+            "class `{class_name}` declares `implements {iface_name}` but does not define required generic method `{}`",
+            m.method_name
+          ),
+          (0, 0),
+        ));
+      };
+      if m.type_params.len() != 1 {
+        return Err(Diagnostic::new(
+          format!(
+            "interface `{iface_name}`'s generic method `{}` declares more than one type parameter — not supported",
+            m.method_name
+          ),
+          (0, 0),
+        ));
+      }
+      let expected_params: Vec<TypeExpr> =
+        expected_params_raw.iter().map(|(_, t)| t.clone()).collect();
+      let actual_params: Vec<TypeExpr> = actual.params_raw.iter().map(|(_, t)| t.clone()).collect();
+      if actual.type_param != m.type_params[0].name
+        || expected_params != actual_params
+        || expected_return_raw != actual.return_type_raw
+      {
+        return Err(Diagnostic::new(
+          format!(
+            "class `{class_name}`'s generic method `{}` does not match interface `{iface_name}`'s required signature",
+            m.method_name
+          ),
+          (0, 0),
+        ));
+      }
+    }
   }
   Ok(())
 }
@@ -11434,6 +11623,35 @@ mod tests {
     assert!(errs
       .iter()
       .any(|d| d.message.contains("does not implement `Cloneable`")));
+  }
+
+  // Plan 89 (interface generics, multi-method interfaces).
+
+  const ITERABLE_WORKED_EXAMPLE: &str = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n\nclass Numbers\n  implements Iterable[Int64]\n\n  values: Array[Int64]\n\n  fn initialize(values: Array[Int64]): Void do\n    @values = values\n  end\n\n  fn map[U](f: Proc[T, U]): Array[U] do\n    values: Array[Int64] = @values\n    result: Array[U] = Array.new(values.count)\n    i: Int64 = 0\n    while i < values.count do\n      result[i] = f.call(values[i])\n      i: Int64 = i + 1\n    end\n    result\n  end\nend\n\nn: Numbers = Numbers.new([1, 2, 3])\ndoubled: Array[Int64] = n.map(do |x: Int64| x * 2 end)\nputs doubled[0]\nputs doubled[2]\n";
+
+  #[test]
+  fn interface_generics_worked_example_type_checks() {
+    let program = emerald_parser::parse(ITERABLE_WORKED_EXAMPLE).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn implements_a_generic_interface_with_the_wrong_arity_is_rejected() {
+    let src = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n\nclass Numbers\n  implements Iterable\n\n  values: Array[Int64]\n\n  fn initialize(values: Array[Int64]): Void do\n    @values = values\n  end\n\n  fn map[U](f: Proc[Int64, U]): Array[U] do\n    result: Array[U] = Array.new(0)\n    result\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("arity mismatch between implements and interface");
+    assert!(errs[0].message.contains("type argument"));
+  }
+
+  #[test]
+  fn a_class_missing_a_required_generic_method_is_rejected() {
+    let src = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n\nclass Numbers\n  implements Iterable[Int64]\n\n  values: Array[Int64]\n\n  fn initialize(values: Array[Int64]): Void do\n    @values = values\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Numbers never defines map");
+    assert!(errs[0]
+      .message
+      .contains("does not define required generic method"));
   }
 
   #[test]

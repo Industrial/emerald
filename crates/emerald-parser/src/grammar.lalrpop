@@ -1,7 +1,7 @@
 use crate::ast::{
   ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant,
-  ExternBlock, ExternFn, Expr, Function, InterfaceDef, Item, ModuleDef, Param, Program,
-  RescueClause, Spanned, Stmt, TypeExpr, TypeParam,
+  ExternBlock, ExternFn, Expr, Function, InterfaceDef, InterfaceMethod, Item, ModuleDef, Param,
+  Program, RescueClause, Spanned, Stmt, TypeExpr, TypeParam,
 };
 use crate::ast::decode_string_lit;
 use crate::interpolate;
@@ -103,8 +103,16 @@ ClassDef: ClassDef = {
 // single interface name, not a list; reachable only from `ClassDef`
 // (never `ModuleDef`), enforcing "modules cannot declare `implements`"
 // structurally rather than as a separately-checked sema invariant.
-ImplementsClause: String = {
-  "implements" <i:Ident> => i,
+// Plan 89's Decision log: an optional trailing `"[" TypeExprList "]"`
+// binds a generic interface's own type parameter(s) to concrete types
+// (`implements Iterable[Int64]`) — reuses `TypeExprList` verbatim (the
+// same list `Array[T]`/`Hash[K, V]`/every other bracketed generic in
+// this grammar already parses with), not a new production. Empty `Vec`
+// for the original bare `implements Comparable` shape, source-
+// compatible with every pre-plan-89 program.
+ImplementsClause: (String, Vec<TypeExpr>) = {
+  "implements" <i:Ident> => (i, Vec::new()),
+  "implements" <i:Ident> "[" <args:TypeExprList> "]" => (i, args),
 };
 
 // `class Point derive Comparable` (plan 61's Decision log) — mirrors
@@ -245,18 +253,37 @@ ContractClause: (bool, Contract) = {
   "ensures" <e:CondExpr> => (false, Contract { expr: e, text: String::new(), line: 0 }),
 };
 
-// `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
-// 41's Decision log) — structurally exactly one required method: no
-// `FuncDef*`-style repetition inside `interface ... end`, so a second
-// `def` before the outer `end` is a real parse error. Reuses the
-// existing `Params`/`Param` rule for the method's parameter list, the
-// same reuse `ClassField` already makes for class fields.
+// `interface Comparable fn compare_to(other: Self): Int64 end` (plan
+// 41's Decision log) — originally structurally exactly one required
+// method with no type-parameter clause at all. Plan 89's Decision log
+// widens this two ways: an optional `TypeParamClause` right after the
+// interface name (`interface Iterable[T]`, reusing plan 41/58's own
+// `[T: Bound]` clause verbatim, the same reuse `ClassDef`/`EnumDef`
+// already make), and `InterfaceMethodDef+` (one-or-more, not exactly
+// one) for the method list — a second `fn` before the outer `end` is
+// no longer a parse error.
 InterfaceDef: InterfaceDef = {
-  // Plan 71: `"fn"`/`":"` replace `"def"`/`"->"` here too — no `"do"`
-  // added, since an interface method has no body at all (this
-  // production ends directly at `"end"`, nothing to disambiguate).
-  "interface" <name:Ident> "fn" <method_name:Ident> "(" <params:Params> ")" ":" <return_type:TypeExpr> "end" => {
-    InterfaceDef { name, method_name, params, return_type }
+  "interface" <name:Ident> <type_params:TypeParamClause?> <methods:InterfaceMethodDef+> "end" => {
+    InterfaceDef { name, type_params: type_params.unwrap_or_default(), methods }
+  }
+};
+
+// One required method inside `interface ... end` (plan 89's Decision
+// log extracts this out of `InterfaceDef`'s own production now that
+// more than one may appear). Plan 71: `"fn"`/`":"` replace `"def"`/
+// `"->"` here too — no `"do"` added, since an interface method has no
+// body at all (this production ends at whatever follows the return
+// type, either another `InterfaceMethodDef` or the outer `"end"`).
+// `<type_params:TypeParamClause?>` mirrors `MethodDef`'s own identical
+// optional clause — `fn map[U](f: Proc[T, U]): Array[U]`, the plan's
+// own worked example, is a required method with its OWN free type
+// parameter, one level of generics on top of whatever the enclosing
+// interface's own `[T]` already binds. Reuses the existing `Params`/
+// `Param` rule for the method's parameter list, the same reuse
+// `ClassField` already makes for class fields.
+InterfaceMethodDef: InterfaceMethod = {
+  "fn" <method_name:Ident> <type_params:TypeParamClause?> "(" <params:Params> ")" ":" <return_type:TypeExpr> => {
+    InterfaceMethod { method_name, type_params: type_params.unwrap_or_default(), params, return_type }
   }
 };
 

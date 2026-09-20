@@ -2657,16 +2657,19 @@ mod tests {
       );
     };
     assert_eq!(iface.name, "Comparable");
-    assert_eq!(iface.method_name, "compare_to");
+    assert_eq!(iface.type_params, Vec::new());
+    assert_eq!(iface.methods.len(), 1);
+    assert_eq!(iface.methods[0].method_name, "compare_to");
+    assert_eq!(iface.methods[0].type_params, Vec::new());
     assert_eq!(
-      iface.params,
+      iface.methods[0].params,
       vec![Param {
         name: "other".to_string(),
         ty: ast::TypeExpr::Named("Self".to_string()),
         default: None,
       }]
     );
-    assert_eq!(iface.return_type, "Int64");
+    assert_eq!(iface.methods[0].return_type, "Int64");
 
     let Item::Class(money) = &program.items[1] else {
       panic!(
@@ -2675,7 +2678,10 @@ mod tests {
       );
     };
     assert_eq!(money.name, "Money");
-    assert_eq!(money.implements, Some("Comparable".to_string()));
+    assert_eq!(
+      money.implements,
+      Some(("Comparable".to_string(), Vec::new()))
+    );
 
     let Item::Function(max_fn) = &program.items[3] else {
       panic!(
@@ -2900,13 +2906,53 @@ mod tests {
   }
 
   #[test]
-  fn interface_with_a_second_method_before_end_is_a_parse_error_not_a_panic() {
-    // The grammar structurally admits exactly one method — a second
-    // `def` before the outer `end` cannot reduce as this same
-    // production, so this is a real parse error.
+  fn interface_with_a_second_method_before_end_parses_both_methods() {
+    // Plan 89's Decision log: `InterfaceDef` widens from exactly one
+    // required method to `InterfaceMethodDef+` (one-or-more) — a second
+    // `fn` before the outer `end` is no longer a parse error.
     let src = "interface Comparable\n  fn compare_to(other: Self): Int64\n  fn other_method(x: Int64): Int64\nend\n";
-    let errs = parse(src).unwrap_err();
-    assert!(!errs.is_empty());
+    let program = parse(src).expect("should parse");
+    let Item::Interface(iface) = &program.items[0] else {
+      panic!("expected an interface, got {:?}", program.items[0]);
+    };
+    assert_eq!(iface.methods.len(), 2);
+    assert_eq!(iface.methods[0].method_name, "compare_to");
+    assert_eq!(iface.methods[1].method_name, "other_method");
+  }
+
+  #[test]
+  fn interface_with_a_type_parameter_clause_parses() {
+    // Plan 89's own worked example: `interface Iterable[T]` with a
+    // generic required method (`map[U]`) referencing both the
+    // interface's own `T` and the method's own `U`.
+    let src = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Interface(iface) = &program.items[0] else {
+      panic!("expected an interface, got {:?}", program.items[0]);
+    };
+    assert_eq!(iface.name, "Iterable");
+    assert_eq!(iface.type_params.len(), 1);
+    assert_eq!(iface.type_params[0].name, "T");
+    assert_eq!(iface.methods.len(), 1);
+    assert_eq!(iface.methods[0].method_name, "map");
+    assert_eq!(iface.methods[0].type_params.len(), 1);
+    assert_eq!(iface.methods[0].type_params[0].name, "U");
+  }
+
+  #[test]
+  fn implements_clause_with_a_type_argument_parses() {
+    let src = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n\nclass Numbers implements Iterable[Int64]\n  values: Array[Int64]\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[1] else {
+      panic!("expected a class, got {:?}", program.items[1]);
+    };
+    assert_eq!(
+      c.implements,
+      Some((
+        "Iterable".to_string(),
+        vec![ast::TypeExpr::Named("Int64".to_string())]
+      ))
+    );
   }
 
   #[test]

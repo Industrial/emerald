@@ -21,8 +21,8 @@
 
 use emerald_parser::{
   CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef, EnumVariant, Expr,
-  Function as AstFunction, Item, ModuleDef, Param, Program, RescueClause, Spanned, Stmt,
-  StringPart, TypeExpr, TypeParam,
+  Function as AstFunction, InterfaceDef, Item, ModuleDef, Param, Program, RescueClause, Spanned,
+  Stmt, StringPart, TypeExpr, TypeParam,
 };
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
@@ -285,6 +285,113 @@ fn make_fn_type<'ctx>(
     ValKind::Tuple(elem_kinds) => {
       tuple_struct_type(context, elem_kinds).fn_type(&param_types, false)
     }
+  }
+}
+
+/// Plan 89's Decision log: a `Proc`-typed runtime VALUE is a pointer to
+/// a small heap block — historically just the lambda's own captured-
+/// environment (`build_lambda_let`'s own doc comment, unchanged for
+/// every existing top-level `Let`-bound lambda) with the callee always
+/// resolved STATICALLY, by the receiver's own source-level NAME, via
+/// `ctx.lambda_func_ids`. That static-name convention cannot resolve a
+/// genuinely indirect Proc value — a method parameter, a field, or a
+/// local forwarding an arbitrary caller-supplied Proc has no compile-
+/// time name to look up at all. This plan reserves the block's own
+/// leading 8 bytes for the lambda's OWN compiled function pointer
+/// (every capture shifts down by this many bytes — see `LambdaInfo`'s
+/// own `capture_offsets`), so ANY Proc value can be called indirectly
+/// by loading this header slot and issuing a real LLVM indirect call,
+/// with the SAME pointer also passed as the callee's own leading `env`
+/// argument (unchanged calling convention) — no vtable, no second
+/// runtime representation, just one extra slot on the existing one.
+const CLOSURE_HEADER_BYTES: u64 = 8;
+
+/// Plan 89: a compact, tagged encoding of a `Proc[Args..., Ret]`
+/// value's own `ValKind`s, stashed into the pre-existing `local_
+/// classes: HashMap<String, String>` side table (already overloaded to
+/// carry a class name/`Pair[K, V]`'s own Display string for a non-
+/// `Ptr`-distinguishing local — see `bind_params`'s own doc comment) —
+/// avoids threading a whole new per-local side table through every
+/// `build_expr`/`build_method_call` call site in this file just for
+/// this one, narrowly-scoped need (resolving a genuinely indirect
+/// `.call`). `\u{1}` can never appear in a real class name (an
+/// `Ident`), so this can never collide with an ordinary class-name
+/// entry already stored there.
+const PROC_SIG_TAG: char = '\u{1}';
+
+fn valkind_code(k: &ValKind) -> char {
+  match k {
+    ValKind::Int64 => 'i',
+    ValKind::Float64 => 'f',
+    ValKind::Str => 's',
+    ValKind::Void => 'v',
+    ValKind::Bool => 'b',
+    ValKind::Symbol => 'y',
+    // `Ptr` and the unreachable-here `Tuple` case share the same
+    // generic bucket — a `Proc` component is never itself a tuple
+    // (sema rejects that shape outright).
+    ValKind::Ptr | ValKind::Tuple(_) => 'p',
+  }
+}
+
+fn code_to_valkind(c: char) -> ValKind {
+  match c {
+    'i' => ValKind::Int64,
+    'f' => ValKind::Float64,
+    's' => ValKind::Str,
+    'v' => ValKind::Void,
+    'b' => ValKind::Bool,
+    'y' => ValKind::Symbol,
+    _ => ValKind::Ptr,
+  }
+}
+
+fn encode_proc_sig(param_kinds: &[ValKind], ret_kind: &ValKind) -> String {
+  let params: String = param_kinds.iter().map(valkind_code).collect();
+  format!("{PROC_SIG_TAG}{params}:{}", valkind_code(ret_kind))
+}
+
+fn decode_proc_sig(s: &str) -> Option<(Vec<ValKind>, ValKind)> {
+  let rest = s.strip_prefix(PROC_SIG_TAG)?;
+  let (params, ret) = rest.split_once(':')?;
+  let param_kinds = params.chars().map(code_to_valkind).collect();
+  let ret_kind = code_to_valkind(ret.chars().next()?);
+  Some((param_kinds, ret_kind))
+}
+
+/// `Proc[Args..., Ret]`'s own encoded signature string for a param/
+/// local declared with this exact written `TypeExpr::Func` form — the
+/// bare, untyped `Proc` annotation (no written signature at all) never
+/// reaches this, and keeps working exactly as before (the pre-existing
+/// static, name-based `lambda_func_ids` dispatch, never indirect).
+fn proc_sig_for_type(ty: &TypeExpr) -> Option<String> {
+  if let TypeExpr::Func(params, ret) = ty {
+    let param_kinds: Vec<ValKind> = params.iter().map(value_kind_for_type).collect();
+    Some(encode_proc_sig(&param_kinds, &value_kind_for_type(ret)))
+  } else {
+    None
+  }
+}
+
+/// Reconstructs a representative `TypeExpr` for a generic method's own
+/// free type parameter (`U`) resolved to `kind` — used only to build
+/// this call site's own monomorphized mangled symbol/substituted
+/// signature (`resolve_generic_method_instance`). `None` for `ValKind::
+/// Ptr`/`Tuple` — a bare storage kind alone can't name which CLASS a
+/// pointer-backed value actually is, a real, disclosed limit: this
+/// plan's own codegen-side generic-method monomorphization only
+/// supports a type parameter resolving to one of the primitive kinds
+/// below (covers this plan's own worked example and every regression
+/// test it adds), not an arbitrary class.
+fn valkind_to_typeexpr(kind: &ValKind) -> Option<TypeExpr> {
+  match kind {
+    ValKind::Int64 => Some(TypeExpr::Named("Int64".to_string())),
+    ValKind::Float64 => Some(TypeExpr::Named("Float64".to_string())),
+    ValKind::Bool => Some(TypeExpr::Named("Boolean".to_string())),
+    ValKind::Str => Some(TypeExpr::Named("String".to_string())),
+    ValKind::Symbol => Some(TypeExpr::Named("Symbol".to_string())),
+    ValKind::Void => Some(TypeExpr::Named("Void".to_string())),
+    ValKind::Ptr | ValKind::Tuple(_) => None,
   }
 }
 
@@ -2124,6 +2231,244 @@ fn substitute_generic_function(
   }
 }
 
+/// Plan 89's Decision log: a generic METHOD's own monomorphization
+/// needs more than `substitute_generic_function`'s "just the params/
+/// return type" substitution — unlike every existing generic top-level
+/// FUNCTION example, this plan's own worked example declares a BODY-
+/// INTERNAL local (`result: Array[U] = Array.new(0)`) whose own type
+/// annotation mentions the free type parameter directly. Left
+/// unsubstituted, `build_stmt`'s `Stmt::Let` handling would resolve
+/// `Array[U]`'s element kind via `value_kind_for_type`'s `_ => Ptr`
+/// catch-all (the bare name `"U"` matches nothing else), silently
+/// wrong whenever the concrete binding isn't itself `ValKind::Ptr` —
+/// exactly the LLVM-verifier-crash shape plan 88's own stopgap existed
+/// to avoid. `substitute_type_params_in_stmt` below walks every nested
+/// statement body (mirroring `collect_typenames_in_stmt`'s own
+/// recursive shape) rewriting each `Stmt::Let`'s own `ty` field; every
+/// other statement kind carries no `TypeExpr` of its own and clones
+/// unchanged.
+fn substitute_function_type_params(
+  f: &AstFunction,
+  subst: &HashMap<&str, &TypeExpr>,
+) -> AstFunction {
+  AstFunction {
+    name: f.name.clone(),
+    params: f
+      .params
+      .iter()
+      .map(|p| Param {
+        name: p.name.clone(),
+        ty: substitute_type_params(&p.ty, subst),
+        default: p.default.clone(),
+      })
+      .collect(),
+    return_type: substitute_type_params(&f.return_type, subst),
+    body: f
+      .body
+      .iter()
+      .map(|s| substitute_type_params_in_stmt(s, subst))
+      .collect(),
+    block_param: f.block_param.clone(),
+    splat_param: f.splat_param.clone(),
+    type_params: Vec::new(),
+    is_comptime: f.is_comptime,
+    requires: f.requires.clone(),
+    ensures: f.ensures.clone(),
+    is_pure: f.is_pure,
+  }
+}
+
+fn substitute_type_params_in_stmt(
+  stmt: &Spanned<Stmt>,
+  subst: &HashMap<&str, &TypeExpr>,
+) -> Spanned<Stmt> {
+  let sub_body = |body: &[Spanned<Stmt>]| -> Vec<Spanned<Stmt>> {
+    body
+      .iter()
+      .map(|s| substitute_type_params_in_stmt(s, subst))
+      .collect()
+  };
+  let node = match &stmt.node {
+    Stmt::Let {
+      name,
+      ty,
+      value,
+      is_var,
+    } => Stmt::Let {
+      name: name.clone(),
+      ty: substitute_type_params(ty, subst),
+      value: value.clone(),
+      is_var: *is_var,
+    },
+    Stmt::If {
+      cond,
+      then_branch,
+      else_branch,
+    } => Stmt::If {
+      cond: cond.clone(),
+      then_branch: sub_body(then_branch),
+      else_branch: else_branch.as_ref().map(|b| sub_body(b)),
+    },
+    Stmt::While { cond, body } => Stmt::While {
+      cond: cond.clone(),
+      body: sub_body(body),
+    },
+    Stmt::For {
+      var,
+      elements,
+      body,
+    } => Stmt::For {
+      var: var.clone(),
+      elements: elements.clone(),
+      body: sub_body(body),
+    },
+    Stmt::ForRange {
+      var,
+      start,
+      end,
+      exclusive,
+      body,
+    } => Stmt::ForRange {
+      var: var.clone(),
+      start: start.clone(),
+      end: end.clone(),
+      exclusive: *exclusive,
+      body: sub_body(body),
+    },
+    Stmt::Begin {
+      body,
+      rescues,
+      ensure,
+    } => Stmt::Begin {
+      body: sub_body(body),
+      rescues: rescues
+        .iter()
+        .map(|r| RescueClause {
+          class_name: r.class_name.clone(),
+          var: r.var.clone(),
+          body: sub_body(&r.body),
+        })
+        .collect(),
+      ensure: ensure.as_ref().map(|e| sub_body(e)),
+    },
+    Stmt::Case {
+      scrutinee,
+      arms,
+      else_body,
+    } => Stmt::Case {
+      scrutinee: scrutinee.clone(),
+      arms: arms
+        .iter()
+        .map(|(pattern, body)| (pattern.clone(), sub_body(body)))
+        .collect(),
+      else_body: else_body.as_ref().map(|b| sub_body(b)),
+    },
+    Stmt::MatchResult {
+      scrutinee,
+      ok_var,
+      ok_body,
+      err_var,
+      err_body,
+    } => Stmt::MatchResult {
+      scrutinee: scrutinee.clone(),
+      ok_var: ok_var.clone(),
+      ok_body: sub_body(ok_body),
+      err_var: err_var.clone(),
+      err_body: sub_body(err_body),
+    },
+    other => other.clone(),
+  };
+  Spanned {
+    span: stmt.span,
+    node,
+  }
+}
+
+/// Plan 89's Decision log: this codegen-side generic-method
+/// monomorphizer needs to know, at a specific call site, what CONCRETE
+/// type a generic method's own free type parameter (`U`) resolves to —
+/// sema's own `infer_type_param_binding` already proved the program
+/// well-typed; this is a narrower, codegen-only re-derivation covering
+/// just the shapes this plan's own worked example and regression tests
+/// exercise: a lambda-literal argument's own inferred return type
+/// (`infer_lambda_ret_kind`, generalized to see the CURRENT function's
+/// own locals too — `build_local_val_kind_env`), or a lambda literal
+/// whose last expression is a bare `ClassName.new(...)` (resolved
+/// directly by name, not through a `ValKind` round-trip at all, since
+/// `Ptr` alone can't name which class). Returns `None` for anything
+/// else — a real, disclosed narrowing: this does not attempt full
+/// structural unification the way `emerald-sema`'s own type checker
+/// does.
+fn infer_concrete_type_from_arg<'ctx>(
+  arg: &Spanned<Expr>,
+  ctx: &Ctx<'_, 'ctx>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+) -> Option<TypeExpr> {
+  match &arg.node {
+    Expr::Lambda { params, body, .. } => {
+      if let Some(Spanned {
+        node: Stmt::Expr(Spanned {
+          node: Expr::New(class_name, _),
+          ..
+        }),
+        ..
+      })
+      | Some(Spanned {
+        node:
+          Stmt::Return(Some(Spanned {
+            node: Expr::New(class_name, _),
+            ..
+          })),
+        ..
+      }) = body.last()
+      {
+        return Some(TypeExpr::Named(class_name.clone()));
+      }
+      let base_env = build_local_val_kind_env(vars, ctx.top_level_types);
+      let kind = infer_lambda_ret_kind(params, body, &base_env, ctx.user_fn_return_types);
+      valkind_to_typeexpr(&kind)
+    }
+    // Plan 89: `emerald-parser`'s own pre-existing block-attached-call
+    // desugaring (unconditional, predates this plan) hoists an inline
+    // lambda literal used as a call argument into a synthesized top-
+    // level `__enum_blk_N` `Proc` `Let`, replacing the argument itself
+    // with a bare `Ident` reference — so THIS, not a raw `Expr::
+    // Lambda`, is the shape a generic method's own lambda-argument call
+    // site actually sees by the time codegen runs. `ctx.lambda_func_ids`
+    // already carries that top-level lambda's own inferred return kind
+    // (`declare_lambda_functions`'s identical inference), reused
+    // directly rather than re-deriving it a second time.
+    Expr::Ident(name) => ctx
+      .lambda_func_ids
+      .get(name)
+      .and_then(|(_, kind)| valkind_to_typeexpr(kind)),
+    _ => None,
+  }
+}
+
+/// Plan 89: the enclosing function/method/lambda's own current
+/// locals/params, plus every top-level name, as one flat `{name} ->
+/// ValKind}` environment — `infer_lambda_ret_kind`'s own base
+/// environment when inferring an INLINE (non-top-level) lambda
+/// literal's return kind (`build_inline_lambda`), or a generic
+/// method's own call-site type-parameter binding
+/// (`infer_concrete_type_from_arg`) — either way, a captured free
+/// variable might be a plain local/parameter, not just a top-level
+/// name, unlike a top-level lambda's own capture set.
+fn build_local_val_kind_env(
+  vars: &HashMap<String, (PointerValue<'_>, ValKind)>,
+  top_level_types: &HashMap<String, TypeExpr>,
+) -> HashMap<String, ValKind> {
+  let mut env: HashMap<String, ValKind> = top_level_types
+    .iter()
+    .map(|(k, v)| (k.clone(), value_kind_for_type(v)))
+    .collect();
+  for (k, (_, kind)) in vars {
+    env.insert(k.clone(), kind.clone());
+  }
+  env
+}
+
 fn free_vars_in_lambda(params: &[Param], body: &[Spanned<Stmt>]) -> Vec<String> {
   let mut referenced = Vec::new();
   let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
@@ -2186,7 +2531,7 @@ fn collect_lambda_infos(program: &Program) -> Result<HashMap<String, LambdaInfo>
     let mut capture_offsets = HashMap::new();
     let mut capture_kinds = HashMap::new();
     for (i, cap_name) in captures.iter().enumerate() {
-      capture_offsets.insert(cap_name.clone(), i as u64 * 8);
+      capture_offsets.insert(cap_name.clone(), CLOSURE_HEADER_BYTES + i as u64 * 8);
       let cap_ty_name = top_level_types.get(cap_name).ok_or_else(|| {
         format!("codegen: cannot determine the type of captured variable `{cap_name}`")
       })?;
@@ -4164,6 +4509,51 @@ struct Ctx<'a, 'ctx> {
   /// never declares `ensures` at all — `leaf-ast-parser-contracts`'
   /// own grammar-level fence already guarantees that).
   current_function_contracts: Option<(&'a str, &'a [Contract])>,
+  /// Plan 89's Decision log: needed so an anonymous lambda literal
+  /// compiled on the fly at its own call-argument position (`build_
+  /// inline_lambda`) or a generic method's own lazily-monomorphized
+  /// specialization (`resolve_generic_method_instance`) can each
+  /// `add_function` a brand-new top-level LLVM function right where
+  /// they're first needed, mid-compile, rather than requiring a
+  /// separate whole-program discovery pass upfront.
+  module: &'a Module<'ctx>,
+  /// `{top-level `Let` name} -> its declared `TypeExpr`}` (plan 89) —
+  /// mirrors `declare_lambda_functions`'s own identical internal scan,
+  /// computed once and shared so `build_inline_lambda`'s own return-
+  /// kind inference (`infer_lambda_ret_kind`) sees the same top-level
+  /// names a top-level lambda's return-kind inference already does.
+  top_level_types: &'a HashMap<String, TypeExpr>,
+  /// `{top-level function name} -> its declared return TypeExpr}` (plan
+  /// 89) — the other half of `infer_lambda_ret_kind`'s own environment,
+  /// mirrored from `declare_lambda_functions`'s identical internal scan.
+  user_fn_return_types: &'a HashMap<String, TypeExpr>,
+  /// `{class name} -> its raw ClassDef}` (plan 89) — covers ordinary
+  /// classes, actors (normalized to a synthetic `ClassDef`), AND every
+  /// monomorphized generic-class instantiation under its OWN mangled
+  /// name, exactly like `compile_to_object_impl`'s own local `class_
+  /// defs` already does; `resolve_generic_method_instance` needs a
+  /// class's own RAW (unmonomorphized) method text to substitute a
+  /// generic method's type parameter(s) into, which `ctx.classes`
+  /// (already-flattened `ClassLayout`s, no AST left) can't answer.
+  class_defs: &'a HashMap<String, &'a ClassDef>,
+  /// `{interface name} -> its raw InterfaceDef}` (plan 89) —
+  /// `resolve_generic_method_instance` needs an implementing class's
+  /// bound interface's own declared type-parameter NAME (`interface
+  /// Iterable[T]`'s `T`) to know which bare identifier in the class's
+  /// own generic method text its `implements Iterable[Int64]` clause's
+  /// concrete argument actually substitutes.
+  interface_defs: &'a HashMap<String, &'a InterfaceDef>,
+  /// Plan 89's Decision log: one memoized `(FunctionValue, return
+  /// ValKind)` per distinct `{class}_{method}$${concrete type}` mangled
+  /// symbol actually called anywhere in the program — a `RefCell`
+  /// cache, not a whole-program discovery-then-declare-then-define
+  /// pre-pass (`Ctx::escape_stats`'s own identical "one `Ctx`, one
+  /// thread, no race" precedent applies here too), populated lazily by
+  /// `resolve_generic_method_instance` the first time `build_method_
+  /// call` reaches a given generic-method call site's own concrete
+  /// binding, reused directly on every subsequent call to the SAME
+  /// binding.
+  generic_method_instances: &'a RefCell<HashMap<String, (FunctionValue<'ctx>, ValKind)>>,
 }
 
 /// `local_classes` maps a local variable name to its declared class
@@ -5979,11 +6369,14 @@ fn build_expr<'ctx>(
       )?;
       Ok((v, kind))
     }
-    // A lambda literal only has codegen meaning at a top-level `Let`'s
-    // value (`build_lambda_let`, invoked from `build_stmt`). Reached
-    // from anywhere else, it's an unsupported shape, not a panic.
+    // Plan 89's Decision log: a lambda literal used to only have codegen
+    // meaning at a top-level `Let`'s value (`build_lambda_let`, invoked
+    // directly from `build_stmt`, never reaching here at all) — every
+    // OTHER position (a call argument, this plan's own worked example)
+    // now compiles via `build_inline_lambda` instead of failing.
     Expr::Lambda { .. } => {
-      Err("codegen: lambda literals are only supported as a top-level `Let`'s value".to_string())
+      let (env_ptr, kind) = build_inline_lambda(context, builder, expr, vars, ctx)?;
+      Ok((env_ptr.into(), kind))
     }
     // Plan 25 (stdlib expansion).
     Expr::Bool(b) => Ok((
@@ -6614,6 +7007,65 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ret_kind));
   }
 
+  // Plan 89's Decision log: a literal, statically-named top-level
+  // `Proc` `Let` still dispatches via a direct call to its own known
+  // `__lambda_{name}` function (unchanged, zero regression — the
+  // common, simplest case). Every OTHER Proc-typed receiver (a
+  // parameter, or a local forwarding one — see `bind_params`'/`Stmt::
+  // Let`'s own `proc_sig_for_type` bookkeeping) falls through to a
+  // genuine INDIRECT call below instead of failing outright.
+  if method == "call" && !ctx.lambda_func_ids.contains_key(recv_name) {
+    let (recv_val, _) = build_expr(
+      context,
+      builder,
+      recv,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let env_ptr = recv_val.into_pointer_value();
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env_ptr.into()];
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let sig = local_classes.get(recv_name).ok_or_else(|| {
+      format!("codegen: cannot determine `{recv_name}`'s Proc signature for an indirect `.call`")
+    })?;
+    let (param_kinds, ret_kind) = decode_proc_sig(sig).ok_or_else(|| {
+      format!("codegen: `{recv_name}` is not a Proc-typed local/parameter — cannot `.call` it")
+    })?;
+    let mut kinds = vec![ValKind::Ptr]; // env
+    kinds.extend(param_kinds);
+    let fn_ty = make_fn_type(context, &kinds, &ret_kind);
+    let fn_ptr_slot = field_ptr(context, builder, env_ptr, 0)?;
+    let fn_ptr = builder
+      .build_load(
+        context.ptr_type(AddressSpace::default()),
+        fn_ptr_slot,
+        "procfnptr",
+      )
+      .map_err(|e| e.to_string())?
+      .into_pointer_value();
+    let call = builder
+      .build_indirect_call(fn_ty, fn_ptr, &call_args, "indirectcalltmp")
+      .map_err(|e| e.to_string())?;
+    return if ret_kind == ValKind::Void {
+      Ok((context.i64_type().const_int(0, false).into(), ret_kind))
+    } else {
+      Ok((call_result(call)?, ret_kind))
+    };
+  }
+
   let (fv, ret_kind) = if method == "call" {
     ctx
       .lambda_func_ids
@@ -6656,71 +7108,54 @@ fn build_method_call<'ctx>(
       .and_then(|owners| owners.get(method))
       .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?;
 
-    // Plan 88 aftermath (real, disclosed regression fix): sema now
-    // fully type-checks a class method's own `[T]`/`[T: Bound]` type
-    // parameter via `ClassInfo.generic_methods`/`GenericMethodSig`
-    // (see `emerald-sema`'s own doc comments), so a call like this one
-    // sails past sema with no diagnostic at all — but this backend was
-    // never extended to actually monomorphize a generic method's body:
-    // `define_method` still compiles it exactly ONCE, with the
-    // method's own type parameter folded to the generic `ValKind::Ptr`
-    // bucket regardless of the real argument type at any given call
-    // site. Before plan 88 this whole program shape was cleanly
-    // rejected at sema time ("generic methods are not supported");
-    // now, left unchecked here, it would instead reach the LLVM
-    // verifier with a mismatched argument type (e.g. `i64` passed
-    // where the compiled signature expects `ptr`) and abort there —
-    // a real crash, not a diagnostic. `ctx.generic_class_methods`
-    // (built once in `compile_to_object_impl`, straight from the raw
-    // `ClassDef.methods`' own `type_params`, independent of sema)
-    // lets this call site catch exactly that shape and refuse it
-    // cleanly instead. Real monomorphization is a separate, larger
-    // undertaking left to its own future plan — this is scoped
-    // narrowly to turning a codegen-time crash into a codegen-time
-    // diagnostic.
+    // Plan 89's Decision log: replaces plan 88's own stopgap rejection
+    // — a generic method's own body is now really monomorphized, one
+    // compiled function per distinct concrete type-parameter binding
+    // actually called anywhere in the program, lazily, right here (see
+    // `resolve_generic_method_instance`'s own doc comment for exactly
+    // which existing mechanism this mirrors and why it's driven lazily
+    // instead of via a separate whole-program discovery pass).
     if ctx
       .generic_class_methods
       .get(defining_class.as_str())
       .is_some_and(|names| names.contains(method))
     {
-      return Err(format!(
-        "codegen: generic methods are not yet supported for code generation (only type-checking) — `{defining_class}.{method}` declares its own type parameter; tracked for a future plan"
-      ));
+      resolve_generic_method_instance(context, builder, ctx, defining_class, method, args, vars)?
+    } else {
+      let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
+
+      // Plan 55's Decision log: the dispatch rule is purely syntactic —
+      // a literal `self` receiver is always a direct call (AC4: zero
+      // enqueue overhead for the same-actor case); any OTHER receiver
+      // whose static class is a declared actor becomes a cross-actor
+      // `emerald_actor_enqueue` call instead, even one that happens to
+      // alias `self` at runtime (deliberately conservative — no runtime
+      // identity check exists anywhere in this backend to tell the
+      // difference). Checked here, before the ordinary direct-call
+      // lookup below, so it applies uniformly to every actor-typed
+      // receiver shape `local_classes` can name (a field, a parameter,
+      // a local — this function's own receiver is always a plain
+      // `Expr::Ident`, per the check at its very top).
+      if recv_name != "self" && ctx.actor_names.contains(class_name.as_str()) {
+        return build_actor_enqueue_call(
+          context,
+          builder,
+          recv,
+          &key,
+          args,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        );
+      }
+
+      ctx
+        .user_func_ids
+        .get(&key)
+        .map(|(fv, k)| (*fv, k.clone()))
+        .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?
     }
-
-    let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
-
-    // Plan 55's Decision log: the dispatch rule is purely syntactic —
-    // a literal `self` receiver is always a direct call (AC4: zero
-    // enqueue overhead for the same-actor case); any OTHER receiver
-    // whose static class is a declared actor becomes a cross-actor
-    // `emerald_actor_enqueue` call instead, even one that happens to
-    // alias `self` at runtime (deliberately conservative — no runtime
-    // identity check exists anywhere in this backend to tell the
-    // difference). Checked here, before the ordinary direct-call
-    // lookup below, so it applies uniformly to every actor-typed
-    // receiver shape `local_classes` can name (a field, a parameter, a
-    // local — this function's own receiver is always a plain
-    // `Expr::Ident`, per the check at its very top).
-    if recv_name != "self" && ctx.actor_names.contains(class_name.as_str()) {
-      return build_actor_enqueue_call(
-        context,
-        builder,
-        recv,
-        &key,
-        args,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      );
-    }
-
-    ctx
-      .user_func_ids
-      .get(&key)
-      .map(|(fv, k)| (*fv, k.clone()))
-      .ok_or_else(|| format!("codegen: unsupported method call `{class_name}.{method}`"))?
   };
 
   let (recv_val, _) = build_expr(
@@ -9702,11 +10137,23 @@ fn build_lambda_let<'ctx>(
   })?;
   let size_val = context
     .i64_type()
-    .const_int(info.captures.len() as u64 * 8, false);
+    .const_int(CLOSURE_HEADER_BYTES + info.captures.len() as u64 * 8, false);
   let call = builder
     .build_call(ctx.alloc, &[size_val.into()], "envalloc")
     .map_err(|e| e.to_string())?;
   let env_ptr = call_result(call)?.into_pointer_value();
+  // Plan 89's Decision log: the closure block's own leading header slot
+  // carries this lambda's compiled function pointer, so any Proc value
+  // derived from `name` later can be called indirectly, not just via
+  // `ctx.lambda_func_ids`'s static name lookup (`.call`'s own dispatch
+  // in `build_method_call`).
+  let (lambda_fv, _) = ctx.lambda_func_ids.get(name).ok_or_else(|| {
+    format!("codegen: internal error — `{name}` has no compiled `__lambda_` function")
+  })?;
+  let fn_ptr_slot = field_ptr(context, builder, env_ptr, 0)?;
+  builder
+    .build_store(fn_ptr_slot, lambda_fv.as_global_value().as_pointer_value())
+    .map_err(|e| e.to_string())?;
   for cap_name in &info.captures {
     let (cap_ptr, cap_kind) = vars.get(cap_name).ok_or_else(|| {
       format!("codegen: captured variable `{cap_name}` is not in scope at `{name}`'s creation site")
@@ -9864,6 +10311,290 @@ fn call_named_proc<'ctx>(
   } else {
     Ok((Some(call_result(call)?), ret_kind))
   }
+}
+
+/// Plan 89's Decision log: compiles an anonymous lambda literal that
+/// appears at an ordinary EXPRESSION position (a call argument — this
+/// plan's own worked example, `n.map(do |x: Int64| x * 2 end)` — never
+/// a top-level `Let`'s own value, which `build_lambda_let` already
+/// handles unchanged) into a real, separately-compiled top-level LLVM
+/// function, on the fly, right where it's first needed — not via a
+/// separate whole-program discovery-then-declare pass. Reuses `define_
+/// lambda` verbatim for the function's own body (same captured-
+/// environment-loading + param-binding + statement-compiling logic a
+/// top-level `Proc` `Let` already gets), and `build_lambda_let`'s own
+/// closure-construction shape (alloc, store the fn pointer at the
+/// header slot, store each capture) for the call-site value. The
+/// builder's own position is saved and restored around the nested
+/// `define_lambda` call — inkwell/LLVM has no notion of "the current
+/// function"; only which basic block the builder is positioned at, so
+/// interleaving a whole separate function's construction mid-
+/// compilation of the caller is sound as long as the builder ends up
+/// back where the caller expects it (exactly what happens here).
+/// Named by the lambda's own source span (`Spanned<Expr>::span`, unique
+/// per literal occurrence) rather than a shared mutable counter.
+fn build_inline_lambda<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  lam_expr: &Spanned<Expr>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(PointerValue<'ctx>, ValKind), String> {
+  let Expr::Lambda { params, body, .. } = &lam_expr.node else {
+    return Err(
+      "codegen: internal error — build_inline_lambda called on a non-lambda expr".to_string(),
+    );
+  };
+  let base_env = build_local_val_kind_env(vars, ctx.top_level_types);
+  let ret_kind = infer_lambda_ret_kind(params, body, &base_env, ctx.user_fn_return_types);
+  let captures = free_vars_in_lambda(params, body);
+  let mut capture_offsets = HashMap::new();
+  let mut capture_kinds = HashMap::new();
+  for (i, cap_name) in captures.iter().enumerate() {
+    let (_, kind) = vars.get(cap_name).ok_or_else(|| {
+      format!(
+        "codegen: captured variable `{cap_name}` is not in scope at this inline lambda's creation site"
+      )
+    })?;
+    capture_offsets.insert(cap_name.clone(), CLOSURE_HEADER_BYTES + i as u64 * 8);
+    capture_kinds.insert(cap_name.clone(), kind.clone());
+  }
+  let info = LambdaInfo {
+    captures: captures.clone(),
+    capture_offsets,
+    capture_kinds,
+  };
+
+  let unique_name = format!("__inline_lambda_{}_{}", lam_expr.span.0, lam_expr.span.1);
+  let mut kinds = vec![ValKind::Ptr]; // env
+  kinds.extend(param_kinds(params));
+  let fn_ty = make_fn_type(context, &kinds, &ret_kind);
+  let fv = ctx.module.add_function(
+    &format!("__lambda_{unique_name}"),
+    fn_ty,
+    Some(Linkage::Internal),
+  );
+
+  // Compiling the new function's own body repositions the shared
+  // `Builder` — save/restore around it so the CALLER's own in-progress
+  // block is exactly where it was once this returns. The debug
+  // location is SEPARATE builder state that survives a `position_at_
+  // end` unchanged (`define_lambda`'s own `build_stmt` calls set a NEW
+  // one, scoped to the nested function's own `DISubprogram`) — left
+  // unrestored, every instruction the CALLER builds after this returns
+  // would carry the wrong function's debug scope until its own next
+  // statement resets it, which is exactly the "!dbg attachment points
+  // at wrong subprogram" verifier failure this restores against.
+  let saved_block = builder.get_insert_block();
+  let saved_di_loc = builder.get_current_debug_location();
+  define_lambda(
+    context,
+    builder,
+    &unique_name,
+    params,
+    ret_kind.clone(),
+    body,
+    &info,
+    fv,
+    ctx,
+  )?;
+  if let Some(block) = saved_block {
+    builder.position_at_end(block);
+  }
+  match saved_di_loc {
+    Some(loc) => builder.set_current_debug_location(loc),
+    None => builder.unset_current_debug_location(),
+  }
+
+  let size_val = context
+    .i64_type()
+    .const_int(CLOSURE_HEADER_BYTES + captures.len() as u64 * 8, false);
+  let alloc_call = builder
+    .build_call(ctx.alloc, &[size_val.into()], "inlineenvalloc")
+    .map_err(|e| e.to_string())?;
+  let env_ptr = call_result(alloc_call)?.into_pointer_value();
+  let fn_ptr_slot = field_ptr(context, builder, env_ptr, 0)?;
+  builder
+    .build_store(fn_ptr_slot, fv.as_global_value().as_pointer_value())
+    .map_err(|e| e.to_string())?;
+  for cap_name in &captures {
+    let (cap_ptr, cap_kind) = vars.get(cap_name).ok_or_else(|| {
+      format!("codegen: captured variable `{cap_name}` is not in scope at this inline lambda's creation site")
+    })?;
+    let val = builder
+      .build_load(local_llvm_type(context, cap_kind), *cap_ptr, cap_name)
+      .map_err(|e| e.to_string())?;
+    let offset = info.capture_offsets[cap_name];
+    let slot_ptr = field_ptr(context, builder, env_ptr, offset)?;
+    builder
+      .build_store(slot_ptr, val)
+      .map_err(|e| e.to_string())?;
+  }
+  Ok((env_ptr, ValKind::Ptr))
+}
+
+/// Plan 89's Decision log: the ONE shape this codegen-side generic-
+/// method type-parameter resolver actually handles — `raw` (the
+/// method's own declared param type, already interface-type-parameter-
+/// substituted) is `Proc[..., U]` (`type_param` in RETURN position,
+/// exactly this plan's own worked example, `f: Proc[T, U]`) and `arg`
+/// is the corresponding call argument. A real, disclosed narrowing
+/// next to `emerald-sema`'s own fuller structural unifier (`infer_
+/// type_param_binding`) — sema already proved the program well-typed;
+/// this only needs to re-derive the SAME binding for THIS one call
+/// shape, not attempt general unification.
+fn infer_method_type_param_binding<'ctx>(
+  raw: &TypeExpr,
+  arg: &Spanned<Expr>,
+  type_param: &str,
+  ctx: &Ctx<'_, 'ctx>,
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+) -> Option<TypeExpr> {
+  match raw {
+    TypeExpr::Func(_, ret) if ret.as_named() == Some(type_param) => {
+      infer_concrete_type_from_arg(arg, ctx, vars)
+    }
+    _ => None,
+  }
+}
+
+/// Plan 89's Decision log: replaces the old codegen-time stopgap
+/// rejection (`build_method_call`'s own former "generic methods are
+/// not yet supported for code generation" diagnostic) with real,
+/// lazy, per-call-site monomorphization — mirroring the existing top-
+/// level generic-FUNCTION pipeline's strategy exactly (a distinct
+/// compiled function per concrete type-parameter binding, mangled
+/// name, no vtables — `substitute_generic_function`/`mangled_generic_
+/// symbol`/`collect_generic_specializations`'s own header comments) but
+/// driven LAZILY from this one call site (`ctx.generic_method_
+/// instances`'s own doc comment) rather than a separate whole-program
+/// discovery-then-declare pass, since a method's own free type
+/// parameter can bind to a non-class primitive (`Int64`, unlike a top-
+/// level generic function's own class-only bound), which needs the
+/// ACTUAL call argument in hand to infer at all.
+///
+/// Also substitutes the enclosing class's own bound interface type
+/// parameter (`implements Iterable[Int64]`'s `T`) — a generic
+/// INTERFACE method's own free type parameter (`U`) is one level of
+/// generics on top of whatever `T` the class's own `implements` clause
+/// already binds, exactly mirroring `emerald-sema`'s own `interface_
+/// type_param_subst`/`build_flattened_class_info` pairing.
+#[allow(clippy::too_many_arguments)]
+fn resolve_generic_method_instance<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  ctx: &Ctx<'_, 'ctx>,
+  class_name: &str,
+  method: &str,
+  args: &[Spanned<Expr>],
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+) -> Result<(FunctionValue<'ctx>, ValKind), String> {
+  let c = ctx.class_defs.get(class_name).ok_or_else(|| {
+    format!("codegen: internal error — unknown class `{class_name}` for generic method `{method}`")
+  })?;
+  let m = c.methods.iter().find(|m| m.name == method).ok_or_else(|| {
+    format!("codegen: internal error — class `{class_name}` has no method `{method}`")
+  })?;
+  if m.type_params.len() != 1 {
+    return Err(format!(
+      "codegen: generic method `{class_name}.{method}` declares {} type parameters — only exactly one is supported",
+      m.type_params.len()
+    ));
+  }
+  let method_tp = m.type_params[0].name.clone();
+
+  // The enclosing class's own `implements Interface[Args]` clause (if
+  // any) binds the INTERFACE's own type parameter(s) — mirrors
+  // `emerald-sema`'s `interface_type_param_subst` exactly, just over
+  // the raw `ClassDef`/`InterfaceDef` ASTs codegen already has.
+  let mut iface_subst_owned: HashMap<String, TypeExpr> = HashMap::new();
+  if let Some((iface_name, iface_args)) = &c.implements {
+    if let Some(iface) = ctx.interface_defs.get(iface_name.as_str()) {
+      for (tp, arg) in iface.type_params.iter().zip(iface_args.iter()) {
+        iface_subst_owned.insert(tp.name.clone(), arg.clone());
+      }
+    }
+  }
+  let iface_subst: HashMap<&str, &TypeExpr> = iface_subst_owned
+    .iter()
+    .map(|(k, v)| (k.as_str(), v))
+    .collect();
+
+  let mut concrete_u: Option<TypeExpr> = None;
+  for (i, p) in m.params.iter().enumerate() {
+    let p_ty = substitute_type_params(&p.ty, &iface_subst);
+    if let Some(arg) = args.get(i) {
+      if let Some(binding) = infer_method_type_param_binding(&p_ty, arg, &method_tp, ctx, vars) {
+        concrete_u = Some(binding);
+      }
+    }
+  }
+  let concrete_u = concrete_u.ok_or_else(|| {
+    format!(
+      "codegen: could not resolve generic method `{class_name}.{method}`'s type parameter `{method_tp}` to a concrete type at this call site"
+    )
+  })?;
+
+  let mangled = format!(
+    "{class_name}_{}$${}",
+    mangled_operator_symbol(method),
+    mangle_type_expr(&concrete_u)
+  );
+  if let Some((fv, ret_kind)) = ctx.generic_method_instances.borrow().get(&mangled) {
+    return Ok((*fv, ret_kind.clone()));
+  }
+
+  let mut full_subst_owned = iface_subst_owned.clone();
+  full_subst_owned.insert(method_tp.clone(), concrete_u);
+  let full_subst: HashMap<&str, &TypeExpr> = full_subst_owned
+    .iter()
+    .map(|(k, v)| (k.as_str(), v))
+    .collect();
+  let substituted = substitute_function_type_params(m, &full_subst);
+
+  let ret_kind = value_kind_for_type(&substituted.return_type);
+  let mut kinds = vec![ValKind::Ptr]; // self
+  kinds.extend(param_kinds(&substituted.params));
+  let fn_ty = make_fn_type(context, &kinds, &ret_kind);
+  let fv = ctx
+    .module
+    .add_function(&mangled, fn_ty, Some(Linkage::Internal));
+  // Inserted BEFORE the body compiles (mirrors `instantiate_generic_
+  // class`'s own self-reference-safe ordering elsewhere in this
+  // codebase) — a recursive generic-method call inside its own body
+  // would otherwise recurse into this same resolver forever.
+  ctx
+    .generic_method_instances
+    .borrow_mut()
+    .insert(mangled.clone(), (fv, ret_kind.clone()));
+
+  let layout = ctx
+    .classes
+    .get(class_name)
+    .ok_or_else(|| format!("codegen: internal error — no ClassLayout for `{class_name}`"))?;
+  // See `build_inline_lambda`'s identical save/restore for why the
+  // debug location (separate builder state from the basic-block
+  // position) must be restored too, not just the block.
+  let saved_block = builder.get_insert_block();
+  let saved_di_loc = builder.get_current_debug_location();
+  define_method(
+    context,
+    builder,
+    &substituted,
+    fv,
+    &layout.fields,
+    &layout.field_classes,
+    ctx,
+  )?;
+  if let Some(block) = saved_block {
+    builder.position_at_end(block);
+  }
+  match saved_di_loc {
+    Some(loc) => builder.set_current_debug_location(loc),
+    None => builder.unset_current_debug_location(),
+  }
+
+  Ok((fv, ret_kind))
 }
 
 /// `for var in [e1, e2, ...] body end` (plan 30's Decision log):
@@ -10864,6 +11595,17 @@ fn build_stmt<'a, 'ctx>(
       if matches!(ty, TypeExpr::Generic(base, _) if base == "Hash" || base == "Result" || base == "Pair")
       {
         local_classes.insert(name.clone(), bare_ty.clone());
+      }
+      // Plan 89's Decision log: a `Proc[Args..., Ret]`-typed local
+      // bound to an arbitrary expression (forwarding a parameter, a
+      // field load, or any other Proc-typed value — not a lambda
+      // literal, which `build_stmt`'s own dedicated `Expr::Lambda` arm
+      // above already special-cases) needs the identical `local_
+      // classes` signature encoding `bind_params` gives a Proc-typed
+      // PARAMETER, so `.call`'s own dispatch can resolve an indirect
+      // call through it too.
+      if let Some(sig) = proc_sig_for_type(ty) {
+        local_classes.insert(name.clone(), sig);
       }
       let (ptr, _) = *vars
         .get(name)
@@ -12780,6 +13522,16 @@ fn bind_params<'ctx>(
         }
       }
     }
+    // Plan 89's Decision log: a `Proc[Args..., Ret]`-typed parameter
+    // (a generic method's own `f: Proc[T, U]`, already fully concrete
+    // by the time this specific specialization's body compiles — see
+    // `resolve_generic_method_instance`) gets its signature encoded
+    // into `local_classes` too, so `.call`'s own dispatch can resolve
+    // an INDIRECT call through it (no compile-time name to look up in
+    // `ctx.lambda_func_ids` for an ordinary parameter).
+    if let Some(sig) = proc_sig_for_type(&p.ty) {
+      local_classes.insert(p.name.clone(), sig);
+    }
   }
   Ok(())
 }
@@ -14265,6 +15017,22 @@ fn declare_user_functions<'ctx>(
       Item::Class(c) if !c.type_params.is_empty() => {}
       Item::Class(c) => {
         for m in &c.methods {
+          // Plan 89's Decision log: a method's OWN `[U]`/`[U: Bound]`
+          // type parameter is never declared under its raw, unmangled
+          // symbol at all — mirroring `Item::Function`'s identical
+          // "generic — skip the bare name" precedent immediately above.
+          // Before this fix, the RAW body (its own type parameter
+          // folded to the generic `ValKind::Ptr` bucket) was declared
+          // and defined unconditionally regardless, which is exactly
+          // the shape that could reach the LLVM verifier with
+          // mismatched types once `.call`'s own dispatch stopped
+          // hard-erroring on a non-static-name Proc receiver (plan 89's
+          // OTHER leaf) — only `resolve_generic_method_instance`'s own
+          // lazily-monomorphized, fully-concrete specializations are
+          // ever compiled now.
+          if !m.type_params.is_empty() {
+            continue;
+          }
           let ret_kind = value_kind_for_type(&m.return_type);
           let mut kinds = vec![ValKind::Ptr]; // self
           kinds.extend(param_kinds(&m.params));
@@ -14288,6 +15056,13 @@ fn declare_user_functions<'ctx>(
       // is `.spawn`'s own allocation call site, not the method ABI.
       Item::Actor(a) => {
         for m in &a.methods {
+          // Plan 89: mirrors `Item::Class`'s own identical generic-
+          // method skip immediately above (grammatically reachable,
+          // even though no actor in this compiler's own examples
+          // declares one).
+          if !m.type_params.is_empty() {
+            continue;
+          }
           let ret_kind = value_kind_for_type(&m.return_type);
           let mut kinds = vec![ValKind::Ptr]; // self
           kinds.extend(param_kinds(&m.params));
@@ -14332,6 +15107,13 @@ fn declare_user_functions<'ctx>(
   // this produces `Stack$Int64_push` with zero further special-casing).
   for c in generic_instances.values() {
     for m in &c.methods {
+      // Plan 89: a generic-class instantiation's own method may ALSO
+      // declare its own further `[U]` type parameter, on top of the
+      // class's own already-substituted one — mirrors `Item::Class`'s
+      // identical skip immediately above.
+      if !m.type_params.is_empty() {
+        continue;
+      }
       let ret_kind = value_kind_for_type(&m.return_type);
       let mut kinds = vec![ValKind::Ptr]; // self
       kinds.extend(param_kinds(&m.params));
@@ -14362,18 +15144,24 @@ fn declare_user_functions<'ctx>(
 /// `Type`-level inference — precise enough to be right for any program that
 /// has already passed sema's own equivalent, real check, not a general type
 /// checker.
+/// Plan 89's Decision log: `base_env` is now caller-supplied rather than
+/// built internally from `top_level_types` alone — `declare_lambda_
+/// functions`'s own top-level-lambda call site still passes exactly
+/// that (unchanged behavior), while `build_inline_lambda`'s new call
+/// site (an anonymous lambda literal compiled on the fly at a call
+/// argument's own position, not bound to any top-level `Let` at all)
+/// passes the ENCLOSING function's own current locals/params too, so a
+/// capture's kind resolves correctly regardless of whether it's a
+/// top-level name or a plain local.
 fn infer_lambda_ret_kind(
   params: &[Param],
   body: &[Spanned<Stmt>],
-  top_level_types: &HashMap<String, TypeExpr>,
+  base_env: &HashMap<String, ValKind>,
   user_fn_return_types: &HashMap<String, TypeExpr>,
 ) -> ValKind {
-  let mut env: HashMap<&str, ValKind> = HashMap::new();
-  for (name, ty) in top_level_types {
-    env.insert(name.as_str(), value_kind_for_type(ty));
-  }
+  let mut env: HashMap<String, ValKind> = base_env.clone();
   for p in params {
-    env.insert(p.name.as_str(), value_kind_for_type(&p.ty));
+    env.insert(p.name.clone(), value_kind_for_type(&p.ty));
   }
   match body.last() {
     Some(Spanned {
@@ -14390,7 +15178,7 @@ fn infer_lambda_ret_kind(
 
 fn infer_expr_val_kind(
   expr: &Spanned<Expr>,
-  env: &HashMap<&str, ValKind>,
+  env: &HashMap<String, ValKind>,
   user_fn_return_types: &HashMap<String, TypeExpr>,
 ) -> ValKind {
   match &expr.node {
@@ -14423,12 +15211,16 @@ fn infer_expr_val_kind(
   }
 }
 
-fn declare_lambda_functions<'ctx>(
-  context: &'ctx Context,
-  module: &Module<'ctx>,
+/// Plan 89: extracted out of `declare_lambda_functions`'s own former
+/// internal scan (unchanged logic) — computed once and shared with
+/// `Ctx::top_level_types`/`Ctx::user_fn_return_types`, so `build_
+/// inline_lambda`'s own return-kind inference (an anonymous lambda
+/// literal compiled on the fly at a call-argument position, never a
+/// top-level `Let`) sees the exact same environment a top-level
+/// lambda's inference already does.
+fn collect_top_level_types_and_fn_returns(
   program: &Program,
-  lambda_infos: &HashMap<String, LambdaInfo>,
-) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
+) -> (HashMap<String, TypeExpr>, HashMap<String, TypeExpr>) {
   let mut top_level_types: HashMap<String, TypeExpr> = HashMap::new();
   let mut user_fn_return_types: HashMap<String, TypeExpr> = HashMap::new();
   for item in &program.items {
@@ -14445,7 +15237,17 @@ fn declare_lambda_functions<'ctx>(
       _ => {}
     }
   }
+  (top_level_types, user_fn_return_types)
+}
 
+fn declare_lambda_functions<'ctx>(
+  context: &'ctx Context,
+  module: &Module<'ctx>,
+  program: &Program,
+  lambda_infos: &HashMap<String, LambdaInfo>,
+  top_level_types: &HashMap<String, TypeExpr>,
+  user_fn_return_types: &HashMap<String, TypeExpr>,
+) -> HashMap<String, (FunctionValue<'ctx>, ValKind)> {
   let mut lambda_func_ids = HashMap::new();
   for item in &program.items {
     let Item::Stmt(Spanned {
@@ -14478,7 +15280,11 @@ fn declare_lambda_functions<'ctx>(
     let ret_kind = if let TypeExpr::Func(_, ret) = ty {
       value_kind_for_type(ret)
     } else {
-      infer_lambda_ret_kind(params, body, &top_level_types, &user_fn_return_types)
+      let base_env: HashMap<String, ValKind> = top_level_types
+        .iter()
+        .map(|(k, v)| (k.clone(), value_kind_for_type(v)))
+        .collect();
+      infer_lambda_ret_kind(params, body, &base_env, user_fn_return_types)
     };
     let mut kinds = vec![ValKind::Ptr]; // env
     kinds.extend(param_kinds(params));
@@ -15376,7 +16182,25 @@ fn compile_to_object_impl(
   // Bugfix (multi-file `--jobs` link) — see `weak_odr_class_shaped_
   // methods`'s own doc comment for why this is needed and safe.
   weak_odr_class_shaped_methods(program, &generic_instances, &user_func_ids);
-  let lambda_func_ids = declare_lambda_functions(&context, &module, program, &lambda_infos);
+  let (top_level_types, user_fn_return_types) = collect_top_level_types_and_fn_returns(program);
+  let lambda_func_ids = declare_lambda_functions(
+    &context,
+    &module,
+    program,
+    &lambda_infos,
+    &top_level_types,
+    &user_fn_return_types,
+  );
+  let interface_defs: HashMap<String, &InterfaceDef> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Interface(idef) => Some((idef.name.clone(), idef)),
+      _ => None,
+    })
+    .collect();
+  let generic_method_instances_cell: RefCell<HashMap<String, (FunctionValue<'_>, ValKind)>> =
+    RefCell::new(HashMap::new());
 
   // Plan 41's Decision log: one specialization cache entry per distinct
   // `(generic function, concrete type)` pair actually called anywhere in
@@ -15568,6 +16392,12 @@ fn compile_to_object_impl(
     actor_method_counts: &actor_method_counts,
     comptime_step_limit: comptime_step_limit.unwrap_or(1_000_000),
     current_function_contracts: None,
+    module: &module,
+    top_level_types: &top_level_types,
+    user_fn_return_types: &user_fn_return_types,
+    class_defs: &class_defs,
+    interface_defs: &interface_defs,
+    generic_method_instances: &generic_method_instances_cell,
   };
 
   for item in &program.items {
@@ -15602,6 +16432,13 @@ fn compile_to_object_impl(
       Item::Class(c) => {
         let layout = &classes[&c.name];
         for m in &c.methods {
+          // Plan 89: mirrors `declare_user_functions`'s identical skip
+          // — the raw, unsubstituted body of a method with its own
+          // `[U]` type parameter is never compiled under its bare
+          // symbol at all (it was never declared one above either).
+          if !m.type_params.is_empty() {
+            continue;
+          }
           let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
           let (fv, _) = user_func_ids[&mangled];
           define_method(
@@ -15632,6 +16469,9 @@ fn compile_to_object_impl(
       Item::Actor(a) => {
         let layout = &classes[&a.name];
         for m in &a.methods {
+          if !m.type_params.is_empty() {
+            continue;
+          }
           let mangled = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
           let (fv, _) = user_func_ids[&mangled];
           define_method(
@@ -15710,6 +16550,11 @@ fn compile_to_object_impl(
   for c in generic_instances.values() {
     let layout = &classes[&c.name];
     for m in &c.methods {
+      // Plan 89: mirrors `declare_user_functions`'s identical skip for
+      // this same `generic_instances` loop.
+      if !m.type_params.is_empty() {
+        continue;
+      }
       let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
       let (fv, _) = user_func_ids[&mangled];
       define_method(
@@ -18990,6 +19835,56 @@ int main(void) {
   fn array_reduce_compiled_linked_and_run_folds_to_the_sum() {
     let src = "adder: Proc = do |acc: Int64, x: Int64| acc + x end\narr: Array[Int64] = [1, 2, 3, 4]\ntotal: Int64 = arr.reduce(0, adder)\nputs total\n";
     assert_eq!(compile_link_run(src), "10\n");
+  }
+
+  // Plan 89 (generic-method codegen, interface generics, indirect Proc
+  // calls).
+
+  // Isolated from generics entirely (Decision log: the gap is
+  // independent of generic methods — a plain, non-generic method
+  // taking a `Proc` PARAMETER and calling it already failed before
+  // this plan, since `.call`'s own dispatch only ever resolved a
+  // literal top-level `Let`-bound lambda `Ident` via `ctx.
+  // lambda_func_ids`, never an indirect call through a parameter).
+  #[test]
+  fn a_non_generic_method_taking_and_calling_a_proc_parameter_works() {
+    let src = "class Doubler\n  fn initialize(): Void do\n  end\n\n  fn apply(f: Proc[Int64, Int64], x: Int64): Int64 do\n    f.call(x)\n  end\nend\n\nd: Doubler = Doubler.new()\ntripler: Proc[Int64, Int64] = do |x: Int64| x * 3 end\nputs d.apply(tripler, 5)\n";
+    assert_eq!(compile_link_run(src), "15\n");
+  }
+
+  // Also proves an INLINE lambda literal (never bound to a top-level
+  // `Let` at all) compiles correctly when passed directly as a call
+  // argument — `build_inline_lambda`'s own worked proof, layered on
+  // top of the indirect-call proof above.
+  #[test]
+  fn an_inline_lambda_literal_passed_directly_as_a_proc_parameter_works() {
+    let src = "class Doubler\n  fn initialize(): Void do\n  end\n\n  fn apply(f: Proc[Int64, Int64], x: Int64): Int64 do\n    f.call(x)\n  end\nend\n\nd: Doubler = Doubler.new()\nputs d.apply(do |x: Int64| x * 3 end, 5)\n";
+    assert_eq!(compile_link_run(src), "15\n");
+  }
+
+  // Plan 88's own original worked example, this time actually compiled,
+  // linked, and run (plan 89's own concrete proof target) — `interface
+  // Iterable[T]` with a generic required method (`map[U]`), implemented
+  // by `Numbers`, called end-to-end with a real lambda argument.
+  const ITERABLE_WORKED_EXAMPLE: &str = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n\nclass Numbers\n  implements Iterable[Int64]\n\n  values: Array[Int64]\n\n  fn initialize(values: Array[Int64]): Void do\n    @values = values\n  end\n\n  fn map[U](f: Proc[T, U]): Array[U] do\n    values: Array[Int64] = @values\n    result: Array[U] = Array.new(values.count)\n    i: Int64 = 0\n    while i < values.count do\n      result[i] = f.call(values[i])\n      i: Int64 = i + 1\n    end\n    result\n  end\nend\n\nn: Numbers = Numbers.new([1, 2, 3])\ndoubled: Array[Int64] = n.map(do |x: Int64| x * 2 end)\nputs doubled[0]\nputs doubled[2]\n";
+
+  #[test]
+  fn interface_generics_worked_example_compiled_linked_and_run_prints_two_and_six() {
+    assert_eq!(compile_link_run(ITERABLE_WORKED_EXAMPLE), "2\n6\n");
+  }
+
+  // The SAME generic method (`Numbers#map[U]`), called twice at two
+  // DIFFERENT concrete type arguments (`U = Int64`, then `U = Boolean`)
+  // — proves `resolve_generic_method_instance` compiles a genuinely
+  // DISTINCT function per binding (a real mangled-name collision here,
+  // rather than reusing/overwriting the first specialization, would
+  // either fail to link or produce the wrong element type/values for
+  // one of the two calls).
+  #[test]
+  fn a_generic_method_called_with_two_different_type_arguments_produces_distinct_compiled_results()
+  {
+    let src = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n\nclass Numbers\n  implements Iterable[Int64]\n\n  values: Array[Int64]\n\n  fn initialize(values: Array[Int64]): Void do\n    @values = values\n  end\n\n  fn map[U](f: Proc[T, U]): Array[U] do\n    values: Array[Int64] = @values\n    result: Array[U] = Array.new(values.count)\n    i: Int64 = 0\n    while i < values.count do\n      result[i] = f.call(values[i])\n      i: Int64 = i + 1\n    end\n    result\n  end\nend\n\nn: Numbers = Numbers.new([1, 2, 3])\ndoubled: Array[Int64] = n.map(do |x: Int64| x * 2 end)\nlabels: Array[String] = n.map(do |x: Int64| \"n#{x}\" end)\nputs doubled[0]\nputs doubled[2]\nputs labels[0]\nputs labels[2]\n";
+    assert_eq!(compile_link_run(src), "2\n6\nn1\nn3\n");
   }
 
   #[test]

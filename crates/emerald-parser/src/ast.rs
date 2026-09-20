@@ -967,19 +967,36 @@ pub struct TypeParam {
   pub bounds: Vec<String>,
 }
 
-/// `interface Comparable def compare_to(other: Self) -> Int64 end` (plan
-/// 41's Decision log) — structurally exactly one required method: the
-/// grammar has no `FuncDef*`-style repetition inside `interface ...
-/// end`, so a two-method interface is a parse error, not a silently
-/// accepted-but-unchecked shape. Reuses `Param`'s `{name, ty}` shape for
-/// the method's parameters, the same reuse plan 08 established for class
-/// fields.
+/// One `fn <name>(<params>): <ReturnType>` required-method declaration
+/// inside an `interface ... end` body (plan 89's Decision log widens
+/// `InterfaceDef` from exactly one such method to a `Vec` of these).
+/// `type_params` is the method's OWN `[U]`/`[U: Bound]` clause (plan
+/// 89's worked example, `fn map[U](f: Proc[T, U]): Array[U]`) — empty
+/// for an ordinary, non-generic required method, mirroring `Function.
+/// type_params`'s identical "empty means not generic" convention.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceMethod {
+  pub method_name: String,
+  pub type_params: Vec<TypeParam>,
+  pub params: Vec<Param>,
+  pub return_type: TypeExpr,
+}
+
+/// `interface Comparable fn compare_to(other: Self): Int64 end` (plan
+/// 41's Decision log) — originally structurally exactly one required
+/// method with no type-parameter clause at all. Plan 89's Decision log
+/// widens this two ways, both additive and source-compatible: `type_
+/// params` is the interface's OWN `[T]`/`[T: Bound]` clause (`interface
+/// Iterable[T] ... end`), empty for a non-generic interface exactly like
+/// every other `type_params` field in this AST; `methods` widens from a
+/// single required method to a `Vec` (still non-empty — the grammar
+/// requires at least one `InterfaceMethod`, mirroring the original
+/// "at least one" cardinality exactly, just no longer capped at one).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InterfaceDef {
   pub name: String,
-  pub method_name: String,
-  pub params: Vec<Param>,
-  pub return_type: TypeExpr,
+  pub type_params: Vec<TypeParam>,
+  pub methods: Vec<InterfaceMethod>,
 }
 
 /// A class declaration: fields (reusing `Param`'s `{name, ty}` shape —
@@ -996,8 +1013,12 @@ pub struct ClassDef {
   /// `implements Comparable` (plan 41's Decision log) — a single
   /// interface name, checked structurally (conformance, not
   /// assignability) at class-declaration time. `None` for every class
-  /// that doesn't declare one.
-  pub implements: Option<String>,
+  /// that doesn't declare one. Plan 89's Decision log widens the second
+  /// tuple element from nothing to `Vec<TypeExpr>` — `implements
+  /// Iterable[Int64]`'s `[Int64]` — empty for a bare `implements
+  /// Comparable` naming a non-generic interface, source-compatible with
+  /// every pre-plan-89 `implements` clause.
+  pub implements: Option<(String, Vec<TypeExpr>)>,
   pub fields: Vec<Param>,
   pub methods: Vec<Function>,
   /// `class Point derive Comparable ... end` (plan 61's Decision log) —
