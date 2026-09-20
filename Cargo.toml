@@ -6,6 +6,7 @@ members = [
   "crates/emerald-codegen",
   "crates/emerald-sema",
   "crates/emerald-driver",
+  "crates/emerald-fmt",
   "crates/emerald-cli",
   "crates/emerald-lsp",
   "crates/emerald-mcp",

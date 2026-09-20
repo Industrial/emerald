@@ -19,6 +19,8 @@ path = "src/main.rs"
 # to emerald_driver::compile_program.
 emerald-parser = { path = "../emerald-parser" }
 emerald-driver = { path = "../emerald-driver" }
+# Plan 78: `emerald format` — see `emerald-fmt`'s own crate doc comment.
+emerald-fmt = { path = "../emerald-fmt" }
 miette = { version = "7", features = ["fancy"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

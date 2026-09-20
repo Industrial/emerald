@@ -1,0 +1,14 @@
+[package]
+name = "emerald-fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Plan 78 (`canonical-formatter`, row 78 of the plan-of-plans): `emerald
+# format` — a real pretty-printer for Emerald source, built on top of
+# `emerald-parser`'s own AST as the single source of truth. See
+# `src/lib.rs`'s own module doc comment for the chosen approach (a pure
+# AST pretty-printer, not a whitespace-preserving pass) and its one
+# disclosed limitation (ordinary comments are lost).
+[dependencies]
+emerald-parser = { path = "../emerald-parser" }

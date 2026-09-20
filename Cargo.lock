@@ -373,6 +373,7 @@ name = "emerald-cli"
 version = "0.1.0"
 dependencies = [
  "emerald-driver",
+ "emerald-fmt",
  "emerald-parser",
  "miette",
  "serde",
@@ -397,6 +398,13 @@ dependencies = [
  "emerald-parser",
  "emerald-sema",
  "id_effect",
+]
+
+[[package]]
+name = "emerald-fmt"
+version = "0.1.0"
+dependencies = [
+ "emerald-parser",
 ]
 
 [[package]]
