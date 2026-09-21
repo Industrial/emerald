@@ -7204,6 +7204,45 @@ fn build_method_call<'ctx>(
     }
   }
 
+  // Real bug fix (found this session, 2026-09-21's "find all bugs"
+  // sweep): a newtype-typed CLASS/ACTOR FIELD's `.value` unwrap was
+  // unsupported for the identical reason the Proc-typed field `.call`
+  // fix immediately above was — the newtype-unwrap check further below
+  // only ever consults `local_classes` (keyed by a named LOCAL
+  // variable), which an `InstanceVar` receiver (`@field`) never
+  // populates, so `@field.value` fell straight through to the ordinary
+  // `Expr::Ident`-only guard and failed with "method calls are only
+  // supported on a plain local-variable receiver" even though sema
+  // fully accepts the program. Mirrors both `InstanceVar` checks
+  // immediately above: the newtype-ness comes from `field_classes`
+  // (`build_class_layout`'s own `f.ty.to_string()` fallback already
+  // stores a newtype field's bare type name there, unchanged — no
+  // change needed on that side), and the actual unwrap is the same
+  // zero-cost identity `build_expr(recv)` the local-variable arm below
+  // already uses, since `@field` compiles to an ordinary field read
+  // either way.
+  if let Expr::InstanceVar(field_name) = &recv.node {
+    if let Some((_, _, field_classes)) = ctx.self_ctx {
+      if field_classes
+        .get(field_name)
+        .is_some_and(|s| ctx.newtypes.contains(s))
+      {
+        if method != "value" {
+          return Err(format!("codegen: newtype has no method `{method}`"));
+        }
+        return build_expr(
+          context,
+          builder,
+          recv,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        );
+      }
+    }
+  }
+
   // Plan 74 (enumerable chaining): resolve a chained-enumerable-call
   // receiver (`nums.select do ... end.map do ... end`) down to a plain
   // Ident first — see `resolve_chained_enumerable_receiver`'s own doc
@@ -18833,6 +18872,21 @@ mod tests {
     // sites — same real answer, same representation.
     let src = "newtype Meters: Float64\narr: Array[Meters] = [Meters.new(1.5), Meters.new(2.5)]\nx: Meters = arr[0]\ny: Meters = arr[1]\nputs x.value + y.value\n";
     assert_eq!(compile_link_run(src), "4\n");
+  }
+
+  // Found and closed 2026-09-21 (this session's "find all bugs" sweep):
+  // a newtype-typed CLASS FIELD's `.value` unwrap (`@distance.value`,
+  // an `Expr::InstanceVar` receiver) previously failed with "method
+  // calls are only supported on a plain local-variable receiver" — the
+  // newtype-unwrap check only ever consulted `local_classes` (keyed by
+  // a named local), never `field_classes`. Confirmed as a real,
+  // pre-existing bug (not assumed) by reverting this fix on a stashed
+  // copy of `emerald-codegen` and reproducing the exact error via the
+  // real CLI before restoring it.
+  #[test]
+  fn newtype_typed_class_field_value_unwrap_from_inside_the_declaring_class_works() {
+    let src = "newtype Meters: Float64\nclass Trip\n  distance: Meters\n\n  fn initialize(distance: Meters): Void do\n    @distance = distance\n  end\n\n  fn distance_value: Float64 do\n    @distance.value\n  end\nend\nt: Trip = Trip.new(Meters.new(5.5))\nputs t.distance_value\n";
+    assert_eq!(compile_link_run(src), "5.5\n");
   }
 
   #[test]
