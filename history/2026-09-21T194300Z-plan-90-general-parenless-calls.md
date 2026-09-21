@@ -172,3 +172,136 @@ format`.
    turns out to be "parens omitted only where truly unambiguous, parens
    kept everywhere else" — a real possible outcome this plan must not
    prejudge before the spike leaf runs.
+
+## Update (2026-09-21, same-day session): attempted, reverted — real, reproduced blocker
+
+A later session in the same day actually ran `leaf-disambiguation-
+strategy-spike` for real against the live grammar, rather than leaving
+it as an open question. The finding is more severe than either
+candidate strategy above anticipated, and is recorded here in full so
+a future attempt doesn't have to re-derive it.
+
+**What was tried.** Strategy (B) (whitespace-adjacency lexing) was
+deprioritized in favor of a third approach neither candidate above
+named: making source newlines themselves significant — a real `;`
+statement-terminator token, mechanically identical to Ruby's own
+newline-as-separator rule, produced by a pre-parse rewrite
+(`significant_newlines`, in `emerald-parser/src/lib.rs`) that turns
+every newline sitting outside a string/comment/bracket into a literal
+`;` before the grammar ever sees the text (one-for-one byte
+substitution, so every `@L`/`@R` offset downstream stays valid against
+the real source). The reasoning: `puts`'s own working `"puts" <arg:
+Expr>` production already proves a *single*-argument command call
+parses fine with no significant whitespace at all, because there's
+nothing after the one argument to disambiguate; the actual blocker
+plan 07 named is specifically about telling two *adjacent statements*
+apart from *one command call*, and a real statement terminator solves
+exactly that.
+
+**Layer 1 — the terminator mechanism itself: real, working, but not by
+itself sufficient.** Getting `;`-as-terminator merely *not to break
+anything already parsing* took three rounds of real, `cargo build`-
+reported LALR conflicts, each a genuinely different structural cause,
+each found only by building — not by static reading of the grammar:
+
+1. `Program`'s own top-level `Item*` list had zero separator
+   tolerance — a real regression, reproduced directly running
+   `examples/ownership.em` through the CLI (`"Unrecognized token
+   ;"`), before any command-call work was even attempted.
+2. Five more `X*`/`X+` Kleene lists — `ContractClause*`, `ClassField*`,
+   `MethodDef*` (both `class` and `actor`), `FuncDef*` (`module`),
+   `InterfaceMethodDef+`, `CaseArm+` — had the identical gap, each a
+   separate list whose real elements are separated by physical
+   newlines-turned-`;` with no tolerance built in. Fixed by wrapping
+   each in its own `;`-tolerant sibling nonterminal
+   (`StmtList`/`ClassFieldList`/`MethodDefList`/`FuncDefList`/
+   `ContractClauseList`/`InterfaceMethodDefList`/`CaseArmList`),
+   mirroring `HashPairs`/`CaseValues`'s existing shape.
+3. A third, independent conflict — `ClassFieldList` immediately
+   adjacent to `MethodDefList` inside one `class`/`actor` production —
+   surfaced only when re-verifying the fix for (2) on its own, without
+   any command-call code layered on top yet. Root cause: both
+   nonterminals independently offer to absorb a leading run of
+   semicolons, so a boundary run of blank-line `;`s between the last
+   field and the first method has more than one valid derivation —
+   genuinely ambiguous, not a false positive. **Left unresolved when
+   this attempt was reverted** — the grammar as reverted does not
+   contain this fix; a real one requires auditing every place two of
+   these separator-tolerant lists (or one such list and a subsequent
+   fixed-but-non-trivial construct, e.g. `StmtList` immediately before
+   `RescueClause+` in `begin`/`rescue`/`ensure`) sit adjacent to each
+   other in the grammar, and giving the semicolon exactly one owner at
+   each such boundary — not a per-symptom patch.
+
+**Layer 2 — the actual feature, on top of a working Layer 1: hit a
+real, unavoidable LALR conflict twice, at two different tiers, for
+the identical structural reason.** Two attempts:
+
+- A `CommandOrStmtExpr` wrapper (falling back to `StmtExpr`, used only
+  for `Stmt`'s own bare-statement position) — `cargo build` reported a
+  genuine conflict at `StmtPrimaryExpr`'s own pre-existing bare-`Ident`
+  alternative (`grammar.lalrpop:1354` at the time).
+- After dropping that and trying only `CommandOrExpr` (falling back to
+  the *general* `Expr`, used at `Let`/`Assign`'s RHS, `return`'s
+  value, and `puts`'s own argument — none of them Stmt-initial) —
+  `cargo build` reported the **identical class of conflict again**,
+  this time at plain `PrimaryExpr`'s own bare-`Ident` alternative.
+
+The second result is the decisive one: it proves the conflict is not
+a Stmt-initial peculiarity fixable by choosing a different subset of
+positions. `Expr`/`PrimaryExpr` is the *one* nonterminal every call-
+argument/RHS/return-value position in this entire grammar shares, and
+it already has, and structurally needs, a bare `<name:Ident> =>
+Expr::Ident(name)` alternative (referencing a plain variable). Adding
+any new `<name:Ident> <args:...>`-headed alternative puts an
+`Ident`-complete-reduce item and an `Ident`-still-extending-shift item
+in the same LALR state, with no lookahead token available at that
+point to prefer one over the other — a structural conflict, present
+at *every* position `Expr` is used, because `Expr` is used
+everywhere. `;` as a statement terminator, however real and however
+correctly implemented, does not touch this: the conflict is *within*
+a single expression's own parse, not between statements.
+
+**Conclusion, stated plainly.** General, unparenthesized command-call
+syntax for an arbitrary user-defined function/method — the actual
+goal this plan and the session that opened it wanted — is **not
+achievable via straightforward LALR(1) grammar extension** in this
+codebase, full stop, not a scoping problem. Closing it for real needs
+one of:
+
+1. **Removing "a bare `Ident` is a complete `Expr`" from the grammar
+   entirely.** Not viable — that is how every plain variable reference
+   is written, in every position, throughout the entire language.
+2. **Real lexer-level whitespace-adjacency tokens** — Ruby's and
+   Crystal's own actual mechanism (candidate strategy (B) above, in
+   its full form): a token stream that already distinguishes `foo(`
+   from `foo (`/`foo x` *before* the parser ever sees it, which
+   requires replacing LALRPOP's own built-in tokenizer with a
+   stateful external lexer. This is a materially larger, separate
+   undertaking from the significant-newlines mechanism above — not a
+   follow-on tweak to it — and was not attempted this session.
+
+**What was reverted, and why.** `grammar.lalrpop`/`lib.rs` were reset
+to their pre-plan-90 state (matching commit `18a4255`) rather than
+left mid-repair, because: (a) the command-call feature itself is
+proven not to work this way, full stop; (b) the enabling
+significant-newlines mechanism, while real and independently useful,
+still has at least one known, unresolved structural conflict (Layer 1
+item 3) and likely more at other list-adjacency boundaries not yet
+found — leaving it half-fixed on `main` would mean a grammar that
+doesn't build; and (c) a concurrent session had, without full
+coordination, already committed this exact in-progress (non-building)
+state to local `main` once — reverting to the last known-good, tested
+commit was the safe, honest baseline to leave the repo at rather than
+compounding an already-tangled git history further.
+
+**If this is picked up again**, the right shape is two separate,
+independently-valuable plans, not one: (a) finish the significant-
+newlines mechanism properly — a systematic audit of every `Stmt*`-
+shaped list boundary in this grammar for the adjacency-ambiguity class
+found in Layer 1 item 3, not incremental patching — on its own merit,
+since real newline significance may be desirable independent of
+command-call syntax; and (b) a real lexer replacement for whitespace-
+adjacency tokens, which is the only mechanism that can actually close
+the Layer 2 conflict. Both are substantially larger than this plan's
+original scope.
