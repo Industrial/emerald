@@ -38,23 +38,33 @@
 //! (built from its `require`/`import` edges, see the two call sites'
 //! own graph-walk code) already grants it.
 //!
-//! ## A disclosed scope limitation
+//! ## `TypeExpr` positions (closed 2026-09-21)
 //!
 //! This walk covers every `Stmt`/`Expr` position an ordinary function/
 //! method/module-level body can reference a cross-file name from
 //! (calls, `.new`/`.spawn`/`.remote`/`.locate`, module-static calls,
-//! lambda bodies, `rescue`/`case`/`for` bodies). It does **not** walk
-//! `TypeExpr` positions (a `Param`'s declared type, a function's
-//! return type, a class field's type) — a function whose *signature*
-//! names an unexported class from another file, but whose *body* never
-//! constructs or calls anything cross-file, is not caught by this
-//! check. Real, not silently pretended otherwise: this is the design's
-//! one deliberate scope cut, made to keep this plan's own AST walk a
-//! single, generic-recursion pass rather than a second, parallel
-//! type-annotation walker.
+//! lambda bodies, `rescue`/`case`/`for` bodies) — and, since this
+//! session's own "find all bugs" sweep, every `TypeExpr` position too
+//! (a `Param`'s declared type, a function's return type, a splat
+//! parameter's element type, a class field's type, a superclass or
+//! `implements` name and its own generic arguments, an enum variant's
+//! field, a newtype's underlying type, an interface's own required-
+//! method signatures). A function whose *signature* names an
+//! unexported class from another file, but whose *body* never
+//! constructs or calls anything cross-file, used to slip through
+//! entirely — this was this design's one deliberately disclosed scope
+//! cut (kept the AST walk a single, generic-recursion pass rather than
+//! a second, parallel type-annotation walker), found and closed once
+//! `check_type_name`/`walk_type` gave that second walker its own
+//! narrow, dedicated pass instead: `TypeExpr` carries no span of its
+//! own, so a violation found this way reports `(0, 0)` — the same
+//! "no better span available" fallback `emerald-sema`'s own
+//! diagnostics already use pervasively — rather than a real
+//! expression-level span, a real, disclosed narrowing of its own.
 
 use crate::ast::{
-  ActorDef, CasePattern, ClassDef, Expr, Function, Item, ModuleDef, Spanned, Stmt, StringPart,
+  ActorDef, CasePattern, ClassDef, Expr, Function, Item, ModuleDef, Param, Spanned, Stmt,
+  StringPart, TypeExpr,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -203,13 +213,89 @@ impl<'a> Checker<'a> {
     }
   }
 
+  /// Found and closed 2026-09-21 (this session's "find all bugs"
+  /// sweep) — the module doc comment's own "disclosed scope
+  /// limitation" section. A `TypeExpr` position (a `Param`'s declared
+  /// type, a function's return type, a class field's type, a
+  /// superclass/`implements` name, an enum variant's field, a
+  /// newtype's underlying type) is never a local-variable binding —
+  /// there's no `locals` set to consult the way `check_name` needs
+  /// for a value-level identifier — so this is a separate, narrower
+  /// helper rather than a `check_name` call site with an empty set.
+  /// `TypeExpr` carries no span of its own (`ast.rs`'s own `TypeExpr`
+  /// definition — a plain, unspanned recursive enum), so every
+  /// violation found this way reports `(0, 0)`, the same "no better
+  /// span available" fallback `emerald-sema`'s own diagnostics already
+  /// use pervasively for a registration-time check with no single
+  /// expression to point at.
+  fn check_type_name(&mut self, name: &str) {
+    if let Some(file) = self.foreign.get(name) {
+      if !self.visible.contains(name) {
+        self.out.push(VisibilityError {
+          span: (0, 0),
+          name: name.to_string(),
+          defining_file: file.clone(),
+        });
+      }
+    }
+  }
+
+  /// Recurses through every wrapper (`Generic`/`Tuple`/`Func`/`Own`/
+  /// `Borrow`) to find every `Named`/`Generic`-base type name actually
+  /// referenced — `Array`/`Hash`/`Pair`/`Result`/`Proc` and every other
+  /// native/builtin name simply never appear in `self.foreign` (which
+  /// only ever holds REAL cross-file top-level declaration names), so
+  /// checking them unconditionally here needs no special-casing.
+  fn walk_type(&mut self, ty: &TypeExpr) {
+    match ty {
+      TypeExpr::Named(name) => self.check_type_name(name),
+      TypeExpr::Generic(name, args) => {
+        self.check_type_name(name);
+        for a in args {
+          self.walk_type(a);
+        }
+      }
+      TypeExpr::Tuple(parts) => {
+        for p in parts {
+          self.walk_type(p);
+        }
+      }
+      TypeExpr::Func(params, ret) => {
+        for p in params {
+          self.walk_type(p);
+        }
+        self.walk_type(ret);
+      }
+      TypeExpr::Own(inner) | TypeExpr::Borrow(inner, _) => self.walk_type(inner),
+    }
+  }
+
+  fn walk_params(&mut self, params: &[Param]) {
+    for p in params {
+      self.walk_type(&p.ty);
+    }
+  }
+
   fn walk_item(&mut self, item: &Item) {
     match item {
       Item::Function(f) => self.walk_function(f),
       Item::Class(c) => self.walk_class(c),
       Item::Module(m) => self.walk_module(m),
       Item::Actor(a) => self.walk_actor(a),
-      Item::Enum(_) | Item::Interface(_) | Item::Newtype(_) => {}
+      Item::Enum(e) => {
+        for variant in &e.variants {
+          for ty in &variant.fields {
+            self.walk_type(ty);
+          }
+        }
+      }
+      Item::Interface(i) => {
+        for m in &i.methods {
+          self.walk_params(&m.params);
+          self.walk_type(&m.return_type);
+        }
+      }
+      Item::Newtype(n) => self.walk_type(&n.underlying),
       Item::Export(inner) => self.walk_item(inner),
       Item::Stmt(s) => {
         let mut locals = std::mem::take(&mut self.top_locals);
@@ -224,6 +310,16 @@ impl<'a> Checker<'a> {
   }
 
   fn walk_class(&mut self, c: &ClassDef) {
+    if let Some(superclass) = &c.superclass {
+      self.check_type_name(superclass);
+    }
+    if let Some((iface_name, iface_args)) = &c.implements {
+      self.check_type_name(iface_name);
+      for a in iface_args {
+        self.walk_type(a);
+      }
+    }
+    self.walk_params(&c.fields);
     for m in &c.methods {
       self.walk_function(m);
     }
@@ -236,17 +332,21 @@ impl<'a> Checker<'a> {
   }
 
   fn walk_actor(&mut self, a: &ActorDef) {
+    self.walk_params(&a.fields);
     for m in &a.methods {
       self.walk_function(m);
     }
   }
 
   fn walk_function(&mut self, f: &Function) {
+    self.walk_params(&f.params);
+    self.walk_type(&f.return_type);
     let mut locals: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
     if let Some(blk) = &f.block_param {
       locals.insert(blk.clone());
     }
     if let Some(splat) = &f.splat_param {
+      self.walk_type(&splat.ty);
       locals.insert(splat.name.clone());
     }
     self.walk_stmts(&f.body, &locals);

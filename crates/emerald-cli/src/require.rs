@@ -704,4 +704,57 @@ mod tests {
     assert!(msg.contains("deep_helper"), "{msg}");
     std::fs::remove_dir_all(&dir).ok();
   }
+
+  // Found and closed 2026-09-21 (this session's "find all bugs" sweep,
+  // `crates/emerald-parser/src/visibility.rs`'s own disclosed scope
+  // limitation): the visibility walk used to cover only `Stmt`/`Expr`
+  // positions (calls, `.new`, ...), never a `TypeExpr` position — a
+  // function whose own PARAMETER type names an unexported class from
+  // another file, but whose BODY never constructs or calls anything
+  // cross-file, slipped through silently. Confirmed as a real, pre-
+  // existing bug (not assumed) by reverting the fix on a stashed copy
+  // of `emerald-parser` and confirming this exact program compiled AND
+  // ran (printing `1`) without complaint before restoring it.
+  #[test]
+  fn a_function_signature_naming_an_unexported_cross_file_type_is_rejected() {
+    let dir = fresh_dir("type-position-leak");
+    std::fs::write(
+      dir.join("types.em"),
+      "export class Public\n  value: Int64\n\n  fn initialize(v: Int64): Void do\n    @value = v\n  end\nend\n\nclass Secret\n  value: Int64\n\n  fn initialize(v: Int64): Void do\n    @value = v\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("middle.em"),
+      "require types\n\nexport fn leaks_secret_type(s: Secret): Int64 do\n  0\nend\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("main.em"), "require middle\nputs 1\n").unwrap();
+    let err = resolve_program(&dir.join("main.em")).unwrap_err();
+    let RequireError::Visibility(msg) = err else {
+      panic!("expected a Visibility error, got {err:?}");
+    };
+    assert!(msg.contains("Secret"), "{msg}");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  // The identical scenario, but `Secret` IS exported this time — must
+  // compile with zero complaint, proving the fix above doesn't
+  // false-positive on a legitimately visible cross-file type.
+  #[test]
+  fn a_function_signature_naming_an_exported_cross_file_type_is_accepted() {
+    let dir = fresh_dir("type-position-accept");
+    std::fs::write(
+      dir.join("types.em"),
+      "export class Public\n  value: Int64\n\n  fn initialize(v: Int64): Void do\n    @value = v\n  end\nend\n\nexport class Secret\n  value: Int64\n\n  fn initialize(v: Int64): Void do\n    @value = v\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("middle.em"),
+      "require types\n\nexport fn uses_secret_type(s: Secret): Int64 do\n  0\nend\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("main.em"), "require middle\nputs 1\n").unwrap();
+    resolve_program(&dir.join("main.em")).expect("Secret is exported — this must compile");
+    std::fs::remove_dir_all(&dir).ok();
+  }
 }
