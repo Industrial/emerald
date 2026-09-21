@@ -6709,9 +6709,10 @@ fn check_message_safety(
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
   check_wire: bool,
+  generic_sigs: &HashMap<String, GenericFunctionSig>,
 ) -> Result<(), Diagnostic> {
   for stmt in body {
-    check_message_safety_stmt(stmt, env, sigs, classes, moved, check_wire)?;
+    check_message_safety_stmt(stmt, env, sigs, classes, moved, check_wire, generic_sigs)?;
   }
   Ok(())
 }
@@ -6723,6 +6724,7 @@ fn check_message_safety(
 /// concatenated with itself once," implemented directly. The whole
 /// loop then poisons every local it sent for all code after the loop
 /// exits, the same conservative-merge posture branches get.
+#[allow(clippy::too_many_arguments)]
 fn check_loop_body(
   body: &[Spanned<Stmt>],
   env: &HashMap<String, Type>,
@@ -6730,11 +6732,28 @@ fn check_loop_body(
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
   check_wire: bool,
+  generic_sigs: &HashMap<String, GenericFunctionSig>,
 ) -> Result<(), Diagnostic> {
   let mut first_pass = moved.clone();
-  check_message_safety(body, env, sigs, classes, &mut first_pass, check_wire)?;
+  check_message_safety(
+    body,
+    env,
+    sigs,
+    classes,
+    &mut first_pass,
+    check_wire,
+    generic_sigs,
+  )?;
   let mut second_pass = first_pass.clone();
-  check_message_safety(body, env, sigs, classes, &mut second_pass, check_wire)?;
+  check_message_safety(
+    body,
+    env,
+    sigs,
+    classes,
+    &mut second_pass,
+    check_wire,
+    generic_sigs,
+  )?;
   moved.extend(second_pass);
   Ok(())
 }
@@ -6775,6 +6794,7 @@ fn reject_borrow_returning_call_bound_to_a_name(
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_message_safety_stmt(
   stmt: &Spanned<Stmt>,
   env: &HashMap<String, Type>,
@@ -6782,6 +6802,7 @@ fn check_message_safety_stmt(
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
   check_wire: bool,
+  generic_sigs: &HashMap<String, GenericFunctionSig>,
 ) -> Result<(), Diagnostic> {
   match &stmt.node {
     // Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own-consumption
@@ -6794,7 +6815,7 @@ fn check_message_safety_stmt(
     // these statement kinds' own value expression, not nested deeper).
     Stmt::Let { value, .. } | Stmt::SetField { value, .. } | Stmt::Assign { value, .. } => {
       reject_borrow_returning_call_bound_to_a_name(value, sigs)?;
-      check_own_consuming_value(value, env, sigs, classes, moved)
+      check_own_consuming_value(value, env, sigs, classes, moved, generic_sigs)
     }
     Stmt::SetIndex {
       array,
@@ -6803,25 +6824,27 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(array, moved)?;
       expr_moved_read(index, moved)?;
-      check_own_consuming_value(value, env, sigs, classes, moved)
+      check_own_consuming_value(value, env, sigs, classes, moved, generic_sigs)
     }
     Stmt::MultiAssign { values, .. } => {
       for v in values {
-        check_own_consuming_value(v, env, sigs, classes, moved)?;
+        check_own_consuming_value(v, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
     Stmt::Return(Some(e)) | Stmt::Raise(e) => {
-      check_own_consuming_value(e, env, sigs, classes, moved)
+      check_own_consuming_value(e, env, sigs, classes, moved, generic_sigs)
     }
     Stmt::Return(None) | Stmt::Break | Stmt::Next | Stmt::Retry => Ok(()),
     Stmt::Yield(args) => {
       for a in args {
-        check_own_consuming_value(a, env, sigs, classes, moved)?;
+        check_own_consuming_value(a, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
-    Stmt::Expr(e) => check_message_safety_expr_stmt(e, env, sigs, classes, moved, check_wire),
+    Stmt::Expr(e) => {
+      check_message_safety_expr_stmt(e, env, sigs, classes, moved, check_wire, generic_sigs)
+    }
     Stmt::If {
       cond,
       then_branch,
@@ -6829,10 +6852,26 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(cond, moved)?;
       let mut then_moved = moved.clone();
-      check_message_safety(then_branch, env, sigs, classes, &mut then_moved, check_wire)?;
+      check_message_safety(
+        then_branch,
+        env,
+        sigs,
+        classes,
+        &mut then_moved,
+        check_wire,
+        generic_sigs,
+      )?;
       let mut else_moved = moved.clone();
       if let Some(else_b) = else_branch {
-        check_message_safety(else_b, env, sigs, classes, &mut else_moved, check_wire)?;
+        check_message_safety(
+          else_b,
+          env,
+          sigs,
+          classes,
+          &mut else_moved,
+          check_wire,
+          generic_sigs,
+        )?;
       }
       moved.extend(then_moved);
       moved.extend(else_moved);
@@ -6840,20 +6879,20 @@ fn check_message_safety_stmt(
     }
     Stmt::While { cond, body } => {
       expr_moved_read(cond, moved)?;
-      check_loop_body(body, env, sigs, classes, moved, check_wire)
+      check_loop_body(body, env, sigs, classes, moved, check_wire, generic_sigs)
     }
     Stmt::For { elements, body, .. } => {
       for e in elements {
         expr_moved_read(e, moved)?;
       }
-      check_loop_body(body, env, sigs, classes, moved, check_wire)
+      check_loop_body(body, env, sigs, classes, moved, check_wire, generic_sigs)
     }
     Stmt::ForRange {
       start, end, body, ..
     } => {
       expr_moved_read(start, moved)?;
       expr_moved_read(end, moved)?;
-      check_loop_body(body, env, sigs, classes, moved, check_wire)
+      check_loop_body(body, env, sigs, classes, moved, check_wire, generic_sigs)
     }
     Stmt::Case {
       scrutinee,
@@ -6864,12 +6903,28 @@ fn check_message_safety_stmt(
       let mut union = HashMap::new();
       for (_, arm_body) in arms {
         let mut arm_moved = moved.clone();
-        check_message_safety(arm_body, env, sigs, classes, &mut arm_moved, check_wire)?;
+        check_message_safety(
+          arm_body,
+          env,
+          sigs,
+          classes,
+          &mut arm_moved,
+          check_wire,
+          generic_sigs,
+        )?;
         union.extend(arm_moved);
       }
       if let Some(else_b) = else_body {
         let mut else_moved = moved.clone();
-        check_message_safety(else_b, env, sigs, classes, &mut else_moved, check_wire)?;
+        check_message_safety(
+          else_b,
+          env,
+          sigs,
+          classes,
+          &mut else_moved,
+          check_wire,
+          generic_sigs,
+        )?;
         union.extend(else_moved);
       }
       moved.extend(union);
@@ -6881,11 +6936,27 @@ fn check_message_safety_stmt(
       ensure,
     } => {
       let mut body_moved = moved.clone();
-      check_message_safety(body, env, sigs, classes, &mut body_moved, check_wire)?;
+      check_message_safety(
+        body,
+        env,
+        sigs,
+        classes,
+        &mut body_moved,
+        check_wire,
+        generic_sigs,
+      )?;
       let mut union = body_moved;
       for r in rescues {
         let mut r_moved = moved.clone();
-        check_message_safety(&r.body, env, sigs, classes, &mut r_moved, check_wire)?;
+        check_message_safety(
+          &r.body,
+          env,
+          sigs,
+          classes,
+          &mut r_moved,
+          check_wire,
+          generic_sigs,
+        )?;
         union.extend(r_moved);
       }
       moved.extend(union);
@@ -6893,7 +6964,15 @@ fn check_message_safety_stmt(
       // `moved` as it now stands post-union, the same conservative
       // posture branches get.
       if let Some(ensure_b) = ensure {
-        check_message_safety(ensure_b, env, sigs, classes, moved, check_wire)?;
+        check_message_safety(
+          ensure_b,
+          env,
+          sigs,
+          classes,
+          moved,
+          check_wire,
+          generic_sigs,
+        )?;
       }
       Ok(())
     }
@@ -6905,9 +6984,25 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(scrutinee, moved)?;
       let mut ok_moved = moved.clone();
-      check_message_safety(ok_body, env, sigs, classes, &mut ok_moved, check_wire)?;
+      check_message_safety(
+        ok_body,
+        env,
+        sigs,
+        classes,
+        &mut ok_moved,
+        check_wire,
+        generic_sigs,
+      )?;
       let mut err_moved = moved.clone();
-      check_message_safety(err_body, env, sigs, classes, &mut err_moved, check_wire)?;
+      check_message_safety(
+        err_body,
+        env,
+        sigs,
+        classes,
+        &mut err_moved,
+        check_wire,
+        generic_sigs,
+      )?;
       moved.extend(ok_moved);
       moved.extend(err_moved);
       Ok(())
@@ -6920,6 +7015,7 @@ fn check_message_safety_stmt(
 /// forces `Void` on every non-`initialize` actor method, so a send can
 /// only ever appear as a bare statement) is recognized; every other
 /// bare-expression statement just gets the ordinary moved-read check.
+#[allow(clippy::too_many_arguments)]
 fn check_message_safety_expr_stmt(
   e: &Spanned<Expr>,
   env: &HashMap<String, Type>,
@@ -6927,6 +7023,7 @@ fn check_message_safety_expr_stmt(
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
   check_wire: bool,
+  generic_sigs: &HashMap<String, GenericFunctionSig>,
 ) -> Result<(), Diagnostic> {
   if let Expr::MethodCall(recv, method, args) = &e.node {
     if let Expr::Ident(recv_name) = &recv.node {
@@ -6968,7 +7065,7 @@ fn check_message_safety_expr_stmt(
       }
     }
   }
-  check_own_consuming_value(e, env, sigs, classes, moved)
+  check_own_consuming_value(e, env, sigs, classes, moved, generic_sigs)
 }
 
 /// Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own-consumption
@@ -7015,11 +7112,48 @@ fn check_own_consuming_value(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
+  generic_sigs: &HashMap<String, GenericFunctionSig>,
 ) -> Result<(), Diagnostic> {
   match &e.node {
+    // Found and closed 2026-09-21 (this session's "find all bugs"
+    // sweep — see the `generic-top-level-function-ownership-checking`
+    // plan-of-plans row for the full story): `sigs` never contains a
+    // generic function's own signature at all (`check_program`'s own
+    // registration pass explicitly skips it — see `GenericFunctionSig`'s
+    // doc comment), so a call to a generic function used to fall
+    // through this arm's `sigs.get(name)` lookup as `None`, treating
+    // EVERY argument as an ordinary read regardless of the callee's own
+    // `own`/`borrow`/`borrow var` annotations. `generic_sigs.get(name)`
+    // is checked as a fallback, deriving the same `Vec<Option<
+    // Ownership>>` shape `FunctionSig.param_ownership` already carries
+    // by stripping each raw parameter's own ownership wrapper — the
+    // exact same `strip_param_ownership` call `check_generic_function_
+    // body`'s own parameter-binding loop already makes, just applied
+    // here to detect an OWN-consuming call argument instead.
     Expr::Call(name, args) => {
-      let ownership: ParamOwnership = sigs.get(name).map(|s| s.param_ownership.as_slice());
-      check_own_consuming_call_args(args, ownership, name, env, sigs, classes, moved)
+      let generic_ownership: Vec<Option<Ownership>>;
+      let ownership: ParamOwnership = if let Some(sig) = sigs.get(name) {
+        Some(sig.param_ownership.as_slice())
+      } else if let Some(g) = generic_sigs.get(name) {
+        generic_ownership = g
+          .params_raw
+          .iter()
+          .map(|(_, raw)| strip_param_ownership(raw).0)
+          .collect();
+        Some(generic_ownership.as_slice())
+      } else {
+        None
+      };
+      check_own_consuming_call_args(
+        args,
+        ownership,
+        name,
+        env,
+        sigs,
+        classes,
+        moved,
+        generic_sigs,
+      )
     }
     Expr::MethodCall(recv, method, args) => {
       expr_moved_read(recv, moved)?;
@@ -7035,7 +7169,16 @@ fn check_own_consuming_value(
           .map(|s| s.param_ownership.as_slice()),
         _ => None,
       };
-      check_own_consuming_call_args(args, ownership, method, env, sigs, classes, moved)
+      check_own_consuming_call_args(
+        args,
+        ownership,
+        method,
+        env,
+        sigs,
+        classes,
+        moved,
+        generic_sigs,
+      )
     }
     Expr::Add(a, b)
     | Expr::Sub(a, b)
@@ -7051,12 +7194,12 @@ fn check_own_consuming_value(
     | Expr::Shr(a, b)
     | Expr::Index(a, b)
     | Expr::Coalesce(a, b) => {
-      check_own_consuming_value(a, env, sigs, classes, moved)?;
-      check_own_consuming_value(b, env, sigs, classes, moved)
+      check_own_consuming_value(a, env, sigs, classes, moved, generic_sigs)?;
+      check_own_consuming_value(b, env, sigs, classes, moved, generic_sigs)
     }
     Expr::Compare(a, _, b) => {
-      check_own_consuming_value(a, env, sigs, classes, moved)?;
-      check_own_consuming_value(b, env, sigs, classes, moved)
+      check_own_consuming_value(a, env, sigs, classes, moved, generic_sigs)?;
+      check_own_consuming_value(b, env, sigs, classes, moved, generic_sigs)
     }
     Expr::Neg(a)
     | Expr::Not(a)
@@ -7065,55 +7208,55 @@ fn check_own_consuming_value(
     | Expr::Ok(a)
     | Expr::Err(a)
     | Expr::Try(a)
-    | Expr::Comptime(a) => check_own_consuming_value(a, env, sigs, classes, moved),
+    | Expr::Comptime(a) => check_own_consuming_value(a, env, sigs, classes, moved, generic_sigs),
     Expr::New(_, args) | Expr::Spawn(_, args) => {
       for a in args {
-        check_own_consuming_value(a, env, sigs, classes, moved)?;
+        check_own_consuming_value(a, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
     Expr::CallKw(_, kwargs) => {
       for (_, v) in kwargs {
-        check_own_consuming_value(v, env, sigs, classes, moved)?;
+        check_own_consuming_value(v, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
     Expr::SafeCall(recv, _, args) => {
-      check_own_consuming_value(recv, env, sigs, classes, moved)?;
+      check_own_consuming_value(recv, env, sigs, classes, moved, generic_sigs)?;
       for a in args {
-        check_own_consuming_value(a, env, sigs, classes, moved)?;
+        check_own_consuming_value(a, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
     Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
       for el in elems {
-        check_own_consuming_value(el, env, sigs, classes, moved)?;
+        check_own_consuming_value(el, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
     Expr::HashLit(pairs) => {
       for (k, v) in pairs {
-        check_own_consuming_value(k, env, sigs, classes, moved)?;
-        check_own_consuming_value(v, env, sigs, classes, moved)?;
+        check_own_consuming_value(k, env, sigs, classes, moved, generic_sigs)?;
+        check_own_consuming_value(v, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
     Expr::Interpolate(parts) => {
       for p in parts {
         if let StringPart::Expr(inner) = p {
-          check_own_consuming_value(inner, env, sigs, classes, moved)?;
+          check_own_consuming_value(inner, env, sigs, classes, moved, generic_sigs)?;
         }
       }
       Ok(())
     }
     Expr::Remote { addr, name, .. } => {
-      check_own_consuming_value(addr, env, sigs, classes, moved)?;
-      check_own_consuming_value(name, env, sigs, classes, moved)
+      check_own_consuming_value(addr, env, sigs, classes, moved, generic_sigs)?;
+      check_own_consuming_value(name, env, sigs, classes, moved, generic_sigs)
     }
     Expr::Locate { key, args, .. } => {
-      check_own_consuming_value(key, env, sigs, classes, moved)?;
+      check_own_consuming_value(key, env, sigs, classes, moved, generic_sigs)?;
       for a in args {
-        check_own_consuming_value(a, env, sigs, classes, moved)?;
+        check_own_consuming_value(a, env, sigs, classes, moved, generic_sigs)?;
       }
       Ok(())
     }
@@ -7142,6 +7285,7 @@ fn check_own_consuming_value(
 /// position recurses back into `check_own_consuming_value` itself
 /// rather than a plain read, which is what lets a nested own-consuming
 /// call inside a non-`own` argument still be found.
+#[allow(clippy::too_many_arguments)]
 fn check_own_consuming_call_args(
   args: &[Spanned<Expr>],
   ownership: ParamOwnership,
@@ -7150,12 +7294,13 @@ fn check_own_consuming_call_args(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
+  generic_sigs: &HashMap<String, GenericFunctionSig>,
 ) -> Result<(), Diagnostic> {
   for (i, arg) in args.iter().enumerate() {
     if ownership.and_then(|o| o.get(i)) == Some(&Some(Ownership::Own)) {
       check_message_arg(arg, i, name, env, moved)?;
     } else {
-      check_own_consuming_value(arg, env, sigs, classes, moved)?;
+      check_own_consuming_value(arg, env, sigs, classes, moved, generic_sigs)?;
     }
   }
   Ok(())
@@ -9957,7 +10102,15 @@ fn check_function_body(
   // ordinary type-check has already succeeded, reusing its final `env`
   // read-only.
   let mut moved = HashMap::new();
-  check_message_safety(&f.body, &env, sigs, classes, &mut moved, true)?;
+  check_message_safety(
+    &f.body,
+    &env,
+    sigs,
+    classes,
+    &mut moved,
+    true,
+    gctx.generic_sigs,
+  )?;
   // Plan 83 (`spec/OWNERSHIP.md` §10's rules 1/2) — a second, separate,
   // read-only pass over the same already-checked body, exactly mirroring
   // `check_message_safety`'s own "run once the body's ordinary type-check
@@ -10062,7 +10215,15 @@ fn check_method_body(
   // actor's own method sending to ANOTHER actor) gets the exact same
   // check.
   let mut moved = HashMap::new();
-  check_message_safety(&m.body, &env, sigs, classes, &mut moved, true)?;
+  check_message_safety(
+    &m.body,
+    &env,
+    sigs,
+    classes,
+    &mut moved,
+    true,
+    gctx.generic_sigs,
+  )?;
   // Plan 83 — see `check_function_body`'s identical call for the full
   // rationale.
   let mut borrow_state = HashMap::new();
@@ -11396,6 +11557,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     &classes,
     &mut top_moved,
     false,
+    &generic_sigs,
   ) {
     diags.push(d);
   }
@@ -11672,7 +11834,15 @@ fn check_generic_function_body(
   // type-check has already succeeded, exactly mirroring `check_
   // function_body`'s identical two-pass posture.
   let mut moved = HashMap::new();
-  check_message_safety(&f.body, &env, sigs, classes, &mut moved, true)?;
+  check_message_safety(
+    &f.body,
+    &env,
+    sigs,
+    classes,
+    &mut moved,
+    true,
+    gctx.generic_sigs,
+  )?;
   let mut borrow_state = HashMap::new();
   check_borrow_scopes(&f.body, &env, sigs, classes, &mut borrow_state)
 }
@@ -12931,15 +13101,41 @@ mod tests {
   // concrete (non-type-parameter) `own Widget` parameter alongside the
   // generic one specifically because a generic call site's own
   // consumption-tracking (`check_own_consuming_value`'s `sigs`-only
-  // lookup, blind to `generic_sigs`) is a separate, still-open gap —
-  // this test isolates the body-level enforcement this fix actually
-  // closes from that other, undisclosed-until-now limitation.
+  // lookup, blind to `generic_sigs`) used to be a separate, still-open
+  // gap — since closed too (see the next test) — this test isolates
+  // the body-level enforcement this fix closes on its own.
   #[test]
   fn rejects_reusing_an_own_consumed_binding_inside_a_generic_functions_own_body() {
     let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Widget implements Comparable\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn compare_to(other: Widget): Int64 do\n    @value - other.value\n  end\nend\n\nfn absorb(w: own Widget): Void do\nend\n\nfn consume[T: Comparable](x: T, w: own Widget): Void do\n  absorb(w)\n  puts w.value\nend\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err(
       "reusing `w` after `absorb(w)` consumed it must be rejected inside a generic function body",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains('w')),
+      "expected a message-safety diagnostic naming `w`: {errs:?}"
+    );
+  }
+
+  // Found and closed 2026-09-21, same session, immediately after the
+  // two tests above: `check_own_consuming_value`'s `Expr::Call` arm
+  // only ever consulted `sigs` (ordinary functions) to detect an
+  // `own`-marked call ARGUMENT, never `generic_sigs` — a generic
+  // function's own signature is never present in `sigs` at all
+  // (`GenericFunctionSig`'s own doc comment). So calling a GENERIC
+  // function with an `own`-typed argument didn't mark that argument
+  // consumed, and reusing it afterward was wrongly accepted. Fixed by
+  // falling back to `generic_sigs.get(name)` and deriving the same
+  // `Vec<Option<Ownership>>` shape by stripping each raw parameter's
+  // own ownership wrapper.
+  #[test]
+  fn rejects_reusing_a_binding_consumed_by_a_generic_functions_own_argument() {
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Widget implements Comparable\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn compare_to(other: Widget): Int64 do\n    @value - other.value\n  end\nend\n\nfn consume[T: Comparable](x: own T): Void do\nend\n\nw: Widget = Widget.new(5)\nconsume(w)\nconsume(w)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "reusing `w` after the first `consume(w)` call consumed it via `own T` must be rejected",
     );
     assert!(
       errs
