@@ -3293,27 +3293,41 @@ fn infer_expr_type(
         .iter()
         .map(|a| infer_expr_type(a, env, sigs, classes, self_fields, gctx))
         .collect::<Result<Vec<_>, _>>()?;
+      if arg_types.len() != g.params_raw.len() {
+        return Err(Diagnostic::new(
+          format!(
+            "`{name}` expects {} argument(s), found {}",
+            g.params_raw.len(),
+            args.len()
+          ),
+          expr.span,
+        ));
+      }
       let mut concrete: Option<Type> = None;
+      // Found and closed 2026-09-21 (this session's "find all bugs"
+      // sweep): this used to compare `raw.as_named()` directly against
+      // `g.type_param`, which only ever matches a BARE `T` parameter —
+      // `x: own T`/`x: borrow T`/`x: borrow var T` never matched (`Own`/
+      // `Borrow` aren't `Named`), so a generic top-level function's
+      // ownership-annotated parameter was silently invisible to this
+      // call-site inference, always failing with "never uses its own
+      // type parameter" even when it plainly did. Switched to the same
+      // `infer_type_param_binding` the generic-METHOD call-site check
+      // immediately below already uses — its own `TypeExpr::Own(inner)
+      // | TypeExpr::Borrow(inner, _)` arm recurses through the wrapper
+      // transparently, so this now matches that already-correct path
+      // instead of diverging from it.
       for (i, (_, raw)) in g.params_raw.iter().enumerate() {
-        if raw.as_named() != Some(g.type_param.as_str()) {
+        let actual = &arg_types[i];
+        let Some(binding) = infer_type_param_binding(raw, actual, &g.type_param) else {
           continue;
-        }
-        let Some(actual) = arg_types.get(i) else {
-          return Err(Diagnostic::new(
-            format!(
-              "`{name}` expects {} argument(s), found {}",
-              g.params_raw.len(),
-              args.len()
-            ),
-            expr.span,
-          ));
         };
         match &concrete {
-          None => concrete = Some(actual.clone()),
-          Some(c) if c != actual => {
+          None => concrete = Some(binding),
+          Some(c) if c != &binding => {
             return Err(Diagnostic::new(
               format!(
-                "type parameter `{}` resolved inconsistently in call to `{name}`: `{c:?}` at an earlier argument, `{actual:?}` at argument {}",
+                "type parameter `{}` resolved inconsistently in call to `{name}`: `{c:?}` at an earlier argument, `{binding:?}` at argument {}",
                 g.type_param,
                 i + 1
               ),
@@ -3364,14 +3378,22 @@ fn infer_expr_type(
           ));
         }
       }
+      // Found and closed 2026-09-21, same fix as this arm's own call-
+      // site consistency check above: strips a legal `own`/`borrow`/
+      // `borrow var` wrapper first (`param_plain_type`'s own precedent)
+      // before either the bare-name comparison or the `resolve_type`
+      // fallback — both previously saw the RAW, unstripped `TypeExpr`
+      // and so rejected (or silently mis-typed) an ownership-annotated
+      // parameter here too.
       let effective_params = g
         .params_raw
         .iter()
         .map(|(_, raw)| {
-          if raw.as_named() == Some(g.type_param.as_str()) {
+          let (_, inner) = strip_param_ownership(raw);
+          if inner.as_named() == Some(g.type_param.as_str()) {
             Ok(concrete.clone())
           } else {
-            resolve_type(raw, classes)
+            resolve_type(inner, classes)
           }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -11551,6 +11573,31 @@ fn check_interface_conformance(
 /// `"T"`), so a method call on it resolves against the bound interface's
 /// required signature (`infer_expr_type`'s `Expr::MethodCall` arm), not
 /// against the `classes` registry.
+///
+/// Found and closed 2026-09-21 (this session's "find all bugs" sweep,
+/// `spec/OWNERSHIP.md` §10 / plan 83's own disclosed gap: "generic
+/// top-level functions don't get `own`/`borrow` param checking yet").
+/// Two real, compounding issues, both fixed here: (1) this function
+/// used to resolve each parameter's type via a bare `resolve_type`
+/// call, never `strip_param_ownership`/`param_plain_type` the way
+/// `check_function_body` does for an ordinary function — since
+/// `resolve_type` itself hard-rejects a bare `TypeExpr::Own`/`Borrow`
+/// wrapper (`strip_param_ownership`'s own doc comment), ANY `own`/
+/// `borrow`/`borrow var` annotation on ANY generic function parameter
+/// was a hard compile error, regardless of whether it named the
+/// function's own type parameter or an ordinary concrete type — not a
+/// narrower "not checked yet," a parse-adjacent rejection before this
+/// plan's own liveness rules could ever run at all. (2) even once (1)
+/// is fixed, this function never called `check_message_safety`/`check_
+/// borrow_scopes` the way `check_function_body` does — so even a
+/// legally-annotated parameter's `own`-consumption or `borrow`/`borrow
+/// var` liveness went completely unenforced inside a generic
+/// function's body. Fixed by mirroring `check_function_body`'s own
+/// parameter-binding (`strip_param_ownership` first, so the ownership
+/// wrapper is now legal on a generic function's parameter exactly like
+/// an ordinary function's) and appending the same two checks, run once
+/// the body's own ordinary type-check has already succeeded, on this
+/// function's own already-computed `env`.
 fn check_generic_function_body(
   f: &Function,
   g: &GenericFunctionSig,
@@ -11576,10 +11623,11 @@ fn check_generic_function_body(
   }
   let mut env = HashMap::new();
   for p in &f.params {
-    let t = if p.ty.as_named() == Some(g.type_param.as_str()) {
+    let (_, inner_ty) = strip_param_ownership(&p.ty);
+    let t = if inner_ty.as_named() == Some(g.type_param.as_str()) {
       Type::Generic(g.type_param.clone(), g.bounds.clone())
     } else {
-      resolve_type(&p.ty, classes)?
+      resolve_type(inner_ty, classes)?
     };
     env.insert(p.name.clone(), t);
   }
@@ -11589,7 +11637,12 @@ fn check_generic_function_body(
     resolve_type(&f.return_type, classes)?
   };
   // Plan 72's Decision log: a generic function's own parameter is
-  // immutable by construction, same as an ordinary function's.
+  // immutable by construction, same as an ordinary function's — the
+  // `borrow var`-primitive-parameter exception `check_function_body`
+  // implements does not apply here even after the fix above, since a
+  // generic parameter's plain type is `Type::Generic(...)` at this
+  // single, pre-monomorphization check, never a concrete `Int64`/
+  // `Float64`/`Boolean`/`Symbol` this pass could recognize.
   let mut mutable_locals: HashSet<String> = HashSet::new();
   check_block(
     &f.body,
@@ -11613,7 +11666,15 @@ fn check_generic_function_body(
     &declared_return,
     &f.name,
     gctx,
-  )
+  )?;
+  // Plan 56/83, closed here 2026-09-21 — see this function's own doc
+  // comment above for the full story: run once the body's ordinary
+  // type-check has already succeeded, exactly mirroring `check_
+  // function_body`'s identical two-pass posture.
+  let mut moved = HashMap::new();
+  check_message_safety(&f.body, &env, sigs, classes, &mut moved, true)?;
+  let mut borrow_state = HashMap::new();
+  check_borrow_scopes(&f.body, &env, sigs, classes, &mut borrow_state)
 }
 
 #[cfg(test)]
@@ -12840,6 +12901,52 @@ mod tests {
     assert!(errs[0]
       .message
       .contains("multiple type parameters are not supported"));
+  }
+
+  // Found and closed 2026-09-21 (this session's "find all bugs" sweep,
+  // `spec/OWNERSHIP.md` §10 / plan 83's own disclosed gap: "generic
+  // top-level functions don't get `own`/`borrow` param checking yet").
+  // Before this fix, an `own`/`borrow`/`borrow var` annotation ANYWHERE
+  // in a generic function's signature — the type parameter itself, or
+  // an ordinary concrete-type parameter alongside it — was a hard
+  // rejection ("`own T` is only valid as a function or method
+  // parameter's own declared type"), because `check_generic_function_
+  // body`'s param-binding loop called a bare `resolve_type` instead of
+  // `strip_param_ownership`/`param_plain_type`.
+  #[test]
+  fn accepts_own_on_a_generic_functions_own_type_parameter() {
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Widget implements Comparable\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn compare_to(other: Widget): Int64 do\n    @value - other.value\n  end\nend\n\nfn consume[T: Comparable](x: own T): Void do\nend\n\nw: Widget = Widget.new(5)\nconsume(w)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "`own T` must be legal on a generic function's own type parameter"
+    );
+  }
+
+  // The identical gap's second half: even once the annotation itself
+  // is legal, `check_generic_function_body` never called `check_
+  // message_safety` at all, so an `own`-consumed local's reuse inside
+  // a generic function's OWN body went completely unenforced. Uses a
+  // concrete (non-type-parameter) `own Widget` parameter alongside the
+  // generic one specifically because a generic call site's own
+  // consumption-tracking (`check_own_consuming_value`'s `sigs`-only
+  // lookup, blind to `generic_sigs`) is a separate, still-open gap —
+  // this test isolates the body-level enforcement this fix actually
+  // closes from that other, undisclosed-until-now limitation.
+  #[test]
+  fn rejects_reusing_an_own_consumed_binding_inside_a_generic_functions_own_body() {
+    let src = "interface Comparable\n  fn compare_to(other: Self): Int64\nend\n\nclass Widget implements Comparable\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\n\n  fn compare_to(other: Widget): Int64 do\n    @value - other.value\n  end\nend\n\nfn absorb(w: own Widget): Void do\nend\n\nfn consume[T: Comparable](x: T, w: own Widget): Void do\n  absorb(w)\n  puts w.value\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "reusing `w` after `absorb(w)` consumed it must be rejected inside a generic function body",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains('w')),
+      "expected a message-safety diagnostic naming `w`: {errs:?}"
+    );
   }
 
   // Plan 88's Decision log: generic methods on a class are now real,
