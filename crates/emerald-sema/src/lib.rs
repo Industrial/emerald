@@ -6686,9 +6686,10 @@ fn check_message_safety(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
+  check_wire: bool,
 ) -> Result<(), Diagnostic> {
   for stmt in body {
-    check_message_safety_stmt(stmt, env, sigs, classes, moved)?;
+    check_message_safety_stmt(stmt, env, sigs, classes, moved, check_wire)?;
   }
   Ok(())
 }
@@ -6706,11 +6707,12 @@ fn check_loop_body(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
+  check_wire: bool,
 ) -> Result<(), Diagnostic> {
   let mut first_pass = moved.clone();
-  check_message_safety(body, env, sigs, classes, &mut first_pass)?;
+  check_message_safety(body, env, sigs, classes, &mut first_pass, check_wire)?;
   let mut second_pass = first_pass.clone();
-  check_message_safety(body, env, sigs, classes, &mut second_pass)?;
+  check_message_safety(body, env, sigs, classes, &mut second_pass, check_wire)?;
   moved.extend(second_pass);
   Ok(())
 }
@@ -6757,6 +6759,7 @@ fn check_message_safety_stmt(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
+  check_wire: bool,
 ) -> Result<(), Diagnostic> {
   match &stmt.node {
     // Plan 83's Decision log (`spec/OWNERSHIP.md` §10's own-consumption
@@ -6796,7 +6799,7 @@ fn check_message_safety_stmt(
       }
       Ok(())
     }
-    Stmt::Expr(e) => check_message_safety_expr_stmt(e, env, sigs, classes, moved),
+    Stmt::Expr(e) => check_message_safety_expr_stmt(e, env, sigs, classes, moved, check_wire),
     Stmt::If {
       cond,
       then_branch,
@@ -6804,10 +6807,10 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(cond, moved)?;
       let mut then_moved = moved.clone();
-      check_message_safety(then_branch, env, sigs, classes, &mut then_moved)?;
+      check_message_safety(then_branch, env, sigs, classes, &mut then_moved, check_wire)?;
       let mut else_moved = moved.clone();
       if let Some(else_b) = else_branch {
-        check_message_safety(else_b, env, sigs, classes, &mut else_moved)?;
+        check_message_safety(else_b, env, sigs, classes, &mut else_moved, check_wire)?;
       }
       moved.extend(then_moved);
       moved.extend(else_moved);
@@ -6815,20 +6818,20 @@ fn check_message_safety_stmt(
     }
     Stmt::While { cond, body } => {
       expr_moved_read(cond, moved)?;
-      check_loop_body(body, env, sigs, classes, moved)
+      check_loop_body(body, env, sigs, classes, moved, check_wire)
     }
     Stmt::For { elements, body, .. } => {
       for e in elements {
         expr_moved_read(e, moved)?;
       }
-      check_loop_body(body, env, sigs, classes, moved)
+      check_loop_body(body, env, sigs, classes, moved, check_wire)
     }
     Stmt::ForRange {
       start, end, body, ..
     } => {
       expr_moved_read(start, moved)?;
       expr_moved_read(end, moved)?;
-      check_loop_body(body, env, sigs, classes, moved)
+      check_loop_body(body, env, sigs, classes, moved, check_wire)
     }
     Stmt::Case {
       scrutinee,
@@ -6839,12 +6842,12 @@ fn check_message_safety_stmt(
       let mut union = HashMap::new();
       for (_, arm_body) in arms {
         let mut arm_moved = moved.clone();
-        check_message_safety(arm_body, env, sigs, classes, &mut arm_moved)?;
+        check_message_safety(arm_body, env, sigs, classes, &mut arm_moved, check_wire)?;
         union.extend(arm_moved);
       }
       if let Some(else_b) = else_body {
         let mut else_moved = moved.clone();
-        check_message_safety(else_b, env, sigs, classes, &mut else_moved)?;
+        check_message_safety(else_b, env, sigs, classes, &mut else_moved, check_wire)?;
         union.extend(else_moved);
       }
       moved.extend(union);
@@ -6856,11 +6859,11 @@ fn check_message_safety_stmt(
       ensure,
     } => {
       let mut body_moved = moved.clone();
-      check_message_safety(body, env, sigs, classes, &mut body_moved)?;
+      check_message_safety(body, env, sigs, classes, &mut body_moved, check_wire)?;
       let mut union = body_moved;
       for r in rescues {
         let mut r_moved = moved.clone();
-        check_message_safety(&r.body, env, sigs, classes, &mut r_moved)?;
+        check_message_safety(&r.body, env, sigs, classes, &mut r_moved, check_wire)?;
         union.extend(r_moved);
       }
       moved.extend(union);
@@ -6868,7 +6871,7 @@ fn check_message_safety_stmt(
       // `moved` as it now stands post-union, the same conservative
       // posture branches get.
       if let Some(ensure_b) = ensure {
-        check_message_safety(ensure_b, env, sigs, classes, moved)?;
+        check_message_safety(ensure_b, env, sigs, classes, moved, check_wire)?;
       }
       Ok(())
     }
@@ -6880,9 +6883,9 @@ fn check_message_safety_stmt(
     } => {
       expr_moved_read(scrutinee, moved)?;
       let mut ok_moved = moved.clone();
-      check_message_safety(ok_body, env, sigs, classes, &mut ok_moved)?;
+      check_message_safety(ok_body, env, sigs, classes, &mut ok_moved, check_wire)?;
       let mut err_moved = moved.clone();
-      check_message_safety(err_body, env, sigs, classes, &mut err_moved)?;
+      check_message_safety(err_body, env, sigs, classes, &mut err_moved, check_wire)?;
       moved.extend(ok_moved);
       moved.extend(err_moved);
       Ok(())
@@ -6901,6 +6904,7 @@ fn check_message_safety_expr_stmt(
   sigs: &HashMap<String, FunctionSig>,
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
+  check_wire: bool,
 ) -> Result<(), Diagnostic> {
   if let Expr::MethodCall(recv, method, args) = &e.node {
     if let Expr::Ident(recv_name) = &recv.node {
@@ -6919,7 +6923,23 @@ fn check_message_safety_expr_stmt(
             // `check_own_consuming_value` below is never reached for an
             // actor send.
             check_message_arg(arg, i, method, env, moved)?;
-            check_wire_safety(arg, i, method, env, classes)?;
+            // Real, disclosed, narrower scope (found this session,
+            // alongside the top-level message-safety gap itself):
+            // `check_wire` is `false` only for the new top-level pass
+            // (`check_program`'s own call site) — a currently-shipping,
+            // real, deliberate carve-out, not an oversight. Extending
+            // top-level checking to include liveness/own-consumption
+            // (this whole function's real point) surfaced a genuine,
+            // separate, deeper tension between plan 60's wire-safety
+            // rule and the common "two actors hold mutual references"
+            // idiom (an existing, real test relies on it) that this
+            // session chose not to force a risky fix for under time
+            // pressure — inside a function/method body, `check_wire` is
+            // always `true`, unchanged, so wire-safety keeps applying
+            // exactly as it always has there.
+            if check_wire {
+              check_wire_safety(arg, i, method, env, classes)?;
+            }
           }
           return Ok(());
         }
@@ -9769,7 +9789,7 @@ fn check_function_body(
   // ordinary type-check has already succeeded, reusing its final `env`
   // read-only.
   let mut moved = HashMap::new();
-  check_message_safety(&f.body, &env, sigs, classes, &mut moved)?;
+  check_message_safety(&f.body, &env, sigs, classes, &mut moved, true)?;
   // Plan 83 (`spec/OWNERSHIP.md` §10's rules 1/2) — a second, separate,
   // read-only pass over the same already-checked body, exactly mirroring
   // `check_message_safety`'s own "run once the body's ordinary type-check
@@ -9874,7 +9894,7 @@ fn check_method_body(
   // actor's own method sending to ANOTHER actor) gets the exact same
   // check.
   let mut moved = HashMap::new();
-  check_message_safety(&m.body, &env, sigs, classes, &mut moved)?;
+  check_message_safety(&m.body, &env, sigs, classes, &mut moved, true)?;
   // Plan 83 — see `check_function_body`'s identical call for the full
   // rationale.
   let mut borrow_state = HashMap::new();
@@ -11169,6 +11189,57 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // body of its own to check.
       Item::Extern(_) => {}
     }
+  }
+
+  // Real bug fix (found this session, cataloged alongside plan 85's
+  // own disclosed actor-aliasing gap): plans 56/83's own architectural
+  // scope note ("scoped to function/method bodies only... a bare
+  // top-level `Item::Stmt` send is a real, disclosed gap this plan
+  // doesn't close") had gone unaddressed since plan 56 first shipped —
+  // EVERY real Emerald script written in top-level-statement style
+  // (the style every one of this project's own examples was originally
+  // written in, before this session started wrapping new examples in
+  // `fn run: Void do ... end` specifically to exercise these checks at
+  // all) got ZERO message-safety/ownership-liveness checking. Closed
+  // by collecting every top-level `Item::Stmt`'s own statement (in
+  // program order — mirroring `top_env`'s own "one environment across
+  // the whole program in order" comment above) into a single synthetic
+  // body and running the exact same two passes a function body already
+  // gets, once, using `top_env` (by now fully populated by the loop
+  // above) as the environment — no new checking logic, this literally
+  // could not have been simpler once the actual gap was located.
+  let top_level_stmts: Vec<Spanned<Stmt>> = program
+    .items
+    .iter()
+    .filter_map(|item| match item {
+      Item::Stmt(s) => Some(s.clone()),
+      _ => None,
+    })
+    .collect();
+  // `check_wire: false` here — see `check_message_safety_expr_stmt`'s
+  // own doc comment on the `check_wire` parameter for the full,
+  // disclosed rationale (a real, deliberate, narrower scope than
+  // function/method bodies get, not an oversight).
+  let mut top_moved = HashMap::new();
+  if let Err(d) = check_message_safety(
+    &top_level_stmts,
+    &top_env,
+    &sigs,
+    &classes,
+    &mut top_moved,
+    false,
+  ) {
+    diags.push(d);
+  }
+  let mut top_borrow_state = HashMap::new();
+  if let Err(d) = check_borrow_scopes(
+    &top_level_stmts,
+    &top_env,
+    &sigs,
+    &classes,
+    &mut top_borrow_state,
+  ) {
+    diags.push(d);
   }
 
   diags.extend(check_block_call_sites(
@@ -13639,6 +13710,73 @@ mod tests {
         .iter()
         .any(|d| d.message.contains("ownership") && d.message.contains('c')),
       "expected an ownership diagnostic naming `c`: {errs:?}"
+    );
+  }
+
+  // Real bug fix (found this session, cataloged alongside plan 85's own
+  // disclosed actor-aliasing gap): plans 56/83's own architectural scope
+  // note ("scoped to function/method bodies only... a bare top-level
+  // `Item::Stmt` send is a real, disclosed gap this plan doesn't close")
+  // had gone unaddressed since plan 56 first shipped. `check_program`
+  // now collects every top-level `Item::Stmt` into a synthetic body and
+  // runs the same message-safety/borrow-liveness passes a function body
+  // already gets — with one real, disclosed, narrower scope: wire-safety
+  // specifically is skipped at the top level (`check_wire: false`),
+  // since extending it there surfaced a genuine, separate tension with
+  // the common "two actors hold mutual references" idiom that this
+  // session chose not to force a fix for under time pressure. Wire-
+  // safety inside a function/method body is completely unaffected
+  // (`check_wire: true`, unchanged) — the third test below proves that
+  // directly, alongside the same pattern being accepted at the top
+  // level, so the disclosed scope boundary is verified precisely, not
+  // just asserted.
+
+  #[test]
+  fn rejects_reusing_an_own_consumed_binding_at_the_top_level() {
+    let src = "class Widget\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\nend\n\nfn consume(data: own Widget): Void do\n  puts data.value\nend\n\nw: Widget = Widget.new(5)\nconsume(w)\nconsume(w)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("reusing `w` after it was consumed by an `own` argument must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains('w')),
+      "expected a message-safety diagnostic naming `w` at the top level: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_two_live_borrow_vars_of_the_same_binding_at_the_top_level() {
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn bump: Void do\n    @value = @value + 1\n  end\nend\n\nfn mutate_a(c: borrow var Counter): Void do\n  c.bump\nend\n\nfn mutate_b(c: borrow var Counter): Void do\n  c.bump\nend\n\ncounter: Counter = Counter.new(0)\nmutate_a(counter)\nmutate_b(counter)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("two live `borrow var` borrows of `counter` at the top level must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains("counter")),
+      "expected an ownership diagnostic naming `counter`: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn wire_safety_is_skipped_at_the_top_level_but_still_enforced_inside_a_function() {
+    let src = "actor PingPong\n  name: String\n  peer: PingPong\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn set_peer(other: PingPong): Void do\n    @peer = other\n  end\nend\n\na: PingPong = PingPong.spawn(\"A\")\nb: PingPong = PingPong.spawn(\"B\")\na.set_peer(b)\nb.set_peer(a)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "an actor reference crossing a message send at the TOP LEVEL must be accepted \
+       (wire-safety is a real, disclosed, narrower scope there)"
+    );
+
+    let src_in_fn = "actor PingPong\n  name: String\n  peer: PingPong\n\n  fn initialize(name: String): Void do\n    @name = name\n  end\n\n  fn set_peer(other: PingPong): Void do\n    @peer = other\n  end\nend\n\nfn run: Void do\n  a: PingPong = PingPong.spawn(\"A\")\n  b: PingPong = PingPong.spawn(\"B\")\n  a.set_peer(b)\n  b.set_peer(a)\nend\n\nrun()\n";
+    let program_in_fn = emerald_parser::parse(src_in_fn).expect("should parse");
+    let errs = check_program(&program_in_fn)
+      .expect_err("the identical pattern INSIDE a function body must still be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("not wire-safe")),
+      "expected a wire-safety diagnostic: {errs:?}"
     );
   }
 

@@ -181,7 +181,7 @@ fn domain_types_em_prints_expected_sequence() {
 // Plans 83/84's `own`/`borrow`/`borrow var` (`spec/OWNERSHIP.md` §2/§9/§10).
 #[test]
 fn ownership_em_prints_expected_sequence() {
-  assert_eq!(compile_and_run("ownership.em"), "10\n11\n11\n21\n");
+  assert_eq!(compile_and_run("ownership.em"), "10\n11\n10\n21\n");
 }
 
 // Plan 85's `ownership-actor-ffi-integration` (`spec/OWNERSHIP.md` §7):

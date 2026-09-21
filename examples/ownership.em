@@ -5,6 +5,19 @@
 # is a shared, read-only reference; `borrow var T` is an exclusive,
 # mutable reference.
 #
+# A real, disclosed consequence of §8's own lexical-scope (not flow-
+# sensitive) model, found this session once top-level statements
+# started getting checked at all (see the plan-of-plans's own "Real
+# bug fix" note on the top-level message-safety/borrow-checking gap):
+# a `borrow` and a `borrow var` of the SAME binding conflict anywhere
+# in one flat scope, even used sequentially with no real overlap — the
+# model has no notion of "this borrow's use already ended." So `report`
+# [borrow] and `increment` [borrow var] below are each demonstrated on
+# their OWN, separate `Counter` instance, never the same one — this is
+# not a workaround for a bug, it's the real, already-accepted rule
+# (plan 83's own doc comment: "never under-rejects, only occasionally
+# over-rejects" independent, non-overlapping uses).
+#
 # Plan 84's real codegen (`spec/OWNERSHIP.md` §9/§10): `own`, and
 # `borrow`/`borrow var` of a class instance (like `Counter` below,
 # already an LLVM pointer), compile to EXACTLY the plain underlying
@@ -76,11 +89,21 @@ fn finish(c: own Counter): Void do
   puts c.value
 end
 
-counter: Counter = Counter.new(10)
-report(counter)
-increment(counter)
-report(counter)
-finish(counter)
+readable: Counter = Counter.new(10)
+report(readable)
+
+# `mutable.value` is read directly (an ordinary method call, not
+# through a `borrow`-typed parameter) rather than via a second call to
+# `report` — reusing `report` here would record a `borrow` of
+# `mutable` in the same flat scope `increment` already recorded a
+# `borrow var` in, exactly the conflict this file's own header comment
+# explains.
+mutable: Counter = Counter.new(10)
+increment(mutable)
+puts mutable.value
+
+owned: Counter = Counter.new(10)
+finish(owned)
 
 # A `borrow` of a BY-VALUE primitive — real, new plan 84 codegen: `x`
 # arrives as an actual pointer into `n`'s own storage, never a copy
