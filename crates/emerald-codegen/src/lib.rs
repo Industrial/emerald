@@ -861,7 +861,17 @@ fn build_class_layout(
           kind: value_kind_for_type(&f.ty),
         },
       );
-      field_classes.insert(f.name.clone(), f.ty.to_string());
+      // Plan 89's Decision log established this exact convention for a
+      // Proc-typed PARAMETER (see `bind_params`'s own identical `proc_
+      // sig_for_type` call): a `Proc[Args..., Ret]`-typed class field
+      // needs its signature encoded here too, not just its plain type
+      // string, so `build_method_call`'s indirect-`.call` dispatch can
+      // resolve `@field.call(...)` the same way it already resolves a
+      // Proc-typed parameter's `.call`.
+      field_classes.insert(
+        f.name.clone(),
+        proc_sig_for_type(&f.ty).unwrap_or_else(|| f.ty.to_string()),
+      );
       offset += 8;
     }
   }
@@ -7153,6 +7163,47 @@ fn build_method_call<'ctx>(
     }
   }
 
+  // Real bug fix (found post-plan-89, this session): a `Proc`-typed
+  // CLASS FIELD's `.call` was disclosed as unsupported — `.call`'s
+  // dispatch required a plain `Ident` receiver, so `@op.call(x)` (from
+  // inside the declaring class's own method body) failed with "method
+  // calls are only supported on a plain local-variable receiver" even
+  // though sema fully accepted the program. Mirrors the actor-
+  // `InstanceVar` check immediately above and reuses plan 89's own
+  // indirect-call mechanism below verbatim (same `decode_proc_sig`/
+  // `build_indirect_call` shape) — the field's Proc signature comes
+  // from `field_classes` (see `build_class_layout`'s own `proc_sig_
+  // for_type` call, added alongside this fix), not `local_classes`,
+  // since a field is never a named local. Disclosed, narrower scope
+  // than a fully general fix: only `@field.call(...)` (an `InstanceVar`
+  // receiver, from inside the declaring class's own method) is
+  // covered — `instance.field.call(...)` from OUTSIDE the class is a
+  // separate, unrelated limitation (this grammar has no public field
+  // read-access expression at all outside a `read`-sugared accessor
+  // method, confirmed separately, not attempted here).
+  if let Expr::InstanceVar(field_name) = &recv.node {
+    if method == "call" {
+      if let Some((_, _, field_classes)) = ctx.self_ctx {
+        if let Some(sig) = field_classes
+          .get(field_name)
+          .and_then(|s| decode_proc_sig(s))
+        {
+          return build_indirect_proc_call(
+            context,
+            builder,
+            recv,
+            args,
+            sig,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          );
+        }
+      }
+    }
+  }
+
   // Plan 74 (enumerable chaining): resolve a chained-enumerable-call
   // receiver (`nums.select do ... end.map do ... end`) down to a plain
   // Ident first — see `resolve_chained_enumerable_receiver`'s own doc
@@ -7580,55 +7631,23 @@ fn build_method_call<'ctx>(
   // Let`'s own `proc_sig_for_type` bookkeeping) falls through to a
   // genuine INDIRECT call below instead of failing outright.
   if method == "call" && !ctx.lambda_func_ids.contains_key(recv_name) {
-    let (recv_val, _) = build_expr(
+    let sig = local_classes.get(recv_name).ok_or_else(|| {
+      format!("codegen: cannot determine `{recv_name}`'s Proc signature for an indirect `.call`")
+    })?;
+    let decoded = decode_proc_sig(sig).ok_or_else(|| {
+      format!("codegen: `{recv_name}` is not a Proc-typed local/parameter — cannot `.call` it")
+    })?;
+    return build_indirect_proc_call(
       context,
       builder,
       recv,
+      args,
+      decoded,
       vars,
       local_classes,
       local_array_elem_types,
       ctx,
-    )?;
-    let env_ptr = recv_val.into_pointer_value();
-    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env_ptr.into()];
-    for a in args {
-      let (v, _) = build_expr(
-        context,
-        builder,
-        a,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
-      call_args.push(v.into());
-    }
-    let sig = local_classes.get(recv_name).ok_or_else(|| {
-      format!("codegen: cannot determine `{recv_name}`'s Proc signature for an indirect `.call`")
-    })?;
-    let (param_kinds, ret_kind) = decode_proc_sig(sig).ok_or_else(|| {
-      format!("codegen: `{recv_name}` is not a Proc-typed local/parameter — cannot `.call` it")
-    })?;
-    let mut kinds = vec![ValKind::Ptr]; // env
-    kinds.extend(param_kinds);
-    let fn_ty = make_fn_type(context, &kinds, &ret_kind);
-    let fn_ptr_slot = field_ptr(context, builder, env_ptr, 0)?;
-    let fn_ptr = builder
-      .build_load(
-        context.ptr_type(AddressSpace::default()),
-        fn_ptr_slot,
-        "procfnptr",
-      )
-      .map_err(|e| e.to_string())?
-      .into_pointer_value();
-    let call = builder
-      .build_indirect_call(fn_ty, fn_ptr, &call_args, "indirectcalltmp")
-      .map_err(|e| e.to_string())?;
-    return if ret_kind == ValKind::Void {
-      Ok((context.i64_type().const_int(0, false).into(), ret_kind))
-    } else {
-      Ok((call_result(call)?, ret_kind))
-    };
+    );
   }
 
   let (fv, ret_kind) = if method == "call" {
@@ -7755,6 +7774,74 @@ fn build_method_call<'ctx>(
     return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
   }
   Ok((call_result(call)?, ret_kind))
+}
+
+/// Plan 89's real, genuine indirect-`.call` mechanism — factored out of
+/// `build_method_call` so its two real call sites (an ordinary Proc-
+/// typed local/parameter receiver, and this session's own fix for a
+/// Proc-typed CLASS FIELD receiver, `@field.call(...)`) share one copy
+/// rather than two independently-maintained ones. `sig` is the
+/// receiver's already-decoded `(param_kinds, ret_kind)` — resolving
+/// WHICH string to decode it from (`local_classes` for a local/param,
+/// `field_classes` for a field) is each caller's own, different job;
+/// this function only ever builds the actual indirect call once a
+/// signature is in hand.
+#[allow(clippy::too_many_arguments)]
+fn build_indirect_proc_call<'ctx>(
+  context: &'ctx Context,
+  builder: &Builder<'ctx>,
+  recv: &Spanned<Expr>,
+  args: &[Spanned<Expr>],
+  sig: (Vec<ValKind>, ValKind),
+  vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
+  local_array_elem_types: &HashMap<String, ValKind>,
+  ctx: &Ctx<'_, 'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, ValKind), String> {
+  let (param_kinds, ret_kind) = sig;
+  let (recv_val, _) = build_expr(
+    context,
+    builder,
+    recv,
+    vars,
+    local_classes,
+    local_array_elem_types,
+    ctx,
+  )?;
+  let env_ptr = recv_val.into_pointer_value();
+  let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env_ptr.into()];
+  for a in args {
+    let (v, _) = build_expr(
+      context,
+      builder,
+      a,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    call_args.push(v.into());
+  }
+  let mut kinds = vec![ValKind::Ptr]; // env
+  kinds.extend(param_kinds);
+  let fn_ty = make_fn_type(context, &kinds, &ret_kind);
+  let fn_ptr_slot = field_ptr(context, builder, env_ptr, 0)?;
+  let fn_ptr = builder
+    .build_load(
+      context.ptr_type(AddressSpace::default()),
+      fn_ptr_slot,
+      "procfnptr",
+    )
+    .map_err(|e| e.to_string())?
+    .into_pointer_value();
+  let call = builder
+    .build_indirect_call(fn_ty, fn_ptr, &call_args, "indirectcalltmp")
+    .map_err(|e| e.to_string())?;
+  if ret_kind == ValKind::Void {
+    Ok((context.i64_type().const_int(0, false).into(), ret_kind))
+  } else {
+    Ok((call_result(call)?, ret_kind))
+  }
 }
 
 /// Plan 42 (enumerable stdlib) — dispatches one of the ten intrinsic
@@ -21006,6 +21093,21 @@ int main(void) {
   #[test]
   fn c_ffi_worked_example_compiled_linked_and_run_prints_the_expected_four_lines() {
     assert_eq!(compile_link_run(FFI_EXAMPLE), "42\n5\nworld\nnot found\n");
+  }
+
+  // Real bug fix (found post-plan-89, this session): a `Proc`-typed
+  // CLASS FIELD's `.call` was disclosed as unsupported — `@op.call(x)`
+  // from inside the declaring class's own method body failed with
+  // "method calls are only supported on a plain local-variable
+  // receiver," even though sema fully accepted the program. Fixed via
+  // `build_indirect_proc_call` (factored out of the pre-existing
+  // Ident-receiver indirect-call path) plus `build_class_layout`
+  // encoding a Proc-typed field's signature into `field_classes` the
+  // same way `bind_params` already does for a Proc-typed parameter.
+  #[test]
+  fn proc_typed_class_field_call_from_inside_the_declaring_class_works() {
+    let src = "class Adder\n  op: Proc[Int64, Int64]\n\n  fn initialize(op: Proc[Int64, Int64]): Void do\n    @op = op\n  end\n\n  fn apply(x: Int64): Int64 do\n    @op.call(x)\n  end\nend\n\nadd_one: Proc = do |y: Int64| y + 1 end\nadder: Adder = Adder.new(add_one)\nputs adder.apply(41)\n";
+    assert_eq!(compile_link_run(src), "42\n");
   }
 
   #[test]

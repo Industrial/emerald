@@ -61,7 +61,7 @@ fn collections_em_prints_expected_sequence() {
 
 #[test]
 fn closures_em_prints_expected_sequence() {
-  assert_eq!(compile_and_run("closures.em"), "15\n42\n0\n1\n2\n");
+  assert_eq!(compile_and_run("closures.em"), "15\n42\n0\n1\n2\n42\n");
 }
 
 #[test]
