@@ -2752,14 +2752,32 @@ fn substitute_type_params_in_stmt(
 /// own locals too — `build_local_val_kind_env`), or a lambda literal
 /// whose last expression is a bare `ClassName.new(...)` (resolved
 /// directly by name, not through a `ValKind` round-trip at all, since
-/// `Ptr` alone can't name which class). Returns `None` for anything
-/// else — a real, disclosed narrowing: this does not attempt full
-/// structural unification the way `emerald-sema`'s own type checker
-/// does.
+/// `Ptr` alone can't name which class).
+///
+/// Found and closed 2026-09-21 (this session's "find all bugs" sweep):
+/// this used to return `None` for every OTHER argument shape, so a
+/// class-bound generic method whose type parameter is bound by an
+/// ORDINARY (non-`Proc`) argument — `fn identity[U](x: U): U do x end`
+/// called with a plain local, a fresh `ClassName.new(...)`, or a bare
+/// literal — failed at codegen time with "could not resolve generic
+/// method ...'s type parameter ... to a concrete type at this call
+/// site," even though `emerald-sema`'s own fuller structural unifier
+/// (`infer_type_param_binding`) already accepted the exact same
+/// program (that function's own `TypeExpr::Named(name) if name ==
+/// param_name` arm is the general case this narrower, codegen-only
+/// re-derivation was missing entirely). Fixed by adding the same set
+/// of leaf shapes `local_classes` and a handful of literal kinds can
+/// name directly, without attempting full structural unification the
+/// way `emerald-sema`'s own type checker does — still a real,
+/// disclosed narrowing (an argument that is itself a nested call
+/// result, a field read, or a binary expression is not covered), but
+/// the common case (a local variable or a fresh literal/constructor
+/// passed directly) now works.
 fn infer_concrete_type_from_arg<'ctx>(
   arg: &Spanned<Expr>,
   ctx: &Ctx<'_, 'ctx>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
 ) -> Option<TypeExpr> {
   match &arg.node {
     Expr::Lambda { params, body, .. } => {
@@ -2785,6 +2803,17 @@ fn infer_concrete_type_from_arg<'ctx>(
       let kind = infer_lambda_ret_kind(params, body, &base_env, ctx.user_fn_return_types);
       valkind_to_typeexpr(&kind)
     }
+    // A fresh instance — the class name is right there, no `ValKind`
+    // round-trip needed (same reasoning as the lambda-literal
+    // `ClassName.new(...)` case above).
+    Expr::New(class_name, _) => Some(TypeExpr::Named(class_name.clone())),
+    // A handful of literal shapes whose type is a fixed, named
+    // constant regardless of context.
+    Expr::Int(_) => Some(TypeExpr::Named("Int64".to_string())),
+    Expr::Float(_) => Some(TypeExpr::Named("Float64".to_string())),
+    Expr::Bool(_) => Some(TypeExpr::Named("Boolean".to_string())),
+    Expr::SymbolLit(_) => Some(TypeExpr::Named("Symbol".to_string())),
+    Expr::StringLit(_) | Expr::Interpolate(_) => Some(TypeExpr::Named("String".to_string())),
     // Plan 89: `emerald-parser`'s own pre-existing block-attached-call
     // desugaring (unconditional, predates this plan) hoists an inline
     // lambda literal used as a call argument into a synthesized top-
@@ -2795,10 +2824,29 @@ fn infer_concrete_type_from_arg<'ctx>(
     // already carries that top-level lambda's own inferred return kind
     // (`declare_lambda_functions`'s identical inference), reused
     // directly rather than re-deriving it a second time.
-    Expr::Ident(name) => ctx
+    //
+    // Checked BEFORE the plain-local fallback immediately below: a
+    // name present in `ctx.lambda_func_ids` is a synthesized top-level
+    // Proc binding, never an ordinary class/newtype-typed local, so
+    // there's no ambiguity between the two lookups.
+    Expr::Ident(name) if ctx.lambda_func_ids.contains_key(name) => ctx
       .lambda_func_ids
       .get(name)
       .and_then(|(_, kind)| valkind_to_typeexpr(kind)),
+    // An ordinary named local — `local_classes` names a class/newtype
+    // receiver exactly (this is the same map `build_method_call`'s own
+    // `Ident`-receiver dispatch already consults), which is what makes
+    // this cover a fresh `own`/`borrow`-agnostic value passed straight
+    // through, not just a `Proc`. Falls back to the local's plain
+    // `ValKind` for a value type `local_classes` never populates.
+    Expr::Ident(name) => local_classes
+      .get(name)
+      .map(|class_name| TypeExpr::Named(class_name.clone()))
+      .or_else(|| {
+        vars
+          .get(name)
+          .and_then(|(_, kind)| valkind_to_typeexpr(kind))
+      }),
     _ => None,
   }
 }
@@ -7743,7 +7791,16 @@ fn build_method_call<'ctx>(
       .get(defining_class.as_str())
       .is_some_and(|names| names.contains(method))
     {
-      resolve_generic_method_instance(context, builder, ctx, defining_class, method, args, vars)?
+      resolve_generic_method_instance(
+        context,
+        builder,
+        ctx,
+        defining_class,
+        method,
+        args,
+        vars,
+        local_classes,
+      )?
     } else {
       let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
 
@@ -11263,26 +11320,37 @@ fn build_inline_lambda<'ctx>(
   Ok((env_ptr, ValKind::Ptr))
 }
 
-/// Plan 89's Decision log: the ONE shape this codegen-side generic-
-/// method type-parameter resolver actually handles — `raw` (the
-/// method's own declared param type, already interface-type-parameter-
-/// substituted) is `Proc[..., U]` (`type_param` in RETURN position,
-/// exactly this plan's own worked example, `f: Proc[T, U]`) and `arg`
-/// is the corresponding call argument. A real, disclosed narrowing
-/// next to `emerald-sema`'s own fuller structural unifier (`infer_
-/// type_param_binding`) — sema already proved the program well-typed;
-/// this only needs to re-derive the SAME binding for THIS one call
-/// shape, not attempt general unification.
+/// Plan 89's Decision log, generalized 2026-09-21 (this session's
+/// "find all bugs" sweep — see `infer_concrete_type_from_arg`'s own
+/// doc comment for the full story): originally the ONE shape this
+/// codegen-side generic-method type-parameter resolver handled was
+/// `raw` (the method's own declared param type, already interface-
+/// type-parameter-substituted) being `Proc[..., U]` (`type_param` in
+/// RETURN position, this plan's own worked example, `f: Proc[T, U]`).
+/// Now also handles the far more common shape — `raw` being the bare
+/// type parameter itself (`x: U`) — via the identical leaf-argument
+/// inference `infer_concrete_type_from_arg` already does for the
+/// `Proc` case, mirroring `emerald-sema`'s own `infer_type_param_
+/// binding`'s `TypeExpr::Named(name) if name == param_name` arm. Still
+/// a real, disclosed narrowing next to that fuller structural unifier
+/// — sema already proved the program well-typed; this only re-derives
+/// the SAME binding for the leaf argument shapes `infer_concrete_type_
+/// from_arg` recognizes, not general structural unification (a type
+/// parameter nested inside `Array[U]`/`Hash[K, U]`/... is not covered).
 fn infer_method_type_param_binding<'ctx>(
   raw: &TypeExpr,
   arg: &Spanned<Expr>,
   type_param: &str,
   ctx: &Ctx<'_, 'ctx>,
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
 ) -> Option<TypeExpr> {
   match raw {
     TypeExpr::Func(_, ret) if ret.as_named() == Some(type_param) => {
-      infer_concrete_type_from_arg(arg, ctx, vars)
+      infer_concrete_type_from_arg(arg, ctx, vars, local_classes)
+    }
+    TypeExpr::Named(name) if name == type_param => {
+      infer_concrete_type_from_arg(arg, ctx, vars, local_classes)
     }
     _ => None,
   }
@@ -11318,6 +11386,7 @@ fn resolve_generic_method_instance<'ctx>(
   method: &str,
   args: &[Spanned<Expr>],
   vars: &HashMap<String, (PointerValue<'ctx>, ValKind)>,
+  local_classes: &HashMap<String, String>,
 ) -> Result<(FunctionValue<'ctx>, ValKind), String> {
   let c = ctx.class_defs.get(class_name).ok_or_else(|| {
     format!("codegen: internal error — unknown class `{class_name}` for generic method `{method}`")
@@ -11354,7 +11423,9 @@ fn resolve_generic_method_instance<'ctx>(
   for (i, p) in m.params.iter().enumerate() {
     let p_ty = substitute_type_params(&p.ty, &iface_subst);
     if let Some(arg) = args.get(i) {
-      if let Some(binding) = infer_method_type_param_binding(&p_ty, arg, &method_tp, ctx, vars) {
+      if let Some(binding) =
+        infer_method_type_param_binding(&p_ty, arg, &method_tp, ctx, vars, local_classes)
+      {
         concrete_u = Some(binding);
       }
     }
@@ -21285,6 +21356,24 @@ int main(void) {
   {
     let src = "interface Iterable[T]\n  fn map[U](f: Proc[T, U]): Array[U]\nend\n\nclass Numbers\n  implements Iterable[Int64]\n\n  values: Array[Int64]\n\n  fn initialize(values: Array[Int64]): Void do\n    @values = values\n  end\n\n  fn map[U](f: Proc[T, U]): Array[U] do\n    values: Array[Int64] = @values\n    result: Array[U] = Array.new(values.count)\n    i: Int64 = 0\n    while i < values.count do\n      result[i] = f.call(values[i])\n      i: Int64 = i + 1\n    end\n    result\n  end\nend\n\nn: Numbers = Numbers.new([1, 2, 3])\ndoubled: Array[Int64] = n.map(do |x: Int64| x * 2 end)\nlabels: Array[String] = n.map(do |x: Int64| \"n#{x}\" end)\nputs doubled[0]\nputs doubled[2]\nputs labels[0]\nputs labels[2]\n";
     assert_eq!(compile_link_run(src), "2\n6\nn1\nn3\n");
+  }
+
+  // Found and closed 2026-09-21 (this session's "find all bugs" sweep):
+  // `resolve_generic_method_instance`'s own type-parameter resolver
+  // (`infer_method_type_param_binding`) used to handle only `Proc[...,
+  // U]` (`U` in RETURN position, the two tests immediately above). A
+  // generic method whose type parameter is bound by an ORDINARY
+  // argument — `x: U` directly, no `Proc` involved — failed at codegen
+  // time with "could not resolve generic method ...'s type parameter
+  // ... to a concrete type at this call site" even though `emerald-
+  // sema`'s own fuller structural unifier already accepted the
+  // program. Confirmed as a real, pre-existing bug (not assumed) by
+  // reverting this fix on a stashed copy of `emerald-codegen` and
+  // reproducing the exact error via the real CLI before restoring it.
+  #[test]
+  fn a_class_bound_generic_method_with_a_plain_non_proc_type_parameter_works() {
+    let src = "class Box\n  fn identity[U](x: U): U do\n    x\n  end\nend\n\nb: Box = Box.new()\nputs b.identity(41)\n";
+    assert_eq!(compile_link_run(src), "41\n");
   }
 
   #[test]
