@@ -384,12 +384,24 @@ fn run_legacy(args: &[String]) {
   // alone and falls through to the unchanged `compile`/`compile_cached`/
   // `compile_with_comptime_step_limit` call below, which reports it
   // with the exact same rich span-based rendering as always.
+  // Plan 76's `import <path> { Name, .. }` is a second, real
+  // multi-file-resolution trigger alongside `Item::Require` above — a
+  // file using only `import` and zero bare `require`s used to skip
+  // this whole branch (this `matches!` only ever named `Require`),
+  // silently falling through to the unresolved single-file
+  // `compile`/`compile_cached` path below and surfacing as a
+  // confusing "undefined function"/"unknown type" error instead of
+  // routing through `require::resolve_program_with_hashes`, which
+  // (`require.rs`'s own `build_graph`) has always spliced `Import`
+  // items exactly like `Require` ones.
   let requires_present = emerald_parser::parse_named(&source, source_path)
     .map(|program| {
-      program
-        .items
-        .iter()
-        .any(|item| matches!(item, emerald_parser::Item::Require(_)))
+      program.items.iter().any(|item| {
+        matches!(
+          item,
+          emerald_parser::Item::Require(_) | emerald_parser::Item::Import { .. }
+        )
+      })
     })
     .unwrap_or(false);
 

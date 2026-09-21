@@ -158,6 +158,20 @@ fn module_visibility_em_prints_expected_sequence() {
   );
 }
 
+// Regression for the plan 69/76 gap: `main.em` above always has a
+// bare `require greeter` alongside its `import`, so it never actually
+// exercised the case of an import-only file — `run_legacy`'s
+// `requires_present` check (`main.rs`) used to only match
+// `Item::Require`, silently skipping multi-file resolution for a file
+// using only `import`. `import_only.em` has zero bare `require`s.
+#[test]
+fn module_visibility_import_only_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("module_visibility/import_only.em"),
+    "7\n12\n"
+  );
+}
+
 // Plan 81's `domain-types-and-units` (`newtype`).
 #[test]
 fn domain_types_em_prints_expected_sequence() {
