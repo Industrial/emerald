@@ -307,8 +307,25 @@ fn strip_ownership_annotations_in_item(item: &mut Item) {
     // must (this file's own established "an `Export` is transparent to
     // every whole-program AST rewrite" convention).
     Item::Export(inner) => strip_ownership_annotations_in_item(inner),
-    // Every other `Item` kind (`Enum`, `Newtype`, `Interface`, `Extern`,
-    // `Stmt`, `Require`) has no `Function`-shaped parameter/return-type
+    // Plan 85 (`spec/OWNERSHIP.md` §7): an `unsafe extern "C"` fn's own
+    // return type is the ONLY position `emerald-sema` ever lets `own`/
+    // `borrow`/`borrow var` reach here (params are rejected at the sema
+    // stage — see `resolve_extern_type`'s own doc comment — so by the
+    // time a program reaches codegen at all, an `ExternFn`'s params
+    // never carry the wrapper). Always `allow_borrow_ptr_marker: false`
+    // — unlike an ordinary parameter, an extern return's `own`/`borrow`
+    // annotation is pure documentation-as-code (§7's own words: "no new
+    // mechanism"); the actual C ABI return value is identical regardless
+    // of the annotation, so this is a plain erasure to the underlying
+    // marshalable type, never the real pointer+writeback machinery
+    // `strip_ownership_in_function` builds for a parameter.
+    Item::Extern(block) => {
+      for f in &mut block.fns {
+        f.return_type = strip_ownership_in_type_expr(&f.return_type, false);
+      }
+    }
+    // Every other `Item` kind (`Enum`, `Newtype`, `Interface`, `Stmt`,
+    // `Require`) has no `Function`-shaped parameter/return-type
     // annotation of its own an `own`/`borrow`/`borrow var` could ever
     // appear on (an `Interface`'s own required-method signatures are
     // never lowered to LLVM at all — conformance is checked entirely in

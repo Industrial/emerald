@@ -142,6 +142,23 @@ session's Pony research, closing the real gap where a `ref`-shaped value can
 escape an actor without ever going through the syntactic send-check) is real,
 disclosed future work — its own plan when it comes, not folded into 83-85.
 
+**Verified (plan 85).** The two layers compose correctly today, and by
+construction rather than luck: an actor method must be `Void`-returning
+(cross-actor calls are asynchronous), so an actor send can only ever appear
+as a bare statement (`Stmt::Expr`) — never nested inside a `Let`/`Assign`/
+`Return` value position, which is the only shape `own`-consumption's own
+annotation-driven check ever reaches. `emerald-sema`'s actor-receiver branch
+(`check_message_safety_expr_stmt`) runs first and unconditionally for that
+one shape, entirely independent of any `own`/`borrow` annotation on the
+receiving method's own parameters, so the two checks never compete for the
+same call. The borrow checker's own liveness rules (rules 1/2 from §10) also
+apply inside an actor's method bodies exactly like any other method body —
+`check_method_body` runs the identical pass for both. The already-named gap
+above (a `ref`-shaped value escaping via a second alias — `b: LogMessage = a`
+then sending only `a`, leaving `b` un-poisoned and freely usable while the
+actor concurrently processes the same underlying object) was confirmed real
+and reproducible; still real, disclosed future work, not attempted here.
+
 ## 6. Relationship to generics (plans 41/58/75) — deferred, not designed here
 
 `own`/`borrow`/`borrow var` apply to concrete, non-generic parameter
@@ -162,6 +179,24 @@ returned data is transferred into a region the *caller* controls and is
 responsible for) or `borrow T` bound to a region the caller guarantees
 outlives the call. No new mechanism — the FFI boundary is just another
 `own`/`borrow`-typed call site.
+
+**Implemented (plan 85).** Legal only on an extern fn's own RETURN type —
+an extern PARAMETER's marshalable-type list (`Int64`/`Float64`/`String`/
+`CString`) stays exactly as strict and unannotated as before this plan; the
+FFI boundary this document means is specifically the return side, where the
+real question ("who now owns this, and for how long is it valid") actually
+lives. `own` needs no new enforcement — a fresh FFI-returned value is
+`emerald-sema`'s existing "trivially fresh" bucket, the same as any freshly
+constructed object. `borrow`/`borrow var` gets one real, new check: the
+call's result cannot be bound to a `Let`/`SetField`/`Assign` (letting the
+reference outlive "the call itself" is exactly what this section's own
+"bound to a region the caller guarantees outlives the call" text forbids);
+it may still be used directly, inline, as another expression's operand.
+Codegen treats the annotation as pure documentation-as-code, per this
+section's own "no new mechanism" — both forms compile to the identical C
+ABI call `emerald-codegen`'s `Item::Extern` stripping pass already produced
+before this plan. See `examples/ffi_ownership.em` for a real, worked
+`strdup`/`strstr` (`own`/`borrow`) pair.
 
 ## 8. Scope staged deliberately: lexical borrow-checking first, NLL-equivalent later
 

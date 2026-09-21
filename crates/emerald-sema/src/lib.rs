@@ -217,6 +217,21 @@ struct FunctionSig {
   /// `check_ownership_call_args`'s own liveness pass below ever reads
   /// this field.
   param_ownership: Vec<Option<Ownership>>,
+  /// Plan 85's Decision log (`spec/OWNERSHIP.md` §7): `Some` only for an
+  /// `unsafe extern "C"` function whose declared return type is `own T`/
+  /// `borrow T`/`borrow var T` — `None` for every ordinary Emerald
+  /// function/method (`resolve_return_type` rejects the wrapper there
+  /// outright, per plan 83's own standing decision, deliberately
+  /// unchanged by this plan) and for every extern fn with a plain,
+  /// unannotated return type. `own` here needs no enforcement of its own
+  /// — a fresh value returned from an FFI call is bucket-2 "trivially
+  /// fresh," the same as `SomeClass.new(...)`, purely documentation-as-
+  /// code per §7's own text. `borrow`/`borrow var` DOES get one real,
+  /// new check: `reject_borrow_returning_call_bound_to_a_name` rejects
+  /// binding such a call's result to a `Let`/`SetField`/`Assign`,
+  /// since that would let the reference outlive the call it's only
+  /// guaranteed valid for.
+  return_ownership: Option<Ownership>,
 }
 
 /// `own` / `borrow` / `borrow var` (plan 83, `spec/OWNERSHIP.md` §2) —
@@ -240,15 +255,19 @@ enum Ownership {
 type ParamOwnership<'a> = Option<&'a [Option<Ownership>]>;
 
 /// Peels at most one leading `own`/`borrow`/`borrow var` wrapper off a
-/// PARAMETER's declared `TypeExpr` — legal only here (every param-type-
-/// resolution call site: `function_signature`, `function_signature_
-/// with_subst`, `check_function_body`, `check_method_body`, `rebuild_
-/// purity_env`), never inside the shared `resolve_type` itself, which
-/// rejects `TypeExpr::Own`/`Borrow` outright everywhere else (return
-/// types, fields, `Let`s, nested generic arguments) — the same "one
-/// dedicated resolution path gives a wrapper shape real meaning, the
-/// shared path rejects it" precedent `resolve_return_type`'s own
-/// `TypeExpr::Tuple` special-case already established for tuples.
+/// declared `TypeExpr`. Originally (plan 83) legal only at a PARAMETER's
+/// own type-resolution call sites (`function_signature`, `function_
+/// signature_with_subst`, `check_function_body`, `check_method_body`,
+/// `rebuild_purity_env`); plan 85 (`spec/OWNERSHIP.md` §7) adds a second
+/// legal call site, `resolve_extern_type`'s own return-position branch —
+/// the peeling logic itself was always general, only ever gated by
+/// which callers chose to invoke it. The shared `resolve_type` still
+/// rejects `TypeExpr::Own`/`Borrow` outright everywhere neither of these
+/// two dedicated paths reaches (an ordinary function's return type,
+/// fields, `Let`s, nested generic arguments) — the same "one dedicated
+/// resolution path gives a wrapper shape real meaning, the shared path
+/// rejects it" precedent `resolve_return_type`'s own `TypeExpr::Tuple`
+/// special-case already established for tuples.
 fn strip_param_ownership(ty: &TypeExpr) -> (Option<Ownership>, &TypeExpr) {
   match ty {
     TypeExpr::Own(inner) => (Some(Ownership::Own), inner),
@@ -1026,6 +1045,7 @@ fn build_generic_class_info(
       FunctionSig {
         params,
         return_type,
+        return_ownership: None,
         block_param: m.block_param.clone(),
         param_names,
         defaults,
@@ -1900,34 +1920,57 @@ fn resolve_return_type(
 /// never a parameter type (mirroring `ret_kind_for_type`/
 /// `value_kind_for_type`'s own return-vs-param asymmetry elsewhere in
 /// this codebase).
-fn resolve_extern_type(texpr: &TypeExpr, is_return_position: bool) -> Result<Type, Diagnostic> {
-  let Some(name) = texpr.as_named() else {
+/// Plan 85 (`spec/OWNERSHIP.md` §7): an `own`/`borrow`/`borrow var`
+/// wrapper is legal ONLY on an extern function's own RETURN type — "the
+/// FFI boundary is just another own/borrow-typed call site," per §7's
+/// own text, but v1 deliberately narrows this to the return position
+/// alone. An extern PARAMETER's marshalable-type check stays exactly as
+/// strict and unannotated as before this plan (`is_return_position ==
+/// false` never peels a wrapper, so `Own`/`Borrow` there still hits
+/// `as_named() == None` and the same "not a supported extern C type"
+/// diagnostic it always has). Reuses `strip_param_ownership` — despite
+/// that function's own doc comment historically saying "legal only for
+/// params" — because its actual peeling logic has always been general;
+/// this is its second real call site, not a special case bolted on.
+fn resolve_extern_type(
+  texpr: &TypeExpr,
+  is_return_position: bool,
+) -> Result<(Type, Option<Ownership>), Diagnostic> {
+  let (ownership, inner) = if is_return_position {
+    strip_param_ownership(texpr)
+  } else {
+    (None, texpr)
+  };
+  let Some(name) = inner.as_named() else {
     return Err(Diagnostic::new(
       format!(
-        "`{texpr}` is not a supported extern \"C\" type — only Int64, Float64, String, CString{} are marshalable across the FFI boundary",
+        "`{inner}` is not a supported extern \"C\" type — only Int64, Float64, String, CString{} are marshalable across the FFI boundary",
         if is_return_position { ", and Void (return only)" } else { "" }
       ),
       (0, 0),
     ));
   };
-  match name {
-    "Int64" => Ok(Type::Int64),
-    "Float64" => Ok(Type::Float64),
-    "String" => Ok(Type::String),
-    "CString" => Ok(Type::CString),
-    "Void" if is_return_position => Ok(Type::Void),
-    other => Err(Diagnostic::new(
-      format!(
-        "`{other}` is not a supported extern \"C\" type — only Int64, Float64, String, CString{} are marshalable across the FFI boundary",
-        if is_return_position {
-          ", and Void (return only)"
-        } else {
-          ""
-        }
-      ),
-      (0, 0),
-    )),
-  }
+  let ty = match name {
+    "Int64" => Type::Int64,
+    "Float64" => Type::Float64,
+    "String" => Type::String,
+    "CString" => Type::CString,
+    "Void" if is_return_position => Type::Void,
+    other => {
+      return Err(Diagnostic::new(
+        format!(
+          "`{other}` is not a supported extern \"C\" type — only Int64, Float64, String, CString{} are marshalable across the FFI boundary",
+          if is_return_position {
+            ", and Void (return only)"
+          } else {
+            ""
+          }
+        ),
+        (0, 0),
+      ));
+    }
+  };
+  Ok((ty, ownership))
 }
 
 /// Plan 43's Decision log originally widened this beyond plain equality
@@ -1979,6 +2022,7 @@ fn function_signature(
   Ok(FunctionSig {
     params,
     return_type,
+    return_ownership: None,
     block_param: f.block_param.clone(),
     param_names,
     defaults,
@@ -2036,6 +2080,7 @@ fn function_signature_with_subst(
   Ok(FunctionSig {
     params,
     return_type,
+    return_ownership: None,
     block_param: f.block_param.clone(),
     param_names,
     defaults,
@@ -6670,6 +6715,42 @@ fn check_loop_body(
   Ok(())
 }
 
+/// Plan 85 (`spec/OWNERSHIP.md` §7): the one real, new enforcement this
+/// plan adds — a `borrow`/`borrow var`-RETURNING extern "C" call's
+/// result must not be bound to a name (`Let`/`SetField`/`Assign`),
+/// because that would let the reference outlive the call itself, the
+/// exact thing §7's "bound to a region the caller guarantees outlives
+/// the call" rule exists to prevent. Only a call appearing DIRECTLY as
+/// the statement's own value expression is recognized (extern
+/// functions are always free functions, `Expr::Call`, never a method —
+/// no `Expr::MethodCall` case exists to check), matching this file's
+/// own established narrowing convention for this class of check.
+/// Ordinary Emerald functions can never trigger this at all (`sigs`
+/// only ever carries `Some(return_ownership)` for an extern "C" fn —
+/// see `FunctionSig.return_ownership`'s own doc comment).
+fn reject_borrow_returning_call_bound_to_a_name(
+  value: &Spanned<Expr>,
+  sigs: &HashMap<String, FunctionSig>,
+) -> Result<(), Diagnostic> {
+  let Expr::Call(name, _) = &value.node else {
+    return Ok(());
+  };
+  let Some(sig) = sigs.get(name) else {
+    return Ok(());
+  };
+  match sig.return_ownership {
+    Some(Ownership::Borrow) | Some(Ownership::BorrowVar) => Err(Diagnostic::new(
+      format!(
+        "ownership: the result of `{name}` (declared `borrow`/`borrow var` return type) \
+         cannot be bound to a name — its validity is guaranteed only for the duration of the \
+         call itself (spec/OWNERSHIP.md §7); use it directly in the same expression instead"
+      ),
+      value.span,
+    )),
+    _ => Ok(()),
+  }
+}
+
 fn check_message_safety_stmt(
   stmt: &Spanned<Stmt>,
   env: &HashMap<String, Type>,
@@ -6687,6 +6768,7 @@ fn check_message_safety_stmt(
     // exact, disclosed scope: a call appearing DIRECTLY as one of
     // these statement kinds' own value expression, not nested deeper).
     Stmt::Let { value, .. } | Stmt::SetField { value, .. } | Stmt::Assign { value, .. } => {
+      reject_borrow_returning_call_bound_to_a_name(value, sigs)?;
       check_own_consuming_value(value, env, sigs, classes, moved)
     }
     Stmt::SetIndex {
@@ -10818,7 +10900,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       let params: Result<Vec<Type>, Diagnostic> = f
         .params
         .iter()
-        .map(|p| resolve_extern_type(&p.ty, false))
+        .map(|p| resolve_extern_type(&p.ty, false).map(|(ty, _)| ty))
         .collect();
       let params = match params {
         Ok(p) => p,
@@ -10827,7 +10909,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           continue;
         }
       };
-      let return_type = match resolve_extern_type(&f.return_type, true) {
+      let (return_type, return_ownership) = match resolve_extern_type(&f.return_type, true) {
         Ok(t) => t,
         Err(d) => {
           diags.push(d);
@@ -10839,6 +10921,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         FunctionSig {
           params,
           return_type,
+          return_ownership,
           block_param: None,
           param_names: f.params.iter().map(|p| p.name.clone()).collect(),
           defaults: vec![None; f.params.len()],
@@ -13477,6 +13560,88 @@ mod tests {
     assert_eq!(check_program(&program), Ok(()));
   }
 
+  /// Plan 85 (`spec/OWNERSHIP.md` §5, "coexist, don't subsume"): an
+  /// actor send (plan 56) and an `own`-argument consumption (plan 83)
+  /// happening on two DIFFERENT bindings in one function body must not
+  /// be confused with each other — this is the concrete "don't
+  /// double-fire, conflict, or silently skip each other" question §5
+  /// raises, verified here rather than just asserted. Neither call's
+  /// receiving parameter needs an explicit `own` annotation for the
+  /// actor send to be tracked — `check_message_safety_expr_stmt`'s own
+  /// actor-receiver branch runs unconditionally, ahead of and
+  /// independent from `check_own_consuming_value`'s annotation-driven
+  /// check, and this composes safely with a real structural invariant
+  /// this test also confirms below: an actor method must be `Void`-
+  /// returning, so an actor send can only ever appear as a bare
+  /// `Stmt::Expr` — never nested inside a `Let`/`Assign`/`Return` value
+  /// position, which is the only shape `check_own_consuming_value`'s
+  /// own annotation-driven check ever reaches. The two mechanisms
+  /// therefore never compete for the same call.
+  fn own_and_actor_send_test_program() -> String {
+    "class LogMessage\n  text: String\n\n  fn initialize(text: String): Void do\n    @text = text\n  end\n\n  fn text: String do\n    @text\n  end\nend\n\nactor Logger\n  fn log(msg: LogMessage): Void do\n    puts msg.text\n  end\nend\n\nfn consume(data: own LogMessage): Void do\n  puts data.text\nend\n\nfn run: Void do\n  logger: Logger = Logger.spawn()\n  sent: LogMessage = LogMessage.new(\"sent\")\n  consumed: LogMessage = LogMessage.new(\"consumed\")\n  logger.log(sent)\n  consume(consumed)\nend\n\nrun()\n".to_string()
+  }
+
+  #[test]
+  fn accepts_an_actor_send_and_an_own_consuming_call_on_different_bindings_in_one_function() {
+    let program = emerald_parser::parse(&own_and_actor_send_test_program()).expect("should parse");
+    assert_eq!(check_program(&program), Ok(()));
+  }
+
+  #[test]
+  fn rejects_reusing_the_actor_sent_binding_without_confusing_it_for_the_own_consumed_one() {
+    let src = own_and_actor_send_test_program().replace(
+      "  consume(consumed)\nend",
+      "  consume(consumed)\n  puts sent.text\nend",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`sent` was already consumed by the actor send and must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains("sent")),
+      "the diagnostic must name `sent`, not `consumed`: {errs:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_reusing_the_own_consumed_binding_without_confusing_it_for_the_actor_sent_one() {
+    let src = own_and_actor_send_test_program().replace(
+      "  consume(consumed)\nend",
+      "  consume(consumed)\n  puts consumed.text\nend",
+    );
+    let program = emerald_parser::parse(&src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("`consumed` was already consumed by the own-argument call and must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains("consumed")),
+      "the diagnostic must name `consumed`, not `sent`: {errs:?}"
+    );
+  }
+
+  /// Plan 85 (`spec/OWNERSHIP.md` §5): plan 83's `check_borrow_scopes`
+  /// liveness rules apply to an actor's own method bodies exactly like
+  /// any other method — `check_method_body` (this file) runs the exact
+  /// same pass for both, per its own doc comment. Verified with a real
+  /// rule-1 violation (two live `borrow var` borrows of one binding)
+  /// occurring entirely inside an actor method body.
+  #[test]
+  fn borrow_checker_liveness_rules_apply_inside_an_actor_method_body() {
+    let src = "class Counter\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn bump: Void do\n    @value = @value + 1\n  end\nend\n\nfn mutate_a(c: borrow var Counter): Void do\n  c.bump\nend\n\nfn mutate_b(c: borrow var Counter): Void do\n  c.bump\nend\n\nactor Worker\n  fn process(c: borrow var Counter): Void do\n    mutate_a(c)\n    mutate_b(c)\n  end\nend\n\nfn run: Void do\n  w: Worker = Worker.spawn()\n  counter: Counter = Counter.new(0)\n  w.process(counter)\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "two live `borrow var` borrows of `c` inside the actor method body must be rejected",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains('c')),
+      "expected an ownership diagnostic naming `c`: {errs:?}"
+    );
+  }
+
   #[test]
   fn rejects_a_field_read_passed_directly_as_a_message_argument() {
     let src = "class LogMessage\n  text: String\n\n  fn initialize(text: String): Void do\n    @text = text\n  end\n\n  fn text: String do\n    @text\n  end\nend\n\nactor Logger\n  fn log(msg: LogMessage): Void do\n    puts msg.text\n  end\nend\n\nclass Holder\n  msg: LogMessage\n\n  fn initialize(msg: LogMessage): Void do\n    @msg = msg\n  end\n\n  fn send_it(logger: Logger): Void do\n    logger.log(@msg)\n  end\nend\n";
@@ -13828,6 +13993,62 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("only \"C\" is a supported extern ABI");
     assert!(errs.iter().any(|d| d.message.contains("C++")), "{errs:?}");
+  }
+
+  // Plan 85 (`spec/OWNERSHIP.md` §7): `own`/`borrow` typing at an
+  // `unsafe extern "C"` boundary.
+
+  #[test]
+  fn an_own_returning_extern_fns_result_is_a_fresh_value_reusable_freely() {
+    let src = "unsafe extern \"C\" {\n  fn f(): own CString\n}\n\nfn run: Void do\n  a: CString = f()\n  b: Option[String] = String.from_cstring(a)\n  puts b ?? \"none\"\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "an `own`-returning extern call's result is bucket-2 trivially-fresh — no consumption \
+       tracking needed, and binding it to a Let is always legal"
+    );
+  }
+
+  #[test]
+  fn a_borrow_returning_extern_fns_result_may_be_used_directly_inline() {
+    let src = "unsafe extern \"C\" {\n  fn f(): borrow CString\n}\n\nfn run: Void do\n  r: Option[String] = String.from_cstring(f())\n  puts r ?? \"none\"\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "passing a `borrow`-returning call's result directly as another call's argument, never \
+       binding it to a name, must be accepted"
+    );
+  }
+
+  #[test]
+  fn a_borrow_returning_extern_fns_result_cannot_be_bound_to_a_let() {
+    let src = "unsafe extern \"C\" {\n  fn f(): borrow CString\n}\n\nfn run: Void do\n  leaked: CString = f()\n  puts \"done\"\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("binding a `borrow`-returning extern call's result to a Let must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains('f')),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn a_borrow_var_returning_extern_fns_result_cannot_be_reassigned_to_a_var() {
+    let src = "unsafe extern \"C\" {\n  fn f(): borrow var CString\n}\n\nfn run: Void do\n  s: String = \"placeholder\"\n  var leaked: CString = s.to_cstring()\n  leaked = f()\n  puts \"done\"\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "reassigning a `var` to a `borrow var`-returning extern call's result must be rejected",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("ownership") && d.message.contains('f')),
+      "{errs:?}"
+    );
   }
 
   #[test]
