@@ -6956,27 +6956,37 @@ fn check_message_safety_expr_stmt(
 /// checked at every `own`-typed call argument" (§2's own words),
 /// reusing `check_message_arg`'s existing four-bucket classification
 /// UNCHANGED for each `own`-marked parameter position; every other
-/// (non-`own`) argument position still gets the ordinary recursive
-/// `expr_moved_read` read-only check. Resolves the call's target
-/// signature from `sigs` (a free function) or, for a `Expr::MethodCall`
-/// with a locally-typed receiver, from that class's own `methods`
-/// table — mirrors `check_message_safety_expr_stmt`'s own "`Ident`
-/// receiver found in `env`" resolution exactly, so a receiver shape
-/// this compiler can't cheaply re-derive a static class for (a field, a
-/// nested call result, ...) simply finds no signature and falls back to
-/// the ordinary read-only walk, the same conservative-safe default
-/// every other unrecognized shape in this pass already gets.
+/// (non-`own`) argument position recurses back into this same function
+/// (not a plain `expr_moved_read`), so an own-consuming call nested
+/// arbitrarily deep beneath a non-`own` position — an arithmetic/
+/// comparison operand, a non-`own` argument, an array/hash/tuple
+/// literal element, a string interpolation part, ... — is still found.
+/// Resolves each call's target signature from `sigs` (a free function)
+/// or, for a `Expr::MethodCall` with a locally-typed receiver, from
+/// that class's own `methods` table — mirrors `check_message_safety_
+/// expr_stmt`'s own "`Ident` receiver found in `env`" resolution
+/// exactly, so a receiver shape this compiler can't cheaply re-derive a
+/// static class for (a field, a nested call result, ...) simply finds
+/// no signature and falls back to the ordinary recursive walk, the same
+/// conservative-safe default every other unrecognized shape in this
+/// pass already gets.
 ///
-/// A REAL, DISCLOSED narrowing versus a fully general expression-
-/// position walk: only a call appearing DIRECTLY as one of `check_
-/// message_safety_stmt`'s own value-bearing statement positions (a
-/// `Let`/`SetField`/`Assign`/`SetIndex`/`MultiAssign`/`Return`/`Raise`/
-/// `Yield` argument) or as a bare `Stmt::Expr` is recognized — an
-/// `own`-consuming call nested one level deeper (inside another call's
-/// own argument, or an arithmetic/comparison operand) is not detected
-/// here, matching this file's own established "state the narrowing
-/// plainly" convention (`expr_moved_read`'s own `Expr::Lambda`/`Expr::
-/// Supervise` doc comments are the precedent this follows).
+/// Found and closed 2026-09-21 (this session's "find all bugs" sweep):
+/// earlier revisions of this function matched ONLY a call appearing
+/// DIRECTLY as one of `check_message_safety_stmt`'s own value-bearing
+/// statement positions, falling to a plain `expr_moved_read` — a read,
+/// not a consumption — for anything else, silently under-rejecting
+/// exactly the shapes this doc comment now enumerates above — the
+/// expression `1 + consume(x)` (with `consume`'s parameter declared
+/// `own`) previously left `x` unmarked in `moved`, so a later read of
+/// `x` was wrongly accepted; this is now a real, recursive walk over
+/// the same `Expr` shapes `expr_moved_read` covers, so it stays
+/// exhaustive as new `Expr` variants are added (a missing arm is a
+/// compile error, not a silent gap). `SafeCall`'s own receiver is never
+/// given `own`-argument treatment (unchanged from before —
+/// safe-navigation's target resolution isn't modeled here), but its
+/// args and receiver still recurse through this same function so a
+/// call nested inside either is still caught.
 fn check_own_consuming_value(
   e: &Spanned<Expr>,
   env: &HashMap<String, Type>,
@@ -6984,12 +6994,11 @@ fn check_own_consuming_value(
   classes: &HashMap<String, ClassInfo>,
   moved: &mut HashMap<String, (usize, usize)>,
 ) -> Result<(), Diagnostic> {
-  let (name, args, ownership): (&str, &[Spanned<Expr>], ParamOwnership) = match &e.node {
-    Expr::Call(name, args) => (
-      name.as_str(),
-      args.as_slice(),
-      sigs.get(name).map(|s| s.param_ownership.as_slice()),
-    ),
+  match &e.node {
+    Expr::Call(name, args) => {
+      let ownership: ParamOwnership = sigs.get(name).map(|s| s.param_ownership.as_slice());
+      check_own_consuming_call_args(args, ownership, name, env, sigs, classes, moved)
+    }
     Expr::MethodCall(recv, method, args) => {
       expr_moved_read(recv, moved)?;
       let recv_ty = match &recv.node {
@@ -6997,25 +7006,134 @@ fn check_own_consuming_value(
         Expr::Ident(n) => env.get(n),
         _ => None,
       };
-      let ownership = match recv_ty {
+      let ownership: ParamOwnership = match recv_ty {
         Some(Type::Class(cn)) => classes
           .get(cn)
           .and_then(|c| c.methods.get(method))
           .map(|s| s.param_ownership.as_slice()),
         _ => None,
       };
-      (method.as_str(), args.as_slice(), ownership)
+      check_own_consuming_call_args(args, ownership, method, env, sigs, classes, moved)
     }
-    _ => return expr_moved_read(e, moved),
-  };
-  let Some(ownership) = ownership else {
-    return expr_moved_read(e, moved);
-  };
+    Expr::Add(a, b)
+    | Expr::Sub(a, b)
+    | Expr::Mul(a, b)
+    | Expr::Div(a, b)
+    | Expr::Rem(a, b)
+    | Expr::And(a, b)
+    | Expr::Or(a, b)
+    | Expr::BitAnd(a, b)
+    | Expr::BitOr(a, b)
+    | Expr::BitXor(a, b)
+    | Expr::Shl(a, b)
+    | Expr::Shr(a, b)
+    | Expr::Index(a, b)
+    | Expr::Coalesce(a, b) => {
+      check_own_consuming_value(a, env, sigs, classes, moved)?;
+      check_own_consuming_value(b, env, sigs, classes, moved)
+    }
+    Expr::Compare(a, _, b) => {
+      check_own_consuming_value(a, env, sigs, classes, moved)?;
+      check_own_consuming_value(b, env, sigs, classes, moved)
+    }
+    Expr::Neg(a)
+    | Expr::Not(a)
+    | Expr::BitNot(a)
+    | Expr::ArrayNew(a)
+    | Expr::Ok(a)
+    | Expr::Err(a)
+    | Expr::Try(a)
+    | Expr::Comptime(a) => check_own_consuming_value(a, env, sigs, classes, moved),
+    Expr::New(_, args) | Expr::Spawn(_, args) => {
+      for a in args {
+        check_own_consuming_value(a, env, sigs, classes, moved)?;
+      }
+      Ok(())
+    }
+    Expr::CallKw(_, kwargs) => {
+      for (_, v) in kwargs {
+        check_own_consuming_value(v, env, sigs, classes, moved)?;
+      }
+      Ok(())
+    }
+    Expr::SafeCall(recv, _, args) => {
+      check_own_consuming_value(recv, env, sigs, classes, moved)?;
+      for a in args {
+        check_own_consuming_value(a, env, sigs, classes, moved)?;
+      }
+      Ok(())
+    }
+    Expr::ArrayLit(elems) | Expr::TupleLit(elems) => {
+      for el in elems {
+        check_own_consuming_value(el, env, sigs, classes, moved)?;
+      }
+      Ok(())
+    }
+    Expr::HashLit(pairs) => {
+      for (k, v) in pairs {
+        check_own_consuming_value(k, env, sigs, classes, moved)?;
+        check_own_consuming_value(v, env, sigs, classes, moved)?;
+      }
+      Ok(())
+    }
+    Expr::Interpolate(parts) => {
+      for p in parts {
+        if let StringPart::Expr(inner) = p {
+          check_own_consuming_value(inner, env, sigs, classes, moved)?;
+        }
+      }
+      Ok(())
+    }
+    Expr::Remote { addr, name, .. } => {
+      check_own_consuming_value(addr, env, sigs, classes, moved)?;
+      check_own_consuming_value(name, env, sigs, classes, moved)
+    }
+    Expr::Locate { key, args, .. } => {
+      check_own_consuming_value(key, env, sigs, classes, moved)?;
+      for a in args {
+        check_own_consuming_value(a, env, sigs, classes, moved)?;
+      }
+      Ok(())
+    }
+    // Same disclosed gap as `expr_moved_read`'s own identical cases —
+    // a nested `Stmt` body needs its own dedicated traversal neither
+    // plan 83 nor plan 57 build.
+    Expr::Lambda { .. } | Expr::Supervise(_) => Ok(()),
+    // Leaves: `Ident` still gets the ordinary moved-use rejection (a
+    // plain read of an already-consumed local is illegal wherever it
+    // appears); every other leaf is a literal with nothing to check.
+    Expr::Ident(_)
+    | Expr::Int(_)
+    | Expr::Float(_)
+    | Expr::StringLit(_)
+    | Expr::SymbolLit(_)
+    | Expr::Bool(_)
+    | Expr::InstanceVar(_) => expr_moved_read(e, moved),
+  }
+}
+
+/// Shared by both of `check_own_consuming_value`'s call arms: an
+/// `own`-marked parameter position gets `check_message_arg`'s existing
+/// four-bucket classification (unchanged — a call/method-call value
+/// there is still rejected outright by that function's own bucket 4,
+/// so no further recursion is needed on that branch); every other
+/// position recurses back into `check_own_consuming_value` itself
+/// rather than a plain read, which is what lets a nested own-consuming
+/// call inside a non-`own` argument still be found.
+fn check_own_consuming_call_args(
+  args: &[Spanned<Expr>],
+  ownership: ParamOwnership,
+  name: &str,
+  env: &HashMap<String, Type>,
+  sigs: &HashMap<String, FunctionSig>,
+  classes: &HashMap<String, ClassInfo>,
+  moved: &mut HashMap<String, (usize, usize)>,
+) -> Result<(), Diagnostic> {
   for (i, arg) in args.iter().enumerate() {
-    if ownership.get(i) == Some(&Some(Ownership::Own)) {
+    if ownership.and_then(|o| o.get(i)) == Some(&Some(Ownership::Own)) {
       check_message_arg(arg, i, name, env, moved)?;
     } else {
-      expr_moved_read(arg, moved)?;
+      check_own_consuming_value(arg, env, sigs, classes, moved)?;
     }
   }
   Ok(())
@@ -13777,6 +13895,33 @@ mod tests {
     assert!(
       errs.iter().any(|d| d.message.contains("not wire-safe")),
       "expected a wire-safety diagnostic: {errs:?}"
+    );
+  }
+
+  // Found and closed 2026-09-21 (this session's "find all bugs" sweep):
+  // `check_own_consuming_value` used to fall to a plain `expr_moved_read`
+  // (a read, not a consumption) for any own-consuming call that wasn't
+  // itself the statement's direct top-level value expression. Here
+  // `consume(w)` sits one level deeper, as a non-`own` argument to
+  // `identity(...)` — the outer `Let` statement's own value expression
+  // IS `identity(consume(w))` directly, but the inner `consume(w)` call
+  // (the one that actually consumes `w` via its `own Widget` parameter)
+  // was never inspected, so `w` was never marked consumed and the
+  // subsequent `puts w.value` was wrongly accepted. This is now caught
+  // because `check_own_consuming_value` recurses into every non-`own`
+  // argument position instead of handing it to `expr_moved_read`.
+  #[test]
+  fn rejects_an_own_consuming_call_nested_inside_a_non_own_argument() {
+    let src = "class Widget\n  value: Int64\n\n  fn initialize(start: Int64): Void do\n    @value = start\n  end\n\n  fn value: Int64 do\n    @value\n  end\nend\n\nfn consume(data: own Widget): Int64 do\n  data.value\nend\n\nfn identity(x: Int64): Int64 do\n  x\nend\n\nw: Widget = Widget.new(5)\nz: Int64 = identity(consume(w))\nputs w.value\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "consuming `w` via a nested `own`-argument call, then reading it again, must be rejected",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("message-safety") && d.message.contains('w')),
+      "expected a message-safety diagnostic naming `w`: {errs:?}"
     );
   }
 
