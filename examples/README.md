@@ -186,11 +186,10 @@ doesn't need to rediscover the constraint from scratch:
   `words: Array[String] = phrase.split(" "); puts words[0]` prints
   `hello` correctly and deterministically. Regression test:
   `plan_66_puts_of_an_array_string_index_read_prints_deterministically`.
-- **`String == String` isn't implemented in codegen** — sema accepts
-  it, then codegen rejects it with "comparison operands must both be
-  Int64 or both Float64." `nullable_safe_nav.em` avoids comparing
-  narrowed `String` locals for equality. (Not this plan's scope — see
-  plan 67.)
+- ~~**`String == String` isn't implemented in codegen**~~ — **Fixed
+  (plan 67, later session), stale here since.** Confirmed again
+  directly (2026-09-21): `a: String = "hello"; b: String = "hello"; a
+  == b` compiles and correctly prints `1` via the real CLI.
 - ~~**A `String?` value populated via safe navigation through a
   function's return value, then read after an `||=`, silently drops
   its `puts` output or fails at codegen**~~ — **Fixed; same race as
@@ -235,14 +234,19 @@ doesn't need to rediscover the constraint from scratch:
   redirection, and this file's own `compile_link_run`/
   `compile_link_run_n_times` in-process capture all showed the correct
   4 lines, every time, on every attempt.
-- **`require`-splicing a file that declares an `actor` class produced a
-  linker failure under `--jobs N`, and produces no splice at all
-  without `--jobs`** — found compiling `host.em`/`client.em`, which
-  `require counter_actor` (an `actor Counter` declaration). **Fixed,
-  same session, for the `--jobs` half.** A bare `emerald host.em -o out`
-  still fails typecheck (`unknown type 'Counter'`, `undefined variable
-  'c'`) — the "no `--jobs`, no splice" gap is unrelated and still real.
-  But `emerald --jobs 2 host.em -o out` used to fail to *link*:
+- ~~**`require`-splicing a file that declares an `actor` class produced
+  a linker failure under `--jobs N`, and produces no splice at all
+  without `--jobs`**~~ — found compiling `host.em`/`client.em`, which
+  `require counter_actor` (an `actor Counter` declaration). **Both
+  halves now fixed.** The `--jobs` half was fixed same-session (below).
+  The bare-`emerald` half (no `--jobs` at all) was later found to be a
+  real bug broader than originally scoped — no `require` of any kind
+  (plain function, ordinary class, or actor) was ever spliced by the
+  bare `emerald <file>.em -o out` path at all; only `emerald build`
+  (via `emerald.toml`) ever called the splicer — and fixed by plan 69,
+  in `run_legacy`. `emerald host.em -o out` (no `--jobs`) now correctly
+  splices and typechecks. Historical detail on the `--jobs` half, for
+  the record: `emerald --jobs 2 host.em -o out` used to fail to *link*:
   `multiple definition of 'Counter_report__trampoline'` and the same
   for `RemoteActorError_encode`/`_decode`, every `Counter_*_encode_args`/
   `_decode_args`, and `Counter__methods` — the requiring file's
