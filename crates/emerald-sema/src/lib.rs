@@ -9851,14 +9851,29 @@ fn check_function_body(
   gctx: &GenericsCtx,
 ) -> Result<(), Diagnostic> {
   let mut env = HashMap::new();
-  // Plan 72's Decision log: a function parameter has no `var` slot
-  // anywhere in this grammar (`ParenParams`/`Params` never accept one)
-  // — an ordinary `env.insert`, never `declare_local`, so every
-  // parameter is unconditionally immutable inside its own function
-  // body. This is the simplest rule available (no syntax exists to opt
-  // a parameter into mutability, so there's no "sometimes" case to
-  // design around) and matches Sable's own examples, none of which
-  // reassign a parameter.
+  // Plan 72's Decision log, narrowed 2026-09-21 (this session's "find
+  // all bugs" sweep): an ordinary function parameter still has no `var`
+  // slot anywhere in this grammar and stays unconditionally immutable.
+  // The one real exception is a `borrow var`-annotated BY-VALUE
+  // parameter (`Int64`/`Float64`/`Boolean`/`Symbol`) — `emerald-codegen`
+  // (`spec/OWNERSHIP.md` §10, plan 84) has bound this to a genuine LLVM
+  // `ptr` parameter and written the local-alloca-plus-writeback
+  // mechanism for a top-level free function ever since that plan
+  // shipped, but this sema check never opened the matching syntax gap:
+  // `Stmt::Assign` to such a parameter was rejected outright as
+  // "declared without `var`," so the already-built, zero-cost-proven
+  // writeback path was unreachable from real `.em` source. A
+  // `borrow`/`borrow var` of any OTHER type (a class, `String`, ...) is
+  // already pointer-represented and gets no such treatment either way
+  // — mutating it means calling a method / setting a field, not
+  // reassigning the parameter binding itself, so it stays immutable
+  // here exactly as before. `check_method_body`'s identical parameter
+  // loop deliberately does NOT mirror this: `strip_ownership_in_type_
+  // expr`'s own doc comment discloses that a method's by-value `borrow
+  // var` parameter keeps plan 83's original full-erasure passthrough
+  // (no real pointer, no writeback) — opening the same mutation syntax
+  // there would silently accept code whose mutation never reaches the
+  // caller, a worse outcome than today's rejection.
   let mut mutable_locals: HashSet<String> = HashSet::new();
   for p in &f.params {
     // Plan 83: `param_plain_type`, not a bare `resolve_type` — strips a
@@ -9867,7 +9882,20 @@ fn check_function_body(
     // plain underlying type either way (this plan's own disclosed
     // codegen/type-checking passthrough); `check_ownership_call_args`
     // below is what actually enforces the four liveness rules.
-    env.insert(p.name.clone(), param_plain_type(&p.ty, classes)?);
+    let plain_ty = param_plain_type(&p.ty, classes)?;
+    let (ownership, _) = strip_param_ownership(&p.ty);
+    let mutable_by_value_borrow = matches!(ownership, Some(Ownership::BorrowVar))
+      && matches!(
+        plain_ty,
+        Type::Int64 | Type::Float64 | Type::Boolean | Type::Symbol
+      );
+    declare_local(
+      &mut env,
+      &mut mutable_locals,
+      &p.name,
+      plain_ty,
+      mutable_by_value_borrow,
+    );
   }
   // Plan 39: a splat parameter is bound inside the body as a real
   // `Array[Elem]` — call sites pack it into one at each call site (the
@@ -13922,6 +13950,61 @@ mod tests {
         .iter()
         .any(|d| d.message.contains("message-safety") && d.message.contains('w')),
       "expected a message-safety diagnostic naming `w`: {errs:?}"
+    );
+  }
+
+  // Found and closed 2026-09-21 (this session's "find all bugs" sweep,
+  // `spec/OWNERSHIP.md` §10 / plan 84's own disclosed gap): a top-level
+  // function's `borrow var`-typed BY-VALUE parameter can now actually
+  // be reassigned inside its own body — `emerald-codegen` has bound
+  // this to a real LLVM `ptr` parameter plus a writeback mechanism ever
+  // since plan 84 shipped, but this sema check rejected `Stmt::Assign`
+  // to EVERY parameter unconditionally, so that codegen was unreachable
+  // from real `.em` source.
+  #[test]
+  fn accepts_reassigning_a_top_level_borrow_var_primitive_parameter() {
+    let src = "fn increment(n: borrow var Int64): Void do\n  n = n + 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    assert_eq!(
+      check_program(&program),
+      Ok(()),
+      "reassigning a `borrow var Int64` parameter must be accepted at the top level"
+    );
+  }
+
+  // A `borrow` (not `borrow var`) primitive parameter is read-only —
+  // this must still be rejected exactly like an ordinary immutable
+  // parameter, unaffected by the fix immediately above.
+  #[test]
+  fn rejects_reassigning_a_plain_borrow_primitive_parameter() {
+    let src = "fn describe(n: borrow Int64): Void do\n  n = n + 1\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a plain `borrow` (not `borrow var`) parameter must stay immutable");
+    assert!(
+      errs.iter().any(|d| d.message.contains("immutable")),
+      "expected an immutability diagnostic: {errs:?}"
+    );
+  }
+
+  // The real, disclosed scope boundary from the same fix: a METHOD's
+  // by-value `borrow var` parameter keeps plan 83's original
+  // full-erasure passthrough in `emerald-codegen` (no real pointer, no
+  // writeback — see `strip_ownership_in_type_expr`'s own doc comment),
+  // so opening the identical mutation syntax there would silently
+  // accept code whose mutation never reaches the caller. This must
+  // still be rejected.
+  #[test]
+  fn rejects_reassigning_a_borrow_var_primitive_method_parameter() {
+    let src = "class Counter\n  fn bump(n: borrow var Int64): Void do\n    n = n + 1\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "reassigning a `borrow var Int64` METHOD parameter must still be rejected \
+       (no real pointer/writeback codegen exists for methods)",
+    );
+    assert!(
+      errs.iter().any(|d| d.message.contains("immutable")),
+      "expected an immutability diagnostic: {errs:?}"
     );
   }
 

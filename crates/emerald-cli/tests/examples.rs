@@ -179,9 +179,13 @@ fn domain_types_em_prints_expected_sequence() {
 }
 
 // Plans 83/84's `own`/`borrow`/`borrow var` (`spec/OWNERSHIP.md` §2/§9/§10).
+// The trailing `42` is this session's own "find all bugs" sweep fix
+// (2026-09-21): a top-level `borrow var Int64` parameter can now
+// actually be reassigned, reaching the real pointer/writeback codegen
+// mechanism plan 84 already built.
 #[test]
 fn ownership_em_prints_expected_sequence() {
-  assert_eq!(compile_and_run("ownership.em"), "10\n11\n10\n21\n");
+  assert_eq!(compile_and_run("ownership.em"), "10\n11\n10\n21\n42\n");
 }
 
 // Plan 85's `ownership-actor-ffi-integration` (`spec/OWNERSHIP.md` §7):
