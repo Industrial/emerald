@@ -1729,6 +1729,38 @@ fn is_option_type(ty: &Type, _classes: &HashMap<String, ClassInfo>) -> bool {
   matches!(ty, Type::Enum(name) if name == "Option" || name.starts_with("Option$"))
 }
 
+// Plan 93's `leaf-actor-local-handle-enforcement`: `true` for
+// `NativeHandle` itself, or for any `Type::Class` whose own (flattened)
+// fields transitively contain one — checked at every cross-actor call
+// site (`infer_expr_type`'s `Expr::MethodCall` arm) so a class holding
+// a native resource handle can never be packed into a cross-actor
+// message, matching this plan's own Decision log ("a handle is actor-
+// local... enforced at the codegen boundary, not merely documented").
+// `seen` guards a self-/mutually-referential class graph the same way
+// `resolve_class_chain`'s own callers already guard cycles elsewhere
+// in this file.
+fn type_contains_native_handle(
+  ty: &Type,
+  classes: &HashMap<String, ClassInfo>,
+  seen: &mut HashSet<String>,
+) -> bool {
+  match ty {
+    Type::Newtype(name, _) if name == "NativeHandle" => true,
+    Type::Class(name) => {
+      if !seen.insert(name.clone()) {
+        return false;
+      }
+      classes.get(name).is_some_and(|info| {
+        info
+          .fields
+          .values()
+          .any(|ft| type_contains_native_handle(ft, classes, seen))
+      })
+    }
+    _ => false,
+  }
+}
+
 /// Plan 73's Decision log: resolves and checks a variant CONSTRUCTION
 /// (`Expr::Call(name, args)`, or a bare zero-arg `Expr::Ident(name)` —
 /// `Option[T]`'s own `None`) directly against one SPECIFIC, already-known
@@ -3251,6 +3283,45 @@ fn infer_expr_type(
       }
       Ok(Type::String)
     }
+    // Plan 93's own Concrete Proof: three compiler-intrinsic free
+    // functions backing `crates/emerald-rt`'s `handle` module, checked
+    // by exact name exactly like `puts`/`gets`/`is_valid_int` above — a
+    // real, disclosed correction to the plan's own original sketch
+    // (`Counter.native_open`-style `ClassName.method` static dispatch),
+    // found only by running it: this language has no user-declarable
+    // class-static-method syntax at all (`fn self.foo` fails to parse).
+    Expr::Call(name, args) if name == "handle_counter_open" => {
+      if !args.is_empty() {
+        return Err(Diagnostic::new(
+          format!(
+            "`handle_counter_open` expects 0 arguments, found {}",
+            args.len()
+          ),
+          expr.span,
+        ));
+      }
+      Ok(Type::Int64)
+    }
+    Expr::Call(name, args) if name == "handle_counter_bump" || name == "handle_counter_close" => {
+      if args.len() != 1 {
+        return Err(Diagnostic::new(
+          format!("`{name}` expects 1 argument, found {}", args.len()),
+          expr.span,
+        ));
+      }
+      let arg_ty = infer_expr_type(&args[0], env, sigs, classes, self_fields, gctx)?;
+      if arg_ty != Type::Int64 {
+        return Err(Diagnostic::new(
+          format!("`{name}` expects an Int64 handle argument, found {arg_ty:?}"),
+          args[0].span,
+        ));
+      }
+      Ok(if name == "handle_counter_bump" {
+        Type::Int64
+      } else {
+        Type::Void
+      })
+    }
     // Plan 47's Decision log: `assert`/`assert_eq` are recognized by
     // literal call name, exactly the mechanism `puts`/`gets` already
     // use above — not new `Stmt` variants. The trailing argument is
@@ -4457,6 +4528,23 @@ fn infer_expr_type(
       // is a local-only setup call, never a cross-actor send, so it's
       // already excluded by construction (that branch already returned).
       if info.is_actor && !matches!(&recv.node, Expr::Ident(n) if n == "self") {
+        // Plan 93's `leaf-actor-local-handle-enforcement`: reject
+        // BEFORE returning the cross-actor `Result`-wrapped type below —
+        // a native resource handle (or a class holding one) is
+        // actor-local, process-local data that may never be packed
+        // into a cross-actor message's argv.
+        for a in args {
+          let arg_ty = infer_expr_type(a, env, sigs, classes, self_fields, gctx)?;
+          let mut seen = HashSet::new();
+          if type_contains_native_handle(&arg_ty, classes, &mut seen) {
+            return Err(Diagnostic::new(
+              format!(
+                "native resource handles cannot cross an actor boundary — `{method}`'s argument here holds one"
+              ),
+              a.span,
+            ));
+          }
+        }
         return Ok(Type::Result(
           Box::new(Type::Void),
           Box::new(Type::Enum("SendError".to_string())),
@@ -10927,6 +11015,31 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       newtype_underlying: None,
     },
   );
+  // Plan 93's Decision log: `NativeHandle` — a compiler-synthesized
+  // newtype over `Int64` (no source `newtype` declaration anywhere),
+  // registered the same way `NativeError` registers as a compiler-
+  // synthesized class immediately above. A future resource-holding
+  // domain plan declares its own handle field as `NativeHandle`
+  // instead of a bare `Int64` — nominally distinct from `Int64` (so a
+  // handle can never be silently mixed up with ordinary integer data)
+  // but zero-cost at runtime (newtype lowering, plan 81's own finding,
+  // applies here unchanged) — and `emerald-codegen`'s own `is_wire_
+  // safe_class_field` rejects it from ever crossing an actor boundary
+  // (`leaf-actor-local-handle-enforcement`).
+  classes.insert(
+    "NativeHandle".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
   for item in &program.items {
     if let Item::Class(c) = item {
       if !c.type_params.is_empty() {
@@ -15563,5 +15676,34 @@ mod tests {
         .any(|d| d.message.contains("ownership") && d.message.contains("return")),
       "{errs:?}"
     );
+  }
+
+  // --- Plan 93's `leaf-actor-local-handle-enforcement` --------------
+
+  #[test]
+  fn rejects_a_native_handle_holding_class_crossing_an_actor_boundary() {
+    let src = "class Holder\n  h: NativeHandle\n\n  fn initialize(h: NativeHandle): Void do\n    @h = h\n  end\nend\n\nactor Receiver\n  fn take(x: Holder): Void do\n    puts \"took it\"\n  end\nend\n\nfn run: Void do\n  r: Receiver = Receiver.spawn()\n  h: NativeHandle = NativeHandle.new(1)\n  holder: Holder = Holder.new(h)\n  r.take(holder)\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "a class holding a NativeHandle field must be rejected as a cross-actor message argument",
+    );
+    assert!(
+      errs.iter().any(|d| d
+        .message
+        .contains("native resource handles cannot cross an actor boundary")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn accepts_an_ordinary_int64_holding_class_crossing_an_actor_boundary() {
+    // Regression: `leaf-actor-local-handle-enforcement`'s own check must
+    // not false-positive on ordinary, non-`NativeHandle` class data —
+    // the exact same shape as the test immediately above, minus the
+    // `NativeHandle` field.
+    let src = "class Holder\n  v: Int64\n\n  fn initialize(v: Int64): Void do\n    @v = v\n  end\nend\n\nactor Receiver\n  fn take(x: Holder): Void do\n    puts \"took it\"\n  end\nend\n\nfn run: Void do\n  r: Receiver = Receiver.spawn()\n  holder: Holder = Holder.new(1)\n  r.take(holder)\nend\n\nrun()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    check_program(&program)
+      .expect("an ordinary Int64-holding class must still cross an actor boundary freely");
   }
 }

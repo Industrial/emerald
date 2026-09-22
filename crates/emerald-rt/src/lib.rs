@@ -62,6 +62,8 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+mod handle;
+
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
 // pass (plan 92's Decision log), so this crate can hardcode it with
@@ -323,6 +325,47 @@ fn fnv1a_hash_bytes(bytes: &[u8]) -> u32 {
     hash = hash.wrapping_mul(FNV_PRIME);
   }
   hash
+}
+
+// Plan 93's own Concrete Proof: a trivial in-memory counter "resource"
+// backed by `handle::handle_alloc`/`_get`/`_get_mut`/`_close` — not a
+// real I/O resource (that's a later domain plan's job, per Out of
+// scope), the vehicle this plan uses to exercise the registry's own
+// lifecycle end to end through a real Emerald program.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_handle_counter_open() -> i64 {
+  catch_and_raise(move || handle::handle_alloc(Box::new(0i64), "counter"))
+}
+
+/// # Safety
+/// `id` should be a value `emerald_rt_handle_counter_open` returned —
+/// a closed or unknown `id` raises a real `NativeError` (plan 92's
+/// channel) rather than corrupting memory or aborting the process.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_handle_counter_bump(id: i64) -> i64 {
+  catch_and_raise(move || {
+    match handle::handle_get_mut::<i64, _>(id, "counter", |v| {
+      *v += 1;
+      *v
+    }) {
+      Ok(v) => v,
+      Err(msg) => raise_native_error(&msg),
+    }
+  })
+}
+
+/// # Safety
+/// Always safe to call, including on an already-closed or unknown
+/// `id` — closing is idempotent (`leaf-double-close-is-a-noop-not-an-
+/// error`) and never raises.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_handle_counter_close(id: i64) {
+  catch_and_raise(move || {
+    handle::handle_close(id);
+  })
 }
 
 // Real, expected consequence of introducing genuine cross-archive

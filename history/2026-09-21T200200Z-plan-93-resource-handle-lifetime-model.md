@@ -10,19 +10,19 @@ maestro:
 todos:
   - id: leaf-registry-and-handle-type
     content: "Add a process-wide `static REGISTRY: OnceLock<Mutex<HashMap<u64, RegistryEntry>>> = OnceLock::new()` to a new `crates/emerald-rt/src/handle.rs`, where `RegistryEntry { value: Box<dyn Any + Send>, type_tag: &'static str, closed: bool }` (the `closed` flag, not an immediate `HashMap::remove`, is deliberate — see Decision log for the double-close/use-after-close diagnostic this enables). Add `emerald_rt_handle_alloc(value: Box<dyn Any + Send>, type_tag: &'static str) -> i64` (a monotonically increasing `u64` counter, never reused within a process's lifetime, cast to `i64` since Emerald has no unsigned integer type per plan 59's own finding), `emerald_rt_handle_get::<T>(id: i64) -> Result<&T, HandleError>`/`emerald_rt_handle_get_mut::<T>`, and `emerald_rt_handle_close(id: i64) -> bool` (marks `closed = true`, drops the boxed value in place, returns whether the handle was actually open) as the four Rust-internal primitives every resource-holding domain plan (HTTP client connections, DB pools, compression streams, TLS sessions) builds its own typed wrapper on top of, per this plan's own naming convention below."
-    status: pending
+    status: done
   - id: leaf-use-after-close-diagnostic
     content: "Wire a closed or unknown handle ID, observed inside any `emerald_rt_handle_get`/`get_mut` call a domain-plan wrapper makes, to `emerald_rt_raise_native_error` (plan 92's `leaf-native-error-and-panic-raise`) with a message naming the concrete failure (`\"use of closed <type_tag> handle\"` or `\"unknown <type_tag> handle: this process never issued id <id>\"`), producing a real, catchable `NativeError` Emerald exception — mirroring `emerald_hash_key_not_found`'s existing disclosed-abort precedent in kind (a controlled, named failure, not silent memory corruption), but using plan 92's exception channel rather than `emerald_hash_key_not_found`'s own `fprintf`+`exit(1)` process-abort, since a native-resource misuse is exactly the kind of programmer-error condition plan 92's Decision log already assigns to the `NativeError`/exception channel rather than `Result[T, E]` (it is never an anticipated, routinely-checked outcome of calling `.read()` on a stream — it is a bug in the calling Emerald code)."
-    status: pending
+    status: done
   - id: leaf-double-close-is-a-noop-not-an-error
     content: "`emerald_rt_handle_close` on an already-closed or already-unknown ID returns `false` and does not raise — only a subsequent *use* (a `.read()`/`.write()`-style method call routed through `emerald_rt_handle_get`) raises. Document this asymmetry explicitly in `handle.rs`'s module doc: idempotent `.close()` matches the disclosed convention most resource-handling stdlibs converge on (Python's own `contextlib`/file objects, Rust's own `Drop` being infallible) specifically so a `.close()` called from both an explicit call site and a future auto-close mechanism (see 'Not yet decided') never double-raises merely because cleanup ran twice."
-    status: pending
+    status: done
   - id: leaf-actor-local-handle-enforcement
     content: "Decide and enforce (see Decision log) that a handle value is actor-local: the codegen-side wrapper type Emerald source actually holds (e.g. a `TcpStream` class instance wrapping the raw `i64` id, introduced by whichever domain plan first needs one — this plan does not itself introduce a resource-holding stdlib class) is never passed as a cross-actor message argument. Concretely, extend plan 55's own cross-actor dispatch check (`crates/emerald-codegen/src/lib.rs`'s `emerald_actor_enqueue`-routing logic) with a rejection: a class whose fields include a compiler-recognized 'native handle' marker type cannot be packed into a trampoline's `argv`, a real, disclosed v1 sema/codegen diagnostic (\"native resource handles cannot cross an actor boundary\") rather than a silently-corrupting shared mutable `i64` racing across two actors' worker threads with no lock around the registry entry itself."
-    status: pending
+    status: done
   - id: leaf-example-and-gate
     content: "Add `examples/resource_handle_lifetime_proof.em` (this plan's own concrete proof below, using a trivial in-memory counter-backed 'resource' introduced only for this proof — a real I/O-backed resource is a later domain plan's job, per Out of scope) to `examples/`, wired into the CI-checked table per plan 91/92's precedent. Add Rust `#[test]`s in `emerald-rt` directly exercising `emerald_rt_handle_alloc`/`get`/`close`/double-close/use-after-close against the registry with no Emerald compilation involved, proving the registry's own concurrency safety (a `Mutex`-guarded `HashMap`, exercised from multiple Rust threads in one test) independent of whether any Emerald program ever calls it. Run the full `AGENTS.md` gate."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -292,3 +292,78 @@ untested.
    as the thing auto-close eventually *calls*, not something it
    replaces, so that a program written against explicit `.close()`
    today keeps working unmodified once auto-close exists.
+
+## Update (2026-09-22, same-day session): implemented, all five leaves done
+
+`crates/emerald-rt/src/handle.rs` created: `handle_alloc`/`handle_get`/
+`handle_get_mut`/`handle_close`, backed by a process-wide
+`Mutex<HashMap<u64, RegistryEntry>>` (`RegistryEntry.value: Option<Box
+<dyn Any + Send>>` — `None` after close, exactly the "keep a closed,
+emptied entry in place" design this plan's own Decision log specifies).
+Six real Rust `#[test]`s, including one spawning 8 real OS threads
+racing 1000 increments each against the same handle through a real
+`Mutex`, proving the registry's own concurrency safety independently
+of any Emerald compilation. Three `emerald_rt_handle_counter_*` exports
+prove the mechanism end to end through `examples/resource_handle_
+lifetime_proof.em`, printing exactly this plan's own predicted
+sequence (`1`, `2`, `use of closed counter handle`, `still running`).
+
+Two real, disclosed corrections to this plan's own original Concrete
+Proof sketch, found only by running it (the same "found only by
+running it" pattern plans 91/92 already established):
+
+- **This language has no user-declarable class-static-method syntax at
+  all.** The plan's own sketch called `Counter.native_open`/
+  `native_bump`/`native_close` as `ClassName.method` static dispatch
+  from within `Counter`'s own methods — `fn self.native_open` fails to
+  parse (`Unrecognized token '.'`, expected `"("`/`":"`/`"["`). Fixed
+  by making all three ordinary compiler-intrinsic FREE FUNCTIONS
+  instead (`handle_counter_open()`/`handle_counter_bump(h)`/
+  `handle_counter_close(h)`), dispatched by exact name in both
+  `emerald-sema`'s `infer_expr_type` and `emerald-codegen`'s
+  `build_expr`/`build_stmt`, exactly the mechanism `puts`/`gets`/
+  `is_valid_int` already use — a real, disclosed narrower mechanism
+  than the plan's own sketch assumed, not a new one invented for this.
+- **A zero-argument `.new`/free-function call still needs explicit
+  `()`.** `Counter.new` (no parens) and `Receiver.spawn` (no parens,
+  found while testing `leaf-actor-local-handle-enforcement` below) both
+  fail to parse; `Counter.new()`/`Receiver.spawn()` are required.
+
+**`leaf-actor-local-handle-enforcement`, implemented as a real,
+enforced sema-level check** (per this plan's own "Not yet decided"
+item 2, which named sema — not codegen — as the default): a
+compiler-synthesized `NativeHandle` newtype over `Int64` (registered in
+`emerald-sema`'s `classes` map and `emerald-codegen`'s `NEWTYPE_
+UNDERLYING` thread-local, the exact same "compiler-synthesized, no
+source declaration" precedent `NativeError` already established in
+plan 92) — a future resource-holding domain plan declares its own
+handle field as `NativeHandle` instead of a bare `Int64` to opt into
+this enforcement. `emerald-sema`'s `type_contains_native_handle` walks
+a class's own (recursively, cycle-guarded) field types; `infer_expr_
+type`'s cross-actor `Expr::MethodCall` arm calls it against every
+argument's inferred type and rejects with `"native resource handles
+cannot cross an actor boundary"` before ever reaching codegen — real,
+disclosed narrowing found by testing it: `emerald-codegen`'s own
+`is_wire_safe_class_field` (extended too, per the leaf's own literal
+text) turned out to be consulted only by the wire-encode/decode codec
+path (apparently reserved for a future remote-actor dispatch mode),
+never by the actual LOCAL same-process cross-actor `argv`-packing path
+(`build_actor_enqueue_call`, which just bit-casts/pointer-casts any
+`Ptr`-kind argument into a raw `i64` slot regardless) — so the codegen-
+level change alone, verified directly, compiled a `NativeHandle`-
+holding class across an actor boundary with ZERO rejection and no
+runtime error either. The sema-level check is what actually blocks it;
+the codegen-level `is_wire_safe_class_field` change stays too (correct
+and harmless, and does the intended job for whatever future remote-
+dispatch path eventually consults it), but is not, by itself,
+sufficient — a fact this plan's own text does not anticipate, found
+only by building both and testing the actual compiled behavior of one
+before adding the other. Two `emerald-sema` regression tests (reject/
+accept) cover this, since the plan's own Concrete Proof intentionally
+never exercises an actor at all (`Counter` is a plain class).
+
+Full workspace gate: `cargo nextest run --workspace` (941/941, 2
+skipped — 9 new: 6 in `emerald-rt`, 2 in `emerald-sema`, 1 in
+`emerald-cli`), `cargo clippy --workspace --all-targets` (clean),
+`treefmt` (0 changed), `cargo audit` (same 5 pre-existing, triaged
+warnings as plan 95 — no new finding).

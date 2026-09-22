@@ -126,7 +126,7 @@ thread_local! {
 /// correctly overwrites rather than accumulates stale entries from a
 /// previous, unrelated compile.
 fn set_newtype_underlying(program: &Program) {
-  let map: HashMap<String, TypeExpr> = program
+  let mut map: HashMap<String, TypeExpr> = program
     .items
     .iter()
     .filter_map(|item| match item {
@@ -134,6 +134,24 @@ fn set_newtype_underlying(program: &Program) {
       _ => None,
     })
     .collect();
+  // Plan 93's own Concrete Proof and `leaf-actor-local-handle-
+  // enforcement`: `NativeHandle` is a compiler-synthesized newtype
+  // (no source `newtype` declaration anywhere), registered here the
+  // same way `NativeError` registers as a compiler-synthesized class
+  // elsewhere in this file — resolves to `Int64`'s own storage kind
+  // for every ordinary purpose (a `handle: NativeHandle` field costs
+  // nothing beyond a bare `Int64` field would), but `is_wire_safe_
+  // class_field` below checks this exact name BEFORE this resolution
+  // ever runs, specifically so it is never wire-safe — a future
+  // resource-holding domain plan's own class, declaring its handle
+  // field as `NativeHandle` instead of a bare `Int64`, is what makes
+  // that class rejected from crossing an actor boundary at all,
+  // versus a bare `Int64` field (ordinary ambient data) which stays
+  // wire-safe as it always has.
+  map.insert(
+    "NativeHandle".to_string(),
+    TypeExpr::Named("Int64".to_string()),
+  );
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
@@ -4177,6 +4195,16 @@ fn is_wire_safe_class_field(
   actor_names: &HashSet<String>,
   seen: &mut HashSet<String>,
 ) -> bool {
+  // Plan 93's `leaf-actor-local-handle-enforcement`: a `NativeHandle`-
+  // typed field (plan 93's own compiler-synthesized newtype, see
+  // `set_newtype_underlying`) is never wire-safe, checked before the
+  // ordinary `value_kind_for_type` resolution below would otherwise
+  // resolve it straight through to `Int64` (wire-safe) — a native
+  // resource handle is process-local, actor-local data by this plan's
+  // own Decision log, never safe to copy into a cross-actor message.
+  if ty == "NativeHandle" {
+    return false;
+  }
   match value_kind_for_type(&TypeExpr::Named(ty.to_string())) {
     ValKind::Int64 | ValKind::Float64 | ValKind::Bool | ValKind::Symbol => true,
     ValKind::Str => true,
@@ -4828,6 +4856,12 @@ struct Ctx<'a, 'ctx> {
   /// handling, the same way `puts` is, since it must be usable as an
   /// expression.
   gets: FunctionValue<'ctx>,
+  /// Plan 93's own Concrete Proof — the three `emerald_rt_handle_
+  /// counter_*` exports, dispatched by exact free-function name
+  /// exactly like `gets` above.
+  handle_counter_open: FunctionValue<'ctx>,
+  handle_counter_bump: FunctionValue<'ctx>,
+  handle_counter_close: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -6202,6 +6236,45 @@ fn build_expr<'ctx>(
         .build_call(ctx.gets, &[], "getstmp")
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Str))
+    }
+    // Plan 93's own Concrete Proof — dispatched by exact free-function
+    // name exactly like `gets` immediately above.
+    Expr::Call(name, args) if name == "handle_counter_open" => {
+      if !args.is_empty() {
+        return Err(format!(
+          "codegen: `handle_counter_open` expects 0 arguments, found {}",
+          args.len()
+        ));
+      }
+      let call = builder
+        .build_call(ctx.handle_counter_open, &[], "handlecounteropentmp")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Int64))
+    }
+    Expr::Call(name, args) if name == "handle_counter_bump" => {
+      if args.len() != 1 {
+        return Err(format!(
+          "codegen: `handle_counter_bump` expects 1 argument, found {}",
+          args.len()
+        ));
+      }
+      let (arg_val, _) = build_expr(
+        context,
+        builder,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call = builder
+        .build_call(
+          ctx.handle_counter_bump,
+          &[arg_val.into()],
+          "handlecounterbumptmp",
+        )
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Int64))
     }
     // Plan 53's Decision log: `is_valid_int`/`parse_digits` are
     // compiler-known intrinsics, mirroring `gets`'s own hard-coded-name
@@ -12754,6 +12827,38 @@ fn build_stmt<'a, 'ctx>(
         .map_err(|e| e.to_string())?;
       Ok(false)
     }
+    // Plan 93's own Concrete Proof: `handle_counter_close` is
+    // `Void`-returning, so (like `gets` immediately above) it must be
+    // reachable as a bare statement — it is never in `ctx.user_func_
+    // ids`, so it could never reach the generic `Expr::Call` arm below.
+    Stmt::Expr(Spanned {
+      node: Expr::Call(name, args),
+      ..
+    }) if name == "handle_counter_close" => {
+      if args.len() != 1 {
+        return Err(format!(
+          "codegen: `handle_counter_close` expects 1 argument, found {}",
+          args.len()
+        ));
+      }
+      let (arg_val, _) = build_expr(
+        context,
+        builder,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      builder
+        .build_call(
+          ctx.handle_counter_close,
+          &[arg_val.into()],
+          "handlecounterclosetmp",
+        )
+        .map_err(|e| e.to_string())?;
+      Ok(false)
+    }
     // Plan 39: a bare-statement call to a `Void`-returning function
     // (`greet(name: "yo")` with no `puts`/assignment around it) must
     // NOT hit `Expr::Call`/`Expr::CallKw`'s own `Void`-rejection —
@@ -17076,6 +17181,23 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[], false),
     Some(Linkage::External),
   );
+  // Plan 93's own Concrete Proof: `crates/emerald-rt`'s handle
+  // registry, exercised through a trivial in-memory counter.
+  let handle_counter_open = module.add_function(
+    "emerald_rt_handle_counter_open",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let handle_counter_bump = module.add_function(
+    "emerald_rt_handle_counter_bump",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let handle_counter_close = module.add_function(
+    "emerald_rt_handle_counter_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -17645,6 +17767,9 @@ fn compile_to_object_impl(
     file_read,
     file_write,
     gets,
+    handle_counter_open,
+    handle_counter_bump,
+    handle_counter_close,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

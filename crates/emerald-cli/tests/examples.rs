@@ -212,3 +212,17 @@ fn ownership_em_prints_expected_sequence() {
 fn ffi_ownership_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("ffi_ownership.em"), "owned copy\nworld\n");
 }
+
+// Plan 93's resource handle & lifetime model (`crates/emerald-rt`'s
+// handle registry): two real bumps of the same counter handle (`1`,
+// `2`), a use-after-close raising a real `NativeError` caught via
+// `rescue` (its message names the closed handle), and a redundant
+// second `.close()` proving double-close is a genuine no-op rather
+// than merely untested.
+#[test]
+fn resource_handle_lifetime_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("resource_handle_lifetime_proof.em"),
+    "1\n2\nuse of closed counter handle\nstill running\n"
+  );
+}
