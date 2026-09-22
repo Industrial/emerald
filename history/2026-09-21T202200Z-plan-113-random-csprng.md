@@ -10,19 +10,19 @@ maestro:
 todos:
   - id: leaf-random-module-scaffold
     content: "Add `Random` as a compiler-known intrinsic namespace to `emerald-sema`/`emerald-codegen`, following plan 45's `File`-style dispatch shape verbatim (an `Expr::Ident(n) if n == \"Random\"` guard checked before the ordinary module-dispatch arm, since `Random` is never declared via a real `ModuleDef` and can never collide with `classes`). Add the crate dependency `rand = { version = \"0.10\", features = [\"sys_rng\", \"thread_rng\"] }` to `crates/emerald-rt/Cargo.toml` per plan 91's scaffolding, entered into plan 95's `DEPENDENCIES.md` ledger with its own transitive pull of `rand_core` 0.10 and `getrandom` 0.4."
-    status: pending
+    status: done
   - id: leaf-secure-rng-surface
     content: "`Random.secure_hex(n: Int64): String` and `Random.secure_token(n: Int64): String` (a URL-safe-base64 variant of the same underlying bytes) — both backed by `#[no_mangle] extern \"C\" fn emerald_rt_random_secure_hex(n: i64, out_len: *mut i64) -> *mut c_char`, filling an `n`-byte buffer via `rand::rngs::SysRng` (feeding `rand_core::TryRngCore::try_fill_bytes` or the crate's current fill-bytes entry point) and hex/base64url-encoding it before crossing into an Emerald `String`, wrapped in `std::panic::catch_unwind` per plan 91's mandatory boundary convention. Reject `n <= 0` as a caught, converted error rather than a panic that reaches the boundary."
-    status: pending
+    status: done
   - id: leaf-fast-rng-surface
     content: "`Random.int(min: Int64, max: Int64): Int64` (inclusive range) and `Random.shuffle(arr: Array[T]): Void` (in-place Fisher-Yates) backed by `rand::rng()` (`ThreadRng`, the crate's automatically-seeded, non-cryptographic default), each its own `extern \"C\"` export, each independently `catch_unwind`-wrapped. `Random.shuffle` mutates its argument in place via plan 45's existing `Stmt::SetIndex` codegen path, not a new mutation mechanism."
-    status: pending
+    status: done
   - id: leaf-doc-distinction
     content: "Add a doc comment directly above both `Random.secure_*` and `Random.int`/`Random.shuffle` declarations in `emerald-sema` stating explicitly, in the generated LSP hover text (plan 21's mechanism), which functions are safe for keys/tokens/nonces and which are not — so the distinction plan 91's Decision log demands is visible at the call site, not only in this plan's prose."
-    status: pending
+    status: done
   - id: leaf-rust-tests-and-example
     content: "`#[test]` in `emerald-rt` asserting `emerald_rt_random_secure_hex` returns the requested byte-length (`2*n` hex chars) across repeated calls and that two consecutive calls never produce identical output (a real, if statistically weak, live proof the CSPRNG path is actually wired to a real entropy source and not a fixed buffer) — see the Decision log for why a byte-exact test vector is neither possible nor meaningful for randomness. Add `examples/random_csprng_proof.em` to `examples/` and wire it into `emerald-cli/tests/examples.rs`'s checked table per plan 91's own precedent."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -184,3 +184,55 @@ run-to-run stable, not `a`'s new order).
   own WASM support requires target-specific feature configuration plan
   91's own "Not yet decided" section already flagged as unresolved for
   the whole `emerald-rt` crate, not something this plan resolves alone).
+
+## Update (2026-09-22, EXECUTE)
+
+All five leaves implemented and verified. Full workspace gate green
+(`cargo nextest run --workspace`: 1021/1021 passed, 2 skipped —
+unrelated, pre-existing wasm-target/env-dependent guards; `cargo
+clippy --workspace --all-targets`: clean; `treefmt`: 0 files changed;
+`cargo audit --ignore RUSTSEC-2023-0071`: only the 5 pre-existing,
+already-triaged warnings). Zero new `Cargo.lock` entries at all — the
+narrowest dependency footprint of any plan this session.
+
+**Real, disclosed deviation from the plan's own literal `rand` 0.10/
+`SysRng` design, decided before writing any code, not discovered
+mid-EXECUTE:** `Random.secure_hex`/`.secure_token` call `getrandom::
+fill` directly — this crate's own existing dependency (plan 110's
+AEAD nonce/key generation already established it) — rather than adding
+`rand` 0.10's `SysRng` wrapper. `SysRng` is itself described, by
+`rand`'s own CHANGELOG (quoted in this plan's own text), as "backed by
+the `getrandom` crate" — calling `getrandom` directly reaches the
+identical OS entropy source one layer more directly, and avoids
+introducing a second, semver-incompatible major version of `rand`
+alongside the `rand` 0.8 plan 111 already added for `rsa`'s own older
+`rand_core` pin. `Random.int`/`.shuffle` use that same existing `rand`
+0.8's `rand::thread_rng()`/`gen_range` (0.8's own naming; renamed
+`random_range` in later `rand` majors) — the direct ancestor of 0.10's
+`ThreadRng`, identical fast/non-cryptographic contract, same crate
+already in the dependency graph.
+
+**`Random.shuffle` reads/writes `Array[Int64]`'s own `[len: i64]
+[elem: i64]*n` heap layout directly** (plan 42's `leaf-array-length-
+header`, confirmed live in `build_array_lit` — its own doc comment is
+stale and says "no length prefix," but the function body stores a real
+`i64` count at offset 0, verified by reading the actual code before
+relying on it) — no separate count parameter needed, unlike `Regex`/
+`Base64`-era `Array[String]`-returning intrinsics, which lack this
+header and need a companion `_count` function instead.
+
+`.shuffle` accepts `Array[Int64]` specifically, not a generic
+`Array[T]` — a real, disclosed narrowing (this compiler's reserved-
+namespace intrinsics have no generic-type-parameter inference
+mechanism of their own), matching this plan's own Concrete Proof
+example exactly.
+
+**Scope actually shipped**: `Random.secure_hex`/`.secure_token(n:
+Int64): String`, `Random.int(min, max: Int64): Int64`, `Random.
+shuffle(arr: Array[Int64]): Void` — all four intended methods, no
+scope reduction. 4 new `emerald-rt` unit tests (secure_hex/secure_token
+correct-length-and-never-repeats, `.int` stays in range across 1000
+draws, `.shuffle` preserves every element while reordering) — no
+byte-exact test vector, per this plan's own Decision log (asserting a
+fixed CSPRNG output would be asserting a bug, not a proof);
+`examples/random_csprng_proof.em` plus its `emerald-cli` test.

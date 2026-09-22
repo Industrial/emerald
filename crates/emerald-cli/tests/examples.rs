@@ -444,3 +444,14 @@ fn secure_compare_proof_em_prints_expected_sequence() {
     "true\nfalse\nfalse\n"
   );
 }
+
+// Plan 113 (Cryptographically Secure Random Number Generation):
+// `token`'s own value is randomized by design — only its length
+// (`32` for 16 hex-encoded bytes) is checked.
+#[test]
+fn random_csprng_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("random_csprng_proof.em"),
+    "32\ntrue\ntrue\n"
+  );
+}

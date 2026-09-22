@@ -137,6 +137,7 @@ mod humantime;
 mod json;
 mod log;
 mod math;
+mod random;
 mod regex;
 mod secure_compare;
 mod system;
@@ -1352,6 +1353,38 @@ pub unsafe extern "C" fn emerald_rt_rsa_verify(
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_secure_compare(a: *const c_char, b: *const c_char) -> i64 {
   catch_and_raise(move || secure_compare::secure_compare(a, b))
+}
+
+// Plan 113 (Cryptographically Secure Random Number Generation):
+// `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle` — see
+// `random.rs`'s own module doc.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_random_secure_hex(n: i64) -> *const c_char {
+  catch_and_raise(move || random::random_secure_hex(n))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_random_secure_token(n: i64) -> *const c_char {
+  catch_and_raise(move || random::random_secure_token(n))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_random_int(min: i64, max: i64) -> i64 {
+  catch_and_raise(move || random::random_int(min, max))
+}
+
+/// # Safety
+/// `arr` must be a live `Array[Int64]` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_random_shuffle(arr: *mut c_void) {
+  catch_and_raise(move || random::random_shuffle(arr as *mut i64))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

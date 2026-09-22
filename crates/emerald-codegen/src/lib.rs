@@ -5069,6 +5069,12 @@ struct Ctx<'a, 'ctx> {
   rsa_verify: FunctionValue<'ctx>,
   /// Plan 117 (Constant-Time Comparison) — `SecureCompare.eq`.
   secure_compare: FunctionValue<'ctx>,
+  /// Plan 113 (Cryptographically Secure Random Number Generation) —
+  /// `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`.
+  random_secure_hex: FunctionValue<'ctx>,
+  random_secure_token: FunctionValue<'ctx>,
+  random_int: FunctionValue<'ctx>,
+  random_shuffle: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8527,6 +8533,43 @@ fn build_method_call<'ctx>(
       )
       .map_err(|e| e.to_string())?;
     return Ok((is_true.into(), ValKind::Bool));
+  }
+
+  // Plan 113's Decision log: `Random.secure_hex`/`.secure_token`/
+  // `.int`/`.shuffle` — the same reserved-namespace static-call shape
+  // immediately above.
+  if recv_name == "Random" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "secure_hex" => (ctx.random_secure_hex, ValKind::Str),
+      "secure_token" => (ctx.random_secure_token, ValKind::Str),
+      "int" => (ctx.random_int, ValKind::Int64),
+      "shuffle" => (ctx.random_shuffle, ValKind::Void),
+      other => {
+        return Err(format!(
+          "codegen: unsupported Random static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "randomtmp")
+      .map_err(|e| e.to_string())?;
+    if ret_kind == ValKind::Void {
+      return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+    }
+    return Ok((call_result(call)?, ret_kind));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -19353,6 +19396,29 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 113 (Cryptographically Secure Random Number Generation):
+  // `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`. `.shuffle`
+  // takes the array's own bare heap pointer directly.
+  let random_secure_hex = module.add_function(
+    "emerald_rt_random_secure_hex",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let random_secure_token = module.add_function(
+    "emerald_rt_random_secure_token",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let random_int = module.add_function(
+    "emerald_rt_random_int",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let random_shuffle = module.add_function(
+    "emerald_rt_random_shuffle",
+    void_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -20102,6 +20168,10 @@ fn compile_to_object_impl(
     rsa_sign,
     rsa_verify,
     secure_compare,
+    random_secure_hex,
+    random_secure_token,
+    random_int,
+    random_shuffle,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

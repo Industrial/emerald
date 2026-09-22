@@ -4371,6 +4371,42 @@ fn infer_expr_type(
       )?;
       Ok(Type::Boolean)
     }
+    // Plan 113's Decision log: `Random.secure_hex`/`.secure_token`/
+    // `.int`/`.shuffle` — the same reserved-namespace static-call
+    // shape immediately above. `.secure_hex`/`.secure_token` are
+    // deliberately separate top-level names from `.int`/`.shuffle`,
+    // never a shared "secure: true" flag — a boolean flag is one
+    // easy-to-drop keyword away from silently downgrading to the
+    // non-cryptographic generator. `.shuffle` accepts `Array[Int64]`
+    // specifically (not a generic `Array[T]`) — a real, disclosed
+    // narrowing, since this compiler's reserved-namespace intrinsics
+    // have no generic-type-parameter inference mechanism of their own.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Random") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "secure_hex" | "secure_token" => (vec![Type::Int64], Type::String),
+        "int" => (vec![Type::Int64, Type::Int64], Type::Int64),
+        "shuffle" => (vec![Type::Array(Box::new(Type::Int64))], Type::Void),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Random has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
