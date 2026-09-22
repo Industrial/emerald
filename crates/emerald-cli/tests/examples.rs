@@ -395,3 +395,19 @@ fn system_info_proof_em_prints_expected_sequence() {
   );
   assert_eq!(lines.next(), None);
 }
+
+// Plan 109 (Cryptographic Hashing): Sha256/Sha3_256/Blake3/Md5
+// one-shot digests plus Sha256Hasher's incremental handle, each value
+// a real, independently-checkable test vector (see this plan's own
+// history doc for each one's primary source).
+#[test]
+fn crypto_hashing_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("crypto_hashing_proof.em"),
+    "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\n\
+     3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532\n\
+     af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262\n\
+     5eb63bbbe01eeed093cb22bb8f5acdc3\n\
+     b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\n"
+  );
+}

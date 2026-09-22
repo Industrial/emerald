@@ -10,22 +10,22 @@ maestro:
 todos:
   - id: leaf-bytes-type-foundation
     content: "New `Type::Bytes` — a two-word {ptr, len: Int64} fat value, sema-level distinct from both `String` (bare null-terminated buffer, no length) and `Array[T]` (bare pointer, also no length, per plan 45's finding) specifically because a hash digest's length is real, runtime-meaningful, and must round-trip exactly. `String.to_bytes(self): Bytes` (zero-copy — a `Bytes` view over the same malloc'd buffer plan 59 found `String` already is, length filled in via the existing `emerald_string_length`/strlen call) and `Bytes.to_hex(self): String` (a small, dependency-free hex-encoder in `emerald-rt`, needed so this plan's own proof output is printable via `puts`). This is shared plumbing plans 110 and 111 both depend on rather than redefining."
-    status: pending
+    status: done
   - id: leaf-emerald-rt-hash-deps
     content: "Add `sha2 = \"0.11\"`, `sha3 = \"0.12\"`, `blake3 = \"1.8\"`, `md-5 = \"0.11\"` to `crates/emerald-rt/Cargo.toml`. One `#[no_mangle] pub extern \"C\" fn emerald_rt_<algo>_hash(ptr: *const u8, len: i64, out: *mut u8) -> i64` per algorithm (six total), each body wrapped in `std::panic::catch_unwind` per plan 91's established convention, writing the algorithm's fixed-length digest into a caller-allocated `out` buffer and returning 0/-1 for success/panic, per plan 92's FFI/ABI error-signaling convention."
-    status: pending
+    status: done
   - id: leaf-one-shot-intrinsics
     content: "`Sha256.hash`/`Sha512.hash`/`Sha3_256.hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — six hardcoded intrinsic arms in `emerald-sema`/`emerald-codegen`, each shaped exactly like plan 45's `File.read`/`File.write` (matched on `Expr::Ident(n) if n == \"Sha256\"` etc., checked before the real module-dispatch arm, never colliding since none of these names ever populate `classes`/`module_names`)."
-    status: pending
+    status: done
   - id: leaf-incremental-hashers
     content: "`Sha256Hasher`/`Blake3Hasher` — two new inert sema-only reference types (CString's exact shape per plan 59: no new runtime representation, just an opaque pointer to a boxed Rust `sha2::Sha256`/`blake3::Hasher`). `Sha256.new(): Sha256Hasher`/`.update(self, data: Bytes): Void`/`.finalize(self): Bytes` and the Blake3 equivalent, backed by `emerald_rt_sha256_new/update/finalize` and `emerald_rt_blake3_new/update/finalize`, each catch_unwind-wrapped. `finalize` consumes the handle (frees the `Box` internally); the handle's lifetime/free story if `finalize` is never reached is plan 93's mechanism, not reinvented here."
-    status: pending
+    status: done
   - id: leaf-example-and-tests
     content: "`examples/crypto_hashing_proof.em` wired into `emerald-cli/tests/examples.rs`'s checked table. `#[test]`s in `emerald-rt` asserting each wrapper against a real, cited test vector: SHA-256(\"hello world\"), SHA3-256(\"abc\"), MD5(\"hello world\"), BLAKE3(\"\") — all independently verifiable against the algorithms' own primary sources, not invented."
-    status: pending
+    status: done
   - id: leaf-dependencies-ledger
     content: "`DEPENDENCIES.md` entries for `sha2`/`sha3`/`blake3`/`md-5` per plan 95's ledger convention: RustCrypto (sha2/sha3/md-5) vs. the BLAKE3 team (blake3) as source, current RustSec advisory status for each (recorded below), and the MD5 legacy-only usage restriction."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -272,3 +272,87 @@ agree bit-for-bit.
    something else) is plan 93's call; this plan's own leaf only commits
    to the handle being *inert and CString-shaped*, not to how its
    lifetime is ultimately managed.
+
+## Update (2026-09-22, EXECUTE)
+
+All six leaves implemented and verified; full workspace gate green
+(`cargo nextest run --workspace`: 1002/1002 passed, 2 skipped —
+unrelated, pre-existing wasm-target/env-dependent guards; `cargo
+clippy --workspace --all-targets`: clean; `treefmt`: 0 files changed;
+`cargo audit`: zero advisories against `sha2`/`sha3`/`blake3`/`md-5` —
+the only 5 warnings are the pre-existing, already-triaged
+`im`/`bitmaps`/`sized-chunks` transitive findings `DEPENDENCIES.md`
+already documents).
+
+**Resolution of item 1 (`Bytes`'s exact shape).** Built now, not
+deferred further — this was the third plan in the batch (after 123's
+own `String`-only workaround) to hit this exact gap, and 110/111 both
+cite it as a shared prerequisite. Real, disclosed deviation from this
+plan's own literal "two-word `{ptr, len: Int64}` fat value": `Bytes`
+is instead a compiler-synthesized `Int64` newtype — the identical
+zero-cost "opaque single machine word" shape `Regex`/`NativeHandle`/
+`LogFields` already use — carrying a bare heap pointer (never a
+`crate::handle` registry id) to a `[len: i64][data: u8 * len]` block,
+the same "pointer to a length-prefixed heap block" convention
+`Array[T]`/`Hash[K, V]` already establish, just byte-tight instead of
+8-byte-per-slot. Chosen over the literal two-word design specifically
+because a genuine fat value would require threading a second machine
+word through every function-call/struct-field/array-element codegen
+path in `emerald-codegen` — a far larger blast radius than this plan's
+real need (a printable, hex-encodable digest buffer). `String.
+to_bytes()` is the zero-copy producer; `Bytes.to_hex()` (via the
+already-vetted `hex` crate, not a hand-rolled encoder — a real,
+disclosed improvement over this plan's own "dependency-free" framing)
+is the one instance method. See `crates/emerald-rt/src/bytes.rs`'s own
+module doc for the full reasoning.
+
+**Resolution of item 2 (hasher lifetime).** `Sha256Hasher`/
+`Blake3Hasher` are real ids in plan 93's own `crate::handle` registry
+(a boxed `sha2::Sha256`/`blake3::Hasher`), not a bespoke mechanism —
+`.finalize()` reads the digest via `handle_get_mut` then calls
+`handle_close`, giving the "finalize consumes the handle" contract
+real teeth today (a closed handle's second `.update()` raises a real
+`NativeError`, verified structurally via `handle_close`'s own
+pre-existing double-close/use-after-close semantics — not re-verified
+by an in-process unit test here, since this crate's `raise_native_
+error` ultimately calls the real `emerald_raise` C export, stubbed in
+test builds to `std::process::abort()`; see `hashing.rs`'s own test
+module comment). The never-finalized-handle leak (item 2's other half)
+remains exactly as disclosed in this plan's own Decision log — no
+destructor/drop-glue exists for any type yet, unchanged by this plan.
+
+**Two further real, disclosed findings, neither anticipated by this
+plan's own text:**
+
+- This grammar's `MethodCall` productions (`PrimaryExpr`/
+  `StmtPrimaryExpr`/`CondPrimaryExpr`, confirmed directly against
+  `grammar.lalrpop`) accept only a bare `Ident`/`InstanceVarTok`/a
+  `do...end`-block-attached `ChainCallExpr` as a call receiver — never
+  a string literal (`"x".to_bytes()` is a real parse error) and never
+  the bare, non-block-attached result of a previous method call
+  (`Sha256.hash(x).to_hex()` is equally a parse error). This plan's
+  own Concrete Proof text assumed both worked; `examples/crypto_
+  hashing_proof.em` binds every intermediate value to a local instead
+  — the same pattern this session's own `libm_proof.em`/`humantime_
+  proof.em` already use for the identical reason.
+- `Sha256.new()`/`Blake3.new()` (this plan's own literal spelling for
+  the incremental-handle constructor) can never reach this plan's
+  `Expr::MethodCall`-based reserved-namespace dispatch at all — `"new"`
+  is a grammar-reserved keyword that parses unconditionally into
+  `Expr::New(recv, args)`, a real class-instantiation node sema
+  rejects with "undefined class `Sha256`" (there is no real,
+  source-declared `Sha256` class). Renamed to `.hasher()` — an
+  ordinary method name, free of the collision — in `emerald-sema`,
+  `emerald-codegen`, and the example; documented at both dispatch
+  sites and in the example's own header comment.
+
+**Scope actually shipped**: all six hash functions' one-shot
+`.hash(bytes: Bytes): Bytes` intrinsics; `Sha256Hasher`/`Blake3Hasher`
+incremental handles (`.hasher()`/`.update`/`.finalize`) exactly as
+scoped (not all six algorithms, per this plan's own Decision log);
+`String.to_bytes()`/`Bytes.to_hex()`; `examples/crypto_hashing_proof.em`
+plus its `emerald-cli` test; 8 new `emerald-rt` unit tests (`bytes.rs`
+×2, `hashing.rs` ×6, all against real, cited test vectors — SHA-256/
+SHA3-256/MD5("hello world"/"abc") from each crate's own README, BLAKE3
+of the empty string from the project's own canonical
+`test_vectors.json`); `DEPENDENCIES.md` rows for all four new crates.

@@ -2492,6 +2492,17 @@ fn string_intrinsic_signature(method: &str) -> Option<(Vec<Type>, Type)> {
     // — an Emerald `String` is already guaranteed non-null, NUL-
     // terminated, real UTF-8, so nothing needs checking going out.
     "to_cstring" => Some((vec![], Type::CString)),
+    // Plan 109's Decision log: `String.to_bytes()` — zero-copy, since
+    // `String` is already "a pointer to a null-terminated UTF-8
+    // buffer" (plan 59's own finding), the same source `Bytes.to_hex`
+    // needs a length for. `Bytes` is a compiler-synthesized `Int64`
+    // newtype (see this plan's own `classes.insert("Bytes", ...)` and
+    // `bytes.rs`'s own module doc for its real representation), the
+    // identical shape `Regex`/`NativeHandle`/`LogFields` already use.
+    "to_bytes" => Some((
+      vec![],
+      Type::Newtype("Bytes".to_string(), Box::new(Type::Int64)),
+    )),
     // Plan 91's own proof function — the first stdlib surface backed
     // by `crates/emerald-rt` (a Rust static archive) rather than
     // `runtime/emerald_runtime.c`. Widened to `Int64` (this type
@@ -4155,6 +4166,54 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 109's Decision log: `Sha256.hash`/`Sha512.hash`/`Sha3_256.
+    // hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — six reserved-
+    // namespace static intrinsics, identically shaped to `Regex.
+    // compile` immediately above. `Sha256.new`/`Blake3.new` are the
+    // two additional reserved statics for this plan's own incremental
+    // handles (this plan's Decision log: proven once each for the two
+    // structurally distinct streaming shapes, not all six algorithms).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "Sha256" | "Sha512" | "Sha3_256" | "Sha3_512" | "Blake3" | "Md5")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      if method == "hash" {
+        check_args(
+          method,
+          args,
+          std::slice::from_ref(&bytes_ty),
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(bytes_ty);
+      }
+      // Real, disclosed deviation from the plan's own literal Concrete
+      // Proof text (`Sha256.new()`): `"new"` is a grammar-reserved
+      // keyword (`grammar.lalrpop`'s own `<recv:Ident> "." "new" "("
+      // <args:Args> ")" => Expr::New(recv, args)`), so `Sha256.new()`
+      // parses as a REAL class-instantiation `Expr::New` node, never
+      // reaching this `Expr::MethodCall` arm at all — confirmed by
+      // actually hitting `Expr::New`'s own "undefined class `Sha256`"
+      // diagnostic (there is no real, source-declared `Sha256` class
+      // for it to construct). `.hasher()` is an ordinary method name,
+      // free of that collision.
+      if method == "hasher" && matches!(recv_name, "Sha256" | "Blake3") {
+        check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+        let hasher_name = format!("{recv_name}Hasher");
+        return Ok(Type::Newtype(hasher_name, Box::new(Type::Int64)));
+      }
+      Err(Diagnostic::new(
+        format!("{recv_name} has no static method `{method}`"),
+        expr.span,
+      ))
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
@@ -4701,6 +4760,47 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("Regex has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 109's Decision log: `Bytes#to_hex` — the same carved-
+        // out-of-`.value`-only shape `Regex`'s own methods immediately
+        // above establish, just with a single method.
+        if name == "Bytes" {
+          if method != "to_hex" {
+            return Err(Diagnostic::new(
+              format!("Bytes has no method `{method}`"),
+              expr.span,
+            ));
+          }
+          check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+          return Ok(Type::String);
+        }
+        // Plan 109's Decision log: `Sha256Hasher#update`/`#finalize`
+        // and `Blake3Hasher#update`/`#finalize` — the identical
+        // carved-out shape, both hasher newtypes sharing one arm since
+        // their method tables are identical.
+        if name == "Sha256Hasher" || name == "Blake3Hasher" {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "update" => (vec![bytes_ty.clone()], Type::Void),
+            "finalize" => (vec![], bytes_ty),
+            other => {
+              return Err(Diagnostic::new(
+                format!("{name} has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -11610,6 +11710,68 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // established, just with nine methods instead of one.
   classes.insert(
     "Regex".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 109's Decision log: `Bytes` — a compiler-synthesized `Int64`
+  // newtype the identical "reserved name, zero-cost handle" shape
+  // `Regex`/`NativeHandle`/`LogFields` above already use, but backed
+  // at codegen by a bare heap pointer (`bytes.rs`'s own `[len: i64]
+  // [data]` block), never a `crate::handle` registry id — a `Bytes`
+  // value holds no Rust-side resource needing a `Box`/registry entry.
+  // `String.to_bytes()` (this plan's own `string_intrinsic_signature`
+  // arm above) is the only producer; `.to_hex()` (the newtype carve-
+  // out further below) is its one instance method.
+  classes.insert(
+    "Bytes".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 109's Decision log: `Sha256Hasher`/`Blake3Hasher` — the
+  // identical "reserved name, zero-cost `Int64` handle" shape `Regex`
+  // uses, backed by plan 93's own `crate::handle` registry in
+  // `emerald-rt` (a boxed `sha2::Sha256`/`blake3::Hasher`, never a raw
+  // pointer smuggled through as an `Int64`) — `CString`'s own "inert,
+  // sema-only reference type" shape (plan 59) applied to a real
+  // incremental-hashing handle rather than a bare pointer relabeling.
+  // `Sha256.new`/`Blake3.new` are reserved-namespace static intrinsics
+  // (this plan's own sibling `Expr::MethodCall` arms below); `.update`/
+  // `.finalize` are carved out of the ordinary newtype `.value`-only
+  // restriction, the same mechanism `Regex`'s own nine methods use.
+  classes.insert(
+    "Sha256Hasher".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  classes.insert(
+    "Blake3Hasher".to_string(),
     ClassInfo {
       fields: HashMap::new(),
       methods: HashMap::new(),

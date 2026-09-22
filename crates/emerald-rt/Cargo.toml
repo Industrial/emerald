@@ -88,5 +88,21 @@ humantime = "2"
 # CPU/memory/disk/process introspection - no pure-Rust alternative
 # exists for this class of cross-platform system introspection.
 sysinfo = "0.39"
+# Plan 109: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - sha2 0.11.0 (Mar 25, 2026), #4 in Cryptography, 90.8M
+# downloads/month, RustCrypto-owned, MIT/Apache; sha3 0.12.0 (May 15,
+# 2026), #1998 in Cryptography, 15.1M downloads/month, RustCrypto-owned,
+# MIT/Apache; md-5 0.11.0 (Mar 27, 2026), #2646 in Cryptography, 34.7M
+# downloads/month, RustCrypto-owned, MIT/Apache (legacy-interop-only -
+# see hashing.rs's own Md5.hash doc comment); blake3 1.8.7 (Aug 20,
+# 2026), #3 in Cryptography, 16.8M downloads/month, owned by the
+# BLAKE3 design team directly (not RustCrypto - no RustCrypto BLAKE3
+# implementation exists to prefer instead), CC0-1.0 OR Apache-2.0. No
+# open RustSec advisory found against any of the four at this pin.
+# All pure Rust. See DEPENDENCIES.md.
+sha2 = "0.11"
+sha3 = "0.12"
+blake3 = "1.8"
+md-5 = "0.11"
 
 [build-dependencies]

@@ -126,9 +126,11 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+mod bytes;
 mod encoding;
 mod env;
 mod handle;
+mod hashing;
 mod humantime;
 mod json;
 mod log;
@@ -990,6 +992,112 @@ pub unsafe extern "C" fn emerald_rt_log_event_fields(
   handle: i64,
 ) -> i64 {
   catch_and_raise(move || log::log_event_fields(level, message, handle))
+}
+
+// Plan 109 (Cryptographic Hashing): `String.to_bytes`/`Bytes.to_hex`
+// (see `bytes.rs`'s own module doc for `Bytes`'s real, disclosed
+// representation), `Sha256`/`Sha512`/`Sha3_256`/`Sha3_512`/`Blake3`/
+// `Md5.hash` one-shot digests, and `Sha256Hasher`/`Blake3Hasher`
+// incremental handles (see `hashing.rs`'s own module doc).
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_to_bytes(s: *const c_char) -> i64 {
+  catch_and_raise(move || bytes::string_to_bytes(s))
+}
+
+/// # Safety
+/// `id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_bytes_to_hex(id: i64) -> *const c_char {
+  catch_and_raise(move || bytes::bytes_to_hex(id))
+}
+
+/// # Safety
+/// `bytes_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sha256_hash(bytes_id: i64) -> i64 {
+  catch_and_raise(move || hashing::sha256_hash(bytes_id))
+}
+
+/// # Safety
+/// `bytes_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sha512_hash(bytes_id: i64) -> i64 {
+  catch_and_raise(move || hashing::sha512_hash(bytes_id))
+}
+
+/// # Safety
+/// `bytes_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sha3_256_hash(bytes_id: i64) -> i64 {
+  catch_and_raise(move || hashing::sha3_256_hash(bytes_id))
+}
+
+/// # Safety
+/// `bytes_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sha3_512_hash(bytes_id: i64) -> i64 {
+  catch_and_raise(move || hashing::sha3_512_hash(bytes_id))
+}
+
+/// # Safety
+/// `bytes_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_blake3_hash(bytes_id: i64) -> i64 {
+  catch_and_raise(move || hashing::blake3_hash(bytes_id))
+}
+
+/// # Safety
+/// `bytes_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_md5_hash(bytes_id: i64) -> i64 {
+  catch_and_raise(move || hashing::md5_hash(bytes_id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sha256_hasher_new() -> i64 {
+  catch_and_raise(hashing::sha256_hasher_new)
+}
+
+/// # Safety
+/// `id` must be a live `Sha256Hasher` handle; `bytes_id` must be a
+/// live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sha256_hasher_update(id: i64, bytes_id: i64) {
+  catch_and_raise(move || hashing::sha256_hasher_update(id, bytes_id))
+}
+
+/// # Safety
+/// `id` must be a live `Sha256Hasher` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sha256_hasher_finalize(id: i64) -> i64 {
+  catch_and_raise(move || hashing::sha256_hasher_finalize(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_blake3_hasher_new() -> i64 {
+  catch_and_raise(hashing::blake3_hasher_new)
+}
+
+/// # Safety
+/// `id` must be a live `Blake3Hasher` handle; `bytes_id` must be a
+/// live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_blake3_hasher_update(id: i64, bytes_id: i64) {
+  catch_and_raise(move || hashing::blake3_hasher_update(id, bytes_id))
+}
+
+/// # Safety
+/// `id` must be a live `Blake3Hasher` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_blake3_hasher_finalize(id: i64) -> i64 {
+  catch_and_raise(move || hashing::blake3_hasher_finalize(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

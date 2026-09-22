@@ -164,6 +164,20 @@ fn set_newtype_underlying(program: &Program) {
   // synthesized, zero-cost `Int64` newtype shape, reusing plan 93's
   // own handle registry to hold a boxed `regex::Regex`.
   map.insert("Regex".to_string(), TypeExpr::Named("Int64".to_string()));
+  // Plan 109's Decision log: `Bytes` — a bare heap pointer
+  // reinterpreted as `Int64` (see `bytes.rs`'s own module doc in
+  // `emerald-rt`), never a `crate::handle` registry id; `Sha256Hasher`/
+  // `Blake3Hasher` — real `crate::handle` registry ids, the identical
+  // shape `Regex` uses.
+  map.insert("Bytes".to_string(), TypeExpr::Named("Int64".to_string()));
+  map.insert(
+    "Sha256Hasher".to_string(),
+    TypeExpr::Named("Int64".to_string()),
+  );
+  map.insert(
+    "Blake3Hasher".to_string(),
+    TypeExpr::Named("Int64".to_string()),
+  );
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
@@ -4992,6 +5006,23 @@ struct Ctx<'a, 'ctx> {
   system_process_ids_count: FunctionValue<'ctx>,
   system_process_name: FunctionValue<'ctx>,
   system_process_memory_bytes: FunctionValue<'ctx>,
+  /// Plan 109 (Cryptographic Hashing) — `String.to_bytes`/`Bytes.
+  /// to_hex`, the six `<Algorithm>.hash` one-shot digests, and the
+  /// `Sha256Hasher`/`Blake3Hasher` incremental handle trios.
+  string_to_bytes: FunctionValue<'ctx>,
+  bytes_to_hex: FunctionValue<'ctx>,
+  sha256_hash: FunctionValue<'ctx>,
+  sha512_hash: FunctionValue<'ctx>,
+  sha3_256_hash: FunctionValue<'ctx>,
+  sha3_512_hash: FunctionValue<'ctx>,
+  blake3_hash: FunctionValue<'ctx>,
+  md5_hash: FunctionValue<'ctx>,
+  sha256_hasher_new: FunctionValue<'ctx>,
+  sha256_hasher_update: FunctionValue<'ctx>,
+  sha256_hasher_finalize: FunctionValue<'ctx>,
+  blake3_hasher_new: FunctionValue<'ctx>,
+  blake3_hasher_update: FunctionValue<'ctx>,
+  blake3_hasher_finalize: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7806,6 +7837,95 @@ fn build_method_call<'ctx>(
       }
       return Ok((result, ret_kind));
     }
+    // Plan 109's Decision log: `Bytes#to_hex` — the identical carved-
+    // out-of-`.value`-only shape `Regex`'s own methods immediately
+    // above establish. `recv_val` is the receiver's own already-
+    // compiled `i64` value — for `Bytes` a bare heap pointer
+    // reinterpreted as `Int64` (`bytes.rs`'s own module doc), not a
+    // `crate::handle` registry id.
+    if local_classes.get(recv_name).map(String::as_str) == Some("Bytes") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method != "to_hex" {
+        return Err(format!("codegen: unsupported Bytes method `{method}`"));
+      }
+      let call = builder
+        .build_call(ctx.bytes_to_hex, &[recv_val.into()], "bytestohextmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Str));
+    }
+    // Plan 109's Decision log: `Sha256Hasher#update`/`#finalize` and
+    // `Blake3Hasher#update`/`#finalize` — the identical carved-out
+    // shape, dispatched by handle-holding function pair rather than
+    // `Regex`'s own single-newtype `match`, since `Sha256Hasher`/
+    // `Blake3Hasher` are two distinct newtypes sharing one method
+    // table.
+    let hasher_funcs = match local_classes.get(recv_name).map(String::as_str) {
+      Some("Sha256Hasher") => Some((
+        ctx.sha256_hasher_update,
+        ctx.sha256_hasher_finalize,
+        "Sha256Hasher",
+      )),
+      Some("Blake3Hasher") => Some((
+        ctx.blake3_hasher_update,
+        ctx.blake3_hasher_finalize,
+        "Blake3Hasher",
+      )),
+      _ => None,
+    };
+    if let Some((update_fn, finalize_fn, hasher_name)) = hasher_funcs {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      match method {
+        "update" => {
+          let arg = args
+            .first()
+            .ok_or_else(|| format!("codegen: `{hasher_name}#update` expects 1 argument"))?;
+          let (arg_val, _) = build_expr(
+            context,
+            builder,
+            arg,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          builder
+            .build_call(
+              update_fn,
+              &[recv_val.into(), arg_val.into()],
+              "hasherupdatetmp",
+            )
+            .map_err(|e| e.to_string())?;
+          return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+        }
+        "finalize" => {
+          let call = builder
+            .build_call(finalize_fn, &[recv_val.into()], "hasherfinalizetmp")
+            .map_err(|e| e.to_string())?;
+          return Ok((call_result(call)?, ValKind::Int64));
+        }
+        other => {
+          return Err(format!(
+            "codegen: unsupported {hasher_name} method `{other}`"
+          ))
+        }
+      }
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -8002,6 +8122,67 @@ fn build_method_call<'ctx>(
       .build_call(ctx.regex_compile, &[v.into()], "regexcompiletmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 109's Decision log: `Sha256.hash`/`Sha512.hash`/`Sha3_256.
+  // hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — the same
+  // reserved-namespace static-call shape `Regex` immediately above
+  // uses; `Sha256.new`/`Blake3.new` are this plan's own two additional
+  // reserved statics for its incremental handles. `Bytes` values cross
+  // every call here as a plain `i64_ty` (see `bytes.rs`'s own module
+  // doc), zero additional marshaling.
+  if matches!(
+    recv_name.as_str(),
+    "Sha256" | "Sha512" | "Sha3_256" | "Sha3_512" | "Blake3" | "Md5"
+  ) {
+    // `.hasher()`, not `.new()` — see `emerald-sema`'s own identical
+    // arm for why `.new()` collides with the grammar's reserved
+    // `Expr::New` production instead of ever reaching here.
+    if method == "hasher" {
+      let fv = match recv_name.as_str() {
+        "Sha256" => ctx.sha256_hasher_new,
+        "Blake3" => ctx.blake3_hasher_new,
+        other => {
+          return Err(format!(
+            "codegen: unsupported {other} static method `hasher`"
+          ))
+        }
+      };
+      let call = builder
+        .build_call(fv, &[], "hashernewtmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
+    if method != "hash" {
+      return Err(format!(
+        "codegen: unsupported {recv_name} static method `{method}`"
+      ));
+    }
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `{recv_name}.hash` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let fv = match recv_name.as_str() {
+      "Sha256" => ctx.sha256_hash,
+      "Sha512" => ctx.sha512_hash,
+      "Sha3_256" => ctx.sha3_256_hash,
+      "Sha3_512" => ctx.sha3_512_hash,
+      "Blake3" => ctx.blake3_hash,
+      "Md5" => ctx.md5_hash,
+      _ => unreachable!(),
+    };
+    let call = builder
+      .build_call(fv, &[v.into()], "hashtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -8631,6 +8812,7 @@ fn build_method_call<'ctx>(
       "slice" => (ctx.string_slice, ValKind::Str),
       "split_count" => (ctx.string_split_count, ValKind::Int64),
       "split" => (ctx.string_split, ValKind::Ptr),
+      "to_bytes" => (ctx.string_to_bytes, ValKind::Int64),
       "fnv1a_hash" => (ctx.rt_fnv1a_hash, ValKind::Int64),
       "fnv1a_hash_checked" => (ctx.rt_fnv1a_hash_checked, ValKind::Ptr),
       "fnv1a_hash_panic_for_test" => (ctx.rt_fnv1a_hash_panic_for_test, ValKind::Void),
@@ -18594,6 +18776,81 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 109 (Cryptographic Hashing): `String.to_bytes`/`Bytes.to_hex`
+  // — `Bytes` is a bare heap pointer reinterpreted as `Int64` (see
+  // `bytes.rs`'s own module doc in `emerald-rt`), so every function
+  // here taking/returning a `Bytes` value declares it as a plain
+  // `i64_ty`, zero additional marshaling.
+  let string_to_bytes = module.add_function(
+    "emerald_rt_string_to_bytes",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bytes_to_hex = module.add_function(
+    "emerald_rt_bytes_to_hex",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sha256_hash = module.add_function(
+    "emerald_rt_sha256_hash",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sha512_hash = module.add_function(
+    "emerald_rt_sha512_hash",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sha3_256_hash = module.add_function(
+    "emerald_rt_sha3_256_hash",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sha3_512_hash = module.add_function(
+    "emerald_rt_sha3_512_hash",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let blake3_hash = module.add_function(
+    "emerald_rt_blake3_hash",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let md5_hash = module.add_function(
+    "emerald_rt_md5_hash",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sha256_hasher_new = module.add_function(
+    "emerald_rt_sha256_hasher_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let sha256_hasher_update = module.add_function(
+    "emerald_rt_sha256_hasher_update",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sha256_hasher_finalize = module.add_function(
+    "emerald_rt_sha256_hasher_finalize",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let blake3_hasher_new = module.add_function(
+    "emerald_rt_blake3_hasher_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let blake3_hasher_update = module.add_function(
+    "emerald_rt_blake3_hasher_update",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let blake3_hasher_finalize = module.add_function(
+    "emerald_rt_blake3_hasher_finalize",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -19177,6 +19434,9 @@ fn compile_to_object_impl(
   newtypes.insert("NativeHandle".to_string());
   newtypes.insert("LogFields".to_string());
   newtypes.insert("Regex".to_string());
+  newtypes.insert("Bytes".to_string());
+  newtypes.insert("Sha256Hasher".to_string());
+  newtypes.insert("Blake3Hasher".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -19294,6 +19554,20 @@ fn compile_to_object_impl(
     system_process_ids_count,
     system_process_name,
     system_process_memory_bytes,
+    string_to_bytes,
+    bytes_to_hex,
+    sha256_hash,
+    sha512_hash,
+    sha3_256_hash,
+    sha3_512_hash,
+    blake3_hash,
+    md5_hash,
+    sha256_hasher_new,
+    sha256_hasher_update,
+    sha256_hasher_finalize,
+    blake3_hasher_new,
+    blake3_hasher_update,
+    blake3_hasher_finalize,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,
