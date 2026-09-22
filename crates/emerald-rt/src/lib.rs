@@ -138,6 +138,7 @@ mod json;
 mod log;
 mod math;
 mod regex;
+mod secure_compare;
 mod system;
 
 // NativeError's class tag - fixed and reserved, assigned before any
@@ -1340,6 +1341,17 @@ pub unsafe extern "C" fn emerald_rt_rsa_verify(
   sig_id: i64,
 ) -> *mut c_void {
   catch_and_raise(move || asymmetric::rsa_verify(keypair_id, digest_id, sig_id))
+}
+
+// Plan 117 (Constant-Time Comparison): `SecureCompare.eq` — see
+// `secure_compare.rs`'s own module doc.
+
+/// # Safety
+/// `a`/`b`, if non-null, must point to valid, NUL-terminated C
+/// strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_secure_compare(a: *const c_char, b: *const c_char) -> i64 {
+  catch_and_raise(move || secure_compare::secure_compare(a, b))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

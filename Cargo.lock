@@ -694,6 +694,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3 0.12.0",
+ "subtle",
  "sysinfo 0.39.6",
  "tracing",
  "tracing-subscriber",

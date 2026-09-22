@@ -10,16 +10,16 @@ maestro:
 todos:
   - id: leaf-securecompare-module-scaffold
     content: "Add `SecureCompare` as a compiler-known intrinsic namespace (plan 45's `File`-style dispatch shape). Add `subtle = \"2.6\"` to `crates/emerald-rt/Cargo.toml`, entered into plan 95's `DEPENDENCIES.md` ledger noting its real, verified-this-session fact: zero runtime dependencies (`docs.rs`'s own dependency listing shows only a `dev`-only `rand 0.8`), making it one of the lowest-risk additions to the ledger of any crate in this batch."
-    status: pending
+    status: done
   - id: leaf-eq-entrypoint
     content: "`SecureCompare.eq(a: String, b: String): Boolean` via `#[no_mangle] extern \"C\" fn emerald_rt_secure_compare(a: *const c_char, b: *const c_char) -> i64`, converting both `CStr`s to `&[u8]` and calling `a.as_bytes().ct_eq(b.as_bytes())` (`subtle::ConstantTimeEq`'s slice impl), converting the resulting `Choice` via `.into()` to a plain `bool` then `i64` (`0`/`1`) at the boundary, `catch_unwind`-wrapped per plan 91's convention. Document explicitly, in both the doc comment and this plan's Decision log, that differing input lengths still short-circuit in non-constant time — see Decision log for why this is accepted, not a gap."
-    status: pending
+    status: done
   - id: leaf-stdlib-internal-routing
     content: "Audit and amend (via a follow-up note in this plan, not a code change this plan performs directly, since plans 109/112/114 are authored in parallel this same session): every `emerald-rt` function in plans 112 (password verification), 109/110 (MAC/hash equality), and 114 (JWT signature verification) that compares secret-derived byte sequences must use `subtle::ConstantTimeEq` (either directly, or by inheriting a crate's own internal use of it/an equivalent RustCrypto-ecosystem constant-time primitive) — recorded here as the cross-cutting requirement those plans' own Decision logs should cite back to this plan number."
-    status: pending
+    status: done
   - id: leaf-rust-tests-and-example
     content: "`#[test]` in `emerald-rt`: (1) `emerald_rt_secure_compare` on two identical strings returns `true`; (2) on two different strings of equal length returns `false`; (3) on two different strings of different length returns `false` (exercising the short-circuit path explicitly, so it's asserted as intentional behavior, not accidentally untested). Add `examples/secure_compare_proof.em` to `examples/`, wired into `emerald-cli/tests/examples.rs`'s checked table, matching the Concrete Proof below."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -189,3 +189,37 @@ short-circuit path described below.
   enforced secret-tracking/taint system forcing `==` on sensitive values
   to be a type error — named above as a real, valuable, larger follow-up
   this plan does not build.
+
+## Update (2026-09-22, EXECUTE)
+
+All four leaves implemented and verified exactly as designed, no
+scope reduction. Full workspace gate green (`cargo nextest run
+--workspace`: 1016/1016 passed, 2 skipped — unrelated, pre-existing
+wasm-target/env-dependent guards; `cargo clippy --workspace
+--all-targets`: clean; `treefmt`: 0 files changed; `cargo audit
+--ignore RUSTSEC-2023-0071`: only the 5 pre-existing, already-triaged
+warnings). `subtle`'s own zero-runtime-dependency claim held exactly
+as this plan's own text predicted — the smallest `Cargo.lock` diff of
+any crate added this session.
+
+One real, disclosed correction found writing the example: `puts`
+doesn't accept a bare `Boolean` — string interpolation used instead,
+the same workaround this entire session's examples have needed.
+
+**Scope actually shipped**: `SecureCompare.eq(a: String, b: String):
+Boolean`, the reserved-namespace static-call shape plans 109-111
+already established, dispatching directly to `subtle::ConstantTimeEq`'s
+slice impl. 3 new `emerald-rt` unit tests (identical strings equal,
+different-but-equal-length strings unequal, different-length strings
+unequal via the disclosed short-circuit path); `examples/secure_
+compare_proof.em` plus its `emerald-cli` test; `DEPENDENCIES.md` row.
+This plan's own central cross-cutting requirement (every secret-
+comparison in plans 109-111/112/114 must route through this or an
+equivalent constant-time primitive) remains, as designed, a project
+rule stated in prose — plans 109-111's own hash/MAC/signature
+comparisons are already delegated entirely to their respective vetted
+crates' own internal verification methods (`VerifyingKey::
+verify_strict`, `Aead::decrypt`'s own tag check, `RsaPublicKey::
+verify`), none of which perform a bare Rust `==` on secret bytes in
+`emerald-rt`'s own code — confirmed by inspection while implementing
+this plan, not by a static check this plan does not build.

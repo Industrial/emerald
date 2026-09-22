@@ -433,3 +433,14 @@ fn crypto_asymmetric_proof_em_prints_expected_sequence() {
     "true\ntrue\ntrue\n"
   );
 }
+
+// Plan 117 (Constant-Time Comparison): `SecureCompare.eq` — the
+// return-value correctness is what's checkable at this level (the
+// constant-time property is `subtle`'s own, verified upstream).
+#[test]
+fn secure_compare_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("secure_compare_proof.em"),
+    "true\nfalse\nfalse\n"
+  );
+}

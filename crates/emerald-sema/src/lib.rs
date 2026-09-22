@@ -4344,6 +4344,33 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 117's Decision log: `SecureCompare.eq` — the same reserved-
+    // namespace static-call shape `Ed25519`/`X25519`/`Rsa` immediately
+    // above use. Takes two `String`s directly (not `Bytes`) — every
+    // real caller in this batch compares ASCII-text secrets (a PHC
+    // string, a hex/base64url-encoded tag), per this plan's own
+    // Decision log.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "SecureCompare") =>
+    {
+      if method != "eq" {
+        return Err(Diagnostic::new(
+          format!("SecureCompare has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(
+        method,
+        args,
+        &[Type::String, Type::String],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Boolean)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`

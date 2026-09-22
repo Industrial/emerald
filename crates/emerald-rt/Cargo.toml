@@ -156,5 +156,12 @@ rsa = "0.9"
 # own README example uses). A real, disclosed extra dependency this
 # plan's own text didn't anticipate.
 rand = "0.8"
+# Plan 117: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs/docs.rs) - subtle 2.6.1 (unchanged since 2024-06-24),
+# dalek-cryptography-owned (isis agora lovecruft, Henry de Valence),
+# BSD-3-Clause, 58M downloads/month, used in 2,026 crates. Zero
+# runtime dependencies (only a dev-only `rand` 0.8) - the smallest
+# possible addition to this ledger of any crate in the 91-191 batch.
+subtle = "2.6"
 
 [build-dependencies]

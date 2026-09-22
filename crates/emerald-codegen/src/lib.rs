@@ -5067,6 +5067,8 @@ struct Ctx<'a, 'ctx> {
   rsa_decrypt: FunctionValue<'ctx>,
   rsa_sign: FunctionValue<'ctx>,
   rsa_verify: FunctionValue<'ctx>,
+  /// Plan 117 (Constant-Time Comparison) — `SecureCompare.eq`.
+  secure_compare: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8489,6 +8491,42 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "asymmetrictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 117's Decision log: `SecureCompare.eq` — the same reserved-
+  // namespace static-call shape immediately above.
+  if recv_name == "SecureCompare" {
+    if method != "eq" {
+      return Err(format!(
+        "codegen: unsupported SecureCompare static method `{method}`"
+      ));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let call = builder
+      .build_call(ctx.secure_compare, &call_args, "securecomparetmp")
+      .map_err(|e| e.to_string())?;
+    let result = call_result(call)?;
+    let is_true = builder
+      .build_int_compare(
+        IntPredicate::NE,
+        result.into_int_value(),
+        context.i64_type().const_int(0, false),
+        "securecomparebool",
+      )
+      .map_err(|e| e.to_string())?;
+    return Ok((is_true.into(), ValKind::Bool));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -19307,6 +19345,14 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 117 (Constant-Time Comparison): `SecureCompare.eq` takes two
+  // real `String`s (bare `ptr_ty`), unlike every `Bytes`-based plan
+  // 109-111 function above.
+  let secure_compare = module.add_function(
+    "emerald_rt_secure_compare",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -20055,6 +20101,7 @@ fn compile_to_object_impl(
     rsa_decrypt,
     rsa_sign,
     rsa_verify,
+    secure_compare,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,
