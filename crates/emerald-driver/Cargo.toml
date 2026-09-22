@@ -10,6 +10,21 @@ emerald-sema = { path = "../emerald-sema" }
 emerald-codegen = { path = "../emerald-codegen" }
 id_effect = "0.4"
 blake3 = "1.8"
+# Plan 91: not actually called from this crate's own Rust source — no
+# `emerald-rt` symbol is ever referenced here. Declared as an ordinary
+# path dependency purely so `emerald-rt` participates in the normal
+# workspace build/dependency graph (rebuild tracking, `cargo build -p
+# emerald-driver` alone still building it) even though the actual
+# artifact this crate needs is produced by `build.rs`'s own separate
+# `cargo build -p emerald-rt --release` subprocess, not by Cargo's
+# ordinary dependency-linking path.
+emerald-rt = { path = "../emerald-rt" }
 
 [build-dependencies]
 cc = "1"
+# Plan 91: parses `cargo build --message-format=json`'s own NDJSON
+# artifact stream to discover the `emerald-rt` staticlib's real output
+# path — see `build.rs`'s own doc comment for why this subprocess-and-
+# parse route, not stable Cargo's own dependency-linking, is what
+# produces that artifact.
+serde_json = "1"

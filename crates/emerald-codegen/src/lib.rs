@@ -4808,6 +4808,11 @@ struct Ctx<'a, 'ctx> {
   string_slice: FunctionValue<'ctx>,
   string_split_count: FunctionValue<'ctx>,
   string_split: FunctionValue<'ctx>,
+  /// Plan 91's proof function — declared and dispatched exactly like
+  /// the `emerald_string_*` intrinsics immediately above, but backed
+  /// by `crates/emerald-rt` (a Rust static archive) rather than
+  /// `runtime/emerald_runtime.c`.
+  rt_fnv1a_hash: FunctionValue<'ctx>,
   /// Plan 45's Decision log: `File` reuses plan 12's `Name.method(args)`
   /// dispatch shape but is a separate, hard-coded arm in `build_method_
   /// call` — `File` is never a `ModuleDef`, so it never populates
@@ -7672,6 +7677,7 @@ fn build_method_call<'ctx>(
       "slice" => (ctx.string_slice, ValKind::Str),
       "split_count" => (ctx.string_split_count, ValKind::Int64),
       "split" => (ctx.string_split, ValKind::Ptr),
+      "fnv1a_hash" => (ctx.rt_fnv1a_hash, ValKind::Int64),
       other => return Err(format!("codegen: unsupported String method `{other}`")),
     };
     let call = builder
@@ -16984,6 +16990,16 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 91: the first stdlib surface backed by `crates/emerald-rt`
+  // (a Rust static archive, linked alongside `runtime/emerald_runtime.c`'s
+  // — see `emerald-driver/build.rs`/`src/lib.rs`) rather than the C
+  // runtime — same `extern "C" fn(*const c_char) -> i64` shape as
+  // `string_length` immediately above, declared identically.
+  let rt_fnv1a_hash = module.add_function(
+    "emerald_rt_fnv1a_hash",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let file_read = module.add_function(
     "emerald_file_read",
     ptr_ty.fn_type(&[ptr_ty.into()], false),
@@ -17525,6 +17541,7 @@ fn compile_to_object_impl(
     string_slice,
     string_split_count,
     string_split,
+    rt_fnv1a_hash,
     file_read,
     file_write,
     gets,

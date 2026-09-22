@@ -1,0 +1,31 @@
+[package]
+name = "emerald-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Plan 91: `staticlib` is the artifact `emerald-driver`'s build.rs
+# discovers and embeds (`include_bytes!`) into the final `emerald-cli`
+# binary, the same role `runtime/emerald_runtime.c`'s own archive
+# plays; `rlib` lets this crate's own `#[test]`s run under plain
+# `cargo nextest run --workspace`/`cargo test -p emerald-rt`, proving
+# the Rust-side logic independently of the FFI/link path.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# No `[profile.release]` override here: Cargo profiles are workspace-
+# root-only (a non-root `[profile.*]` table is silently ignored, and
+# this plan's own instruction to keep `panic = "unwind"` is already
+# this workspace's real, un-overridden default — the root `Cargo.toml`
+# sets no `[profile.*]` table of its own at all, verified before
+# writing this file rather than assumed). `catch_unwind` at every
+# exported function's own boundary (see `src/lib.rs`) only works
+# because this default holds; if a future change ever adds a
+# workspace-root `panic = "abort"` override, it will silently break
+# every native call's exception-to-`Result`/raise conversion, not just
+# this crate's own proof function — flagged here so that change finds
+# this warning before it finds the bug.
+
+[dependencies]
+
+[build-dependencies]

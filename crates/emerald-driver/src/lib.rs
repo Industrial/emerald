@@ -192,6 +192,15 @@ fn obj_file_name(prefix: &str) -> String {
 /// binary itself.
 static RUNTIME_ARCHIVE: &[u8] = include_bytes!(env!("EMERALD_RUNTIME_ARCHIVE"));
 
+/// Plan 91: the second, Rust-compiled static archive (`crates/
+/// emerald-rt`), embedded the identical way `RUNTIME_ARCHIVE` already
+/// is — real bytes baked into this binary at compile time, not a path
+/// that stops existing once the binary is copied elsewhere. Extracted
+/// to its own temp file and linked alongside `RUNTIME_ARCHIVE`, never
+/// instead of it (see `build_link_args`) — this plan adds a second
+/// archive, it does not begin retiring the first.
+static EMERALD_RT_ARCHIVE: &[u8] = include_bytes!(env!("EMERALD_RT_ARCHIVE"));
+
 /// Plan 64's `leaf-wasi-runtime-and-sequential-actors`: `build.rs`
 /// always embeds SOMETHING here — a real, `wasm32-wasip1`-compiled
 /// archive when a WASI-capable compiler was configured at *this
@@ -238,6 +247,7 @@ fn link_stage_with_libs(
 fn build_link_args(
   obj_path: &Path,
   runtime_archive_path: &Path,
+  emerald_rt_archive_path: &Path,
   output_path: &Path,
   extra_libs: &[String],
 ) -> Vec<std::ffi::OsString> {
@@ -247,12 +257,18 @@ fn build_link_args(
   // it can prove nothing reachable from `main`/the user's program refers
   // to (e.g. the actor/networking runtime, for a program with no actors).
   // No effect without the build.rs flags; harmless if the linker finds
-  // nothing prunable.
+  // nothing prunable. Plan 91: `emerald_rt_archive_path` (a real Rust
+  // `staticlib`, whose own symbols are already per-function-sectioned
+  // by `rustc` itself with no equivalent C-toolchain flag needed —
+  // see `build.rs`'s own Decision log) is added right after the C
+  // runtime archive; nothing in either archive references the other's
+  // symbols yet, so this order is not load-bearing, only convention.
   let mut args: Vec<std::ffi::OsString> = vec![
     "-no-pie".into(),
     "-Wl,--gc-sections".into(),
     obj_path.as_os_str().to_os_string(),
     runtime_archive_path.as_os_str().to_os_string(),
+    emerald_rt_archive_path.as_os_str().to_os_string(),
   ];
   for lib in extra_libs {
     args.push(format!("-l{lib}").into());
@@ -391,10 +407,28 @@ pub fn link_with_libs(
       "failed to extract the embedded runtime archive: {e}"
     )));
   }
-  let args = build_link_args(&obj_path, &runtime_archive_path, &output_path, extra_libs);
+  // Plan 91: the second, Rust-compiled archive — extracted and cleaned
+  // up the identical way `runtime_archive_path` already is.
+  let emerald_rt_archive_path =
+    std::env::temp_dir().join(format!("libemerald_rt_{}.a", process::id()));
+  if let Err(e) = std::fs::write(&emerald_rt_archive_path, EMERALD_RT_ARCHIVE) {
+    std::fs::remove_file(&obj_path).ok();
+    std::fs::remove_file(&runtime_archive_path).ok();
+    return Err(DriverError::Link(format!(
+      "failed to extract the embedded emerald-rt archive: {e}"
+    )));
+  }
+  let args = build_link_args(
+    &obj_path,
+    &runtime_archive_path,
+    &emerald_rt_archive_path,
+    &output_path,
+    extra_libs,
+  );
   let link_result = Command::new("cc").args(&args).status();
   std::fs::remove_file(&obj_path).ok();
   std::fs::remove_file(&runtime_archive_path).ok();
+  std::fs::remove_file(&emerald_rt_archive_path).ok();
   match link_result {
     Ok(status) if status.success() => Ok(()),
     Ok(_) => Err(DriverError::Link("linking failed".to_string())),
@@ -825,12 +859,14 @@ mod tests {
   #[test]
   fn build_link_args_with_no_extra_libs_is_byte_for_byte_the_original_five_argument_list() {
     // Bugfix (benchmark session): name kept for history, but this is now
-    // the six-argument list including `-Wl,--gc-sections` — see that
-    // flag's own doc comment on `build_link_args` for why.
+    // a seven-argument list including `-Wl,--gc-sections` and (plan 91)
+    // the second, Rust-compiled archive — see each flag/argument's own
+    // doc comment on `build_link_args` for why.
     let obj = Path::new("/tmp/x.o");
     let archive = Path::new("/tmp/libemerald_runtime.a");
+    let rt_archive = Path::new("/tmp/libemerald_rt.a");
     let out = Path::new("/tmp/out");
-    let args = build_link_args(obj, archive, out, &[]);
+    let args = build_link_args(obj, archive, rt_archive, out, &[]);
     assert_eq!(
       args,
       vec![
@@ -838,6 +874,7 @@ mod tests {
         std::ffi::OsString::from("-Wl,--gc-sections"),
         std::ffi::OsString::from("/tmp/x.o"),
         std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
+        std::ffi::OsString::from("/tmp/libemerald_rt.a"),
         std::ffi::OsString::from("-o"),
         std::ffi::OsString::from("/tmp/out"),
       ]
@@ -848,8 +885,9 @@ mod tests {
   fn build_link_args_with_extra_libs_inserts_l_flags_after_the_objects_and_before_o() {
     let obj = Path::new("/tmp/x.o");
     let archive = Path::new("/tmp/libemerald_runtime.a");
+    let rt_archive = Path::new("/tmp/libemerald_rt.a");
     let out = Path::new("/tmp/out");
-    let args = build_link_args(obj, archive, out, &["sqlite3".to_string()]);
+    let args = build_link_args(obj, archive, rt_archive, out, &["sqlite3".to_string()]);
     assert_eq!(
       args,
       vec![
@@ -857,6 +895,7 @@ mod tests {
         std::ffi::OsString::from("-Wl,--gc-sections"),
         std::ffi::OsString::from("/tmp/x.o"),
         std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
+        std::ffi::OsString::from("/tmp/libemerald_rt.a"),
         std::ffi::OsString::from("-lsqlite3"),
         std::ffi::OsString::from("-o"),
         std::ffi::OsString::from("/tmp/out"),

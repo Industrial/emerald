@@ -85,4 +85,103 @@ fn main() {
     "cargo:rustc-env=EMERALD_RUNTIME_ARCHIVE_WASM32_WASI={}",
     wasm_archive_path.display()
   );
+
+  build_emerald_rt_archive(&manifest_dir, &out_dir);
+}
+
+/// Plan 91's `leaf-json-artifact-discovery-in-build-rs`: builds
+/// `crates/emerald-rt` as a real `cargo build -p emerald-rt --release`
+/// subprocess and discovers its `staticlib` artifact's path by parsing
+/// `--message-format=json`'s NDJSON stream — stable Cargo has no
+/// artifact-dependency feature (`-Zbindeps` is nightly-only, and this
+/// project's toolchain is pinned to a stable release per the
+/// `rust-devenv` skill's own convention) to obtain a sibling crate's
+/// compiled staticlib path any other way. `--target-dir` is pointed at
+/// a fresh subdirectory of this crate's own `OUT_DIR`, never the
+/// workspace's shared `target/`, specifically so this inner `cargo`
+/// invocation never contends for the same lockfile-guarded directory
+/// the outer build is itself already running inside — recursive
+/// `cargo build` from a build script is a real, named anti-pattern
+/// (lock contention, environment-variable leakage) adopted here
+/// deliberately, with that one mitigation, not accidentally.
+fn build_emerald_rt_archive(manifest_dir: &str, out_dir: &str) {
+  let emerald_rt_src = std::path::Path::new(manifest_dir)
+    .join("../emerald-rt/src/lib.rs")
+    .canonicalize()
+    .expect("crates/emerald-rt/src/lib.rs must exist relative to this crate's manifest dir");
+  println!("cargo:rerun-if-changed={}", emerald_rt_src.display());
+  let emerald_rt_manifest = std::path::Path::new(manifest_dir)
+    .join("../emerald-rt/Cargo.toml")
+    .canonicalize()
+    .expect("crates/emerald-rt/Cargo.toml must exist relative to this crate's manifest dir");
+  println!("cargo:rerun-if-changed={}", emerald_rt_manifest.display());
+
+  let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+  let rt_target_dir = std::path::Path::new(out_dir).join("emerald-rt-target");
+  let output = std::process::Command::new(&cargo)
+    .args([
+      "build",
+      "--message-format=json",
+      "--release",
+      "--manifest-path",
+    ])
+    .arg(&emerald_rt_manifest)
+    .arg("--target-dir")
+    .arg(&rt_target_dir)
+    .output()
+    .expect("failed to invoke `cargo build -p emerald-rt` from build.rs");
+
+  assert!(
+    output.status.success(),
+    "cargo build -p emerald-rt failed:\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Each line of `--message-format=json`'s stdout is one independent
+  // JSON object (Cargo's own documented NDJSON contract) — a line this
+  // crate doesn't recognize (a `"build-finished"` message, a plain
+  // compiler warning) is skipped, not an error; only the one
+  // `"compiler-artifact"` message naming `emerald_rt`'s `staticlib`
+  // target is real signal here.
+  let mut archive_path: Option<String> = None;
+  for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+      continue;
+    };
+    if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+      continue;
+    }
+    let Some(target) = msg.get("target") else {
+      continue;
+    };
+    // Cargo's own artifact messages report the TARGET name with
+    // hyphens already replaced by underscores (`emerald-rt`'s package
+    // name becomes `emerald_rt` here) — matched literally, not
+    // normalized, since that is the real, stable contract this
+    // message shape has always used.
+    if target.get("name").and_then(|n| n.as_str()) != Some("emerald_rt") {
+      continue;
+    }
+    let is_staticlib = target
+      .get("kind")
+      .and_then(|k| k.as_array())
+      .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("staticlib")));
+    if !is_staticlib {
+      continue;
+    }
+    if let Some(filenames) = msg.get("filenames").and_then(|f| f.as_array()) {
+      archive_path = filenames
+        .iter()
+        .filter_map(|f| f.as_str())
+        .find(|f| f.ends_with(".a"))
+        .map(str::to_string);
+    }
+  }
+
+  let archive_path = archive_path.expect(
+    "cargo build -p emerald-rt --message-format=json produced no compiler-artifact message \
+     naming an `emerald_rt` staticlib — its own stdout is printed above on failure",
+  );
+  println!("cargo:rustc-env=EMERALD_RT_ARCHIVE={archive_path}");
 }

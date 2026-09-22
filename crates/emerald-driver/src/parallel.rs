@@ -16,7 +16,7 @@ use crate::require_graph::{
   build_require_graph, closure_hashes, closure_items, compute_levels, own_function_names,
   unsupported_construct, RequireGraph,
 };
-use crate::{DriverError, RUNTIME_ARCHIVE};
+use crate::{DriverError, EMERALD_RT_ARCHIVE, RUNTIME_ARCHIVE};
 use emerald_parser::Program;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -316,6 +316,19 @@ fn link_many(obj_paths: Vec<PathBuf>, output_path: PathBuf) -> Result<(), Driver
       "failed to extract the embedded runtime archive: {e}"
     )));
   }
+  // Plan 91: the second, Rust-compiled archive — extracted the same
+  // way `runtime_archive_path` already is.
+  let emerald_rt_archive_path =
+    std::env::temp_dir().join(format!("libemerald_rt_par_{}.a", process::id()));
+  if let Err(e) = std::fs::write(&emerald_rt_archive_path, EMERALD_RT_ARCHIVE) {
+    for obj in &obj_paths {
+      std::fs::remove_file(obj).ok();
+    }
+    std::fs::remove_file(&runtime_archive_path).ok();
+    return Err(DriverError::Link(format!(
+      "failed to extract the embedded emerald-rt archive: {e}"
+    )));
+  }
   // Bugfix (benchmark session): matches `build_link_args`'s own
   // `-Wl,--gc-sections` (`emerald-driver/src/lib.rs`) — this is the
   // `--jobs` build's separate `cc` invocation, so it needs the same flag
@@ -326,6 +339,7 @@ fn link_many(obj_paths: Vec<PathBuf>, output_path: PathBuf) -> Result<(), Driver
     .arg("-Wl,--gc-sections")
     .args(&obj_paths)
     .arg(&runtime_archive_path)
+    .arg(&emerald_rt_archive_path)
     .arg("-o")
     .arg(&output_path)
     .status();
@@ -333,6 +347,7 @@ fn link_many(obj_paths: Vec<PathBuf>, output_path: PathBuf) -> Result<(), Driver
     std::fs::remove_file(obj).ok();
   }
   std::fs::remove_file(&runtime_archive_path).ok();
+  std::fs::remove_file(&emerald_rt_archive_path).ok();
   match link_result {
     Ok(status) if status.success() => Ok(()),
     Ok(_) => Err(DriverError::Link("linking failed".to_string())),

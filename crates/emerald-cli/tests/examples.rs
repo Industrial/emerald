@@ -39,6 +39,18 @@ fn compile_and_run(example: &str) -> String {
 }
 
 #[test]
+fn rust_native_runtime_proof_em_prints_expected_sequence() {
+  // Plan 91: FNV-1a-32 of "hello"/"hello world"/"" widened to Int64 —
+  // hand-computed and independently verified against a from-scratch
+  // Python re-implementation of the algorithm before being hard-coded
+  // here, not copied from this crate's own output.
+  assert_eq!(
+    compile_and_run("rust_native_runtime_proof.em"),
+    "1335831723\n3582672807\n2166136261\n"
+  );
+}
+
+#[test]
 fn control_flow_em_prints_expected_sequence() {
   assert_eq!(
     compile_and_run("control_flow.em"),

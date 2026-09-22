@@ -10,6 +10,10 @@ members = [
   "crates/emerald-cli",
   "crates/emerald-lsp",
   "crates/emerald-mcp",
+  # Plan 91: a second, Rust-compiled static archive alongside
+  # `runtime/emerald_runtime.c` — every stdlib expansion plan from 92
+  # onward is a tenant of the archive this crate builds.
+  "crates/emerald-rt",
 ]
 
 # Single version and shared metadata for all workspace crates (inherit with version.workspace = true).

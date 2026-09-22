@@ -2460,6 +2460,12 @@ fn string_intrinsic_signature(method: &str) -> Option<(Vec<Type>, Type)> {
     // — an Emerald `String` is already guaranteed non-null, NUL-
     // terminated, real UTF-8, so nothing needs checking going out.
     "to_cstring" => Some((vec![], Type::CString)),
+    // Plan 91's own proof function — the first stdlib surface backed
+    // by `crates/emerald-rt` (a Rust static archive) rather than
+    // `runtime/emerald_runtime.c`. Widened to `Int64` (this type
+    // system's own only integer width, per plan 59), same as every
+    // other `Int64`-returning String intrinsic above.
+    "fnv1a_hash" => Some((vec![], Type::Int64)),
     _ => None,
   }
 }
