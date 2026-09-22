@@ -594,3 +594,19 @@ fn charset_encoding_proof_em_prints_expected_sequence() {
     "café\nnot valid utf-8\ncafé\n"
   );
 }
+
+// Plan 154 (Unicode Normalization & Segmentation): `composed` is
+// "café" with a single precomposed U+00E9 (4 codepoints, 5 UTF-8
+// bytes); `decomposed` is "cafe" + a literal COMBINING ACUTE ACCENT
+// U+0301 (5 codepoints, 6 UTF-8 bytes) — both render identically and
+// both have `.grapheme_count == 4` (the combining accent attaches to
+// the preceding "e" as one extended grapheme cluster, UAX #29). Only
+// `decomposed.nfc`'s canonical composition collapses `.length` to `5`,
+// matching `composed` byte-for-byte.
+#[test]
+fn unicode_normalization_segmentation_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("unicode_normalization_segmentation_proof.em"),
+    "5\n6\n4\n5\n4\n4\n5\n"
+  );
+}

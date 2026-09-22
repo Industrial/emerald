@@ -180,6 +180,16 @@ mod system;
 // `aead.rs`/`url.rs` already hit and disclosed.
 #[path = "toml.rs"]
 mod tomls;
+// Plan 154 (Unicode Normalization & Segmentation) — `String.nfc`/
+// `.nfd`/`.nfkc`/`.nfkd`/`.codepoint_count`/`.grapheme_count`/
+// `.graphemes`/`.words`/`.sentences`/`.grapheme_split_count`/
+// `.word_split_count`/`.sentence_split_count`, wrapping `unicode-
+// normalization` + `unicode-segmentation` — see `unicode.rs`'s own
+// module doc. Named `unicode`, not either wrapped crate's own name —
+// no collision either way (`unicode_normalization`/`unicode_
+// segmentation` both have underscores a bare `mod unicode;` can't
+// shadow), unlike `csvs`/`tomls`/`urls`/`charset`'s own dodges.
+mod unicode;
 // Named `urls`, not `url` — this crate's own `mod url` would shadow
 // the external `url` crate this module wraps, exactly the collision
 // `aead.rs` hit against the external `aead` crate (see that module's
@@ -1861,6 +1871,96 @@ pub unsafe extern "C" fn emerald_rt_csv_parse_with_headers(s: *const c_char) -> 
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_csv_write(rows: *const c_void) -> *const c_char {
   catch_and_raise(move || csvs::csv_write(rows))
+}
+
+// Plan 154 (Unicode Normalization & Segmentation): `String.nfc`/
+// `.nfd`/`.nfkc`/`.nfkd`/`.codepoint_count`/`.grapheme_count`/
+// `.graphemes`/`.words`/`.sentences`/`.grapheme_split_count`/
+// `.word_split_count`/`.sentence_split_count` — see `unicode.rs`'s own
+// module doc.
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_nfc(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || unicode::string_nfc(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_nfd(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || unicode::string_nfd(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_nfkc(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || unicode::string_nfkc(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_nfkd(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || unicode::string_nfkd(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_codepoint_count(s: *const c_char) -> i64 {
+  catch_and_raise(move || unicode::string_codepoint_count(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_grapheme_count(s: *const c_char) -> i64 {
+  catch_and_raise(move || unicode::string_grapheme_count(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_graphemes(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || unicode::string_graphemes(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_words(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || unicode::string_words(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_sentences(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || unicode::string_sentences(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_grapheme_split_count(s: *const c_char) -> i64 {
+  catch_and_raise(move || unicode::string_grapheme_split_count(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_word_split_count(s: *const c_char) -> i64 {
+  catch_and_raise(move || unicode::string_word_split_count(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_string_sentence_split_count(s: *const c_char) -> i64 {
+  catch_and_raise(move || unicode::string_sentence_split_count(s))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

@@ -4979,6 +4979,23 @@ struct Ctx<'a, 'ctx> {
   /// Plan 92's own concrete proof: a deliberately, unconditionally
   /// panicking export, proving a real panic reaches a real `rescue`.
   rt_fnv1a_hash_panic_for_test: FunctionValue<'ctx>,
+  /// Plan 154 (Unicode Normalization & Segmentation): `String.nfc`/
+  /// `.nfd`/`.nfkc`/`.nfkd`/`.codepoint_count`/`.grapheme_count`/
+  /// `.graphemes`/`.words`/`.sentences`/`.grapheme_split_count`/
+  /// `.word_split_count`/`.sentence_split_count` — same `emerald_rt_*`
+  /// single-`ptr_ty`-argument shape as `rt_fnv1a_hash` above.
+  rt_string_nfc: FunctionValue<'ctx>,
+  rt_string_nfd: FunctionValue<'ctx>,
+  rt_string_nfkc: FunctionValue<'ctx>,
+  rt_string_nfkd: FunctionValue<'ctx>,
+  rt_string_codepoint_count: FunctionValue<'ctx>,
+  rt_string_grapheme_count: FunctionValue<'ctx>,
+  rt_string_graphemes: FunctionValue<'ctx>,
+  rt_string_words: FunctionValue<'ctx>,
+  rt_string_sentences: FunctionValue<'ctx>,
+  rt_string_grapheme_split_count: FunctionValue<'ctx>,
+  rt_string_word_split_count: FunctionValue<'ctx>,
+  rt_string_sentence_split_count: FunctionValue<'ctx>,
   /// Plan 45's Decision log: `File` reuses plan 12's `Name.method(args)`
   /// dispatch shape but is a separate, hard-coded arm in `build_method_
   /// call` — `File` is never a `ModuleDef`, so it never populates
@@ -10250,6 +10267,19 @@ fn build_method_call<'ctx>(
       "fnv1a_hash" => (ctx.rt_fnv1a_hash, ValKind::Int64),
       "fnv1a_hash_checked" => (ctx.rt_fnv1a_hash_checked, ValKind::Ptr),
       "fnv1a_hash_panic_for_test" => (ctx.rt_fnv1a_hash_panic_for_test, ValKind::Void),
+      // Plan 154 (Unicode Normalization & Segmentation).
+      "nfc" => (ctx.rt_string_nfc, ValKind::Str),
+      "nfd" => (ctx.rt_string_nfd, ValKind::Str),
+      "nfkc" => (ctx.rt_string_nfkc, ValKind::Str),
+      "nfkd" => (ctx.rt_string_nfkd, ValKind::Str),
+      "codepoint_count" => (ctx.rt_string_codepoint_count, ValKind::Int64),
+      "grapheme_count" => (ctx.rt_string_grapheme_count, ValKind::Int64),
+      "graphemes" => (ctx.rt_string_graphemes, ValKind::Ptr),
+      "words" => (ctx.rt_string_words, ValKind::Ptr),
+      "sentences" => (ctx.rt_string_sentences, ValKind::Ptr),
+      "grapheme_split_count" => (ctx.rt_string_grapheme_split_count, ValKind::Int64),
+      "word_split_count" => (ctx.rt_string_word_split_count, ValKind::Int64),
+      "sentence_split_count" => (ctx.rt_string_sentence_split_count, ValKind::Int64),
       other => return Err(format!("codegen: unsupported String method `{other}`")),
     };
     let call = builder
@@ -19952,6 +19982,74 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 154 (Unicode Normalization & Segmentation): `.nfc`/`.nfd`/
+  // `.nfkc`/`.nfkd` return a heap `String` pointer; `.codepoint_count`/
+  // `.grapheme_count`/`.grapheme_split_count`/`.word_split_count`/
+  // `.sentence_split_count` return a plain `i64`; `.graphemes`/
+  // `.words`/`.sentences` return an `Array[String]` heap pointer —
+  // same `ptr_ty` LLVM type as the `String`-returning ones, only the
+  // `ValKind` tag at the call site differs (mirrors `regex_split`
+  // above exactly).
+  let rt_string_nfc = module.add_function(
+    "emerald_rt_string_nfc",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_nfd = module.add_function(
+    "emerald_rt_string_nfd",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_nfkc = module.add_function(
+    "emerald_rt_string_nfkc",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_nfkd = module.add_function(
+    "emerald_rt_string_nfkd",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_codepoint_count = module.add_function(
+    "emerald_rt_string_codepoint_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_grapheme_count = module.add_function(
+    "emerald_rt_string_grapheme_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_graphemes = module.add_function(
+    "emerald_rt_string_graphemes",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_words = module.add_function(
+    "emerald_rt_string_words",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_sentences = module.add_function(
+    "emerald_rt_string_sentences",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_grapheme_split_count = module.add_function(
+    "emerald_rt_string_grapheme_split_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_word_split_count = module.add_function(
+    "emerald_rt_string_word_split_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rt_string_sentence_split_count = module.add_function(
+    "emerald_rt_string_sentence_split_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let file_read = module.add_function(
     "emerald_file_read",
     ptr_ty.fn_type(&[ptr_ty.into()], false),
@@ -21626,6 +21724,18 @@ fn compile_to_object_impl(
     rt_fnv1a_hash,
     rt_fnv1a_hash_checked,
     rt_fnv1a_hash_panic_for_test,
+    rt_string_nfc,
+    rt_string_nfd,
+    rt_string_nfkc,
+    rt_string_nfkd,
+    rt_string_codepoint_count,
+    rt_string_grapheme_count,
+    rt_string_graphemes,
+    rt_string_words,
+    rt_string_sentences,
+    rt_string_grapheme_split_count,
+    rt_string_word_split_count,
+    rt_string_sentence_split_count,
     file_read,
     file_write,
     gets,

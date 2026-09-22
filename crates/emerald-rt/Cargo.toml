@@ -320,5 +320,36 @@ quick-xml = "0.42"
 # codec in Rust rather than binding ICU/iconv. `Encoding.decode`/
 # `.decode_strict`/`.encode`'s direct backing.
 encoding_rs = "0.8.41"
+# Plan 154: real-checked this plan's own authoring time (2026-09-23,
+# via lib.rs, since crates.io itself 403s bot access — the identical
+# finding plan 118's own comment already discloses) - unicode-
+# normalization 0.1.25 (Oct 30, 2025), #43 in Text processing, 37.0M
+# downloads/month, used in 21,868 crates (1,159 directly), MIT/Apache,
+# maintained under the `unicode-rs` GitHub organization (kwantam,
+# Manishearth, sujayakar, SimonSapin, huonw as owners) - implements
+# Unicode Standard Annex #15 directly. A real, disclosed correction
+# against this plan's own text, which does not mention it: this crate
+# is NOT zero-transitive-dependency - it pulls in `tinyvec` (+`alloc`
+# feature) for its own internal small-vector storage; searched for an
+# open RustSec advisory against both `unicode-normalization` and
+# `tinyvec` and found none. `no_std`+`alloc`-compatible (the `std`
+# feature is left on/default here since this crate already links
+# `std` throughout regardless - no benefit to disabling it, and doing
+# so would require re-verifying every other dependency's own `std`
+# assumption for no real gain).
+unicode-normalization = "0.1.25"
+# Plan 154: real-checked this plan's own authoring time (2026-09-23,
+# via lib.rs) - unicode-segmentation 1.13.3 (Jun 1, 2026), #3 in
+# crates.io's own Text processing category (ahead of nearly every
+# other crate in this file), 45.0M downloads/month, used in 44,483
+# crates (1,656 directly) - the plan's own cited figures, reverified
+# rather than merely copied. MIT/Apache, same `unicode-rs`-organization
+# ownership as `unicode-normalization` immediately above (Manishearth,
+# kwantam, SimonSapin, huonw, sujayakar). "No runtime deps" per its own
+# `lib.rs` listing - genuinely zero further transitive dependencies,
+# unlike its sibling crate above. Implements Unicode Standard Annex
+# #29 directly (grapheme cluster/word/sentence boundaries). No open
+# RustSec advisory found.
+unicode-segmentation = "1.13.3"
 
 [build-dependencies]

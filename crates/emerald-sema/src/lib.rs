@@ -2522,6 +2522,35 @@ fn string_intrinsic_signature(method: &str) -> Option<(Vec<Type>, Type)> {
     // converting into a real, rescuable `NativeError` via
     // `catch_and_raise`. Void — no return value is ever produced.
     "fnv1a_hash_panic_for_test" => Some((vec![], Type::Void)),
+    // Plan 154's Decision log: `.length` (byte count, plan 45/59)
+    // keeps its existing meaning unchanged — these are two new,
+    // precisely-named, additive counts sitting alongside it, backed by
+    // `crates/emerald-rt`'s `unicode.rs`. `.codepoint_count` needs no
+    // third-party crate (a Rust `char` is already a Unicode scalar
+    // value); `.grapheme_count` is real Unicode Annex #29 extended-
+    // grapheme-cluster segmentation via `unicode-segmentation`.
+    "codepoint_count" => Some((vec![], Type::Int64)),
+    "grapheme_count" => Some((vec![], Type::Int64)),
+    // Canonical/compatibility (de)composition (UAX #15) via `unicode-
+    // normalization` — operate on the receiver only, never implicitly
+    // applied by `==` (this plan's own Decision log).
+    "nfc" => Some((vec![], Type::String)),
+    "nfd" => Some((vec![], Type::String)),
+    "nfkc" => Some((vec![], Type::String)),
+    "nfkd" => Some((vec![], Type::String)),
+    // Real Unicode Annex #29 boundary segmentation, mirroring plan
+    // 45's own `.split`/`.split_count` two-scan precedent exactly
+    // (`Array[T]` carries no runtime length metadata of its own — see
+    // this plan's own Decision log): `.graphemes`/`.words`/
+    // `.sentences` return `Array[String]`, paired with an
+    // independently-computed `.grapheme_split_count`/`.word_split_
+    // count`/`.sentence_split_count` companion scalar apiece.
+    "graphemes" => Some((vec![], Type::Array(Box::new(Type::String)))),
+    "words" => Some((vec![], Type::Array(Box::new(Type::String)))),
+    "sentences" => Some((vec![], Type::Array(Box::new(Type::String)))),
+    "grapheme_split_count" => Some((vec![], Type::Int64)),
+    "word_split_count" => Some((vec![], Type::Int64)),
+    "sentence_split_count" => Some((vec![], Type::Int64)),
     _ => None,
   }
 }
