@@ -187,6 +187,7 @@ fn set_newtype_underlying(program: &Program) {
     "X25519EphemeralSecret",
     "X25519StaticSecret",
     "RsaKeyPair",
+    "Url",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5075,6 +5076,20 @@ struct Ctx<'a, 'ctx> {
   random_secure_token: FunctionValue<'ctx>,
   random_int: FunctionValue<'ctx>,
   random_shuffle: FunctionValue<'ctx>,
+  /// Plan 98 (URL Parsing) — `Url.parse`/`.build`, `Url#scheme`/
+  /// `#host`/`#port`/`#path`/`#query`/`#fragment`/`#with_path`/
+  /// `#with_query`/`#with_port`.
+  url_parse: FunctionValue<'ctx>,
+  url_build: FunctionValue<'ctx>,
+  url_scheme: FunctionValue<'ctx>,
+  url_host: FunctionValue<'ctx>,
+  url_port: FunctionValue<'ctx>,
+  url_path: FunctionValue<'ctx>,
+  url_query: FunctionValue<'ctx>,
+  url_fragment: FunctionValue<'ctx>,
+  url_with_path: FunctionValue<'ctx>,
+  url_with_query: FunctionValue<'ctx>,
+  url_with_port: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8122,6 +8137,47 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Ptr));
     }
+    // Plan 98's Decision log: `Url`'s own instance methods.
+    if local_classes.get(recv_name).map(String::as_str) == Some("Url") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "scheme" => (ctx.url_scheme, ValKind::Str),
+        "host" => (ctx.url_host, ValKind::Str),
+        "port" => (ctx.url_port, ValKind::Int64),
+        "path" => (ctx.url_path, ValKind::Str),
+        "query" => (ctx.url_query, ValKind::Str),
+        "fragment" => (ctx.url_fragment, ValKind::Str),
+        "with_path" => (ctx.url_with_path, ValKind::Int64),
+        "with_query" => (ctx.url_with_query, ValKind::Int64),
+        "with_port" => (ctx.url_with_port, ValKind::Int64),
+        other => return Err(format!("codegen: unsupported Url method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "urltmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -8570,6 +8626,33 @@ fn build_method_call<'ctx>(
       return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
     }
     return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 98's Decision log: `Url.parse`/`.build` — the same reserved-
+  // namespace static-call shape immediately above.
+  if recv_name == "Url" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "parse" => ctx.url_parse,
+      "build" => ctx.url_build,
+      other => return Err(format!("codegen: unsupported Url static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "urlstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -19419,6 +19502,63 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 98 (URL Parsing): `Url` values cross every call here as a
+  // plain `i64_ty` (see `url.rs`'s own module doc).
+  let url_parse = module.add_function(
+    "emerald_rt_url_parse",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_build = module.add_function(
+    "emerald_rt_url_build",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_scheme = module.add_function(
+    "emerald_rt_url_scheme",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_host = module.add_function(
+    "emerald_rt_url_host",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_port = module.add_function(
+    "emerald_rt_url_port",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_path = module.add_function(
+    "emerald_rt_url_path",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_query = module.add_function(
+    "emerald_rt_url_query",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_fragment = module.add_function(
+    "emerald_rt_url_fragment",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_with_path = module.add_function(
+    "emerald_rt_url_with_path",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_with_query = module.add_function(
+    "emerald_rt_url_with_query",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let url_with_port = module.add_function(
+    "emerald_rt_url_with_port",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -20010,6 +20150,7 @@ fn compile_to_object_impl(
   newtypes.insert("X25519EphemeralSecret".to_string());
   newtypes.insert("X25519StaticSecret".to_string());
   newtypes.insert("RsaKeyPair".to_string());
+  newtypes.insert("Url".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -20172,6 +20313,17 @@ fn compile_to_object_impl(
     random_secure_token,
     random_int,
     random_shuffle,
+    url_parse,
+    url_build,
+    url_scheme,
+    url_host,
+    url_port,
+    url_path,
+    url_query,
+    url_fragment,
+    url_with_path,
+    url_with_query,
+    url_with_port,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

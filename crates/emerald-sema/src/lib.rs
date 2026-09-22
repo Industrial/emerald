@@ -4407,6 +4407,34 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 98's Decision log: `Url.parse`/`.build` — the same
+    // reserved-namespace static-call shape immediately above.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Url") =>
+    {
+      let url_ty = Type::Newtype("Url".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match method.as_str() {
+        "parse" => (vec![Type::String], url_ty),
+        "build" => (vec![Type::String, Type::String, Type::String], url_ty),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Url has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
@@ -5096,6 +5124,37 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("RsaKeyPair has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 98's Decision log: `Url`'s own instance methods — the
+        // identical carved-out shape `Regex`/`Ed25519KeyPair` already
+        // establish. `#host` raises rather than returning `""` on
+        // absence; `#query`/`#fragment` return `""` on absence —
+        // deliberately asymmetric, see this plan's own Decision log.
+        if name == "Url" {
+          let url_ty = Type::Newtype("Url".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "scheme" | "host" | "path" | "query" | "fragment" => (vec![], Type::String),
+            "port" => (vec![], Type::Int64),
+            "with_path" | "with_query" => (vec![Type::String], url_ty),
+            "with_port" => (vec![Type::Int64], url_ty),
+            other => {
+              return Err(Diagnostic::new(
+                format!("Url has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -12109,11 +12168,18 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // each backed by plan 93's own `crate::handle` registry in
   // `emerald-rt` (a boxed `SigningKey`/`EphemeralSecret`/
   // `StaticSecret`/`RsaPrivateKey` respectively).
+  // Plan 98's Decision log: `Url` — the identical "reserved name,
+  // zero-cost `Int64` handle" shape, backed by plan 93's own
+  // `crate::handle` registry (a boxed `url::Url`). Not a true plan-93
+  // *resource* (no OS handle, no `.close`) — stored the same way
+  // regardless, for representational consistency with every other
+  // compiler-provided handle-carrying type here.
   for name in [
     "Ed25519KeyPair",
     "X25519EphemeralSecret",
     "X25519StaticSecret",
     "RsaKeyPair",
+    "Url",
   ] {
     classes.insert(
       name.to_string(),

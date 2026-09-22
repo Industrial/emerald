@@ -455,3 +455,13 @@ fn random_csprng_proof_em_prints_expected_sequence() {
     "32\ntrue\ntrue\n"
   );
 }
+
+// Plan 98 (URL Parsing): `plain.port` (`443`, no explicit port at
+// all) is the real proof of `#port`'s scheme-default fallback.
+#[test]
+fn url_parsing_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("url_parsing.em"),
+    "https\nexample.com\n443\n/search\nq=emerald\nresults\n443\n/api\nid=42\n"
+  );
+}

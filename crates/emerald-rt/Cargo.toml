@@ -163,5 +163,14 @@ rand = "0.8"
 # runtime dependencies (only a dev-only `rand` 0.8) - the smallest
 # possible addition to this ledger of any crate in the 91-191 batch.
 subtle = "2.6"
+# Plan 98: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - url 2.5.8 (Jan 5, 2026), servo-owned (the reference-
+# grade WHATWG URL Standard implementation the rest of the Rust web
+# ecosystem - reqwest, hyper, cargo itself - already depends on), #8 in
+# Parser implementations, 64.9M downloads/month, used in 77,921 crates.
+# Pure Rust - depends only on form_urlencoded/idna/percent-encoding
+# (+optional serde), all pure-Rust siblings from the same maintainer
+# ecosystem, no C dependency of any kind. No RustSec advisory found.
+url = "2.5"
 
 [build-dependencies]

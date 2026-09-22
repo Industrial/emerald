@@ -141,6 +141,12 @@ mod random;
 mod regex;
 mod secure_compare;
 mod system;
+// Named `urls`, not `url` — this crate's own `mod url` would shadow
+// the external `url` crate this module wraps, exactly the collision
+// `aead.rs` hit against the external `aead` crate (see that module's
+// own doc comment); `#[path]` keeps the file itself named `url.rs`.
+#[path = "url.rs"]
+mod urls;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -1385,6 +1391,95 @@ pub unsafe extern "C" fn emerald_rt_random_int(min: i64, max: i64) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_random_shuffle(arr: *mut c_void) {
   catch_and_raise(move || random::random_shuffle(arr as *mut i64))
+}
+
+// Plan 98 (URL Parsing): `Url.parse`/`.build`, `Url#scheme`/`#host`/
+// `#port`/`#path`/`#query`/`#fragment`/`#with_path`/`#with_query`/
+// `#with_port` — see `url.rs`'s own module doc (declared as `mod
+// urls` in this file to avoid shadowing the external `url` crate).
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_parse(s: *const c_char) -> i64 {
+  catch_and_raise(move || urls::url_parse(s))
+}
+
+/// # Safety
+/// `scheme`/`host`/`path`, if non-null, must point to valid, NUL-
+/// terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_build(
+  scheme: *const c_char,
+  host: *const c_char,
+  path: *const c_char,
+) -> i64 {
+  catch_and_raise(move || urls::url_build(scheme, host, path))
+}
+
+/// # Safety
+/// Always safe to call for a live `Url` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_scheme(id: i64) -> *const c_char {
+  catch_and_raise(move || urls::url_scheme(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `Url` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_host(id: i64) -> *const c_char {
+  catch_and_raise(move || urls::url_host(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `Url` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_port(id: i64) -> i64 {
+  catch_and_raise(move || urls::url_port(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `Url` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_path(id: i64) -> *const c_char {
+  catch_and_raise(move || urls::url_path(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `Url` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_query(id: i64) -> *const c_char {
+  catch_and_raise(move || urls::url_query(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `Url` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_fragment(id: i64) -> *const c_char {
+  catch_and_raise(move || urls::url_fragment(id))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_with_path(id: i64, path: *const c_char) -> i64 {
+  catch_and_raise(move || urls::url_with_path(id, path))
+}
+
+/// # Safety
+/// `query`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_with_query(id: i64, query: *const c_char) -> i64 {
+  catch_and_raise(move || urls::url_with_query(id, query))
+}
+
+/// # Safety
+/// Always safe to call for a live `Url` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_url_with_port(id: i64, port: i64) -> i64 {
+  catch_and_raise(move || urls::url_with_port(id, port))
 }
 
 // Real, expected consequence of introducing genuine cross-archive
