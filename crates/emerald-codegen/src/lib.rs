@@ -5110,6 +5110,12 @@ struct Ctx<'a, 'ctx> {
   udp_socket_close: FunctionValue<'ctx>,
   udp_socket_last_sender_host: FunctionValue<'ctx>,
   udp_socket_last_sender_port: FunctionValue<'ctx>,
+  /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
+  /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
+  dns_resolve: FunctionValue<'ctx>,
+  dns_resolve_all: FunctionValue<'ctx>,
+  dns_resolve_count: FunctionValue<'ctx>,
+  dns_configure: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8885,6 +8891,52 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "udpsocketstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 97's Decision log: `Dns.resolve`/`.resolve_all`/
+  // `.resolve_count`/`.configure` — the same reserved-namespace
+  // static-call shape `Url`/`Env` use.
+  if recv_name == "Dns" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    return match method {
+      "resolve" => {
+        let call = builder
+          .build_call(ctx.dns_resolve, &call_args, "dnsresolvetmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Str))
+      }
+      "resolve_all" => {
+        let call = builder
+          .build_call(ctx.dns_resolve_all, &call_args, "dnsresolvealltmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Ptr))
+      }
+      "resolve_count" => {
+        let call = builder
+          .build_call(ctx.dns_resolve_count, &call_args, "dnsresolvecounttmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Int64))
+      }
+      "configure" => {
+        builder
+          .build_call(ctx.dns_configure, &call_args, "dnsconfiguretmp")
+          .map_err(|e| e.to_string())?;
+        Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
+      }
+      other => Err(format!("codegen: unsupported Dns static method `{other}`")),
+    };
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -19861,6 +19913,27 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[], false),
     Some(Linkage::External),
   );
+  // Plan 97 (DNS Resolution).
+  let dns_resolve = module.add_function(
+    "emerald_rt_dns_resolve",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let dns_resolve_all = module.add_function(
+    "emerald_rt_dns_resolve_all",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let dns_resolve_count = module.add_function(
+    "emerald_rt_dns_resolve_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let dns_configure = module.add_function(
+    "emerald_rt_dns_configure",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -20643,6 +20716,10 @@ fn compile_to_object_impl(
     udp_socket_close,
     udp_socket_last_sender_host,
     udp_socket_last_sender_port,
+    dns_resolve,
+    dns_resolve_all,
+    dns_resolve_count,
+    dns_configure,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

@@ -4519,6 +4519,36 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 97's Decision log: `Dns.resolve`/`.resolve_all`/
+    // `.resolve_count`/`.configure` — the same reserved-namespace
+    // static-call shape `Url`/`Env` already use. `.configure` commits
+    // to this plan's own "Not yet decided" item 1/2: a single
+    // `(mode, nameserver)` pair, global-reconfiguration model.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Dns") => {
+      let (expected_params, ret) = match method.as_str() {
+        "resolve" => (vec![Type::String], Type::String),
+        "resolve_all" => (vec![Type::String], Type::Array(Box::new(Type::String))),
+        "resolve_count" => (vec![Type::String], Type::Int64),
+        "configure" => (vec![Type::String, Type::String], Type::Void),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Dns has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`

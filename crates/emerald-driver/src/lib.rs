@@ -269,6 +269,21 @@ fn build_link_args(
     obj_path.as_os_str().to_os_string(),
     runtime_archive_path.as_os_str().to_os_string(),
     emerald_rt_archive_path.as_os_str().to_os_string(),
+    // Plan 97 (DNS Resolution): a real, disclosed, unconditional
+    // requirement, not a per-program opt-in via `emerald.toml`'s own
+    // `[ffi] link` table — `emerald-rt` is one single combined
+    // `staticlib` archive for the whole crate, so once `hickory-
+    // resolver`/`tokio`'s own object code (which calls raw libm
+    // symbols like `exp`/`pow` directly, unlike this project's own
+    // `Math` module, which deliberately uses the pure-Rust `libm`
+    // *crate* specifically to avoid this — see plan 164's own
+    // Decision log) is linked into that archive, EVERY compiled
+    // Emerald program pulls those unresolved symbols in, whether or
+    // not that particular program ever calls `Dns.*`. Found as a real
+    // link failure (`undefined reference to 'exp'`/`'pow'`), not
+    // anticipated — `--gc-sections` does not prune it away, since this
+    // code is reachable from `tokio`'s own scheduler init path.
+    "-lm".into(),
   ];
   for lib in extra_libs {
     args.push(format!("-l{lib}").into());
@@ -859,9 +874,10 @@ mod tests {
   #[test]
   fn build_link_args_with_no_extra_libs_is_byte_for_byte_the_original_five_argument_list() {
     // Bugfix (benchmark session): name kept for history, but this is now
-    // a seven-argument list including `-Wl,--gc-sections` and (plan 91)
-    // the second, Rust-compiled archive — see each flag/argument's own
-    // doc comment on `build_link_args` for why.
+    // an eight-argument list including `-Wl,--gc-sections` (plan 91) the
+    // second, Rust-compiled archive, and (plan 97) an unconditional
+    // `-lm` — see each flag/argument's own doc comment on
+    // `build_link_args` for why.
     let obj = Path::new("/tmp/x.o");
     let archive = Path::new("/tmp/libemerald_runtime.a");
     let rt_archive = Path::new("/tmp/libemerald_rt.a");
@@ -875,6 +891,7 @@ mod tests {
         std::ffi::OsString::from("/tmp/x.o"),
         std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
         std::ffi::OsString::from("/tmp/libemerald_rt.a"),
+        std::ffi::OsString::from("-lm"),
         std::ffi::OsString::from("-o"),
         std::ffi::OsString::from("/tmp/out"),
       ]
@@ -896,6 +913,7 @@ mod tests {
         std::ffi::OsString::from("/tmp/x.o"),
         std::ffi::OsString::from("/tmp/libemerald_runtime.a"),
         std::ffi::OsString::from("/tmp/libemerald_rt.a"),
+        std::ffi::OsString::from("-lm"),
         std::ffi::OsString::from("-lsqlite3"),
         std::ffi::OsString::from("-o"),
         std::ffi::OsString::from("/tmp/out"),

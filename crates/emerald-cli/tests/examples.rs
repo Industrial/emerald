@@ -477,3 +477,17 @@ fn url_parsing_em_prints_expected_sequence() {
 fn raw_tcp_sockets_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("raw_tcp_sockets.em"), "ping\npong\n");
 }
+
+// Plan 97 (DNS Resolution): network-dependent, real DNS lookups against
+// Cloudflare's own stable `one.one.one.one` vanity hostname — the
+// second call routes the query through DNS-over-TLS to that same
+// service, a real proof the DoT configuration path actually changes
+// transport, not an inert flag. Per the plan's own Concrete Proof, the
+// exact resolved address is not asserted verbatim (randomized by
+// upstream DNS load-balancing/IPv4-vs-IPv6 ordering) — only that each
+// call succeeds and returns a well-formed address, checked here via a
+// real `Regex` match rather than an unchecked `puts` of the raw value.
+#[test]
+fn dns_resolution_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("dns_resolution.em"), "true\ntrue\n");
+}

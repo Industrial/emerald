@@ -126,9 +126,26 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+// Plan 97: the first real (non-illustrative) use of the shared-runtime
+// pattern this crate's own module doc above describes — exactly one
+// lazily-initialized `Runtime` behind a `OnceLock`, `rt-multi-thread`
+// (not `rt`/current-thread alone — `hickory_resolver::Resolver`'s own
+// docs warn that its lookup futures and the background tasks they
+// spawn must be able to run concurrently on the same executor, which
+// a single-threaded runtime blocked on `block_on` cannot provide).
+// Any future async-backed domain plan reuses this exact function
+// rather than starting a second runtime of its own.
+pub(crate) fn tokio_rt() -> &'static tokio::runtime::Runtime {
+  static TOKIO_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+  TOKIO_RT.get_or_init(|| {
+    tokio::runtime::Runtime::new().expect("emerald-rt: failed to start the shared tokio runtime")
+  })
+}
+
 mod aead;
 mod asymmetric;
 mod bytes;
+mod dns;
 mod encoding;
 mod env;
 mod handle;
@@ -1578,6 +1595,35 @@ pub unsafe extern "C" fn emerald_rt_udp_socket_last_sender_host() -> *const c_ch
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_udp_socket_last_sender_port() -> i64 {
   catch_and_raise(net::udp_socket_last_sender_port)
+}
+
+/// # Safety
+/// `mode`/`nameserver`, if non-null, must point to valid, NUL-
+/// terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dns_configure(mode: *const c_char, nameserver: *const c_char) {
+  catch_and_raise(move || dns::dns_configure(mode, nameserver))
+}
+
+/// # Safety
+/// `host`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dns_resolve(host: *const c_char) -> *const c_char {
+  catch_and_raise(move || dns::dns_resolve(host))
+}
+
+/// # Safety
+/// `host`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dns_resolve_all(host: *const c_char) -> *mut c_void {
+  catch_and_raise(move || dns::dns_resolve_all(host))
+}
+
+/// # Safety
+/// `host`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dns_resolve_count(host: *const c_char) -> i64 {
+  catch_and_raise(move || dns::dns_resolve_count(host))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

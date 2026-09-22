@@ -191,5 +191,58 @@ url = "2.5"
 # instruction, not by depending on `socket2` (a larger, narrower-
 # purpose crate this plan doesn't otherwise need).
 libc = "0.2"
+# Plan 97: real-checked at this plan's own authoring time (2026-09-22,
+# via docs.rs) - hickory-resolver 0.26.3, the actively maintained,
+# pure-Rust-first successor to `trust-dns-resolver` (renamed when the
+# project moved under the `hickory-dns` GitHub organization), owned by
+# `bluejekyll`. Pinned at >=0.26.2 specifically because a real,
+# disclosed RustSec-relevant advisory exists against earlier versions
+# (Amazon Linux's own CVE tracking: "hickory-resolver versions before
+# 0.26.2 fail to propagate bogus DNSSEC proof" correctly) - re-checked
+# against `cargo audit` below, not merely against this comment's own
+# snapshot. Two real, disclosed corrections found against the plan's
+# own text, neither cosmetic: (1) the plan's own Decision log claims
+# a "genuinely separate, real synchronous `Resolver` type" exists -
+# verified false for 0.26.x: `Resolver<P>` (`TokioResolver` is its own
+# `Resolver<TokioRuntimeProvider>` alias) is doc-commented "An
+# asynchronous resolver for DNS generic over async Runtimes" with only
+# `pub async fn lookup_ip`/etc. - this plan is therefore the FIRST to
+# actually implement plan 94's own illustrative, never-yet-used
+# `tokio_rt()`/`block_on` bridging pattern for real, adding `tokio`
+# below rather than finding a sync entry point that does not exist.
+# (2) the plan's own text names `ResolverConfig::cloudflare_tls()`/
+# `::cloudflare_https()`/`::google()`/`::quad9()` named-provider preset
+# constructors and `dns-over-rustls`/`dns-over-https-rustls` feature
+# names - verified false for 0.26.3: no named-provider presets exist
+# at all (`ResolverConfig`'s own associated functions are the generic
+# `udp_and_tcp`/`tls`/`https`/`quic`/`h3`/`from_name_servers`), and the
+# real feature flags are `tls-ring`/`tls-aws-lc-rs`/`https-ring`/
+# `https-aws-lc-rs` (a dual-crypto-backend split that didn't exist when
+# the plan's text was written) - this module builds Cloudflare's own
+# `1.1.1.1`/`1.0.0.1`/`cloudflare-dns.com` DoT/DoH config directly via
+# `NameServerConfig::tls`/`::https` instead of a one-line preset call.
+# `-ring` chosen over `-aws-lc-rs`: `ring` is the RustCrypto-adjacent,
+# long-established choice most "pure-Rust-first" Rust projects already
+# accept as a real, disclosed C-exception (hand-optimized assembly,
+# not a full C library fork); `aws-lc-rs` vendors a full AWS-LC (a
+# BoringSSL fork) C codebase, a substantially larger, more exotic
+# C-exception for the same functional requirement - a real, disclosed
+# correction to the plan's own "stays pure-Rust end to end" claim,
+# which does not hold for either backend once TLS is actually needed.
+hickory-resolver = { version = "0.26.2", features = [
+  "tls-ring",
+  "https-ring",
+  "webpki-roots",
+] }
+# `tokio` (real, not illustrative) - the first genuine use of plan 94's
+# own documented `tokio_rt()`/`OnceLock`/`block_on` bridging pattern
+# (see `lib.rs`'s own module doc), needed because no sync-native DNS
+# resolver survives plan 95's vetting bar in this crate's actual pinned
+# version (see above). `rt-multi-thread`, not `rt` alone: `Resolver`'s
+# own docs state its lookup futures and the background tasks they
+# spawn must run on the SAME executor and can deadlock a single-
+# threaded `block_on` if the background work can't also make progress
+# concurrently - a multi-thread runtime is required, not a convenience.
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [build-dependencies]

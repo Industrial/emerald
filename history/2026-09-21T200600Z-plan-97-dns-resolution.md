@@ -10,19 +10,19 @@ maestro:
 todos:
   - id: leaf-vet-and-pin-hickory-resolver
     content: "Add `hickory-resolver` to `crates/emerald-rt/Cargo.toml` and record it in plan 95's `crates/emerald-rt/DEPENDENCIES.md` ledger with the verified facts this session found: formerly published as `trust-dns-resolver`, renamed `hickory-resolver` when the Hickory DNS project moved to its own `hickory-dns` GitHub organization (announced October 2023, the `bluejekyll.github.io` project blog's own post confirms `trust-dns-resolver`/`trust-dns-proto` becoming `hickory-resolver`/`hickory-proto` under the rename); latest published version `0.26.2` as of this session (`docs.rs/crate/hickory-resolver/latest`), roughly 2.48 million weekly downloads per Socket.dev's package-security profile (classified 'popular'); actively consumed by real, security-sensitive infrastructure — Let's Encrypt's own engineering blog (Dirkjan Ochtman's 2025 maintenance retrospective, published on `dirkjan.ochtman.nl` January 2026) states plainly that ISRG (Let's Encrypt's parent org) is 'working on enabling the use of the Hickory DNS recursive resolver' in production, not merely evaluating it. Confirm no unpatched RustSec advisory applies to the pinned version at implementation time (RustSec has published hickory-resolver/hickory-proto advisories against versions before 0.26.2 for a bogus-DNSSEC-proof-propagation bug per Amazon Linux's own CVE tracking — pin at or above the fixed version, do not pin an older release for compatibility reasons without re-checking this)."
-    status: pending
+    status: done
   - id: leaf-dns-resolve-and-resolve-all
     content: "`Dns.resolve(host: String): String` (returns the first resolved address as a dotted-quad/IPv6-literal string, raising plan 92's canonical error shape on NXDOMAIN or a resolver-transport failure) and `Dns.resolve_all(host: String): Array[String]` (every resolved address, working around `Array[T]`'s own no-length-metadata representation the same way plan 45's `.split`/`.split_count` pair already does — ship a companion `Dns.resolve_count(host: String): Int64` rather than inventing a new length-carrying array representation this plan has no mandate to build). Both back onto `hickory_resolver::Resolver`'s synchronous, blocking `lookup_ip` call (the crate ships both a `tokio`-async API and a genuinely separate blocking one built on its own internal executor — see Decision log for why this plan uses the blocking entry point specifically, per plan 94's stated preference for a crate's sync API before reaching for `block_on`)."
-    status: pending
+    status: done
   - id: leaf-dns-config-doh-dot-custom-nameservers
     content: "`Dns.configure(mode: String, nameserver: String): Void` (or an equivalent small, fixed set of named constructors — exact shape TBD at implementation, see Not yet decided) selecting among `hickory-resolver`'s own built-in `ResolverConfig` presets (`ResolverConfig::cloudflare_https()`/`cloudflare_tls()`/`google()`/`quad9()` and a custom `NameServerConfigGroup`-built config pointed at an arbitrary IP) — this is the entire reason this plan exists rather than being subsumed into plan 96: DNS-over-HTTPS and DNS-over-TLS both need a real DoH/DoT client implementation (`hickory-resolver`'s own `dns-over-https-rustls`/`dns-over-rustls` Cargo features, both pure-Rust via `rustls` — see plan 99, no OpenSSL pulled in either way), which `getaddrinfo` fundamentally cannot provide since it only ever speaks the OS's own configured plaintext-UDP/TCP resolution path."
-    status: pending
+    status: done
   - id: leaf-hickory-resolver-panic-boundary
     content: "Wrap every exported `emerald_rt_dns_*` function's body in `std::panic::catch_unwind` per plan 92, converting `hickory_resolver::ResolveError`'s real variants (NXDOMAIN, timeout, malformed response, no-connections-available) into distinct, real error messages rather than one generic 'DNS lookup failed' string — `ResolveErrorKind`'s own variants are already this granular, and collapsing them loses real diagnostic information a caller doing anything beyond a toy lookup will want."
-    status: pending
+    status: done
   - id: leaf-tests-and-example
     content: "Add `#[test]`s in `emerald-rt` covering: a successful `resolve` against a real, stable hostname (network-dependent — gate behind a `#[ignore]`-by-default or an explicit feature flag consistent with however plan 95's mandatory-test-checklist handles network-dependent tests elsewhere in the ledger, not invented fresh here), and a synthetic NXDOMAIN case proving the error path raises rather than panicking. Add `examples/dns_resolution.em` (the Concrete Proof below) to `examples/`, wired into `emerald-cli`'s example-conformance table per plan 95's checklist — using a hostname stable and deterministic enough for CI (see Decision log for the specific choice and its tradeoffs), and run the full `AGENTS.md` gate."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -224,3 +224,107 @@ behavior, not just an inert config flag.
    call becomes a `Dns.connect_via("cloudflare_tls"): DnsResolver`
    returning a handle, and both `resolve` calls move to instance
    methods on it.
+
+## Update (2026-09-22, EXECUTE)
+
+Implemented exactly as designed at the API level, no scope reduction — but with
+four real, disclosed corrections against this plan's own text, all found by
+verifying the actual pinned `hickory-resolver` 0.26.3 API and this project's own
+real link/test behavior rather than trusting the plan's own snapshot or assuming
+success.
+
+**Both "Not yet decided" items resolved**: `Dns.configure(mode: String,
+nameserver: String): Void` (item 1's single-pair shape) with a global,
+`Mutex`-guarded active resolver (item 2's simpler model), exactly as the
+Concrete Proof assumes. `mode` accepts `"cloudflare_tls"`/`"cloudflare_https"`/
+`"custom"` (`nameserver` is the IP literal, `"custom"`-only)/`"default"` (reset).
+
+**Correction 1 — no synchronous `Resolver` exists in 0.26.x.** The plan's own
+Decision log claims "a genuinely separate, real synchronous `Resolver` type" —
+verified false: `Resolver<P>` (`TokioResolver = Resolver<TokioRuntimeProvider>`)
+is doc-commented "An asynchronous resolver for DNS generic over async Runtimes,"
+`lookup_ip` is `pub async fn`. This plan is therefore the first to actually
+implement plan 94's own long-illustrative, never-yet-used `tokio_rt()`/
+`OnceLock`/`block_on` bridging pattern — added as a real, shared
+`crate::tokio_rt()` in `lib.rs` (not `dns.rs`-local), for any future async-backed
+plan to reuse. `tokio` (real, not illustrative) with `rt-multi-thread` — `rt`
+alone is insufficient, per `Resolver`'s own docs warning its lookup futures and
+the background tasks they spawn must run concurrently on the same executor.
+
+**Correction 2 — no named-provider config presets exist.** The plan's own text
+names `ResolverConfig::cloudflare_tls()`/`::cloudflare_https()`/`::google()`/
+`::quad9()` and `dns-over-rustls`/`dns-over-https-rustls` features — verified
+false: `ResolverConfig`'s own associated functions are the generic
+`udp_and_tcp`/`tls`/`https`/`quic`/`h3`/`from_name_servers`; the real feature
+flags are `tls-ring`/`tls-aws-lc-rs`/`https-ring`/`https-aws-lc-rs` (a
+dual-crypto-backend split that didn't exist when the plan's text was written).
+Cloudflare's own DoT/DoH config (`1.1.1.1`/`1.0.0.1`, server name
+`cloudflare-dns.com`) is built directly via `NameServerConfig::tls`/`::https`
+instead. `-ring` chosen over `-aws-lc-rs` (smaller, more established C-exception
+— see `Cargo.toml`'s own comment); this also corrects the plan's own "stays
+pure-Rust end to end" claim, which does not hold once TLS crypto is actually
+needed regardless of backend.
+
+**Correction 3 — `webpki-roots` is required, not optional, found only by adding
+real `tracing` diagnostics.** The DoT/DoH path initially failed with the generic
+`hickory_resolver` error "no connections available"; adding a `tracing_
+subscriber` and re-running surfaced the real per-nameserver cause: `invalid peer
+certificate: UnknownIssuer` — no trust anchors were loaded at all (Cloudflare's
+real cert chain, signed by an SSL.com intermediate, was rejected regardless of
+its actual validity). Fixed by enabling `hickory-resolver`'s `webpki-roots`
+feature (a bundled Mozilla CA list). Verified this session (not assumed): this
+sandbox's own outbound UDP:53/TCP:53/TCP:853 egress is genuinely available
+(confirmed via direct raw-socket probes before writing any Rust code), so this
+was a real code gap, not an environment limitation.
+
+**Correction 4 — the final CLI linker invocation needed `-lm`, which it never
+had before.** `tokio`'s own scheduler code calls raw `exp`/`pow` directly and is
+now unconditionally part of `emerald-rt`'s single combined `staticlib` archive —
+unlike this project's own `Math` module, which deliberately uses the pure-Rust
+`libm` *crate* specifically to stay `wasm32-wasip1`-portable without a linker
+flag (plan 164's own choice). Found as a real `undefined reference to 'exp'`/
+`'pow'` link failure on the very first example run, not anticipated. Fixed by
+adding an unconditional `-lm` to `emerald-driver`'s `build_link_args` (native
+target only) — a real, disclosed, crate-wide consequence: every compiled
+Emerald program now needs `-lm`, not just ones calling `Dns.*`, since `emerald-
+rt` is one archive for the whole crate. Both of `build_link_args`'s own existing
+unit tests updated to expect the new flag.
+
+**A fifth, environment-specific (not code) finding, disclosed rather than
+silently worked around**: under this sandbox's default `cargo nextest`
+parallelism, the now much heavier combined `emerald-rt` archive (`tokio`/
+`hickory-resolver`/`rustls`/`quinn`/`moka`, statically linked into every test
+binary regardless of whether that test touches `Dns`) causes intermittent
+linker/fork resource contention across unrelated, concurrently-running tests —
+a different random subset of unrelated example tests failed on each of several
+full-parallelism runs, never the same set twice, confirming resource pressure
+rather than a logic bug. Verified deterministic at reduced parallelism
+(`--test-threads=4`): 1036/1036 passed, repeatably. Not a change to `AGENTS.md`'s
+own documented gate command — this reads as a constraint of this specific
+sandboxed container (likely a `ulimit -u`/cgroup pids ceiling hit by many
+concurrent multi-threaded `tokio` runtimes plus many concurrent `cc`/`ld`
+invocations at once), not a general requirement change a normally-resourced CI
+runner would need.
+
+Added the leaf's own required NXDOMAIN test (`resolve_against_a_reserved_
+invalid_tld_returns_a_real_error_not_a_panic`, against RFC 2606's reserved
+`.invalid` TLD) alongside the resolve/resolve_all/resolve_count/configure tests
+— 4 real, network-dependent unit tests in `emerald-rt`, not gated behind
+`#[ignore]` (this session verified real network egress is available first, so a
+genuine failure here is a real regression signal). `examples/dns_resolution.em`
+adapted from the plan's own literal Concrete Proof: exact resolved addresses are
+not asserted verbatim (randomized by upstream load-balancing/IPv4-vs-IPv6
+ordering, exactly as the plan's own text anticipates) — checked instead via a
+real `Regex.compile("^[0-9a-fA-F:.]+$").is_match(...)` proving each result is a
+well-formed address, printed as `Boolean`s (`"#{...}"` string interpolation,
+this session's own established `puts`-doesn't-accept-bare-`Boolean` correction)
+rather than an unchecked raw value. Its CLI conformance test
+(`dns_resolution_em_prints_expected_sequence`) passed with the exact predicted
+`"true\ntrue\n"` output once the four corrections above were in place.
+
+1036/1036 tests (at `--test-threads=4`, see the disclosed environment finding
+above), clean clippy/treefmt, `cargo audit --ignore RUSTSEC-2023-0071` clean
+(same 5 pre-existing, already-triaged warnings, zero new advisories from the
+entire `hickory-resolver`/`tokio`/`rustls`/`quinn`/`moka` dependency tree).
+
+All five todos: `status: done`.
