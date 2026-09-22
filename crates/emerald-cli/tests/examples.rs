@@ -320,3 +320,16 @@ fn base64_hex_encoding_em_prints_expected_sequence() {
   assert!(!last.is_empty() && last != "unexpected ok", "{last:?}");
   assert_eq!(lines.next(), None);
 }
+
+// Plan 122 (Regular Expressions): `Regex.compile`/`.is_match`/`.find`/
+// `.captures`/`.replace_all` against a date pattern, matching the
+// original plan's own predicted values exactly (adapted only for two
+// real, disclosed syntax corrections — see `examples/regex_dates.em`'s
+// own header comment).
+#[test]
+fn regex_dates_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("regex_dates.em"),
+    "true\n2026-09-21\n2026\n21/09/2026 and 08/01/2026\n"
+  );
+}

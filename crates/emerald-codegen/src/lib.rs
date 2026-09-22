@@ -160,6 +160,10 @@ fn set_newtype_underlying(program: &Program) {
     "LogFields".to_string(),
     TypeExpr::Named("Int64".to_string()),
   );
+  // Plan 122's Decision log: `Regex` — the identical compiler-
+  // synthesized, zero-cost `Int64` newtype shape, reusing plan 93's
+  // own handle registry to hold a boxed `regex::Regex`.
+  map.insert("Regex".to_string(), TypeExpr::Named("Int64".to_string()));
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
@@ -4928,6 +4932,18 @@ struct Ctx<'a, 'ctx> {
   hex_encode: FunctionValue<'ctx>,
   hex_encode_upper: FunctionValue<'ctx>,
   hex_decode: FunctionValue<'ctx>,
+  /// Plan 122 (Regular Expressions) — `Regex.compile` plus its nine
+  /// instance methods.
+  regex_compile: FunctionValue<'ctx>,
+  regex_is_match: FunctionValue<'ctx>,
+  regex_find: FunctionValue<'ctx>,
+  regex_find_all: FunctionValue<'ctx>,
+  regex_find_all_count: FunctionValue<'ctx>,
+  regex_captures: FunctionValue<'ctx>,
+  regex_replace: FunctionValue<'ctx>,
+  regex_replace_all: FunctionValue<'ctx>,
+  regex_split: FunctionValue<'ctx>,
+  regex_split_count: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7657,6 +7673,67 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
     }
+    // Plan 122's Decision log: `Regex`'s own nine instance methods —
+    // the identical carved-out-of-`.value`-only shape `LogFields#set`
+    // immediately above already establishes. `recv_val` is the
+    // receiver's own already-compiled `i64` handle id (zero-cost
+    // newtype lowering, unchanged from every other newtype here).
+    if local_classes.get(recv_name).map(String::as_str) == Some("Regex") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "is_match" => (ctx.regex_is_match, ValKind::Int64),
+        "find" => (ctx.regex_find, ValKind::Ptr),
+        "find_all" => (ctx.regex_find_all, ValKind::Ptr),
+        "find_all_count" => (ctx.regex_find_all_count, ValKind::Int64),
+        "captures" => (ctx.regex_captures, ValKind::Ptr),
+        "replace" => (ctx.regex_replace, ValKind::Str),
+        "replace_all" => (ctx.regex_replace_all, ValKind::Str),
+        "split" => (ctx.regex_split, ValKind::Ptr),
+        "split_count" => (ctx.regex_split_count, ValKind::Int64),
+        other => return Err(format!("codegen: unsupported Regex method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "regextmp")
+        .map_err(|e| e.to_string())?;
+      let result = call_result(call)?;
+      if method == "is_match" {
+        // Plan 122's Decision log: narrows the `i64` (0/1) ABI value
+        // back into a real `i1`, the same "widen the other direction"
+        // trick this codebase already uses for `emerald_bool_to_string`
+        // (see this plan's own Decision log for the full precedent).
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "regexismatchbool",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      return Ok((result, ret_kind));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -7825,6 +7902,34 @@ fn build_method_call<'ctx>(
       .build_call(fv, &[v.into()], "hextmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 122's Decision log: `Regex.compile(pattern)` — the same
+  // reserved-namespace static-call shape `Json`/`Base64`/`Hex` use.
+  // `emerald_rt_regex_compile` already returns plan 53's own `Result`
+  // layout directly (a heap pointer), zero additional marshaling.
+  if recv_name == "Regex" {
+    if method != "compile" {
+      return Err(format!(
+        "codegen: unsupported Regex static method `{method}`"
+      ));
+    }
+    let arg = args
+      .first()
+      .ok_or_else(|| "codegen: `Regex.compile` expects 1 argument".to_string())?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(ctx.regex_compile, &[v.into()], "regexcompiletmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
   }
 
   // Plan 168's Decision log: `Log.configure`/`.<level>`/
@@ -17784,6 +17889,60 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 122 (Regular Expressions): `.compile` returns plan 53's own
+  // `Result` layout (a heap pointer); `.is_match`/`.find_all_count`/
+  // `.split_count` return a plain `i64`; every other method returns a
+  // heap pointer (`String`/`Array[T]`/`Option[T]`, all pointer-sized).
+  let regex_compile = module.add_function(
+    "emerald_rt_regex_compile",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_is_match = module.add_function(
+    "emerald_rt_regex_is_match",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_find = module.add_function(
+    "emerald_rt_regex_find",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_find_all = module.add_function(
+    "emerald_rt_regex_find_all",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_find_all_count = module.add_function(
+    "emerald_rt_regex_find_all_count",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_captures = module.add_function(
+    "emerald_rt_regex_captures",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_replace = module.add_function(
+    "emerald_rt_regex_replace",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_replace_all = module.add_function(
+    "emerald_rt_regex_replace_all",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_split = module.add_function(
+    "emerald_rt_regex_split",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let regex_split_count = module.add_function(
+    "emerald_rt_regex_split_count",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -18366,6 +18525,7 @@ fn compile_to_object_impl(
   // newtype of the identical shape already gets.
   newtypes.insert("NativeHandle".to_string());
   newtypes.insert("LogFields".to_string());
+  newtypes.insert("Regex".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -18433,6 +18593,16 @@ fn compile_to_object_impl(
     hex_encode,
     hex_encode_upper,
     hex_decode,
+    regex_compile,
+    regex_is_match,
+    regex_find,
+    regex_find_all,
+    regex_find_all_count,
+    regex_captures,
+    regex_replace,
+    regex_replace_all,
+    regex_split,
+    regex_split_count,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

@@ -57,5 +57,15 @@ tracing-subscriber = { version = "0.3.20", features = ["registry"] }
 # this API level - no C exception needed). See DEPENDENCIES.md.
 base64 = "0.23"
 hex = "0.4"
+# Plan 122: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - regex 1.13.1 (Jul 15, 2026), #1 in Text processing,
+# 91,877,768 downloads/month, used in 105,388 crates, owned directly
+# by rust-lang itself, MIT/Apache. Chosen for a real, verified,
+# structural security property: RE2-derived finite-automata matching
+# guarantees worst-case O(m*n) time with no catastrophic-backtracking/
+# ReDoS class at all (confirmed against the crate's own README and
+# independent security literature) - the entire reason it lacks
+# backreferences/lookaround. No RustSec advisory found.
+regex = "1.13"
 
 [build-dependencies]

@@ -4127,6 +4127,34 @@ fn infer_expr_type(
         )),
       }
     }
+    // Plan 122's Decision log: `Regex.compile(pattern)` — the same
+    // reserved-namespace static-call shape `Json`/`Base64`/`Hex` use.
+    // Every OTHER `Regex` method is an instance method on an already-
+    // compiled `Regex`-newtype-typed receiver, dispatched by the
+    // `Type::Newtype` arm further below, never reached from here.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Regex") =>
+    {
+      if method != "compile" {
+        return Err(Diagnostic::new(
+          format!("Regex has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(
+        method,
+        args,
+        &[Type::String],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Result(
+        Box::new(Type::Newtype("Regex".to_string(), Box::new(Type::Int64))),
+        Box::new(Type::String),
+      ))
+    }
     // Plan 168's Decision log: `Log.configure`/`.<level>`/
     // `.<level>_fields` — the same reserved-namespace static-call
     // shape `File`/`Json` immediately below use, for the same reason
@@ -4454,6 +4482,50 @@ fn infer_expr_type(
         // `NativeHandle`'s own actor-boundary carve-out (plan 93) —
         // `LogFields` needs a real mutating method, not just an
         // unwrap.
+        // Plan 122's Decision log: `Regex`'s own nine instance methods
+        // — the identical carved-out-of-`.value`-only shape
+        // `LogFields#set` immediately below already establishes, just
+        // with a real return-type table instead of a single `Void`.
+        if name == "Regex" {
+          let option_string = Type::Enum("Option$String".to_string());
+          let captures_ty = Type::Enum(mangle_type_expr(&TypeExpr::Generic(
+            "Option".to_string(),
+            vec![TypeExpr::Generic(
+              "Array".to_string(),
+              vec![TypeExpr::Generic(
+                "Option".to_string(),
+                vec![TypeExpr::Named("String".to_string())],
+              )],
+            )],
+          )));
+          let (expected_params, ret) = match method.as_str() {
+            "is_match" => (vec![Type::String], Type::Boolean),
+            "find" => (vec![Type::String], option_string),
+            "find_all" => (vec![Type::String], Type::Array(Box::new(Type::String))),
+            "find_all_count" => (vec![Type::String], Type::Int64),
+            "captures" => (vec![Type::String], captures_ty),
+            "replace" | "replace_all" => (vec![Type::String, Type::String], Type::String),
+            "split" => (vec![Type::String], Type::Array(Box::new(Type::String))),
+            "split_count" => (vec![Type::String], Type::Int64),
+            other => {
+              return Err(Diagnostic::new(
+                format!("Regex has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
         if name == "LogFields" && method == "set" {
           if args.len() != 2 {
             return Err(Diagnostic::new(
@@ -11321,6 +11393,31 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       newtype_underlying: Some(Type::Int64),
     },
   );
+  // Plan 122's Decision log: `Regex` — the identical "reserved name,
+  // zero-cost `Int64` handle" shape `NativeHandle`/`LogFields` above
+  // already use, backed by plan 93's own `crate::handle` registry in
+  // `emerald-rt` (a boxed `regex::Regex`, never a raw pointer smuggled
+  // through as an `Int64`). `Regex.compile` is a reserved-namespace
+  // static intrinsic (this `Expr::MethodCall` arm's own sibling below);
+  // every other method (`.is_match`/`.find`/`.find_all`/`.find_all_
+  // count`/`.captures`/`.replace`/`.replace_all`/`.split`/`.split_
+  // count`) is carved out of the ordinary newtype `.value`-only
+  // restriction, the same mechanism `LogFields#set` already
+  // established, just with nine methods instead of one.
+  classes.insert(
+    "Regex".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
   for item in &program.items {
     if let Item::Class(c) = item {
       if !c.type_params.is_empty() {
@@ -11692,6 +11789,37 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     if let Err(d) = instantiate_generic_enum(
       "Option",
       &[TypeExpr::Named("JsonValue".to_string())],
+      &generic_classes,
+      &generic_enums,
+      &mut classes,
+      &mut in_progress,
+    ) {
+      diags.push(d);
+    }
+  }
+  // Plan 122: `Regex#captures`'s own real return type is `Option[
+  // Array[Option[String]]]` — the identical "unconditionally pre-
+  // instantiated, regardless of whether this specific program ever
+  // writes it as literal annotation text" reasoning as `Option[String]`/
+  // `Option[JsonValue]` above, for the identical reason. Doubly-nested
+  // (an `Option[T]` whose own `T` is `Array[Option[String]]`) rather
+  // than a single level — `instantiate_generic_enum` resolves each
+  // variant field's own type recursively (the same machinery that
+  // already makes `Array[JsonValue]`'s self-reference inside `JsonValue`
+  // itself work), so nothing beyond this one call is needed for the
+  // inner `Option[String]` (already pre-instantiated immediately above)
+  // to resolve correctly inside the `Array[...]` element position too.
+  {
+    let mut in_progress = Vec::new();
+    if let Err(d) = instantiate_generic_enum(
+      "Option",
+      &[TypeExpr::Generic(
+        "Array".to_string(),
+        vec![TypeExpr::Generic(
+          "Option".to_string(),
+          vec![TypeExpr::Named("String".to_string())],
+        )],
+      )],
       &generic_classes,
       &generic_enums,
       &mut classes,

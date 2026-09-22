@@ -456,6 +456,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "hex",
+ "regex",
  "serde_json",
  "tracing",
  "tracing-subscriber",

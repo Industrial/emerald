@@ -130,6 +130,7 @@ mod encoding;
 mod handle;
 mod json;
 mod log;
+mod regex;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -563,6 +564,92 @@ pub unsafe extern "C" fn emerald_rt_hex_encode_upper(s: *const c_char) -> *const
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_hex_decode(s: *const c_char) -> *mut c_void {
   catch_and_raise(move || encoding::hex_decode(s))
+}
+
+// Plan 122 (Regular Expressions): `Regex.compile` and its instance
+// methods (dispatched by `emerald-codegen`'s own `Regex`-newtype
+// method-call arm, not the reserved-namespace static-call shape
+// `Json`/`Log`/`Base64`/`Hex` use) — see `regex.rs`'s own module doc.
+
+/// # Safety
+/// `pattern`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_compile(pattern: *const c_char) -> *mut c_void {
+  catch_and_raise(move || regex::regex_compile(pattern))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_is_match(id: i64, s: *const c_char) -> i64 {
+  catch_and_raise(move || regex::regex_is_match(id, s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_find(id: i64, s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || regex::regex_find(id, s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_find_all(id: i64, s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || regex::regex_find_all(id, s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_find_all_count(id: i64, s: *const c_char) -> i64 {
+  catch_and_raise(move || regex::regex_find_all_count(id, s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_captures(id: i64, s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || regex::regex_captures(id, s))
+}
+
+/// # Safety
+/// `s`/`replacement`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_replace(
+  id: i64,
+  s: *const c_char,
+  replacement: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || regex::regex_replace(id, s, replacement))
+}
+
+/// # Safety
+/// `s`/`replacement`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_replace_all(
+  id: i64,
+  s: *const c_char,
+  replacement: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || regex::regex_replace_all(id, s, replacement))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_split(id: i64, s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || regex::regex_split(id, s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_regex_split_count(id: i64, s: *const c_char) -> i64 {
+  catch_and_raise(move || regex::regex_split_count(id, s))
 }
 
 // Plan 168 (Structured Logging): `Log.configure`/`.trace`/`.debug`/

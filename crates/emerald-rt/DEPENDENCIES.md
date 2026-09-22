@@ -43,6 +43,7 @@ reasoning — add a new row instead.
 | `tracing-subscriber` (+ `registry` feature) | 0.3.23 | Subscriber/Layer composition utilities for `tracing`, same owners; backs `Log`'s custom JSON `Layer`. RUSTSEC-2025-0055 (ANSI-escape injection) checked — patched in >=0.3.20, this pin resolves well above it | pure-Rust | 2026-09-22 | 168 |
 | `base64` | 0.23.1 | #4 in crates.io's Encoding category, 123.7M downloads/month, used in 95,248 crates; `Engine`-trait API's four predefined `general_purpose` constants map 1:1 onto `Base64`'s own four variant pairs. No RustSec advisory found | pure-Rust (default-on `simd-unsafe` feature is internal-only `unsafe`, invisible at this API level) | 2026-09-22 | 123 |
 | `hex` | 0.4.3 | #52 in crates.io's Encoding category, 53.9M downloads/month, used in 44,269 crates; stable/essentially unchanged since 2021, case-insensitive `decode` matching this plan's own wrapper design. No RustSec advisory found | pure-Rust | 2026-09-22 | 123 |
+| `regex` | 1.13.1 | #1 in crates.io's Text processing category, 91.9M downloads/month, used in 105,388 crates, owned directly by rust-lang; RE2-derived finite-automata matching gives a real, verified worst-case `O(m*n)` time guarantee with no catastrophic-backtracking/ReDoS class at all. No RustSec advisory found | pure-Rust | 2026-09-22 | 122 |
 
 ## Pre-existing transitive dependencies (out of scope, triaged)
 
