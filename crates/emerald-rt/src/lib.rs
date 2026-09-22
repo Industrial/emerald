@@ -154,6 +154,7 @@ mod http_client;
 mod http_server;
 mod humantime;
 mod json;
+mod kdf;
 mod log;
 mod math;
 mod net;
@@ -1698,6 +1699,32 @@ pub unsafe extern "C" fn emerald_rt_http_request_path(id: i64) -> *const c_char 
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_http_request_body(id: i64) -> *const c_char {
   catch_and_raise(move || http_server::http_request_body(id))
+}
+
+/// # Safety
+/// `ikm`/`salt`/`info`, if non-null, must point to valid, NUL-
+/// terminated hex-text C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_kdf_hkdf(
+  ikm: *const c_char,
+  salt: *const c_char,
+  info: *const c_char,
+  length: i64,
+) -> *const c_char {
+  catch_and_raise(move || kdf::kdf_hkdf(ikm, salt, info, length))
+}
+
+/// # Safety
+/// `password`/`salt`, if non-null, must point to valid, NUL-terminated
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_kdf_pbkdf2(
+  password: *const c_char,
+  salt: *const c_char,
+  iterations: i64,
+  length: i64,
+) -> *const c_char {
+  catch_and_raise(move || kdf::kdf_pbkdf2(password, salt, iterations, length))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

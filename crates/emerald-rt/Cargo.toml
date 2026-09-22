@@ -268,5 +268,16 @@ ureq = "3.4"
 # No RustSec advisory found. `Http.serve`/`HttpResponse.build`/
 # `HttpRequest#method`/`#path`/`#body`'s direct backing.
 tiny_http = "0.12"
+# Plan 115: real-checked at this plan's own authoring time (2026-09-22,
+# via docs.rs) - hkdf 0.13.0 and pbkdf2 0.13.0, both RustCrypto-owned,
+# pure Rust. Both crates' own docs.rs usage examples were fetched live
+# this session and match this plan's own cited RFC 5869 Test Case 1 /
+# `pbkdf2` doctest vectors byte-for-byte - a rare case in this batch
+# where the plan's own text needed no correction against the real,
+# current API. `hkdf` depends on `hmac`/`sha2` transitively; `pbkdf2`'s
+# "sha2" feature enables the same. No RustSec advisory found against
+# either crate.
+hkdf = "0.13"
+pbkdf2 = { version = "0.13", features = ["sha2"] }
 
 [build-dependencies]

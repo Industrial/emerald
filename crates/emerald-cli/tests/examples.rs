@@ -501,3 +501,21 @@ fn dns_resolution_em_prints_expected_sequence() {
 fn http_client_proof_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("http_client_proof.em"), "200\n404\n500\n");
 }
+
+// Plan 115 (Key Derivation Functions): RFC 5869 Test Case 1's own
+// published HKDF vector, and the `pbkdf2` crate's own published
+// doctest vector — both quoted directly, not invented (see this
+// plan's own Decision log). Real, disclosed correction found writing
+// this example: the plan's own Concrete Proof passes a literal
+// `"salt"` (raw ASCII) to `Kdf.pbkdf2`, contradicting its own Decision
+// log's stated hex-in/hex-out convention for both functions — this
+// example passes `"73616c74"` (hex for `"salt"`) instead, matching
+// the Decision log's own stated design and still producing the exact
+// same cited expected output.
+#[test]
+fn key_derivation_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("key_derivation_proof.em"),
+    "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865\n669cfe52482116fda1aa2cbe409b2f56c8e45637\n"
+  );
+}

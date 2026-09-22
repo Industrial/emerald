@@ -4658,6 +4658,40 @@ fn infer_expr_type(
       )?;
       Ok(http_response_ty)
     }
+    // Plan 115's Decision log: `Kdf.hkdf`/`.pbkdf2` — the same
+    // reserved-namespace static-call shape `Url`/`Dns`/`Http` already
+    // use. Both hex-in/hex-out `String`s, no new `Type` needed at all.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Kdf") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "hkdf" => (
+          vec![Type::String, Type::String, Type::String, Type::Int64],
+          Type::String,
+        ),
+        "pbkdf2" => (
+          vec![Type::String, Type::String, Type::Int64, Type::Int64],
+          Type::String,
+        ),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Kdf has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`

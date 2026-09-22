@@ -5139,6 +5139,9 @@ struct Ctx<'a, 'ctx> {
   http_request_method: FunctionValue<'ctx>,
   http_request_path: FunctionValue<'ctx>,
   http_request_body: FunctionValue<'ctx>,
+  /// Plan 115 (Key Derivation Functions) — `Kdf.hkdf`/`.pbkdf2`.
+  kdf_hkdf: FunctionValue<'ctx>,
+  kdf_pbkdf2: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -9233,6 +9236,33 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "httpstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 115's Decision log: `Kdf.hkdf`/`.pbkdf2` — plain hex-`String`-
+  // in, hex-`String`-out passthrough, no `Result`/newtype marshaling.
+  if recv_name == "Kdf" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "hkdf" => ctx.kdf_hkdf,
+      "pbkdf2" => ctx.kdf_pbkdf2,
+      other => return Err(format!("codegen: unsupported Kdf static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "kdfstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Str));
   }
 
   // Plan 101's Decision log: `HttpResponse.build(status, body)` — the
@@ -20382,6 +20412,23 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 115 (Key Derivation Functions).
+  let kdf_hkdf = module.add_function(
+    "emerald_rt_kdf_hkdf",
+    ptr_ty.fn_type(
+      &[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let kdf_pbkdf2 = module.add_function(
+    "emerald_rt_kdf_pbkdf2",
+    ptr_ty.fn_type(
+      &[ptr_ty.into(), ptr_ty.into(), i64_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -21181,6 +21228,8 @@ fn compile_to_object_impl(
     http_request_method,
     http_request_path,
     http_request_body,
+    kdf_hkdf,
+    kdf_pbkdf2,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

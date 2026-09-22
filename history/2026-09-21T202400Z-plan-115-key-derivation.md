@@ -10,16 +10,16 @@ maestro:
 todos:
   - id: leaf-kdf-module-scaffold
     content: "Add `Kdf` as a compiler-known intrinsic namespace (plan 45's `File`-style dispatch). Add `hkdf = \"0.13\"` and `pbkdf2 = { version = \"0.13\", features = [\"sha2\"] }` to `crates/emerald-rt/Cargo.toml`, entered into plan 95's `DEPENDENCIES.md` ledger with their real transitive pulls verified this session against docs.rs: `hkdf` depends on `hmac` 0.13; `pbkdf2` depends on `digest` 0.11, `hmac` 0.13 (default feature), and optional `sha2` 0.11 (enabled here, since SHA-256 is this plan's only offered hash)."
-    status: pending
+    status: done
   - id: leaf-hkdf-entrypoint
     content: "`Kdf.hkdf(ikm: String, salt: String, info: String, length: Int64): String` via `emerald_rt_hkdf_sha256`, hex-decoding `ikm`/`salt`/`info` from caller-supplied hex text (see Decision log for why hex-in/hex-out, not raw bytes, is this plan's Emerald-facing convention), constructing `Hkdf::<Sha256>::new(Some(salt_bytes), ikm_bytes)` and calling `.expand(info_bytes, &mut okm_buf)` where `okm_buf` is `length` bytes, hex-encoding the result before crossing back into a `String`. `catch_unwind`-wrapped per plan 91; `length > 255 * 32` (SHA-256's `L <= 255*HashLen` ceiling per RFC 5869) rejected as a caught error, not a panic."
-    status: pending
+    status: done
   - id: leaf-pbkdf2-entrypoint
     content: "`Kdf.pbkdf2(password: String, salt: String, iterations: Int64, length: Int64): String` via `emerald_rt_pbkdf2_hmac_sha256`, calling `pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt_bytes, iterations as u32, &mut key_buf)`, hex-encoding the result. `iterations < 600_000` (OWASP's current PBKDF2-HMAC-SHA256 minimum, cited alongside plan 112's Decision log making the case for Argon2id instead) does not error — a lower iteration count is a legitimate interop requirement this plan doesn't gate — but the doc comment states the OWASP minimum explicitly at the call site (plan 21's LSP hover mechanism)."
-    status: pending
+    status: done
   - id: leaf-rust-tests-and-example
     content: "`#[test]` in `emerald-rt`: (1) HKDF-SHA256 against RFC 5869 Test Case 1's real, published vector; (2) PBKDF2-HMAC-SHA256 against the `pbkdf2` crate's own published doctest vector (`password`/`salt`, 600,000 iterations, 20-byte output). Both cited exactly in the Decision log below, not invented. Add `examples/key_derivation_proof.em` to `examples/`, wired into `emerald-cli/tests/examples.rs`'s checked table, reproducing the HKDF vector end-to-end through the Emerald surface (see Concrete Proof)."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -183,3 +183,45 @@ password/salt/iteration-count/length).
   600,000 minimum — documented as a recommendation, not enforced, since
   legitimate interop targets may mandate a specific, possibly lower,
   count this plan must not silently override.
+
+## Update (2026-09-22, EXECUTE)
+
+Implemented exactly as designed, no scope reduction — a rare plan in this batch
+whose own cited crate versions and API needed no correction at all against the
+real, current `hkdf`/`pbkdf2` 0.13.0. Both crates' own `docs.rs` usage examples
+were fetched live this session and matched this plan's own cited RFC 5869
+Test Case 1 / `pbkdf2` doctest vectors byte-for-byte — no drift, unlike almost
+every other crate touched this session.
+
+`Kdf.hkdf(ikm, salt, info, length): String` and `Kdf.pbkdf2(password, salt,
+iterations, length): String` are plain reserved-namespace static functions —
+no new `Type`, no `Result`, no newtype — the simplest possible shape in this
+batch, since both functions are pure `String`-in/`String`-out with no error
+arm the plan's own design ever needed (an out-of-range `length`/non-hex input
+raises a `NativeError`, plan 92's channel, rather than returning `Result`).
+`.hkdf`'s hex-decoded `ikm`/`salt`/`info` and hex-encoded `okm` reuse the same
+`hex` crate this crate already depends on (plan 123); `.pbkdf2` takes
+`password` as plain UTF-8 text (not hex — a human password is not hex data,
+a real, disclosed asymmetry against `salt`'s own hex-text convention, stated
+explicitly rather than left for a reader to notice as an inconsistency).
+
+One real, disclosed inconsistency found in the plan's own text, not present in
+either crate's real API: the plan's own Concrete Proof passes a literal
+`"salt"` (raw ASCII) as `Kdf.pbkdf2`'s second argument, directly contradicting
+its own Decision log's explicitly stated hex-in/hex-out convention for both
+functions (`"Both functions take and return hex-encoded Strings, never raw
+bytes"`). `examples/key_derivation_proof.em` passes `"73616c74"` (hex for
+`"salt"`) instead, matching the Decision log's own stated design — this still
+produces the exact same cited expected output (`669cfe52482116fda1aa2cbe409b2
+f56c8e45637`), since the crate's own `pbkdf2_hmac` call receives the identical
+decoded bytes either way.
+
+2 new unit tests in `emerald-rt` (RFC 5869 Test Case 1, the `pbkdf2` crate's
+own doctest vector), both passed on the first attempt with zero corrections
+needed. `examples/key_derivation_proof.em` matches the plan's own Concrete
+Proof (adjusted per the disclosed inconsistency above) and its CLI conformance
+test passed on the first attempt with the exact predicted two-line hex output.
+1048/1048 tests, clean clippy/treefmt, `cargo audit --ignore RUSTSEC-2023-0071`
+clean (zero new advisories from either new crate).
+
+All four todos: `status: done`.
