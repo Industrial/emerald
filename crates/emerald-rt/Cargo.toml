@@ -27,5 +27,15 @@ crate-type = ["staticlib", "rlib"]
 # this warning before it finds the bug.
 
 [dependencies]
+# Plan 118: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs since crates.io itself blocks bot access) — serde_json
+# 1.0.151 (published Jul 20, 2026), #1 in the Encoding category,
+# 116,478,133 downloads/month, used in 156,879 crates (104,196
+# directly), owned by dtolnay/serde-rs, MIT/Apache. No RustSec advisory
+# against serde_json itself (RUSTSEC-2022-0081 is a different,
+# unrelated crate literally named "json"). Pure-Rust, clearing plan
+# 95's own pure-Rust-first preference outright — no C-exception needed.
+# See crates/emerald-rt/DEPENDENCIES.md for this row's ledger entry.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [build-dependencies]

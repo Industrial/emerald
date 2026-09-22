@@ -38,6 +38,7 @@ reasoning — add a new row instead.
 
 | Crate | Version | Why chosen | Pure-Rust or C-exception (+ justification) | Date added | Plan # |
 |---|---|---|---|---|---|
+| `serde_json` (+ `preserve_order` feature, pulling in `indexmap`) | 1.0.151 | #1 in crates.io's Encoding category, 116M downloads/month, no serious pure-Rust competing choice for JSON; `serde_json::Value` lowers directly to Emerald's own `JsonValue` enum layout | pure-Rust | 2026-09-22 | 118 |
 
 ## Pre-existing transitive dependencies (out of scope, triaged)
 

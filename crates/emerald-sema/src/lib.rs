@@ -3998,6 +3998,32 @@ fn infer_expr_type(
     // is free to write `module File ... end`, which registers into
     // `classes` as normal — this arm never consults that registry at
     // all, so there is nothing to shadow).
+    // Plan 118's Decision log: `Json.parse(s)` — the same reserved-
+    // namespace static-call shape `File`/`String.from_cstring`
+    // immediately below use, for the same reason (`Json` is never a
+    // real `ModuleDef`).
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Json") => {
+      if method != "parse" {
+        return Err(Diagnostic::new(
+          format!("Json has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(
+        method,
+        args,
+        &[Type::String],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Result(
+        Box::new(Type::Enum("JsonValue".to_string())),
+        Box::new(Type::String),
+      ))
+    }
     Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "File") => {
       let (expected_params, ret) = match method.as_str() {
         "read" => (vec![Type::String], Type::String),
@@ -4356,6 +4382,40 @@ fn infer_expr_type(
             format!("String has no method `{method}`"),
             expr.span,
           ));
+        };
+        check_args(
+          method,
+          args,
+          &expected_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(ret);
+      }
+      // Plan 118's Decision log: `.get`/`.to_s` on a `JsonValue`-typed
+      // receiver — the same receiver-inferred-type dispatch shape
+      // `String`'s own intrinsics immediately above use, never a real
+      // `ClassInfo`-registered method (`JsonValue`'s own `ClassInfo`,
+      // per `check_program`'s registration, has an empty `methods` map
+      // — it's an enum, consumed by `match` like any other, with these
+      // two methods layered on top the same way `String`'s own
+      // intrinsics sit outside its `ClassInfo` table too).
+      if recv_ty == Type::Enum("JsonValue".to_string()) {
+        let (expected_params, ret) = match method.as_str() {
+          "get" => (
+            vec![Type::String],
+            Type::Enum("Option$JsonValue".to_string()),
+          ),
+          "to_s" => (vec![], Type::String),
+          other => {
+            return Err(Diagnostic::new(
+              format!("JsonValue has no method `{other}`"),
+              expr.span,
+            ));
+          }
         };
         check_args(
           method,
@@ -11142,6 +11202,78 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   generic_enums.insert("Option".to_string(), &option_enum_def);
   let mut enum_defs: Vec<&EnumDef> = Vec::new();
   let mut seen_variant_names: HashSet<String> = HashSet::new();
+  // Plan 118's Decision log: `JsonValue` — a compiler-synthesized,
+  // NON-generic enum (unlike `Option[T]` above), registered the exact
+  // same two-pass way a plain user `enum JsonValue = ... end` would be:
+  // a placeholder `classes` entry (empty `enum_variants`) inserted
+  // FIRST, so `JsonArray(Array[JsonValue])`/`JsonObject(Hash[String,
+  // JsonValue])`'s own self-reference resolves regardless of
+  // declaration order (the identical recursive-enum precedent
+  // `instantiate_generic_enum`'s own doc comment already cites for
+  // `Tree[T] = Node(T, Tree[T])`), then pushed into `enum_defs` so the
+  // ordinary second pass below (`resolve_type` on each variant's own
+  // field types) resolves it with zero special-casing beyond this
+  // seed. Every JSON number is `Float64` — Emerald has no unified
+  // numeric type, and this plan does not add one (a disclosed,
+  // deliberate widening, not an oversight).
+  let json_value_enum_def = EnumDef {
+    name: "JsonValue".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "JsonNull".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "JsonBool".to_string(),
+        fields: vec![TypeExpr::Named("Boolean".to_string())],
+      },
+      EnumVariant {
+        name: "JsonNumber".to_string(),
+        fields: vec![TypeExpr::Named("Float64".to_string())],
+      },
+      EnumVariant {
+        name: "JsonString".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "JsonArray".to_string(),
+        fields: vec![TypeExpr::Generic(
+          "Array".to_string(),
+          vec![TypeExpr::Named("JsonValue".to_string())],
+        )],
+      },
+      EnumVariant {
+        name: "JsonObject".to_string(),
+        fields: vec![TypeExpr::Generic(
+          "Hash".to_string(),
+          vec![
+            TypeExpr::Named("String".to_string()),
+            TypeExpr::Named("JsonValue".to_string()),
+          ],
+        )],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "JsonValue".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &json_value_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&json_value_enum_def);
   for item in &program.items {
     if let Item::Enum(e) = item {
       if !e.type_params.is_empty() {
@@ -11319,6 +11451,26 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     if let Err(d) = instantiate_generic_enum(
       "Option",
       &[TypeExpr::Named("String".to_string())],
+      &generic_classes,
+      &generic_enums,
+      &mut classes,
+      &mut in_progress,
+    ) {
+      diags.push(d);
+    }
+  }
+  // Plan 118: `JsonValue.get`'s own real return type is `Option[
+  // JsonValue]` — the identical "unconditionally pre-instantiated,
+  // regardless of whether this specific program ever writes it as
+  // literal annotation text" reasoning as `Option[String]` immediately
+  // above, for the identical reason (a compiler-internal-derived
+  // return type, never discovered by the textual-annotation scan
+  // above).
+  {
+    let mut in_progress = Vec::new();
+    if let Err(d) = instantiate_generic_enum(
+      "Option",
+      &[TypeExpr::Named("JsonValue".to_string())],
       &generic_classes,
       &generic_enums,
       &mut classes,

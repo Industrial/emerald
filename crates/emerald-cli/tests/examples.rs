@@ -226,3 +226,16 @@ fn resource_handle_lifetime_proof_em_prints_expected_sequence() {
     "1\n2\nuse of closed counter handle\nstill running\n"
   );
 }
+
+// Plan 118 (JSON): Json.parse/JsonValue.get/.to_s against a real,
+// nested document — the Ok path (a found key, a missing key, an
+// array's own .count, and a full to_s round-trip) and a second,
+// negative Err proof (invalid JSON reaching Err with a real,
+// non-empty serde_json parser error, never a crash or empty string).
+#[test]
+fn json_demo_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("json_demo.em"),
+    "Ada\nmissing\n2\n{\"name\":\"Ada\",\"age\":36.0,\"active\":true,\"tags\":[\"math\",\"cs\"]}\nkey must be a string at line 1 column 2\n"
+  );
+}

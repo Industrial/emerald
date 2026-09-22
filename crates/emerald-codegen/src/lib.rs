@@ -753,6 +753,22 @@ struct EnumLayout {
   /// `Option[T]`'s unwrapped `Some` payload when `T` is a class), which
   /// `ValKind::Ptr` alone can't distinguish from "any other pointer."
   variant_field_types: HashMap<String, Vec<String>>,
+  /// Plan 118's Decision log: `{variant name} -> its own field TypeExprs,
+  /// in declaration order}` — `variant_field_types` above only ever
+  /// carries each field's `Display`-rendered STRING, which is enough to
+  /// tell `build_method_call`'s cross-actor dispatch check a `Ptr`-kind
+  /// field's declared class name, but not enough to rebuild a compound
+  /// type's own inner structure (`Array[JsonValue]`'s element type)
+  /// from scratch. `build_enum_case`'s own binding loop needs the real
+  /// `TypeExpr` to populate `local_classes`/`local_array_elem_types`
+  /// for a bound pattern variable exactly the way `bind_params` already
+  /// does for an ordinary parameter — a real, previously-undisclosed
+  /// gap this plan found by running it: no enum variant field in this
+  /// compiler had ever been an `Array[T]`/`Hash[K,V]`/class type before
+  /// `JsonValue`'s own `JsonArray(Array[JsonValue])`/`JsonObject(Hash[
+  /// String, JsonValue])`, so this gap was real but unreachable until
+  /// now.
+  variant_field_type_exprs: HashMap<String, Vec<TypeExpr>>,
   size: u64,
 }
 
@@ -766,6 +782,7 @@ fn build_enum_layout(e: &EnumDef) -> EnumLayout {
   let mut variant_tags = HashMap::new();
   let mut variant_fields = HashMap::new();
   let mut variant_field_types = HashMap::new();
+  let mut variant_field_type_exprs = HashMap::new();
   let mut max_fields = 0usize;
   for (i, v) in e.variants.iter().enumerate() {
     variant_tags.insert(v.name.clone(), i as u64);
@@ -779,11 +796,13 @@ fn build_enum_layout(e: &EnumDef) -> EnumLayout {
         .map(|f| f.to_string())
         .collect::<Vec<String>>(),
     );
+    variant_field_type_exprs.insert(v.name.clone(), v.fields.clone());
   }
   EnumLayout {
     variant_tags,
     variant_fields,
     variant_field_types,
+    variant_field_type_exprs,
     size: 8 + 8 * max_fields as u64,
   }
 }
@@ -3050,6 +3069,21 @@ fn collect_lets(stmts: &[Spanned<Stmt>], out: &mut Vec<(String, ValKind)>) {
           collect_lets(else_b, out);
         }
       }
+      // Plan 118's Decision log: a real, previously-undisclosed gap
+      // found by running it — `Stmt::MatchResult`'s own `ok_body`/
+      // `err_body` fell through this function's `_ => {}` catch-all,
+      // so a `Let` declared directly inside an `Ok(v) do ... end`/
+      // `Err(e) do ... end` arm was never pre-allocated at all (a real,
+      // reachable `.expect("pre-allocated by prealloc_lets for every
+      // reachable Let")` panic in `build_stmt`'s own `Stmt::Let` arm —
+      // never exercised until this plan's own Concrete Proof nested a
+      // `Let` inside `Json.parse`'s own `Ok(doc) do ... end`).
+      Stmt::MatchResult {
+        ok_body, err_body, ..
+      } => {
+        collect_lets(ok_body, out);
+        collect_lets(err_body, out);
+      }
       _ => {}
     }
   }
@@ -4862,6 +4896,10 @@ struct Ctx<'a, 'ctx> {
   handle_counter_open: FunctionValue<'ctx>,
   handle_counter_bump: FunctionValue<'ctx>,
   handle_counter_close: FunctionValue<'ctx>,
+  /// Plan 118 (JSON) — `Json.parse`/`JsonValue.get`/`JsonValue.to_s`.
+  json_parse: FunctionValue<'ctx>,
+  json_object_get: FunctionValue<'ctx>,
+  json_to_string: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7560,6 +7598,36 @@ fn build_method_call<'ctx>(
     return Ok((val, kind));
   }
 
+  // Plan 118's Decision log: `Json.parse(s)` — the same reserved-
+  // namespace static-call shape `File` immediately below uses, for the
+  // same reason (`Json` is never a real `ModuleDef`). `Ok`'s own
+  // payload (a `JsonValue` pointer) needs zero additional marshaling —
+  // `emerald_rt_json_parse` already returns plan 53's own `Result`
+  // layout directly (see `json.rs`'s own doc comment).
+  if recv_name == "Json" {
+    if method != "parse" {
+      return Err(format!(
+        "codegen: unsupported Json static method `{method}`"
+      ));
+    }
+    let arg = args
+      .first()
+      .ok_or_else(|| "codegen: `Json.parse` expects 1 argument".to_string())?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(ctx.json_parse, &[v.into()], "jsonparsetmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
   // Plan 45's Decision log: `File` is a separate, hard-coded arm, not
   // plan 12's real module-dispatch mechanism (`File` is never a
   // `ModuleDef`, so it never populates `ctx.module_names`) — checked
@@ -7889,6 +7957,49 @@ fn build_method_call<'ctx>(
         .ok_or("codegen: internal error — NativeError has no `message` field layout")?;
       let val = load_field(context, builder, recv_val.into_pointer_value(), field)?;
       return Ok((val, ValKind::Str));
+    }
+    // Plan 118's Decision log: `.get`/`.to_s` on a `JsonValue`-typed
+    // receiver — neither is a real declared method (`JsonValue` has no
+    // `ClassDef`/`AstFunction` at all — it's an enum, per its own
+    // `json_value_enum_def_cg` above), so neither ever appears in
+    // `method_owners`. Checked here, before that lookup, the same way
+    // `NativeError.message` immediately above is.
+    if class_name == "JsonValue" && (method == "get" || method == "to_s") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "to_s" {
+        let call = builder
+          .build_call(ctx.json_to_string, &[recv_val.into()], "jsontostringtmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      let key_arg = args
+        .first()
+        .ok_or_else(|| "codegen: `JsonValue.get` expects 1 argument".to_string())?;
+      let (key_val, _) = build_expr(
+        context,
+        builder,
+        key_arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call = builder
+        .build_call(
+          ctx.json_object_get,
+          &[recv_val.into(), key_val.into()],
+          "jsonobjectgettmp",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Ptr));
     }
     // Plan 32: resolve which ancestor actually *declares* `method` —
     // only the defining class has a compiled `{Class}_{method}` symbol
@@ -13344,6 +13455,11 @@ fn build_stmt<'a, 'ctx>(
       })?;
       let ok_kind = value_kind_for_type(&TypeExpr::Named(t_name.to_string()));
       let err_kind = value_kind_for_type(&TypeExpr::Named(e_name.to_string()));
+      // Owned, breaking the borrow on `local_classes` (via `result_ty`)
+      // that `build_match_result`'s own `&mut local_classes` parameter
+      // would otherwise conflict with.
+      let t_name = t_name.to_string();
+      let e_name = e_name.to_string();
       build_match_result(
         context,
         builder,
@@ -13355,6 +13471,8 @@ fn build_stmt<'a, 'ctx>(
         err_body,
         ok_kind,
         err_kind,
+        &t_name,
+        &e_name,
         vars,
         local_classes,
         local_array_elem_types,
@@ -13691,6 +13809,14 @@ fn build_enum_case<'a, 'ctx>(
     builder.position_at_end(arm_blk);
 
     let mut prior_vars: Vec<(String, Option<(PointerValue<'ctx>, ValKind)>)> = Vec::new();
+    // Plan 118's Decision log: mirrors `prior_vars` above exactly, for
+    // the same reason — `local_classes`/`local_array_elem_types` this
+    // arm's own bindings populate below must not leak into a later
+    // arm/sibling scope reusing the same binding name for a
+    // differently-typed field.
+    let mut prior_local_classes: Vec<(String, Option<String>)> = Vec::new();
+    let mut prior_array_elem_types: Vec<(String, Option<ValKind>)> = Vec::new();
+    let field_type_exprs = layout.variant_field_type_exprs.get(name);
     for (i, bname) in bindings.iter().enumerate() {
       let kind = field_kinds.get(i).ok_or_else(|| {
         format!(
@@ -13719,6 +13845,36 @@ fn build_enum_case<'a, 'ctx>(
         .map_err(|e| e.to_string())?;
       prior_vars.push((bname.clone(), vars.get(bname).cloned()));
       vars.insert(bname.clone(), (alloca, kind.clone()));
+      // Plan 118's Decision log: a `Ptr`-kind binding needs the same
+      // `local_classes`/`local_array_elem_types` bookkeeping
+      // `bind_params` already gives an ordinary parameter of the
+      // identical declared type — a real, previously-undisclosed gap
+      // found by running it: no enum variant field had ever been an
+      // `Array[T]`/`Hash[K,V]`/class type before `JsonValue`'s own
+      // `JsonArray`/`JsonObject`, so a bound `.count`/`.each`/etc. call
+      // on such a binding used to fail with "cannot determine the
+      // class" — never actually reachable until this plan's own enum.
+      if let Some(field_ty) = field_type_exprs.and_then(|tys| tys.get(i)) {
+        let ty_str = field_ty.to_string();
+        prior_local_classes.push((bname.clone(), local_classes.get(bname).cloned()));
+        if ctx.classes.contains_key(&ty_str)
+          || ctx.enums.contains_key(&ty_str)
+          || ctx.newtypes.contains(&ty_str)
+        {
+          local_classes.insert(bname.clone(), ty_str.clone());
+        }
+        if matches!(field_ty, TypeExpr::Generic(base, _) if base == "Pair") {
+          local_classes.insert(bname.clone(), ty_str);
+        }
+        prior_array_elem_types.push((bname.clone(), local_array_elem_types.get(bname).cloned()));
+        if let TypeExpr::Generic(base, args) = field_ty {
+          if base == "Array" {
+            if let Some(elem_ty) = args.first() {
+              local_array_elem_types.insert(bname.clone(), value_kind_for_type(elem_ty));
+            }
+          }
+        }
+      }
     }
 
     let terminated = build_block(
@@ -13743,6 +13899,26 @@ fn build_enum_case<'a, 'ctx>(
         }
         None => {
           vars.remove(&bname);
+        }
+      }
+    }
+    for (bname, prior) in prior_local_classes {
+      match prior {
+        Some(p) => {
+          local_classes.insert(bname, p);
+        }
+        None => {
+          local_classes.remove(&bname);
+        }
+      }
+    }
+    for (bname, prior) in prior_array_elem_types {
+      match prior {
+        Some(p) => {
+          local_array_elem_types.insert(bname, p);
+        }
+        None => {
+          local_array_elem_types.remove(&bname);
         }
       }
     }
@@ -13808,6 +13984,16 @@ fn build_match_result<'a, 'ctx>(
   err_body: &'a [Spanned<Stmt>],
   ok_kind: ValKind,
   err_kind: ValKind,
+  // Plan 118's Decision log: `Ok(doc)`'s own binding needs the same
+  // `local_classes` bookkeeping `bind_params` already gives an ordinary
+  // parameter of the identical declared type — a real, previously-
+  // undisclosed gap found by running it: `Result[T, E]`'s own `Ok(v)`
+  // binding never populated `local_classes` for a class/enum-typed
+  // `T`, so a method call on `v` inside the `Ok` arm (`doc.get(...)`)
+  // used to fail with "cannot determine the class" — never actually
+  // reachable until this plan's own `Result[JsonValue, String]`.
+  t_name: &str,
+  e_name: &str,
   vars: &mut HashMap<String, (PointerValue<'ctx>, ValKind)>,
   local_classes: &mut HashMap<String, String>,
   local_array_elem_types: &mut HashMap<String, ValKind>,
@@ -13882,6 +14068,13 @@ fn build_match_result<'a, 'ctx>(
       .map_err(|e| e.to_string())?;
     vars.insert(ok_var.to_string(), (ok_alloca, ok_kind));
   }
+  let prior_ok_class = local_classes.get(ok_var).cloned();
+  if ctx.classes.contains_key(t_name)
+    || ctx.enums.contains_key(t_name)
+    || ctx.newtypes.contains(t_name)
+  {
+    local_classes.insert(ok_var.to_string(), t_name.to_string());
+  }
   let ok_terminated = build_block(
     context,
     builder,
@@ -13902,6 +14095,14 @@ fn build_match_result<'a, 'ctx>(
     }
     None => {
       vars.remove(ok_var);
+    }
+  }
+  match prior_ok_class {
+    Some(c) => {
+      local_classes.insert(ok_var.to_string(), c);
+    }
+    None => {
+      local_classes.remove(ok_var);
     }
   }
   if !ok_terminated {
@@ -13928,6 +14129,13 @@ fn build_match_result<'a, 'ctx>(
     .map_err(|e| e.to_string())?;
   let prior_err = vars.get(err_var).cloned();
   vars.insert(err_var.to_string(), (err_alloca, err_kind));
+  let prior_err_class = local_classes.get(err_var).cloned();
+  if ctx.classes.contains_key(e_name)
+    || ctx.enums.contains_key(e_name)
+    || ctx.newtypes.contains(e_name)
+  {
+    local_classes.insert(err_var.to_string(), e_name.to_string());
+  }
   let err_terminated = build_block(
     context,
     builder,
@@ -13948,6 +14156,14 @@ fn build_match_result<'a, 'ctx>(
     }
     None => {
       vars.remove(err_var);
+    }
+  }
+  match prior_err_class {
+    Some(c) => {
+      local_classes.insert(err_var.to_string(), c);
+    }
+    None => {
+      local_classes.remove(err_var);
     }
   }
   if !err_terminated {
@@ -17198,6 +17414,22 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 118 (JSON): `Json.parse`/`JsonValue.get`/`JsonValue.to_s`.
+  let json_parse = module.add_function(
+    "emerald_rt_json_parse",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let json_object_get = module.add_function(
+    "emerald_rt_json_object_get",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let json_to_string = module.add_function(
+    "emerald_rt_json_to_string",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -17459,6 +17691,55 @@ fn compile_to_object_impl(
   for (name, e) in &synthesized_enums {
     enums.insert(name.clone(), build_enum_layout(e));
   }
+  // Plan 118: `JsonValue` — codegen's own mirror of `emerald-sema`'s
+  // identical synthetic, NON-generic `EnumDef` (see that crate's
+  // `check_program` own Decision log) — inserted directly into `enums`
+  // the same way any other non-generic `Item::Enum` above is, since
+  // `JsonValue` is never parsed from source at all.
+  let json_value_enum_def_cg = EnumDef {
+    name: "JsonValue".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "JsonNull".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "JsonBool".to_string(),
+        fields: vec![TypeExpr::Named("Boolean".to_string())],
+      },
+      EnumVariant {
+        name: "JsonNumber".to_string(),
+        fields: vec![TypeExpr::Named("Float64".to_string())],
+      },
+      EnumVariant {
+        name: "JsonString".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "JsonArray".to_string(),
+        fields: vec![TypeExpr::Generic(
+          "Array".to_string(),
+          vec![TypeExpr::Named("JsonValue".to_string())],
+        )],
+      },
+      EnumVariant {
+        name: "JsonObject".to_string(),
+        fields: vec![TypeExpr::Generic(
+          "Hash".to_string(),
+          vec![
+            TypeExpr::Named("String".to_string()),
+            TypeExpr::Named("JsonValue".to_string()),
+          ],
+        )],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "JsonValue".to_string(),
+    build_enum_layout(&json_value_enum_def_cg),
+  );
 
   // Plan 44: see `Ctx::symbol_table`'s own doc comment — built once,
   // alongside `class_tags`, before any function body compiles.
@@ -17770,6 +18051,9 @@ fn compile_to_object_impl(
     handle_counter_open,
     handle_counter_bump,
     handle_counter_close,
+    json_parse,
+    json_object_get,
+    json_to_string,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

@@ -127,6 +127,7 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 
 mod handle;
+mod json;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -321,6 +322,20 @@ pub unsafe extern "C" fn emerald_rt_result_err(msg: *const c_char) -> *mut c_voi
   ptr as *mut c_void
 }
 
+// `emerald_rt_result_err`'s own internal-Rust-caller sibling - takes a
+// real `&str` directly rather than a `*const c_char`, avoiding a
+// pointless `CString` round-trip for a call site (plan 118's
+// `json::json_parse`) that already has an owned Rust `String` in hand.
+// Never `#[no_mangle]`/`extern "C"` - not an ABI-visible export, purely
+// an internal helper shared across this crate's own modules.
+unsafe fn emerald_rt_result_err_str(msg: &str) -> *mut c_void {
+  let copied = alloc_and_copy_str(msg);
+  let ptr = emerald_alloc(16) as *mut i64;
+  *ptr = 1;
+  *(ptr.add(1) as *mut *const c_char) = copied;
+  ptr as *mut c_void
+}
+
 // The FNV-1a-32 hash of s's bytes, widened to i64. Renamed from plan
 // 91's own emerald_rt_fnv1a_hash to follow this plan's naming
 // convention - a pure rename, no behavior change.
@@ -430,6 +445,36 @@ pub unsafe extern "C" fn emerald_rt_handle_counter_close(id: i64) {
   catch_and_raise(move || {
     handle::handle_close(id);
   })
+}
+
+// Plan 118 (JSON): `Json.parse`/`JsonValue.get`/`JsonValue.to_s`,
+// dispatched by exact free-function/receiver-gated name in
+// `emerald-codegen`'s own `build_expr`/`build_method_call` — see
+// `json.rs`'s own module doc for the full design.
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_json_parse(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || json::json_parse(s))
+}
+
+/// # Safety
+/// `obj` must point to a real `JsonValue` block. `key`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_json_object_get(
+  obj: *const c_void,
+  key: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || json::json_object_get(obj, key))
+}
+
+/// # Safety
+/// `obj` must point to a real `JsonValue` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_json_to_string(obj: *const c_void) -> *const c_char {
+  catch_and_raise(move || json::json_to_string(obj))
 }
 
 // Real, expected consequence of introducing genuine cross-archive
