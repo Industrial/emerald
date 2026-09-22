@@ -28,14 +28,17 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
-const TAG_NULL: i64 = 0;
-const TAG_BOOL: i64 = 1;
-const TAG_NUMBER: i64 = 2;
-const TAG_STRING: i64 = 3;
-const TAG_ARRAY: i64 = 4;
-const TAG_OBJECT: i64 = 5;
+// `pub(crate)`, not private: plan 119's `toml.rs` reuses these tags and
+// `alloc_enum_block`/`lift_json_value` directly rather than duplicating
+// the `JsonValue` byte layout a second time.
+pub(crate) const TAG_NULL: i64 = 0;
+pub(crate) const TAG_BOOL: i64 = 1;
+pub(crate) const TAG_NUMBER: i64 = 2;
+pub(crate) const TAG_STRING: i64 = 3;
+pub(crate) const TAG_ARRAY: i64 = 4;
+pub(crate) const TAG_OBJECT: i64 = 5;
 
-unsafe fn alloc_enum_block(tag: i64) -> *mut i64 {
+pub(crate) unsafe fn alloc_enum_block(tag: i64) -> *mut i64 {
   let ptr = crate::emerald_alloc(16) as *mut i64;
   *ptr = tag;
   ptr
@@ -109,7 +112,7 @@ unsafe fn lower_object(map: &serde_json::Map<String, serde_json::Value>) -> *mut
 /// compiled Emerald program built directly via `JsonBool(true)` etc. —
 /// indistinguishable, by design) back into an owned `serde_json::Value`,
 /// for `.to_s`'s own `serde_json::to_string` call.
-unsafe fn lift_json_value(ptr: *const c_void) -> serde_json::Value {
+pub(crate) unsafe fn lift_json_value(ptr: *const c_void) -> serde_json::Value {
   let block = ptr as *const i64;
   let tag = *block;
   match tag {

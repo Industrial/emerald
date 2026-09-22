@@ -4954,6 +4954,9 @@ struct Ctx<'a, 'ctx> {
   json_parse: FunctionValue<'ctx>,
   json_object_get: FunctionValue<'ctx>,
   json_to_string: FunctionValue<'ctx>,
+  /// Plan 119 (TOML) — `Toml.parse`, `JsonValue.to_toml`.
+  toml_parse: FunctionValue<'ctx>,
+  json_to_toml: FunctionValue<'ctx>,
   /// Plan 168 (Structured Logging).
   log_configure: FunctionValue<'ctx>,
   log_event: FunctionValue<'ctx>,
@@ -8503,6 +8506,33 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ValKind::Ptr));
   }
 
+  // Plan 119's Decision log: `Toml.parse(s)` — the identical shape
+  // `Json.parse` immediately above uses; `emerald_rt_toml_parse`
+  // already returns plan 53's own `Result` layout directly.
+  if recv_name == "Toml" {
+    if method != "parse" {
+      return Err(format!(
+        "codegen: unsupported Toml static method `{method}`"
+      ));
+    }
+    let arg = args
+      .first()
+      .ok_or_else(|| "codegen: `Toml.parse` expects 1 argument".to_string())?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(ctx.toml_parse, &[v.into()], "tomlparsetmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
   // Plan 123's Decision log (revised, `String`-only scope): `Base64.
   // encode`/`.decode` and its four-variant-pair siblings — the same
   // reserved-namespace static-call shape `Json`/`Log`/`File` use.
@@ -10063,7 +10093,7 @@ fn build_method_call<'ctx>(
     // `json_value_enum_def_cg` above), so neither ever appears in
     // `method_owners`. Checked here, before that lookup, the same way
     // `NativeError.message` immediately above is.
-    if class_name == "JsonValue" && (method == "get" || method == "to_s") {
+    if class_name == "JsonValue" && (method == "get" || method == "to_s" || method == "to_toml") {
       let (recv_val, _) = build_expr(
         context,
         builder,
@@ -10078,6 +10108,15 @@ fn build_method_call<'ctx>(
           .build_call(ctx.json_to_string, &[recv_val.into()], "jsontostringtmp")
           .map_err(|e| e.to_string())?;
         return Ok((call_result(call)?, ValKind::Str));
+      }
+      // Plan 119's Decision log: `.to_toml` — `emerald_rt_json_to_toml`
+      // already returns plan 53's own `Result` layout directly, the
+      // same shape `Toml.parse`/`Json.parse` use.
+      if method == "to_toml" {
+        let call = builder
+          .build_call(ctx.json_to_toml, &[recv_val.into()], "jsontotomltmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
       }
       let key_arg = args
         .first()
@@ -19601,6 +19640,17 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 119 (TOML).
+  let toml_parse = module.add_function(
+    "emerald_rt_toml_parse",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let json_to_toml = module.add_function(
+    "emerald_rt_json_to_toml",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 168 (Structured Logging).
   let log_configure = module.add_function(
     "emerald_rt_log_configure",
@@ -21080,6 +21130,8 @@ fn compile_to_object_impl(
     json_parse,
     json_object_get,
     json_to_string,
+    toml_parse,
+    json_to_toml,
     log_configure,
     log_event,
     log_fields_new,

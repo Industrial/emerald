@@ -519,3 +519,25 @@ fn key_derivation_proof_em_prints_expected_sequence() {
     "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865\n669cfe52482116fda1aa2cbe409b2f56c8e45637\n"
   );
 }
+
+// Plan 119 (TOML): a nested TOML table round-trips through `toml`'s
+// own parser into the same `JsonValue` enum plan 118 already defines
+// — `.get` works identically regardless of which parser produced the
+// tree. Second, real negative proof: invalid TOML reaches `Err` with
+// the `toml` crate's own real parse-error text, never a crash. Real,
+// disclosed finding: unlike `serde_json::Error`'s single-line
+// `Display`, `toml` 1.x's own parse-error text is a real, multi-line,
+// pretty-printed diagnostic (a source snippet plus a `|`/`^` caret
+// line) — this assertion checks the first line and that real,
+// non-empty diagnostic text follows, not an exact single-line shape.
+#[test]
+fn toml_demo_em_prints_expected_sequence() {
+  let output = compile_and_run("toml_demo.em");
+  let mut lines = output.lines();
+  assert_eq!(lines.next(), Some("demo"));
+  let rest: String = lines.collect::<Vec<_>>().join("\n");
+  assert!(
+    !rest.trim().is_empty(),
+    "expected real, non-empty TOML parse-error diagnostic text after the first line, got {rest:?}"
+  );
+}

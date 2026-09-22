@@ -162,6 +162,11 @@ mod random;
 mod regex;
 mod secure_compare;
 mod system;
+// Named `tomls`, not `toml` — this crate's own `mod toml` would shadow
+// the external `toml` crate this module wraps, the identical collision
+// `aead.rs`/`url.rs` already hit and disclosed.
+#[path = "toml.rs"]
+mod tomls;
 // Named `urls`, not `url` — this crate's own `mod url` would shadow
 // the external `url` crate this module wraps, exactly the collision
 // `aead.rs` hit against the external `aead` crate (see that module's
@@ -1725,6 +1730,20 @@ pub unsafe extern "C" fn emerald_rt_kdf_pbkdf2(
   length: i64,
 ) -> *const c_char {
   catch_and_raise(move || kdf::kdf_pbkdf2(password, salt, iterations, length))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_toml_parse(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || tomls::toml_parse(s))
+}
+
+/// # Safety
+/// `obj` must point to a real `JsonValue` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_json_to_toml(obj: *const c_void) -> *mut c_void {
+  catch_and_raise(move || tomls::json_to_toml(obj))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

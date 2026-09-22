@@ -4056,6 +4056,34 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 119's Decision log: `Toml.parse(s)` — the identical
+    // reserved-namespace static-call shape `Json.parse` immediately
+    // above uses, reusing the same `JsonValue` enum as the parsed
+    // dynamic-value representation (no second `TomlValue` enum).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Toml") =>
+    {
+      if method != "parse" {
+        return Err(Diagnostic::new(
+          format!("Toml has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(
+        method,
+        args,
+        &[Type::String],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Result(
+        Box::new(Type::Enum("JsonValue".to_string())),
+        Box::new(Type::String),
+      ))
+    }
     // Plan 123's Decision log (revised, `String`-only scope — see
     // `crates/emerald-rt/src/encoding.rs`'s own module doc): `Base64.
     // encode`/`.decode` and its four-variant-pair siblings, the same
@@ -5675,6 +5703,11 @@ fn infer_expr_type(
             Type::Enum("Option$JsonValue".to_string()),
           ),
           "to_s" => (vec![], Type::String),
+          // Plan 119's Decision log: `.to_toml` — `Result[String,
+          // String]`, not a total `String` (unlike `.to_s` above),
+          // since not every `JsonValue` a JSON document can produce is
+          // representable in TOML (no null literal).
+          "to_toml" => (vec![], Type::Result(Box::new(Type::String), Box::new(Type::String))),
           other => {
             return Err(Diagnostic::new(
               format!("JsonValue has no method `{other}`"),

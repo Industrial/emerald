@@ -70,6 +70,7 @@ reasoning — add a new row instead.
 
 | `hkdf` | 0.13.0 | RustCrypto-owned, pure Rust. `Kdf.hkdf`'s direct backing. A rare row in this ledger where the plan's own cited version/API needed zero correction — its own `docs.rs` usage example, fetched live this session, matches the plan's own cited RFC 5869 Test Case 1 vector byte-for-byte. No RustSec advisory found | pure-Rust | 2026-09-22 | 115 |
 | `pbkdf2` (+ `sha2` feature) | 0.13.0 | RustCrypto-owned, pure Rust. `Kdf.pbkdf2`'s direct backing (`pbkdf2_hmac::<Sha256>`). Its own `docs.rs` usage example matches the plan's own cited doctest vector byte-for-byte, same as `hkdf` above. No RustSec advisory found | pure-Rust | 2026-09-22 | 115 |
+| `toml` | 1.1.6+spec-1.1.0 | Already an in-tree, already-vetted dependency — `crates/emerald-cli/Cargo.toml` pins `toml = "0.8"` separately, parsing every `emerald.toml` manifest since plan 46. This crate's own copy is pinned at the crate's real, current major (a full major ahead, now targeting TOML spec 1.1.0 vs 0.8.x's spec 1.0.0) — a real, disclosed version skew two workspace members carry independently with no conflict. `Toml.parse`/`JsonValue.to_toml`'s direct backing, reusing plan 118's `JsonValue` enum verbatim as the dynamic-value representation. No RustSec advisory found | pure-Rust | 2026-09-22 | 119 |
 
 ## Pre-existing transitive dependencies (out of scope, triaged)
 

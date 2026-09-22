@@ -279,5 +279,17 @@ tiny_http = "0.12"
 # either crate.
 hkdf = "0.13"
 pbkdf2 = { version = "0.13", features = ["sha2"] }
+# Plan 119: this repository already depends on `toml` (crates/emerald-
+# cli/Cargo.toml pins "0.8", parsing every `emerald.toml` manifest
+# since plan 46) - this crate's own copy is pinned separately at the
+# crate's real, current major (1.1.6+spec-1.1.0 as of this session,
+# real-checked via docs.rs, now targeting TOML spec 1.1.0 vs 0.8.x's
+# spec 1.0.0), a real, disclosed version skew Cargo workspaces tolerate
+# with no conflict (each member crate compiles/links its own copy
+# independently). `emerald-cli`'s own manifest-parsing pin is
+# deliberately left untouched - bumping it is real, separate, out-of-
+# scope follow-up work, not folded in here. `Toml.parse`/`JsonValue.
+# to_toml`'s direct backing.
+toml = "1"
 
 [build-dependencies]
