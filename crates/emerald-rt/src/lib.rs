@@ -178,6 +178,7 @@ mod tomls;
 // own doc comment); `#[path]` keeps the file itself named `url.rs`.
 #[path = "url.rs"]
 mod urls;
+mod xml;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -697,6 +698,47 @@ pub unsafe extern "C" fn emerald_rt_regex_split(id: i64, s: *const c_char) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_regex_split_count(id: i64, s: *const c_char) -> i64 {
   catch_and_raise(move || regex::regex_split_count(id, s))
+}
+
+// Plan 124 (XML Parsing): `Xml.parse`/`.parse_file`/`.reader_from_
+// string`/`.reader_from_file`, `XmlReader#next_event` — see `xml.rs`'s
+// own module doc.
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xml_parse(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || xml::xml_parse(s))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xml_parse_file(path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || xml::xml_parse_file(path))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xml_reader_from_string(s: *const c_char) -> i64 {
+  catch_and_raise(move || xml::xml_reader_from_string(s))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xml_reader_from_file(path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || xml::xml_reader_from_file(path))
+}
+
+/// # Safety
+/// `id` must be a live `XmlReader` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xml_reader_next_event(id: i64) -> *mut c_void {
+  catch_and_raise(move || xml::xml_reader_next_event(id))
 }
 
 // Plan 146 (Environment Variables): `Env.get`/`.set`/`.remove`/

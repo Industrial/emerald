@@ -4194,6 +4194,75 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 124's Decision log: `Xml.parse`/`.parse_file`/`.reader_
+    // from_string`/`.reader_from_file` — the same reserved-namespace
+    // static-call shape `Regex.compile` immediately above uses.
+    // `.reader_from_string` alone returns a bare `XmlReader`, not a
+    // `Result` — constructing a streaming reader over an in-memory
+    // string can never fail (quick-xml's own `Reader::from_reader`
+    // does no I/O and no parsing until the first `.next_event` call);
+    // `.reader_from_file` can fail (the file may not exist), so it
+    // stays `Result`-shaped, matching `.parse_file`. Every OTHER
+    // `XmlReader` method (`.next_event`) is an instance method on an
+    // already-compiled `XmlReader`-newtype-typed receiver, dispatched
+    // by the `Type::Newtype` arm further below, never reached from
+    // here.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Xml") =>
+    {
+      let xml_node_ty = Type::Enum("XmlNode".to_string());
+      let xml_reader_ty = Type::Newtype("XmlReader".to_string(), Box::new(Type::Int64));
+      match method.as_str() {
+        "parse" | "parse_file" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(
+            Box::new(xml_node_ty),
+            Box::new(Type::String),
+          ))
+        }
+        "reader_from_string" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(xml_reader_ty)
+        }
+        "reader_from_file" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(
+            Box::new(xml_reader_ty),
+            Box::new(Type::String),
+          ))
+        }
+        other => Err(Diagnostic::new(
+          format!("Xml has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
     // Plan 109's Decision log: `Sha256.hash`/`Sha512.hash`/`Sha3_256.
     // hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — six reserved-
     // namespace static intrinsics, identically shaped to `Regex.
@@ -5324,6 +5393,20 @@ fn infer_expr_type(
             gctx,
           )?;
           return Ok(ret);
+        }
+        // Plan 124's Decision log: `XmlReader#next_event` — the same
+        // carved-out-of-`.value`-only shape `Regex`'s own methods
+        // immediately above establish, just with one zero-arg method
+        // instead of nine.
+        if name == "XmlReader" {
+          if method != "next_event" {
+            return Err(Diagnostic::new(
+              format!("XmlReader has no method `{method}`"),
+              expr.span,
+            ));
+          }
+          check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+          return Ok(Type::Enum("XmlEvent".to_string()));
         }
         // Plan 109's Decision log: `Bytes#to_hex` — the same carved-
         // out-of-`.value`-only shape `Regex`'s own methods immediately
@@ -12541,6 +12624,30 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       newtype_underlying: Some(Type::Int64),
     },
   );
+  // Plan 124's Decision log: `XmlReader` — the identical "reserved
+  // name, zero-cost `Int64` handle" shape `Regex` immediately above
+  // already uses, backed by plan 93's own `crate::handle` registry (a
+  // boxed streaming `quick_xml::reader::Reader` variant, never a raw
+  // pointer smuggled through as an `Int64`). `Xml.reader_from_string`/
+  // `.reader_from_file` are reserved-namespace static intrinsics (this
+  // `Expr::MethodCall` arm's own sibling below); `.next_event` is
+  // carved out of the ordinary newtype `.value`-only restriction, the
+  // same mechanism `Regex`'s own nine methods already establish, just
+  // with one zero-arg method instead of nine.
+  classes.insert(
+    "XmlReader".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
   // Plan 109's Decision log: `Bytes` — a compiler-synthesized `Int64`
   // newtype the identical "reserved name, zero-cost handle" shape
   // `Regex`/`NativeHandle`/`LogFields` above already use, but backed
@@ -12850,6 +12957,123 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&json_value_enum_def);
+  // Plan 124's Decision log: `XmlNode` — the XML-shaped sibling of
+  // `JsonValue` immediately above, registered the identical compiler-
+  // synthesized, NON-generic, self-referential-via-placeholder-seed
+  // way: `Element(String, Hash[String,String], Array[XmlNode])`'s own
+  // `Array[XmlNode]` field resolves against the exact same placeholder-
+  // first mechanism `JsonArray(Array[JsonValue])` above already proves
+  // works for a compiler-synthesized enum — real self-reference, not a
+  // new risk this plan had to prove out from scratch. A REAL, plan-
+  // text-contradicting correction found while registering this: the
+  // plan's own text names an `XmlEvent` variant `Text(String)` too, but
+  // this compiler's enum-variant namespace is GLOBAL and flat (`seen_
+  // variant_names` above is checked across every enum in the program,
+  // not per-enum — the same bare-name enum-variant-construction
+  // precedent `emerald-parser/src/ast.rs`'s own `expand_derives`
+  // already documents), so two different enums cannot both declare a
+  // variant literally named `Text`. `XmlNode::Text` keeps the plan's
+  // own name (it's the one the plan's own Concrete Proof directly
+  // pattern-matches: `match child do ... Text(_) do ... end end`);
+  // `XmlEvent`'s sibling is renamed `TextContent` below instead.
+  let xml_node_enum_def = EnumDef {
+    name: "XmlNode".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Element".to_string(),
+        fields: vec![
+          TypeExpr::Named("String".to_string()),
+          TypeExpr::Generic(
+            "Hash".to_string(),
+            vec![
+              TypeExpr::Named("String".to_string()),
+              TypeExpr::Named("String".to_string()),
+            ],
+          ),
+          TypeExpr::Generic(
+            "Array".to_string(),
+            vec![TypeExpr::Named("XmlNode".to_string())],
+          ),
+        ],
+      },
+      EnumVariant {
+        name: "Text".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "XmlNode".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &xml_node_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&xml_node_enum_def);
+  // `XmlEvent` — the streaming-mode sibling, flat (never self-
+  // referential; a single event never contains another event).
+  let xml_event_enum_def = EnumDef {
+    name: "XmlEvent".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "StartElement".to_string(),
+        fields: vec![
+          TypeExpr::Named("String".to_string()),
+          TypeExpr::Generic(
+            "Hash".to_string(),
+            vec![
+              TypeExpr::Named("String".to_string()),
+              TypeExpr::Named("String".to_string()),
+            ],
+          ),
+        ],
+      },
+      EnumVariant {
+        name: "EndElement".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "TextContent".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Eof".to_string(),
+        fields: vec![],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "XmlEvent".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &xml_event_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&xml_event_enum_def);
   for item in &program.items {
     if let Item::Enum(e) = item {
       if !e.type_params.is_empty() {

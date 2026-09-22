@@ -197,6 +197,21 @@ fn set_newtype_underlying(program: &Program) {
     "HttpResponse",
     // Plan 101's Decision log: `HttpRequest` — the identical shape.
     "HttpRequest",
+    // Plan 124's Decision log: `XmlReader` — the identical shape. A
+    // real, previously-undisclosed gap found by running it: `ctx.
+    // newtypes` (the `local_classes`-side registry `Stmt::Let`/
+    // `value_kind_for_type`'s own `_ => ValKind::Ptr` catch-all
+    // guards against) is a SEPARATE registry from this one — adding
+    // "XmlReader" to `newtypes.insert(...)` alone (near `compile_to_
+    // object_impl`'s own `newtypes` construction) was not enough;
+    // without this entry too, `reader: XmlReader = Xml.reader_from_
+    // string(xml)` allocated `reader`'s own storage as `ValKind::Ptr`
+    // (the generic bare-name default), producing a real LLVM
+    // verifier failure ("Call parameter type does not match function
+    // signature") the moment `reader.next_event` tried to pass that
+    // `ptr`-typed load where `emerald_rt_xml_reader_next_event`'s
+    // real `i64` parameter expected an `Int64`.
+    "XmlReader",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -4991,6 +5006,13 @@ struct Ctx<'a, 'ctx> {
   csv_parse: FunctionValue<'ctx>,
   csv_parse_with_headers: FunctionValue<'ctx>,
   csv_write: FunctionValue<'ctx>,
+  /// Plan 124 (XML) — `Xml.parse`/`.parse_file`/`.reader_from_string`/
+  /// `.reader_from_file`, `XmlReader#next_event`.
+  xml_parse: FunctionValue<'ctx>,
+  xml_parse_file: FunctionValue<'ctx>,
+  xml_reader_from_string: FunctionValue<'ctx>,
+  xml_reader_from_file: FunctionValue<'ctx>,
+  xml_reader_next_event: FunctionValue<'ctx>,
   /// Plan 168 (Structured Logging).
   log_configure: FunctionValue<'ctx>,
   log_event: FunctionValue<'ctx>,
@@ -7993,6 +8015,33 @@ fn build_method_call<'ctx>(
       }
       return Ok((result, ret_kind));
     }
+    // Plan 124's Decision log: `XmlReader#next_event` — the identical
+    // carved-out-of-`.value`-only shape `Regex`'s own methods
+    // immediately above establish, just with one zero-arg method
+    // returning a plain `ValKind::Ptr` (an `XmlEvent` enum block) —
+    // no narrowing step needed, unlike `Regex#is_match`'s `i64`->`i1`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("XmlReader") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method != "next_event" {
+        return Err(format!("codegen: unsupported XmlReader method `{method}`"));
+      }
+      let call = builder
+        .build_call(
+          ctx.xml_reader_next_event,
+          &[recv_val.into()],
+          "xmlnexteventtmp",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Ptr));
+    }
     // Plan 109's Decision log: `Bytes#to_hex` — the identical carved-
     // out-of-`.value`-only shape `Regex`'s own methods immediately
     // above establish. `recv_val` is the receiver's own already-
@@ -9384,6 +9433,39 @@ fn build_method_call<'ctx>(
     };
     let call = builder
       .build_call(fv, &call_args, "csvstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 124's Decision log: `Xml.parse`/`.parse_file`/`.reader_from_
+  // string`/`.reader_from_file` — `.parse`/`.parse_file`/`.reader_
+  // from_file` return plan 53's own `Result` layout directly from the
+  // Rust side (`ValKind::Ptr`); `.reader_from_string` returns a bare
+  // `i64` handle id (`ValKind::Int64`), never wrapped in `Result` (see
+  // `emerald-sema`'s own Decision log for why).
+  if recv_name == "Xml" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "parse" => (ctx.xml_parse, ValKind::Ptr),
+      "parse_file" => (ctx.xml_parse_file, ValKind::Ptr),
+      "reader_from_string" => (ctx.xml_reader_from_string, ValKind::Int64),
+      "reader_from_file" => (ctx.xml_reader_from_file, ValKind::Ptr),
+      other => return Err(format!("codegen: unsupported Xml static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "xmlstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
   }
@@ -16114,7 +16196,18 @@ fn build_enum_case<'a, 'ctx>(
         {
           local_classes.insert(bname.clone(), ty_str.clone());
         }
-        if matches!(field_ty, TypeExpr::Generic(base, _) if base == "Pair") {
+        // Plan 124's own real, disclosed finding: this arm's `Pair`
+        // special-case never covered `Hash[K, V]` — no enum variant
+        // field had ever been a `Hash[K,V]` type before `XmlNode::
+        // Element`'s own attribute-map field, so a bound `.get(...)`
+        // call on it (`Xml.parse`'s own attribute `Hash[String,
+        // String]`) used to fail with "method call `.get` on
+        // non-class type", mirroring `build_match_result`'s own
+        // already-fixed `Ok(v)`-binding version of this identical gap
+        // (its own Decision log, `t_name.starts_with("Hash[")`) —
+        // folded into the same `TypeExpr::Generic` check as `Pair`
+        // here since `field_ty` is already a structured `TypeExpr`.
+        if matches!(field_ty, TypeExpr::Generic(base, _) if base == "Pair" || base == "Hash") {
           local_classes.insert(bname.clone(), ty_str);
         }
         prior_array_elem_types.push((bname.clone(), local_array_elem_types.get(bname).cloned()));
@@ -19785,6 +19878,32 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 124 (XML).
+  let xml_parse = module.add_function(
+    "emerald_rt_xml_parse",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let xml_parse_file = module.add_function(
+    "emerald_rt_xml_parse_file",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let xml_reader_from_string = module.add_function(
+    "emerald_rt_xml_reader_from_string",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let xml_reader_from_file = module.add_function(
+    "emerald_rt_xml_reader_from_file",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let xml_reader_next_event = module.add_function(
+    "emerald_rt_xml_reader_next_event",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 168 (Structured Logging).
   let log_configure = module.add_function(
     "emerald_rt_log_configure",
@@ -20923,6 +21042,86 @@ fn compile_to_object_impl(
     "JsonValue".to_string(),
     build_enum_layout(&json_value_enum_def_cg),
   );
+  // Plan 124: `XmlNode`/`XmlEvent` — codegen's own mirror of `emerald-
+  // sema`'s identical synthetic `EnumDef`s (see that crate's own
+  // Decision log for why `XmlEvent`'s text-content variant is named
+  // `TextContent`, not `Text` — `XmlNode::Text` already claims that
+  // name in this compiler's global, flat enum-variant namespace).
+  // `build_enum_layout` needs no placeholder-seed step here the way
+  // `emerald-sema`'s two-pass registration does: `Array[XmlNode]`'s
+  // field only needs classifying as `ValKind::Ptr` (`value_kind_for_
+  // type`), never a real, already-registered `XmlNode` layout to
+  // recurse into — the identical reason `JsonArray(Array[JsonValue])`
+  // above needs no placeholder step in THIS crate either, unlike
+  // `emerald-sema`'s own `resolve_type`.
+  let xml_node_enum_def_cg = EnumDef {
+    name: "XmlNode".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Element".to_string(),
+        fields: vec![
+          TypeExpr::Named("String".to_string()),
+          TypeExpr::Generic(
+            "Hash".to_string(),
+            vec![
+              TypeExpr::Named("String".to_string()),
+              TypeExpr::Named("String".to_string()),
+            ],
+          ),
+          TypeExpr::Generic(
+            "Array".to_string(),
+            vec![TypeExpr::Named("XmlNode".to_string())],
+          ),
+        ],
+      },
+      EnumVariant {
+        name: "Text".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "XmlNode".to_string(),
+    build_enum_layout(&xml_node_enum_def_cg),
+  );
+  let xml_event_enum_def_cg = EnumDef {
+    name: "XmlEvent".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "StartElement".to_string(),
+        fields: vec![
+          TypeExpr::Named("String".to_string()),
+          TypeExpr::Generic(
+            "Hash".to_string(),
+            vec![
+              TypeExpr::Named("String".to_string()),
+              TypeExpr::Named("String".to_string()),
+            ],
+          ),
+        ],
+      },
+      EnumVariant {
+        name: "EndElement".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "TextContent".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Eof".to_string(),
+        fields: vec![],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "XmlEvent".to_string(),
+    build_enum_layout(&xml_event_enum_def_cg),
+  );
 
   // Plan 44: see `Ctx::symbol_table`'s own doc comment — built once,
   // alongside `class_tags`, before any function body compiles.
@@ -21213,6 +21412,8 @@ fn compile_to_object_impl(
   newtypes.insert("HttpResponse".to_string());
   // Plan 101's Decision log: `HttpRequest`.
   newtypes.insert("HttpRequest".to_string());
+  // Plan 124's Decision log: `XmlReader`.
+  newtypes.insert("XmlReader".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -21269,6 +21470,11 @@ fn compile_to_object_impl(
     csv_parse,
     csv_parse_with_headers,
     csv_write,
+    xml_parse,
+    xml_parse_file,
+    xml_reader_from_string,
+    xml_reader_from_file,
+    xml_reader_next_event,
     log_configure,
     log_event,
     log_fields_new,

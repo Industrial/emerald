@@ -298,5 +298,16 @@ toml = "1"
 # `.parse_with_headers`/`.write`'s direct backing. No RustSec advisory
 # found.
 csv = "1"
+# Plan 124: real-checked at this plan's own execution time (2026-09-22,
+# via `cargo update -p quick-xml --precise` against the live crates.io
+# index) - quick-xml 0.42.0 is confirmed the actual latest release,
+# matching the plan's own cited figure. Owned by `tafia`/`Mingun`/
+# `dralley`, the standard pure-Rust XML choice (a StAX-model streaming
+# `Reader`/`Writer` at its core). This crate builds a small tree-mode
+# (`Xml.parse`/`.parse_file`) on top of that streaming `Reader` entirely
+# in `xml.rs` - quick-xml supplies no DOM API of its own. No `serialize`
+# feature enabled (no Emerald-side derive mechanism exists to consume
+# it - the same real gap plan 126 designs around).
+quick-xml = "0.42"
 
 [build-dependencies]

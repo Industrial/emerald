@@ -553,3 +553,27 @@ fn toml_demo_em_prints_expected_sequence() {
     "expected real, non-empty TOML parse-error diagnostic text after the first line, got {rest:?}"
   );
 }
+
+// Plan 124 (XML): `Xml.parse`/`.reader_from_string` proving tree mode
+// and streaming mode agree on the same document's root element —
+// `library` printed twice (tree mode's own root tag, then the
+// streaming reader's very first real event), with each `<book>`'s
+// `title` attribute read in between via `Hash[String,String].each`/
+// `Pair[String,String]#key`/`#value` (plan 124's own real, disclosed
+// finding: `Hash[K,V]` has no `.get` method at all — plan 25's history
+// doc already establishes `[]`/`Expr::Index` as the only access path —
+// and `[]` indexing a `Hash[String,V]` by a `String` key is itself
+// unimplemented in codegen, a real crash found and disclosed by
+// running exactly this. `.each`'s own inline block, in turn, only
+// compiles as a bare top-level statement, never nested inside `if`/
+// `while`/`match` — a second real, disclosed limitation, broader than
+// plan 121's own already-disclosed "nested inside `Ok(v)`" version of
+// the same gap — so both attribute maps are hoisted to top-level
+// `var`s and read after every enclosing `match` has closed).
+#[test]
+fn xml_demo_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("xml_demo.em"),
+    "library\nDune\n1984\nlibrary\n"
+  );
+}
