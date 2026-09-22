@@ -151,6 +151,7 @@ mod env;
 mod handle;
 mod hashing;
 mod http_client;
+mod http_server;
 mod humantime;
 mod json;
 mod log;
@@ -1657,6 +1658,46 @@ pub unsafe extern "C" fn emerald_rt_http_response_status(id: i64) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_http_response_body(id: i64) -> *const c_char {
   catch_and_raise(move || http_client::http_response_body(id))
+}
+
+/// # Safety
+/// `handler` must be a valid function pointer to a compiled Emerald
+/// trampoline taking one live `HttpRequest` handle id and returning
+/// one live `HttpResponse` handle id.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_serve(
+  port: i64,
+  handler: extern "C-unwind" fn(i64) -> i64,
+) -> i64 {
+  catch_and_raise(move || http_server::http_serve(port, handler))
+}
+
+/// # Safety
+/// `body`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_response_build(status: i64, body: *const c_char) -> i64 {
+  catch_and_raise(move || http_server::http_response_build(status, body))
+}
+
+/// # Safety
+/// Always safe to call for a live `HttpRequest` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_request_method(id: i64) -> *const c_char {
+  catch_and_raise(move || http_server::http_request_method(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `HttpRequest` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_request_path(id: i64) -> *const c_char {
+  catch_and_raise(move || http_server::http_request_path(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `HttpRequest` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_request_body(id: i64) -> *const c_char {
+  catch_and_raise(move || http_server::http_request_body(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

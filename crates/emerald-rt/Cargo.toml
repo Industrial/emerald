@@ -258,5 +258,15 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # feature by default - unlike plan 97's `hickory-resolver`, no extra
 # feature needed here). No RustSec advisory found.
 ureq = "3.4"
+# Plan 101: real-reconfirmed at this plan's own authoring time
+# (2026-09-22, via docs.rs) - tiny_http 0.12.0 is STILL the latest
+# crates.io release (published Oct 6, 2022) - the plan's own "no newer
+# release since 2022" staleness caveat re-checked and found still true,
+# unlike every other crate touched this session. 100% blocking, no
+# embedded async runtime, own internal per-connection thread pool
+# already solves concurrency - the sync-first fit `Http.serve` needs.
+# No RustSec advisory found. `Http.serve`/`HttpResponse.build`/
+# `HttpRequest#method`/`#path`/`#body`'s direct backing.
+tiny_http = "0.12"
 
 [build-dependencies]

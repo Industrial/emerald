@@ -48,11 +48,28 @@ use crate::handle::{handle_alloc, handle_get_mut};
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
-const HTTP_RESPONSE_TAG: &str = "HttpResponse";
+// `pub(crate)` — plan 101 (HTTP Server) reuses this exact type (not a
+// structurally-identical duplicate, which would be a DIFFERENT type
+// for `crate::handle`'s own `Any`-downcast purposes) to build a real
+// `HttpResponse` handle from a handler's own `HttpResponse.build(...)`
+// call and from its own panic/exception-boundary 500 fallback.
+pub(crate) const HTTP_RESPONSE_TAG: &str = "HttpResponse";
 
-struct HttpResponseData {
-  status: i64,
-  body: String,
+pub(crate) struct HttpResponseData {
+  pub(crate) status: i64,
+  pub(crate) body: String,
+}
+
+/// Allocates a real `HttpResponse` handle and returns its bare id —
+/// `wrap_response` below's own un-`Result`-wrapped sibling, for a
+/// caller (plan 101's `HttpResponse.build`/trampoline fallback) that
+/// wants the id itself, not a `Result[HttpResponse, String]` heap
+/// value built around it.
+pub(crate) fn http_response_new_handle(status: i64, body: String) -> i64 {
+  handle_alloc(
+    Box::new(HttpResponseData { status, body }),
+    HTTP_RESPONSE_TAG,
+  )
 }
 
 // The one shared, process-lifetime `ureq::Agent` — the same "one lazy
@@ -80,10 +97,7 @@ unsafe fn read_str<'a>(s: *const c_char) -> Result<&'a str, String> {
 }
 
 fn wrap_response(status: i64, body: String) -> *mut std::ffi::c_void {
-  let id = handle_alloc(
-    Box::new(HttpResponseData { status, body }),
-    HTTP_RESPONSE_TAG,
-  );
+  let id = http_response_new_handle(status, body);
   unsafe { crate::emerald_rt_result_ok(id) }
 }
 

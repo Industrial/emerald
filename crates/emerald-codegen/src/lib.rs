@@ -195,6 +195,8 @@ fn set_newtype_underlying(program: &Program) {
     "UdpSocket",
     // Plan 100's Decision log: `HttpResponse` — the identical shape.
     "HttpResponse",
+    // Plan 101's Decision log: `HttpRequest` — the identical shape.
+    "HttpRequest",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -2883,7 +2885,13 @@ fn infer_concrete_type_from_arg<'ctx>(
         return Some(TypeExpr::Named(class_name.clone()));
       }
       let base_env = build_local_val_kind_env(vars, ctx.top_level_types);
-      let kind = infer_lambda_ret_kind(params, body, &base_env, ctx.user_fn_return_types);
+      let kind = infer_lambda_ret_kind(
+        params,
+        body,
+        &base_env,
+        ctx.user_fn_return_types,
+        Some(ctx.newtypes),
+      );
       valkind_to_typeexpr(&kind)
     }
     // A fresh instance — the class name is right there, no `ValKind`
@@ -5124,6 +5132,13 @@ struct Ctx<'a, 'ctx> {
   http_post: FunctionValue<'ctx>,
   http_response_status: FunctionValue<'ctx>,
   http_response_body: FunctionValue<'ctx>,
+  /// Plan 101 (HTTP Server) — `Http.serve`, `HttpResponse.build`,
+  /// `HttpRequest#method`/`#path`/`#body`.
+  http_serve: FunctionValue<'ctx>,
+  http_response_build: FunctionValue<'ctx>,
+  http_request_method: FunctionValue<'ctx>,
+  http_request_path: FunctionValue<'ctx>,
+  http_request_body: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8362,6 +8377,28 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ret_kind));
     }
+    // Plan 101's Decision log: `HttpRequest#method`/`#path`/`#body`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("HttpRequest") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let fv = match method {
+        "method" => ctx.http_request_method,
+        "path" => ctx.http_request_path,
+        "body" => ctx.http_request_body,
+        other => return Err(format!("codegen: unsupported HttpRequest method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "httprequesttmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Str));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -8977,6 +9014,202 @@ fn build_method_call<'ctx>(
   // (via `emerald_rt_result_ok`/`_err_str`), so this call site is a
   // plain passthrough, the same shape `Rsa.decrypt`/`AesGcm256.encrypt`
   // already use for their own `Result`-returning statics.
+  if recv_name == "Http" && method == "serve" {
+    // Plan 101's Decision log: `Http.serve(port, block)` — the genuinely
+    // new mechanism this plan builds: native Rust code calling back into
+    // compiled Emerald code. The block is compiled via `build_inline_
+    // lambda` (the SAME machinery `.each do |x| ... end` already uses —
+    // every block literal already compiles to a real, separate top-level
+    // LLVM function, contrary to this plan's own "effectively inlined"
+    // framing), then wrapped in a hand-built, call-site-unique
+    // `extern "C-unwind" fn(i64) -> i64` trampoline mirroring plan 55's
+    // own `declare_actor_trampolines` shape: loads the block's own
+    // closure/captures from a call-site-unique global (`Linkage::
+    // Internal` — nothing outside this one compiled function ever
+    // references it BY NAME; only its raw address, passed as data, into
+    // `emerald_rt_http_serve`), indirect-calls the real compiled block
+    // body, and wraps that call in the identical `setjmp`/`push_handler`
+    // catch frame `declare_actor_trampolines` already establishes — an
+    // uncaught Emerald exception inside a handler becomes a real
+    // `HttpResponse.build(500, "Internal Server Error")` value produced
+    // INSIDE the trampoline itself, never a `longjmp` reaching across
+    // the Rust FFI boundary at all.
+    let port_expr = args
+      .first()
+      .ok_or_else(|| "codegen: `Http.serve` expects a port argument".to_string())?;
+    let block_expr = args
+      .get(1)
+      .ok_or_else(|| "codegen: `Http.serve` expects a block argument".to_string())?;
+    let (port_val, _) = build_expr(
+      context,
+      builder,
+      port_expr,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (env_ptr, _) = build_inline_lambda(context, builder, block_expr, vars, ctx)?;
+
+    let ptr_ty = context.ptr_type(AddressSpace::default());
+    let i64_ty = context.i64_type();
+    let span_id = format!("{}_{}", block_expr.span.0, block_expr.span.1);
+
+    // Persists the block's own closure pointer for the trampoline to
+    // read back later, from a native-code call this compiled function's
+    // own stack frame is long gone by the time it happens — the
+    // standard "thunk with captured state behind a global" technique a
+    // plain C function pointer needs when it also needs closure state.
+    let env_global = ctx
+      .module
+      .add_global(ptr_ty, None, &format!("__http_serve_env_{span_id}"));
+    env_global.set_linkage(Linkage::Internal);
+    env_global.set_initializer(&ptr_ty.const_null());
+    builder
+      .build_store(env_global.as_pointer_value(), env_ptr)
+      .map_err(|e| e.to_string())?;
+
+    let trampoline_ty = i64_ty.fn_type(&[i64_ty.into()], false);
+    let trampoline_fv = ctx.module.add_function(
+      &format!("__http_serve_trampoline_{span_id}"),
+      trampoline_ty,
+      Some(Linkage::Internal),
+    );
+
+    // Building the trampoline's own body repositions the shared
+    // `Builder` — save/restore around it, the exact same discipline
+    // `build_inline_lambda` already establishes for its own nested
+    // `define_lambda` call.
+    let saved_block = builder.get_insert_block();
+    let saved_di_loc = builder.get_current_debug_location();
+
+    let entry = context.append_basic_block(trampoline_fv, "entry");
+    builder.position_at_end(entry);
+    let req_param = trampoline_fv
+      .get_nth_param(0)
+      .ok_or_else(|| "codegen: internal error — http_serve trampoline has no param".to_string())?
+      .into_int_value();
+
+    let loaded_env = builder
+      .build_load(ptr_ty, env_global.as_pointer_value(), "httpserveenv")
+      .map_err(|e| e.to_string())?
+      .into_pointer_value();
+    let fn_ptr_slot = field_ptr(context, builder, loaded_env, 0)?;
+    let fn_ptr = builder
+      .build_load(ptr_ty, fn_ptr_slot, "httpservefnptr")
+      .map_err(|e| e.to_string())?
+      .into_pointer_value();
+    let call_fn_ty = make_fn_type(context, &[ValKind::Ptr, ValKind::Int64], &ValKind::Int64);
+    let handler_call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      vec![loaded_env.into(), req_param.into()];
+
+    // Plan 57's own crash-isolation pattern, reused verbatim: a
+    // synthetic, compiler-only `push_handler`/`setjmp` frame around the
+    // real handler call.
+    let push_call = builder
+      .build_call(ctx.exc_funcs.push_handler, &[], "httpservepushhandler")
+      .map_err(|e| e.to_string())?;
+    let handler_ptr = call_result(push_call)?.into_pointer_value();
+    let jmpbuf_call = builder
+      .build_call(
+        ctx.exc_funcs.handler_jmpbuf,
+        &[handler_ptr.into()],
+        "httpservejmpbuf",
+      )
+      .map_err(|e| e.to_string())?;
+    let jmpbuf_ptr = call_result(jmpbuf_call)?.into_pointer_value();
+    let setjmp_call = builder
+      .build_call(
+        ctx.exc_funcs.setjmp,
+        &[jmpbuf_ptr.into()],
+        "httpservesetjmpres",
+      )
+      .map_err(|e| e.to_string())?;
+    let returns_twice_id = Attribute::get_named_enum_kind_id("returns_twice");
+    let returns_twice_attr = context.create_enum_attribute(returns_twice_id, 0);
+    setjmp_call.add_attribute(AttributeLoc::Function, returns_twice_attr);
+    let setjmp_result = call_result(setjmp_call)?.into_int_value();
+
+    let try_blk = context.append_basic_block(trampoline_fv, "httpserve.try");
+    let catch_blk = context.append_basic_block(trampoline_fv, "httpserve.catch");
+    let zero32 = context.i32_type().const_int(0, false);
+    let is_first_pass = builder
+      .build_int_compare(
+        IntPredicate::EQ,
+        setjmp_result,
+        zero32,
+        "httpserveisfirstpass",
+      )
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_conditional_branch(is_first_pass, try_blk, catch_blk)
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(try_blk);
+    let handler_call = builder
+      .build_indirect_call(
+        call_fn_ty,
+        fn_ptr,
+        &handler_call_args,
+        "httpservehandlercall",
+      )
+      .map_err(|e| e.to_string())?;
+    let resp_id = call_result(handler_call)?;
+    builder
+      .build_call(ctx.exc_funcs.pop_handler, &[], "httpservepophandler")
+      .map_err(|e| e.to_string())?;
+    builder
+      .build_return(Some(&resp_id))
+      .map_err(|e| e.to_string())?;
+
+    builder.position_at_end(catch_blk);
+    // `emerald_raise` already unlinked this handler from the stack
+    // before jumping back here — `free_handler`, not `pop_handler`,
+    // matches `declare_actor_trampolines`'s own identical catch arm.
+    builder
+      .build_call(
+        ctx.exc_funcs.free_handler,
+        &[handler_ptr.into()],
+        "httpservefreehandler",
+      )
+      .map_err(|e| e.to_string())?;
+    let error_msg_global = builder
+      .build_global_string_ptr("Internal Server Error", "httpserve500msg")
+      .map_err(|e| e.to_string())?;
+    let fallback_call = builder
+      .build_call(
+        ctx.http_response_build,
+        &[
+          i64_ty.const_int(500, false).into(),
+          error_msg_global.as_pointer_value().into(),
+        ],
+        "httpservefallback500",
+      )
+      .map_err(|e| e.to_string())?;
+    let fallback_resp = call_result(fallback_call)?;
+    builder
+      .build_return(Some(&fallback_resp))
+      .map_err(|e| e.to_string())?;
+
+    if let Some(block) = saved_block {
+      builder.position_at_end(block);
+    }
+    match saved_di_loc {
+      Some(loc) => builder.set_current_debug_location(loc),
+      None => builder.unset_current_debug_location(),
+    }
+
+    let handler_ptr_val = trampoline_fv.as_global_value().as_pointer_value();
+    builder
+      .build_call(
+        ctx.http_serve,
+        &[port_val.into(), handler_ptr_val.into()],
+        "httpservecalltmp",
+      )
+      .map_err(|e| e.to_string())?;
+    return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+  }
+
   if recv_name == "Http" {
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
     for a in args {
@@ -9000,6 +9233,35 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "httpstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 101's Decision log: `HttpResponse.build(status, body)` — the
+  // plan's own literal `.new` can never reach reserved-namespace
+  // dispatch (`"new"` is grammar-reserved), renamed here for the same
+  // reason `Sha256Hasher` renamed to `.hasher()`.
+  if recv_name == "HttpResponse" {
+    if method != "build" {
+      return Err(format!(
+        "codegen: unsupported HttpResponse static method `{method}`"
+      ));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let call = builder
+      .build_call(ctx.http_response_build, &call_args, "httpresponsebuildtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -13272,8 +13534,42 @@ fn build_inline_lambda<'ctx>(
     );
   };
   let base_env = build_local_val_kind_env(vars, ctx.top_level_types);
-  let ret_kind = infer_lambda_ret_kind(params, body, &base_env, ctx.user_fn_return_types);
-  let captures = free_vars_in_lambda(params, body);
+  let ret_kind = infer_lambda_ret_kind(
+    params,
+    body,
+    &base_env,
+    ctx.user_fn_return_types,
+    Some(ctx.newtypes),
+  );
+  // Real, previously-undisclosed bug found and fixed by plan 101's own
+  // Concrete Proof (`HttpResponse.build(...)` used inside an inline
+  // block for the first time this session): `free_vars_in_lambda`'s
+  // own `collect_idents_in_expr` is purely syntactic (per its own doc
+  // comment, "language-only — no LLVM/Cranelift API") and has no
+  // notion of a reserved-namespace/class-static-call receiver —
+  // `Expr::MethodCall(recv, ..)`'s own arm walks into ANY `recv`,
+  // including `Expr::Ident("HttpResponse")`, and
+  // `Expr::Ident(name) => out.push(name.clone())` adds it
+  // unconditionally, so a reserved type/namespace NAME used as a
+  // receiver inside a block body was (wrongly) treated as a free
+  // variable this block must capture from its enclosing scope — a
+  // real local variable never exists to satisfy that, and this
+  // function's own lookup below used to hard error. Filtered out here:
+  // a "captured" name that is actually a registered class/newtype name
+  // is never a real capture at all — the reserved-namespace/newtype
+  // dispatch inside the block's own body resolves it independently,
+  // with no runtime value needed from the closure. Real, disclosed
+  // scope limit: this only covers names already registered in `ctx.
+  // classes`/`ctx.newtypes` (which is what plan 101's own `HttpResponse`
+  // needs) — a BARE reserved namespace with no corresponding class/
+  // newtype entry at all (e.g. `Env`/`Random`/`Json`, none of which are
+  // ever registered as a class) used as a block-body receiver would
+  // still hit this same false-positive; closing that fully generally
+  // is real, separate work for whichever future plan first needs it.
+  let captures: Vec<String> = free_vars_in_lambda(params, body)
+    .into_iter()
+    .filter(|name| !(ctx.classes.contains_key(name) || ctx.newtypes.contains(name)))
+    .collect();
   let mut capture_offsets = HashMap::new();
   let mut capture_kinds = HashMap::new();
   for (i, cap_name) in captures.iter().enumerate() {
@@ -18428,6 +18724,7 @@ fn infer_lambda_ret_kind(
   body: &[Spanned<Stmt>],
   base_env: &HashMap<String, ValKind>,
   user_fn_return_types: &HashMap<String, TypeExpr>,
+  newtypes: Option<&HashSet<String>>,
 ) -> ValKind {
   let mut env: HashMap<String, ValKind> = base_env.clone();
   for p in params {
@@ -18441,15 +18738,23 @@ fn infer_lambda_ret_kind(
     | Some(Spanned {
       node: Stmt::Return(Some(e)),
       ..
-    }) => infer_expr_val_kind(e, &env, user_fn_return_types),
+    }) => infer_expr_val_kind(e, &env, user_fn_return_types, newtypes),
     _ => ValKind::Void,
   }
 }
 
+// `newtypes`, when given, is `Some(ctx.newtypes)` at both call sites
+// that already have a `Ctx` in scope (`infer_concrete_type_from_arg`,
+// `build_inline_lambda`) — `None` only at `declare_lambda_functions`'s
+// own call site, which covers a narrower, so-far-unaffected case (a
+// top-level named `Proc` `Let`, not an inline block literal), left
+// exactly as it already behaved rather than widening this fix beyond
+// what this plan's own Concrete Proof actually needs verified.
 fn infer_expr_val_kind(
   expr: &Spanned<Expr>,
   env: &HashMap<String, ValKind>,
   user_fn_return_types: &HashMap<String, TypeExpr>,
+  newtypes: Option<&HashSet<String>>,
 ) -> ValKind {
   match &expr.node {
     Expr::Ident(name) => env.get(name.as_str()).cloned().unwrap_or(ValKind::Int64),
@@ -18464,7 +18769,7 @@ fn infer_expr_val_kind(
     | Expr::Mul(l, _)
     | Expr::Div(l, _)
     | Expr::Rem(l, _)
-    | Expr::Neg(l) => infer_expr_val_kind(l, env, user_fn_return_types),
+    | Expr::Neg(l) => infer_expr_val_kind(l, env, user_fn_return_types, newtypes),
     Expr::BitAnd(_, _)
     | Expr::BitOr(_, _)
     | Expr::BitXor(_, _)
@@ -18477,6 +18782,24 @@ fn infer_expr_val_kind(
       .map(value_kind_for_type)
       .unwrap_or(ValKind::Void),
     Expr::MethodCall(_, method, _) if method == "key" || method == "value" => ValKind::Int64,
+    // Real, previously-undisclosed bug found by plan 101's own Concrete
+    // Proof: `HttpResponse.build(...)` used as an inline block's own
+    // trailing/return expression for the first time this session — this
+    // purely-syntactic heuristic had no case for "a reserved-namespace
+    // static call constructing a registered newtype" at all, silently
+    // falling to the catch-all `ValKind::Ptr` below even though every
+    // newtype in this compiler is `Int64`-represented, producing a real
+    // LLVM verifier failure ("Function return type does not match
+    // operand type of return inst") the moment such a call became a
+    // lambda's own inferred return value. `ReservedName.ctor(...)`
+    // constructing that SAME `ReservedName` newtype is the consistent
+    // shape every newtype "constructor" in this batch already follows
+    // (`Url.parse`, `Regex.compile`, `TcpStream.connect`, `HttpResponse.
+    // build`, ...) — checked here directly against `newtypes` rather
+    // than hardcoding another parallel name list.
+    Expr::MethodCall(recv, _, _) if matches!(&recv.node, Expr::Ident(n) if newtypes.is_some_and(|nt| nt.contains(n))) => {
+      ValKind::Int64
+    }
     _ => ValKind::Ptr,
   }
 }
@@ -18554,7 +18877,7 @@ fn declare_lambda_functions<'ctx>(
         .iter()
         .map(|(k, v)| (k.clone(), value_kind_for_type(v)))
         .collect();
-      infer_lambda_ret_kind(params, body, &base_env, user_fn_return_types)
+      infer_lambda_ret_kind(params, body, &base_env, user_fn_return_types, None)
     };
     let mut kinds = vec![ValKind::Ptr]; // env
     kinds.extend(param_kinds(params));
@@ -20029,6 +20352,36 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 101 (HTTP Server). `handler`'s own Rust-side type is `extern
+  // "C-unwind" fn(i64) -> i64` — invisible to LLVM IR (that distinction
+  // is Rust-type-system-only, never encoded in the actual calling
+  // convention bits); a plain opaque `ptr_ty` here is the correct,
+  // complete LLVM-level type.
+  let http_serve = module.add_function(
+    "emerald_rt_http_serve",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http_response_build = module.add_function(
+    "emerald_rt_http_response_build",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http_request_method = module.add_function(
+    "emerald_rt_http_request_method",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http_request_path = module.add_function(
+    "emerald_rt_http_request_path",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http_request_body = module.add_function(
+    "emerald_rt_http_request_body",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -20627,6 +20980,8 @@ fn compile_to_object_impl(
   newtypes.insert("UdpSocket".to_string());
   // Plan 100's Decision log: `HttpResponse`.
   newtypes.insert("HttpResponse".to_string());
+  // Plan 101's Decision log: `HttpRequest`.
+  newtypes.insert("HttpRequest".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -20821,6 +21176,11 @@ fn compile_to_object_impl(
     http_post,
     http_response_status,
     http_response_body,
+    http_serve,
+    http_response_build,
+    http_request_method,
+    http_request_path,
+    http_request_body,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

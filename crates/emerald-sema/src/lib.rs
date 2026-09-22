@@ -4558,13 +4558,55 @@ fn infer_expr_type(
     Expr::MethodCall(recv, method, args)
       if matches!(&recv.node, Expr::Ident(n) if n == "Http") =>
     {
-      let response_ty = Type::Result(
-        Box::new(Type::Newtype(
-          "HttpResponse".to_string(),
-          Box::new(Type::Int64),
-        )),
-        Box::new(Type::String),
-      );
+      let http_response_ty = Type::Newtype("HttpResponse".to_string(), Box::new(Type::Int64));
+      // Plan 101's Decision log: `Http.serve(port, block)` — a block-
+      // attached reserved-namespace call, checked separately from the
+      // fixed-arity `check_args` shape "get"/"post" use below, since
+      // the block argument's own type comes from `infer_lambda_type`,
+      // not a plain positional type comparison. Real, disclosed
+      // finding: this needs ZERO new grammar (`ChainCallExpr` already
+      // parses `Http.serve(port) do |req| ... end` with no special-
+      // casing — `Http` is an ordinary receiver `Ident` like any
+      // other) and ZERO new block-typing mechanism (`infer_lambda_type`
+      // already resolves ANY block param's declared type generically
+      // via `resolve_type`, `HttpRequest` included, since it's
+      // registered in `classes` the identical way `Regex`/`Url` are).
+      if method == "serve" {
+        let [port_arg, block_arg] = args.as_slice() else {
+          return Err(Diagnostic::new(
+            format!(
+              "`Http.serve` expects exactly 2 arguments (a port and a block), found {}",
+              args.len()
+            ),
+            expr.span,
+          ));
+        };
+        let port_ty = infer_expr_type(port_arg, env, sigs, classes, self_fields, gctx)?;
+        if port_ty != Type::Int64 {
+          return Err(Diagnostic::new(
+            format!("`Http.serve`'s port must be Int64, found {port_ty:?}"),
+            port_arg.span,
+          ));
+        }
+        let http_request_ty = Type::Newtype("HttpRequest".to_string(), Box::new(Type::Int64));
+        let block_ret = check_enumerable_proc_arg(
+          block_arg,
+          &[http_request_ty],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        if block_ret != http_response_ty {
+          return Err(Diagnostic::new(
+            format!("`Http.serve`'s block must return HttpResponse, found {block_ret:?}"),
+            block_arg.span,
+          ));
+        }
+        return Ok(Type::Void);
+      }
+      let response_ty = Type::Result(Box::new(http_response_ty), Box::new(Type::String));
       let (expected_params, ret) = match method.as_str() {
         "get" => (vec![Type::String], response_ty),
         "post" => (vec![Type::String, Type::String], response_ty),
@@ -4586,6 +4628,35 @@ fn infer_expr_type(
         gctx,
       )?;
       Ok(ret)
+    }
+    // Plan 101's Decision log: `HttpResponse.build(status, body)` — the
+    // plan's own literal `.new` can never reach reserved-namespace
+    // dispatch at all (`"new"` is a grammar-reserved keyword parsing
+    // unconditionally into `Expr::New`, confirmed against
+    // `grammar.lalrpop`, the identical finding plan 109 already made
+    // for `Sha256.new()`) — renamed `.build` for the same reason
+    // `Sha256Hasher` renamed to `.hasher()`.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "HttpResponse") =>
+    {
+      if method != "build" {
+        return Err(Diagnostic::new(
+          format!("HttpResponse has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      let http_response_ty = Type::Newtype("HttpResponse".to_string(), Box::new(Type::Int64));
+      check_args(
+        method,
+        args,
+        &[Type::Int64, Type::String],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(http_response_ty)
     }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
@@ -5414,6 +5485,31 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("HttpResponse has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 101's Decision log: `HttpRequest#method`/`#path`/
+        // `#body` — the identical carved-out shape `HttpResponse`
+        // already establishes.
+        if name == "HttpRequest" {
+          let (expected_params, ret) = match method.as_str() {
+            "method" | "path" | "body" => (vec![], Type::String),
+            other => {
+              return Err(Diagnostic::new(
+                format!("HttpRequest has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -12452,6 +12548,8 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     "UdpSocket",
     // Plan 100's Decision log: `HttpResponse` — the identical shape.
     "HttpResponse",
+    // Plan 101's Decision log: `HttpRequest` — the identical shape.
+    "HttpRequest",
   ] {
     classes.insert(
       name.to_string(),
