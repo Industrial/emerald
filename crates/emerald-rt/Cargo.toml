@@ -244,5 +244,19 @@ hickory-resolver = { version = "0.26.2", features = [
 # threaded `block_on` if the background work can't also make progress
 # concurrently - a multi-thread runtime is required, not a convenience.
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# Plan 100: real-checked at this plan's own authoring time (2026-09-22,
+# via docs.rs) - ureq 3.4.2, #1 in lib.rs's own HTTP-client category,
+# 22.2M downloads/month, used in 8,525 crates. Chosen over `reqwest`
+# (69.4M downloads/month, more widely used in raw numbers) specifically
+# because `reqwest::blocking` still drives an embedded `tokio` Runtime
+# under the hood, while `ureq` is genuinely, natively blocking I/O with
+# no embedded async runtime at all - the strongest possible fit for
+# plan 94's "prefer a crate's sync API" rule, a real, disclosed
+# trade-off against raw popularity, not a default assumed without
+# checking `reqwest` at all. Default features (`gzip` + `rustls`, the
+# latter already pulling in its own `rustls-webpki-roots` trust-anchor
+# feature by default - unlike plan 97's `hickory-resolver`, no extra
+# feature needed here). No RustSec advisory found.
+ureq = "3.4"
 
 [build-dependencies]

@@ -491,3 +491,13 @@ fn raw_tcp_sockets_em_prints_expected_sequence() {
 fn dns_resolution_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("dns_resolution.em"), "true\ntrue\n");
 }
+
+// Plan 100 (HTTP Client): network-dependent, real GET requests against
+// `httpbin.org`'s own deterministic `/status/<code>` endpoint. All
+// three lines go through the `Ok` arm — a completed 404/500 response
+// is a successful transport outcome, not a `Result` failure, this
+// plan's own central, deliberate divergence from `ureq`'s own default.
+#[test]
+fn http_client_proof_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("http_client_proof.em"), "200\n404\n500\n");
+}

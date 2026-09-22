@@ -4549,6 +4549,44 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 100's Decision log: `Http.get`/`.post` — the same reserved-
+    // namespace static-call shape `Url`/`Dns` already use. Real,
+    // disclosed simplification vs. this plan's own text: no
+    // `HttpError` compound type — the error arm is a plain `String`,
+    // matching every other `Result`-returning reserved-namespace call
+    // this session already establishes (`Rsa.decrypt`/`Regex.compile`).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Http") =>
+    {
+      let response_ty = Type::Result(
+        Box::new(Type::Newtype(
+          "HttpResponse".to_string(),
+          Box::new(Type::Int64),
+        )),
+        Box::new(Type::String),
+      );
+      let (expected_params, ret) = match method.as_str() {
+        "get" => (vec![Type::String], response_ty),
+        "post" => (vec![Type::String, Type::String], response_ty),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Http has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
@@ -5351,6 +5389,31 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("UdpSocket has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 100's Decision log: `HttpResponse#status`/`#body` — the
+        // identical carved-out shape `Url`/`Regex` already establish.
+        if name == "HttpResponse" {
+          let (expected_params, ret) = match method.as_str() {
+            "status" => (vec![], Type::Int64),
+            "body" => (vec![], Type::String),
+            other => {
+              return Err(Diagnostic::new(
+                format!("HttpResponse has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -12387,6 +12450,8 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     "TcpStream",
     "TcpListener",
     "UdpSocket",
+    // Plan 100's Decision log: `HttpResponse` — the identical shape.
+    "HttpResponse",
   ] {
     classes.insert(
       name.to_string(),

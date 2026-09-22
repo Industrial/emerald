@@ -150,6 +150,7 @@ mod encoding;
 mod env;
 mod handle;
 mod hashing;
+mod http_client;
 mod humantime;
 mod json;
 mod log;
@@ -1624,6 +1625,38 @@ pub unsafe extern "C" fn emerald_rt_dns_resolve_all(host: *const c_char) -> *mut
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_dns_resolve_count(host: *const c_char) -> i64 {
   catch_and_raise(move || dns::dns_resolve_count(host))
+}
+
+/// # Safety
+/// `url`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_get(url: *const c_char) -> *mut c_void {
+  catch_and_raise(move || http_client::http_get(url))
+}
+
+/// # Safety
+/// `url`/`body`, if non-null, must point to valid, NUL-terminated C
+/// strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_post(
+  url: *const c_char,
+  body: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || http_client::http_post(url, body))
+}
+
+/// # Safety
+/// Always safe to call for a live `HttpResponse` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_response_status(id: i64) -> i64 {
+  catch_and_raise(move || http_client::http_response_status(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `HttpResponse` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_response_body(id: i64) -> *const c_char {
+  catch_and_raise(move || http_client::http_response_body(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

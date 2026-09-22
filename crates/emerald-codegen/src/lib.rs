@@ -193,6 +193,8 @@ fn set_newtype_underlying(program: &Program) {
     "TcpStream",
     "TcpListener",
     "UdpSocket",
+    // Plan 100's Decision log: `HttpResponse` — the identical shape.
+    "HttpResponse",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5116,6 +5118,12 @@ struct Ctx<'a, 'ctx> {
   dns_resolve_all: FunctionValue<'ctx>,
   dns_resolve_count: FunctionValue<'ctx>,
   dns_configure: FunctionValue<'ctx>,
+  /// Plan 100 (HTTP Client) — `Http.get`/`.post`, `HttpResponse#status`/
+  /// `#body`, wrapping `ureq`.
+  http_get: FunctionValue<'ctx>,
+  http_post: FunctionValue<'ctx>,
+  http_response_status: FunctionValue<'ctx>,
+  http_response_body: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8329,6 +8337,31 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ret_kind));
     }
+    // Plan 100's Decision log: `HttpResponse#status`/`#body`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("HttpResponse") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (fv, ret_kind) = match method {
+        "status" => (ctx.http_response_status, ValKind::Int64),
+        "body" => (ctx.http_response_body, ValKind::Str),
+        other => {
+          return Err(format!(
+            "codegen: unsupported HttpResponse method `{other}`"
+          ))
+        }
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "httpresponsetmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -8937,6 +8970,36 @@ fn build_method_call<'ctx>(
       }
       other => Err(format!("codegen: unsupported Dns static method `{other}`")),
     };
+  }
+
+  // Plan 100's Decision log: `Http.get`/`.post` — the Rust side already
+  // returns a fully-formed `Result[HttpResponse, String]` heap value
+  // (via `emerald_rt_result_ok`/`_err_str`), so this call site is a
+  // plain passthrough, the same shape `Rsa.decrypt`/`AesGcm256.encrypt`
+  // already use for their own `Result`-returning statics.
+  if recv_name == "Http" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "get" => ctx.http_get,
+      "post" => ctx.http_post,
+      other => return Err(format!("codegen: unsupported Http static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "httpstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -14303,9 +14366,20 @@ fn build_stmt<'a, 'ctx>(
         },
       )?;
       let ty_str = ty.to_string();
+      // Plan 100's own real, disclosed finding: this arm never checked
+      // `ctx.newtypes` — the sibling `match ... Ok(var) do ... end`
+      // binding path (`local_classes.insert` guarded on
+      // `ctx.classes.contains_key(t_name) || ctx.enums.contains_key(t_name)
+      // || ctx.newtypes.contains(t_name)`) already does, so
+      // `r: HttpResponse = Http.get(url)?` left `r` unable to dispatch
+      // `.status()`/`.body()` — `r`'s own newtype-carved-out instance
+      // methods — while the structurally identical `match Ok(r) do
+      // r.status() end` form already worked. Fixed by mirroring that
+      // same three-way check here.
       if matches!(ty, TypeExpr::Generic(base, _) if base == "Result")
         || ctx.classes.contains_key(&ty_str)
         || ctx.enums.contains_key(&ty_str)
+        || ctx.newtypes.contains(&ty_str)
       {
         local_classes.insert(name.clone(), ty_str);
       }
@@ -19934,6 +20008,27 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 100 (HTTP Client).
+  let http_get = module.add_function(
+    "emerald_rt_http_get",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http_post = module.add_function(
+    "emerald_rt_http_post",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http_response_status = module.add_function(
+    "emerald_rt_http_response_status",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http_response_body = module.add_function(
+    "emerald_rt_http_response_body",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -20530,6 +20625,8 @@ fn compile_to_object_impl(
   newtypes.insert("TcpStream".to_string());
   newtypes.insert("TcpListener".to_string());
   newtypes.insert("UdpSocket".to_string());
+  // Plan 100's Decision log: `HttpResponse`.
+  newtypes.insert("HttpResponse".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -20720,6 +20817,10 @@ fn compile_to_object_impl(
     dns_resolve_all,
     dns_resolve_count,
     dns_configure,
+    http_get,
+    http_post,
+    http_response_status,
+    http_response_body,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,
