@@ -4914,6 +4914,20 @@ struct Ctx<'a, 'ctx> {
   log_fields_new: FunctionValue<'ctx>,
   log_fields_set: FunctionValue<'ctx>,
   log_event_fields: FunctionValue<'ctx>,
+  /// Plan 123 (Base64 & Hex Encoding, `String`-only scope) —
+  /// `Base64.encode`/`.decode` and its four-variant-pair siblings.
+  base64_encode: FunctionValue<'ctx>,
+  base64_decode: FunctionValue<'ctx>,
+  base64_encode_no_pad: FunctionValue<'ctx>,
+  base64_decode_no_pad: FunctionValue<'ctx>,
+  base64_encode_url_safe: FunctionValue<'ctx>,
+  base64_decode_url_safe: FunctionValue<'ctx>,
+  base64_encode_url_safe_padded: FunctionValue<'ctx>,
+  base64_decode_url_safe_padded: FunctionValue<'ctx>,
+  /// `Hex.encode`/`.encode_upper`/`.decode`.
+  hex_encode: FunctionValue<'ctx>,
+  hex_encode_upper: FunctionValue<'ctx>,
+  hex_decode: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7742,6 +7756,75 @@ fn build_method_call<'ctx>(
       .build_call(ctx.json_parse, &[v.into()], "jsonparsetmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 123's Decision log (revised, `String`-only scope): `Base64.
+  // encode`/`.decode` and its four-variant-pair siblings — the same
+  // reserved-namespace static-call shape `Json`/`Log`/`File` use.
+  // `.encode*` returns a plain `String` (`ValKind::Str`); `.decode*`
+  // returns `Result[String, String]` — `encoding.rs`'s own Rust side
+  // already returns plan 53's own `Result` layout directly, zero
+  // additional marshaling needed here.
+  if recv_name == "Base64" {
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `Base64.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (fv, ret_kind) = match method {
+      "encode" => (ctx.base64_encode, ValKind::Str),
+      "encode_no_pad" => (ctx.base64_encode_no_pad, ValKind::Str),
+      "encode_url_safe" => (ctx.base64_encode_url_safe, ValKind::Str),
+      "encode_url_safe_padded" => (ctx.base64_encode_url_safe_padded, ValKind::Str),
+      "decode" => (ctx.base64_decode, ValKind::Ptr),
+      "decode_no_pad" => (ctx.base64_decode_no_pad, ValKind::Ptr),
+      "decode_url_safe" => (ctx.base64_decode_url_safe, ValKind::Ptr),
+      "decode_url_safe_padded" => (ctx.base64_decode_url_safe_padded, ValKind::Ptr),
+      other => {
+        return Err(format!(
+          "codegen: unsupported Base64 static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &[v.into()], "base64tmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 123's Decision log: `Hex.encode`/`.encode_upper`/`.decode` —
+  // the identical reserved-namespace shape `Base64` immediately above
+  // uses.
+  if recv_name == "Hex" {
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `Hex.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (fv, ret_kind) = match method {
+      "encode" => (ctx.hex_encode, ValKind::Str),
+      "encode_upper" => (ctx.hex_encode_upper, ValKind::Str),
+      "decode" => (ctx.hex_decode, ValKind::Ptr),
+      other => return Err(format!("codegen: unsupported Hex static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &[v.into()], "hextmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
   }
 
   // Plan 168's Decision log: `Log.configure`/`.<level>`/
@@ -17642,6 +17725,65 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 123 (Base64 & Hex Encoding, `String`-only scope): `.encode*`
+  // returns a plain `String` pointer; `.decode*` returns plan 53's own
+  // `Result` layout (a heap pointer), same shape `rt_fnv1a_hash_checked`
+  // above already uses.
+  let base64_encode = module.add_function(
+    "emerald_rt_base64_encode",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let base64_decode = module.add_function(
+    "emerald_rt_base64_decode",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let base64_encode_no_pad = module.add_function(
+    "emerald_rt_base64_encode_no_pad",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let base64_decode_no_pad = module.add_function(
+    "emerald_rt_base64_decode_no_pad",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let base64_encode_url_safe = module.add_function(
+    "emerald_rt_base64_encode_url_safe",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let base64_decode_url_safe = module.add_function(
+    "emerald_rt_base64_decode_url_safe",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let base64_encode_url_safe_padded = module.add_function(
+    "emerald_rt_base64_encode_url_safe_padded",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let base64_decode_url_safe_padded = module.add_function(
+    "emerald_rt_base64_decode_url_safe_padded",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let hex_encode = module.add_function(
+    "emerald_rt_hex_encode",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let hex_encode_upper = module.add_function(
+    "emerald_rt_hex_encode_upper",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let hex_decode = module.add_function(
+    "emerald_rt_hex_decode",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -18280,6 +18422,17 @@ fn compile_to_object_impl(
     log_fields_new,
     log_fields_set,
     log_event_fields,
+    base64_encode,
+    base64_decode,
+    base64_encode_no_pad,
+    base64_decode_no_pad,
+    base64_encode_url_safe,
+    base64_decode_url_safe,
+    base64_encode_url_safe_padded,
+    base64_decode_url_safe_padded,
+    hex_encode,
+    hex_encode_upper,
+    hex_decode,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

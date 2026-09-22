@@ -4045,6 +4045,88 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 123's Decision log (revised, `String`-only scope — see
+    // `crates/emerald-rt/src/encoding.rs`'s own module doc): `Base64.
+    // encode`/`.decode` and its four-variant-pair siblings, the same
+    // reserved-namespace static-call shape `Json`/`Log`/`File` use.
+    // `.encode*` never fails (`Type::String`); `.decode*` returns
+    // `Result[String, String]` — a real, disclosed narrowing from the
+    // plan's own original `Bytes`-typed signature, since no `Bytes`
+    // type exists anywhere in this compiler (verified against this
+    // `Type` enum directly, and against plan 92's own "not yet
+    // decided" section, which named exactly this gap).
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Base64") =>
+    {
+      match method.as_str() {
+        "encode" | "encode_no_pad" | "encode_url_safe" | "encode_url_safe_padded" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::String)
+        }
+        "decode" | "decode_no_pad" | "decode_url_safe" | "decode_url_safe_padded" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(Box::new(Type::String), Box::new(Type::String)))
+        }
+        other => Err(Diagnostic::new(
+          format!("Base64 has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
+    // Plan 123's Decision log: `Hex.encode`/`.encode_upper`/`.decode` —
+    // the identical reserved-namespace shape `Base64` immediately above
+    // uses, same `String`-only scope narrowing.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Hex") => {
+      match method.as_str() {
+        "encode" | "encode_upper" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::String)
+        }
+        "decode" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(Box::new(Type::String), Box::new(Type::String)))
+        }
+        other => Err(Diagnostic::new(
+          format!("Hex has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
     // Plan 168's Decision log: `Log.configure`/`.<level>`/
     // `.<level>_fields` — the same reserved-namespace static-call
     // shape `File`/`Json` immediately below use, for the same reason

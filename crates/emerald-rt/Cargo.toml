@@ -46,5 +46,16 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # this pin resolves to. Both pure-Rust, no C exception needed.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["registry"] }
+# Plan 123: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - base64 0.23.1 (Aug 4, 2026), #4 in Encoding,
+# 123,729,640 downloads/month, used in 95,248 crates, MIT/Apache; hex
+# 0.4.3 (Mar 3, 2021, stable/unchanged since), #52 in Encoding,
+# 53,852,713 downloads/month, used in 44,269 crates, MIT/Apache. No
+# RustSec advisory found against either crate. Both pure-Rust
+# (base64's default-on `simd-unsafe` feature is `unsafe`-using SIMD
+# purely internal to the crate's own engine dispatch, invisible at
+# this API level - no C exception needed). See DEPENDENCIES.md.
+base64 = "0.23"
+hex = "0.4"
 
 [build-dependencies]

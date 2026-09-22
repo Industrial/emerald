@@ -126,6 +126,7 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+mod encoding;
 mod handle;
 mod json;
 mod log;
@@ -476,6 +477,92 @@ pub unsafe extern "C" fn emerald_rt_json_object_get(
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_json_to_string(obj: *const c_void) -> *const c_char {
   catch_and_raise(move || json::json_to_string(obj))
+}
+
+// Plan 123 (Base64 & Hex Encoding — revised, `String`-only scope; see
+// `encoding.rs`'s own module doc): `Base64.encode`/`.decode` and their
+// four-variant siblings, `Hex.encode`/`.encode_upper`/`.decode`,
+// dispatched by exact free-function name in `emerald-codegen`'s own
+// `build_method_call`, mirroring `Json`/`Log`/`File`'s reserved-
+// namespace static-call shape exactly.
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_encode(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || encoding::base64_encode(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_decode(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || encoding::base64_decode(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_encode_no_pad(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || encoding::base64_encode_no_pad(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_decode_no_pad(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || encoding::base64_decode_no_pad(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_encode_url_safe(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || encoding::base64_encode_url_safe(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_decode_url_safe(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || encoding::base64_decode_url_safe(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_encode_url_safe_padded(
+  s: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || encoding::base64_encode_url_safe_padded(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_base64_decode_url_safe_padded(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || encoding::base64_decode_url_safe_padded(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_hex_encode(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || encoding::hex_encode(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_hex_encode_upper(s: *const c_char) -> *const c_char {
+  catch_and_raise(move || encoding::hex_encode_upper(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_hex_decode(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || encoding::hex_decode(s))
 }
 
 // Plan 168 (Structured Logging): `Log.configure`/`.trace`/`.debug`/

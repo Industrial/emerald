@@ -300,3 +300,23 @@ fn derive_serializable_em_prints_expected_sequence() {
     "{\"active\":true,\"age\":36.0,\"gpa\":3.9,\"name\":\"Ada\"}\n"
   );
 }
+
+// Plan 123 (Base64 & Hex Encoding, revised `String`-only scope — see
+// `examples/base64_hex_encoding.em`'s own header comment): RFC 4648's
+// own worked example ("hello world"), round-tripped through standard
+// base64, url-safe base64 (unpadded by default), hex, and a real
+// negative proof (malformed base64 reaching Err with a real,
+// non-empty library error message).
+#[test]
+fn base64_hex_encoding_em_prints_expected_sequence() {
+  let output = compile_and_run("base64_hex_encoding.em");
+  let mut lines = output.lines();
+  assert_eq!(lines.next(), Some("aGVsbG8gd29ybGQ="));
+  assert_eq!(lines.next(), Some("hello world"));
+  assert_eq!(lines.next(), Some("aGVsbG8gd29ybGQ"));
+  assert_eq!(lines.next(), Some("68656c6c6f20776f726c64"));
+  assert_eq!(lines.next(), Some("hello world"));
+  let last = lines.next().expect("expected a fifth, negative-proof line");
+  assert!(!last.is_empty() && last != "unexpected ok", "{last:?}");
+  assert_eq!(lines.next(), None);
+}

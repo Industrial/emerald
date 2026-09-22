@@ -41,6 +41,8 @@ reasoning — add a new row instead.
 | `serde_json` (+ `preserve_order` feature, pulling in `indexmap`) | 1.0.151 | #1 in crates.io's Encoding category, 116M downloads/month, no serious pure-Rust competing choice for JSON; `serde_json::Value` lowers directly to Emerald's own `JsonValue` enum layout | pure-Rust | 2026-09-22 | 118 |
 | `tracing` | 0.1.44 | #1 in crates.io's Debugging category, 67M downloads/month, tokio-rs-owned; industry-standard structured-event macros/dispatch | pure-Rust | 2026-09-22 | 168 |
 | `tracing-subscriber` (+ `registry` feature) | 0.3.23 | Subscriber/Layer composition utilities for `tracing`, same owners; backs `Log`'s custom JSON `Layer`. RUSTSEC-2025-0055 (ANSI-escape injection) checked — patched in >=0.3.20, this pin resolves well above it | pure-Rust | 2026-09-22 | 168 |
+| `base64` | 0.23.1 | #4 in crates.io's Encoding category, 123.7M downloads/month, used in 95,248 crates; `Engine`-trait API's four predefined `general_purpose` constants map 1:1 onto `Base64`'s own four variant pairs. No RustSec advisory found | pure-Rust (default-on `simd-unsafe` feature is internal-only `unsafe`, invisible at this API level) | 2026-09-22 | 123 |
+| `hex` | 0.4.3 | #52 in crates.io's Encoding category, 53.9M downloads/month, used in 44,269 crates; stable/essentially unchanged since 2021, case-insensitive `decode` matching this plan's own wrapper design. No RustSec advisory found | pure-Rust | 2026-09-22 | 123 |
 
 ## Pre-existing transitive dependencies (out of scope, triaged)
 

@@ -10,19 +10,19 @@ maestro:
 todos:
   - id: leaf-base64-four-engines
     content: "`Base64.encode(data: Bytes): String` / `Base64.decode(s: String): Result[Bytes, String]` (RFC 4648 §4, standard alphabet, padded — the sane default, matching what Python's `base64.b64encode`, Ruby's `Base64.encode64`, and MIME/PEM all default to); `Base64.encode_no_pad`/`Base64.decode_no_pad` (§4, unpadded); `Base64.encode_url_safe`/`Base64.decode_url_safe` (§5, unpadded — matches RFC 7515 JWT's mandatory unpadded base64url, the dominant real-world url-safe convention); `Base64.encode_url_safe_padded`/`Base64.decode_url_safe_padded` (§5, padded, for the rarer case a caller needs it) — a direct 1:1 mapping onto the crate's four predefined `engine::general_purpose` constants (`STANDARD`, `STANDARD_NO_PAD`, `URL_SAFE`, `URL_SAFE_NO_PAD`)"
-    status: pending
+    status: done
   - id: leaf-hex-encode-decode
     content: "`Hex.encode(data: Bytes): String` (lowercase, the crate's own default), `Hex.encode_upper(data: Bytes): String`, `Hex.decode(s: String): Result[Bytes, String]` (case-insensitive on input, matching the crate's own documented `decode` behavior — accepts a mix of upper/lower in the same string)"
-    status: pending
+    status: done
   - id: leaf-bytes-ffi-plumbing
     content: "Every function's raw-byte side uses plan 92's `(ptr, len)` `Bytes` convention on both call and return; every text side reuses plan 59's zero-conversion null-terminated `String`; decode failure (invalid alphabet character, incorrect padding, odd hex digit count) returns `Err(<library error's Display output>)` via plan 53's `Result[T, E]`, never a runtime abort"
-    status: pending
+    status: deferred
   - id: leaf-panic-boundary-and-tests
     content: "`std::panic::catch_unwind` at every exported function per plan 91's convention; Rust `#[test]`s asserting all eight functions against RFC 4648's own published test vectors plus one deliberately malformed input per decode function"
-    status: pending
+    status: done
   - id: leaf-example-and-gate
     content: "Add the Concrete Proof example to `examples/`, wire into `emerald-cli/tests/examples.rs`, run the full AGENTS.md gate (`cargo nextest run --workspace`, `cargo clippy --workspace --all-targets`, `treefmt`)"
-    status: pending
+    status: done
 isProject: false
 ---
 
