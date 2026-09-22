@@ -58,6 +58,70 @@
 // call produces, but cannot yet accept an Emerald-source-literal
 // String containing an embedded NUL byte. That requires a real
 // Emerald-level Bytes/binary-literal type, not yet designed.
+//
+// Plan 94's async-to-sync bridging convention (documented here, no
+// code merged by this plan - see its own Decision log for why `tokio`
+// is not added to this crate's Cargo.toml yet). Emerald has no
+// async/await surface and none of the 96+ upcoming domain plans add
+// one - every emerald_rt_* export stays a plain, synchronous
+// `extern "C" fn`, exactly plan 92's own shape, regardless of what it
+// does internally to get its answer.
+//
+// Preference order every domain plan citing plan 94 must justify
+// against: (1) a crate with a genuinely synchronous, non-async API
+// (ureq for HTTP, tungstenite's own blocking mode for WebSocket) is
+// always preferred when one exists and is otherwise plan-95-vetting-
+// eligible - zero embedded runtime, and a plain blocking call is
+// indistinguishable, from plan 55's scheduler's point of view, from
+// any CPU-bound native call this crate already makes; (2) only when no
+// sync-native option survives plan 95's vetting bar does a domain plan
+// reach for an async crate (reqwest, tonic, tokio-tungstenite) bridged
+// via the pattern below. A domain plan reaching for (2) without first
+// stating why (1) was unavailable or rejected fails plan 95's own
+// acceptance checklist item 3.
+//
+// The exact pattern the first async-backed domain plan must implement
+// verbatim (illustrative prose here, not compiled code - `tokio` is
+// not a real dependency of this crate as of plan 94):
+//
+//   static TOKIO_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+//   fn tokio_rt() -> &'static tokio::runtime::Runtime {
+//     TOKIO_RT.get_or_init(|| {
+//       tokio::runtime::Runtime::new()
+//         .expect("emerald-rt: failed to start the shared tokio runtime")
+//     })
+//   }
+//
+// Exactly one shared, lazily-initialized Runtime behind a OnceLock,
+// never one runtime per call and never one runtime per domain plan -
+// every async-backed export calls `tokio_rt().block_on(async { ... })`
+// inside its own catch_and_raise-wrapped body against that one shared
+// runtime. Whichever domain plan implements this pattern for real is
+// the one that adds `tokio` to this crate's Cargo.toml and to
+// DEPENDENCIES.md (plan 95's ledger), subject to plan 95's own vetting
+// bar (a genuine WebSearch/WebFetch-verified check against crates.io
+// and the RustSec advisory database) at THAT plan's own authoring
+// time - this module's own naming of `tokio` throughout is
+// illustrative of the pattern, not a pre-vetted approval a later plan
+// can cite in place of doing that check itself.
+//
+// The cost/safety analysis every domain plan author should understand
+// before using this pattern: a `.block_on(...)` call inside an actor
+// method body is memory-safe by construction, independent of how long
+// it blocks (plan 55's own safety argument is about which THREAD may
+// touch an actor's state at a given moment, never about how LONG a
+// method body takes to return - a 200ms block_on changes nothing about
+// that argument). The real cost is throughput, not safety: plan 55's
+// worker pool is a FIXED pool of OS threads shared by every actor in
+// the process, so a slow block_on call occupies one of those threads
+// for its entire real-world duration, starving every OTHER actor's
+// mailbox in the meantime - a real, disclosed, non-compiler-enforced
+// concern. The mitigation is architectural, not mechanical: spread
+// concurrent slow native calls across many actor instances (each with
+// its own mailbox, per plan 54) rather than piling them onto one, so
+// plan 55's own multi-worker pool can actually overlap them - the same
+// shape its own Spinner proof already demonstrates for pure CPU-bound
+// work, now generalized to I/O-bound native calls.
 
 use std::ffi::c_void;
 use std::os::raw::c_char;

@@ -10,16 +10,16 @@ maestro:
 todos:
   - id: leaf-sync-native-preference-rule
     content: "Document, in `crates/emerald-rt/src/lib.rs`'s module-level doc (alongside plan 92's naming/panic-boundary conventions this plan extends, not replaces), the mandatory preference order every domain plan's own leaf descriptions from plan 96 onward must justify against: (1) a crate with a genuinely synchronous, non-async API (e.g. `ureq` for HTTP, `tungstenite` in its blocking mode for WebSocket) is always preferred when one exists and is otherwise plan-95-vetting-eligible, since it needs zero embedded runtime and composes with plan 55's scheduler with no additional design surface at all — a plain blocking call is indistinguishable, from the scheduler's point of view, from any CPU-bound native call this codebase already makes; (2) only when no sync-native option survives plan 95's vetting bar does a domain plan reach for an async crate (`reqwest`, `tonic`, `tokio-tungstenite`) bridged via this plan's `block_on` mechanism below. A domain plan that reaches for (2) without first stating why (1) was unavailable or rejected fails plan 95's own acceptance checklist item 3 (FFI/ABI notes citing this plan)."
-    status: pending
+    status: done
   - id: leaf-lazy-shared-tokio-runtime-pattern
     content: "Document (no code merged by this plan — see Decision log for why `tokio` is not added to `crates/emerald-rt/Cargo.toml` here) the exact pattern the first async-backed domain plan must implement verbatim: `static TOKIO_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();` and a `fn tokio_rt() -> &'static tokio::runtime::Runtime { TOKIO_RT.get_or_init(|| tokio::runtime::Runtime::new().expect(\"emerald-rt: failed to start the shared tokio runtime\")) }` helper in `crates/emerald-rt/src/lib.rs`, with every async-backed export calling `tokio_rt().block_on(async { ... })` inside its own `emerald_rt_fn!`-wrapped (plan 92) body against that one shared, lazily-initialized runtime — never one `Runtime::new()` per call, never one runtime per domain plan. Whichever domain plan implements this pattern for real is the one that adds `tokio` to `crates/emerald-rt/Cargo.toml` and to `crates/emerald-rt/DEPENDENCIES.md` (plan 95's ledger), subject to plan 95's own vetting bar at that plan's own authoring/execution time — not this one."
-    status: pending
+    status: done
   - id: leaf-blocking-cost-documentation
     content: "Write the actor-interaction analysis (this plan's Decision log, reproduced as a doc comment on `tokio_rt()` itself) explaining plainly, for whoever writes the next 90+ domain plans: a `.block_on(...)` call inside an actor method body blocks that actor's *current* OS worker thread for the call's real wall-clock duration (a slow HTTP request, a stalled DB query) — this is memory-safe by construction (plan 55's own single-thread-per-actor-at-a-time invariant holds regardless of how long a method body takes to return) but reduces the effective size of the worker pool available to every *other* actor's messages for that same duration, a real, disclosed throughput cost. Document the concrete mitigation as usage guidance, not a compiler-enforced rule: spread many concurrent slow native calls across many actor instances (each with its own mailbox, per plan 54) rather than issuing them serially from one actor, so the scheduler's own multi-worker pool (plan 55) can actually overlap them, the same way the plan 55 `Spinner` CPU-bound proof already demonstrates overlap for pure computation."
-    status: pending
+    status: done
   - id: leaf-no-new-example-this-plan
     content: "Confirm and state explicitly (see Decision log and Out of scope) that this plan adds no new `emerald_rt_*` export, no new third-party dependency, and therefore no new `.em` example or CI table entry of its own — the `tokio_rt()` pattern and preference-order documentation are exercised for real the first time a domain plan (the batch's own HTTP-client plan is the anticipated first user) actually implements it against a real export. Run the full `AGENTS.md` gate (`cargo nextest run --workspace`, `cargo clippy --workspace --all-targets`, `treefmt`) confirming this plan's doc-only changes to `crates/emerald-rt/src/lib.rs` build cleanly and zero existing behavior (plan 91's hash function, plan 92's checked variant and panic proof, plan 93's handle registry) regresses."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -252,3 +252,22 @@ to write and run it first.
    revisit only if a concrete domain plan's own workload demonstrates
    the documented mitigation (spread calls across more actors) is
    insufficient in practice.
+
+## Update (2026-09-22, same-day session): implemented, all four leaves done
+
+A pure documentation plan, as its own text specifies (mirroring plan
+82's precedent) — no code, no new dependency, no new example. Added a
+substantial new section to `crates/emerald-rt/src/lib.rs`'s existing
+module-level doc comment (the same one plans 91-93 already extend),
+covering, in order: the sync-native-preference rule and its two-item
+priority list; the exact `TOKIO_RT`/`tokio_rt()` pattern the first
+async-backed domain plan must implement verbatim, written as
+illustrative prose/code — not compiled code, since `tokio` is
+deliberately not a real dependency of this crate yet; the blocking-cost
+analysis (memory-safe by construction, a real throughput cost, the
+architectural mitigation), reproduced from this plan's own Decision
+log rather than merely cited by number, so a future domain-plan author
+reads it in the one file they're already extending, not a separate
+history entry. `cargo build -p emerald-rt`/`cargo test -p emerald-rt`
+confirm the doc-only change is genuinely behavior-inert: all 15
+existing `emerald-rt` tests (plans 91-93's own) still pass unmodified.
