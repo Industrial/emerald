@@ -4813,6 +4813,11 @@ struct Ctx<'a, 'ctx> {
   /// by `crates/emerald-rt` (a Rust static archive) rather than
   /// `runtime/emerald_runtime.c`.
   rt_fnv1a_hash: FunctionValue<'ctx>,
+  /// Plan 92's own concrete proof: the same hash, `Result`-shaped.
+  rt_fnv1a_hash_checked: FunctionValue<'ctx>,
+  /// Plan 92's own concrete proof: a deliberately, unconditionally
+  /// panicking export, proving a real panic reaches a real `rescue`.
+  rt_fnv1a_hash_panic_for_test: FunctionValue<'ctx>,
   /// Plan 45's Decision log: `File` reuses plan 12's `Name.method(args)`
   /// dispatch shape but is a separate, hard-coded arm in `build_method_
   /// call` — `File` is never a `ModuleDef`, so it never populates
@@ -7678,11 +7683,21 @@ fn build_method_call<'ctx>(
       "split_count" => (ctx.string_split_count, ValKind::Int64),
       "split" => (ctx.string_split, ValKind::Ptr),
       "fnv1a_hash" => (ctx.rt_fnv1a_hash, ValKind::Int64),
+      "fnv1a_hash_checked" => (ctx.rt_fnv1a_hash_checked, ValKind::Ptr),
+      "fnv1a_hash_panic_for_test" => (ctx.rt_fnv1a_hash_panic_for_test, ValKind::Void),
       other => return Err(format!("codegen: unsupported String method `{other}`")),
     };
     let call = builder
       .build_call(fv, &call_args, "strmethodtmp")
       .map_err(|e| e.to_string())?;
+    if ret_kind == ValKind::Void {
+      // Plan 92's own `.fnv1a_hash_panic_for_test` — Void on the
+      // Emerald side, invoked purely for its side effect (a caught
+      // panic raising a real `NativeError`). Same guard `build_method_
+      // call`'s own class-method dispatch below already applies to a
+      // Void-returning user method.
+      return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+    }
     return Ok((call_result(call)?, ret_kind));
   }
 
@@ -7774,6 +7789,33 @@ fn build_method_call<'ctx>(
         local_array_elem_types,
         ctx,
       );
+    }
+    // Plan 92's Decision log: `NativeError.message` — a synthesized
+    // getter with no `AstFunction`/`ClassDef.methods` entry of its own
+    // (see the `native_error_class_def` this function declares above),
+    // so it never appears in `method_owners` the way a real declared
+    // method would. Checked here, before that lookup, the same way
+    // `register`'s own actor special case immediately above is —
+    // reads the one real field `emerald-rt`'s own `build_native_error_
+    // instance` already lays out at offset 0, directly.
+    if class_name == "NativeError" && method == "message" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let field = ctx
+        .classes
+        .get("NativeError")
+        .and_then(|layout| layout.fields.get("message"))
+        .cloned()
+        .ok_or("codegen: internal error — NativeError has no `message` field layout")?;
+      let val = load_field(context, builder, recv_val.into_pointer_value(), field)?;
+      return Ok((val, ValKind::Str));
     }
     // Plan 32: resolve which ancestor actually *declares* `method` —
     // only the defining class has a compiled `{Class}_{method}` symbol
@@ -16995,9 +17037,28 @@ fn compile_to_object_impl(
   // — see `emerald-driver/build.rs`/`src/lib.rs`) rather than the C
   // runtime — same `extern "C" fn(*const c_char) -> i64` shape as
   // `string_length` immediately above, declared identically.
+  // Plan 92: renamed from `emerald_rt_fnv1a_hash` to follow this
+  // plan's own naming convention (`emerald_rt_MODULE_FN`) — a pure
+  // rename, no behavior change.
   let rt_fnv1a_hash = module.add_function(
-    "emerald_rt_fnv1a_hash",
+    "emerald_rt_string_fnv1a_hash",
     i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  // Plan 92's own concrete proof: the same hash, returning plan 53's
+  // `Result` layout (a heap pointer, like every other `Ptr`-kinded
+  // intrinsic) rather than a bare `Int64`.
+  let rt_fnv1a_hash_checked = module.add_function(
+    "emerald_rt_string_fnv1a_hash_checked",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  // Plan 92's own concrete proof: a deliberately, unconditionally
+  // panicking export — Void on the Emerald side, exists only to
+  // demonstrate a real panic reaching a real `rescue`.
+  let rt_fnv1a_hash_panic_for_test = module.add_function(
+    "emerald_rt_string_fnv1a_hash_panic_for_test",
+    void_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
   let file_read = module.add_function(
@@ -17094,8 +17155,31 @@ fn compile_to_object_impl(
   // name (it has no `ClassLayout` of its own at all); routed here
   // instead, consulted only by `collect_generic_class_specializations`
   // below.
+  // Plan 92's Decision log: a compiler-synthesized, single-field
+  // (`message: String`) class every `emerald-rt` panic-boundary raise
+  // targets — the same "resolves against the real class registry with
+  // no matching source-level declaration" shape `Option[T]` already
+  // has (see `grammar.lalrpop`'s own comment above the `own`/`borrow`
+  // `TypeExpr` productions). Declared here, alive for the rest of this
+  // function, so `class_defs` can borrow it the same way it borrows
+  // every real `Item::Class`/`Item::Actor`/generic-instance `ClassDef`.
+  let native_error_class_def = ClassDef {
+    name: "NativeError".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![Param {
+      name: "message".to_string(),
+      ty: TypeExpr::Named("String".to_string()),
+      default: None,
+    }],
+    methods: Vec::new(),
+    type_params: Vec::new(),
+    doc: None,
+  };
   let mut generic_class_defs: HashMap<String, &ClassDef> = HashMap::new();
   let mut class_defs: HashMap<String, &ClassDef> = HashMap::new();
+  class_defs.insert("NativeError".to_string(), &native_error_class_def);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -17125,6 +17209,20 @@ fn compile_to_object_impl(
   // integer tag (declaration order) for `rescue` matching.
   let mut classes: HashMap<String, ClassLayout> = HashMap::new();
   let mut class_tags: HashMap<String, i64> = HashMap::new();
+  // Plan 92's Decision log: `NativeError` gets a fixed, reserved tag
+  // (`0`), assigned before any user-declared class — `emerald-rt` has
+  // no access to a particular compilation's own `program.items` order,
+  // so it hardcodes `NATIVE_ERROR_TAG = 0` as a Rust `const` and both
+  // sides must agree on that value by construction, not by threading
+  // it through the FFI call itself. Every user class's own tag shifts
+  // up by one relative to before this plan (still declaration-order,
+  // still internal-only — `rescue`'s own codegen reads `class_tags`
+  // the same map either way, so no call site needed to change).
+  classes.insert(
+    "NativeError".to_string(),
+    build_class_layout("NativeError", &class_defs)?,
+  );
+  class_tags.insert("NativeError".to_string(), 0);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -17542,6 +17640,8 @@ fn compile_to_object_impl(
     string_split_count,
     string_split,
     rt_fnv1a_hash,
+    rt_fnv1a_hash_checked,
+    rt_fnv1a_hash_panic_for_test,
     file_read,
     file_write,
     gets,

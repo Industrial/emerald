@@ -10,22 +10,22 @@ maestro:
 todos:
   - id: leaf-rename-to-naming-convention
     content: "Rename plan 91's one shipped export, `emerald_rt_fnv1a_hash`, to `emerald_rt_string_fnv1a_hash` in `crates/emerald-rt/src/lib.rs`, and update every call site that names it literally: the `module.add_function(\"emerald_rt_fnv1a_hash\", ...)` declaration in `emerald-codegen` (plan 91's `leaf-panic-boundary-and-fnv1a-proof`), the `#[test]` in `emerald-rt` asserting its FNV-1a value, and `examples/rust_native_runtime_proof.em`'s expected-output table entry if the example harness names the symbol anywhere. Add a doc comment at the top of `crates/emerald-rt/src/lib.rs` stating the mandatory `emerald_rt_<module>_<fn>` naming rule in prose, citing this plan by number, so it reads as an enforced convention rather than an accident of plan 91's single function happening to be named that way. `<module>` is the lowercase noun the function's Emerald-facing surface groups under (`string`, `file`, `http`, `sqlite`, ...) — not the Rust crate name (`emerald_rt` is already the fixed prefix) and not the wrapped third-party crate's own name (which may change across a re-vetting per plan 95 without the ABI-visible symbol needing to change)."
-    status: pending
+    status: done
   - id: leaf-panic-boundary-macro
     content: "Add a `macro_rules! emerald_rt_fn` (or equivalently a documented helper function taking a closure) to `crates/emerald-rt/src/lib.rs` that wraps `std::panic::catch_unwind` around a function body and, on a caught panic, converts the panic payload (downcast `&str`/`String`, falling back to a fixed `\"native panic (no message)\"` literal for a non-string payload per `std::panic::catch_unwind`'s own documented payload contract) into a call to `leaf-native-error-and-panic-raise`'s `emerald_rt_raise_native_error` rather than returning a sentinel value. Rewrite `emerald_rt_string_fnv1a_hash` (renamed above) to go through this macro, replacing plan 91's placeholder `.unwrap_or(-1)` — its function body never actually panics today (FNV-1a is total over any byte slice), so this rewrite is a pure convention change with no behavior difference for that one function, proven by its existing `#[test]` continuing to pass unmodified."
-    status: pending
+    status: done
   - id: leaf-native-error-and-panic-raise
     content: "Add a compiler-synthesized `NativeError` class (one field, `message: String`, mirroring the `Option[T]` enum's own 'a compiler-synthesized... name in `classes`' precedent noted in `grammar.lalrpop`'s own comment above the `own`/`borrow` `TypeExpr` productions) registered in `emerald-sema`'s `classes` map and `emerald-codegen`'s class-tag-assignment pass at a fixed, reserved class tag (tag `0`) assigned *before* any user-declared class from `program.items` gets a tag, so `NativeError`'s numeric identity is identical in every compiled Emerald program and safe for `emerald-rt` to hardcode as a Rust `const NATIVE_ERROR_TAG: i64 = 0;` with no access to that specific compilation's class registry. Add `emerald_rt_raise_native_error(msg: *const c_char) -> !` to `crates/emerald-rt/src/lib.rs`, implemented by declaring `emerald_alloc`/`emerald_raise` as `unsafe extern \"C\"` inside `emerald-rt` itself (both symbols are already exported from the linked-in C archive per plan 91's dual-archive build — no new marshaling boundary, the same runtime entry point codegen's own `Stmt::Raise` lowering already calls, per plan 11) and calling `emerald_raise(NATIVE_ERROR_TAG, alloc_and_store_message(msg))`. A `.em` regression test rescues a deliberately panicking native call (see the plan's own concrete proof for a candidate) with an ordinary `rescue NativeError => e; puts e.message`, proving the boundary is a real, catchable Emerald exception and not merely documented prose."
-    status: pending
+    status: done
   - id: leaf-result-construction-helpers
     content: "Add `emerald_rt_result_ok(payload: i64) -> *mut c_void` and `emerald_rt_result_err(msg: *const c_char) -> *mut c_void` to `crates/emerald-rt/src/lib.rs`, each allocating exactly plan 53's own `Result[T, E]` layout (16 bytes via the same cross-archive `emerald_alloc` call as the leaf above: `[discriminant: i64 @ offset 0][payload: i64 @ offset 8]`, `0`/`1` respectively) so the pointer either helper returns is byte-for-byte what `emerald-codegen`'s own `Expr::Ok`/`Expr::Err` arms already produce — a native function declaring `Result[Int64, String]` as its LLVM return type needs zero additional marshaling at the call site, the same free convergence plan 59 found between `CString`/`String?` and plan 43's nullable-pointer representation. Add `String.fnv1a_hash_checked(self): Result[Int64, String]` to `emerald-rt` (extending plan 91's own proof function, not a new domain) returning `Err(\"input must not be empty\")` for `\"\"` and `Ok(<same FNV-1a value as .fnv1a_hash>)` otherwise, dispatched through the identical `ValKind::Str`-gated intrinsic mechanism plan 91's `leaf-panic-boundary-and-fnv1a-proof` already established for `.fnv1a_hash`."
-    status: pending
+    status: done
   - id: leaf-binary-safe-buffer-convention
     content: "Document, in a new `crates/emerald-rt/src/lib.rs` module-level doc section (no new Emerald-facing type introduced by this plan — see Decision log), the `(ptr: *const u8, len: i64)` two-parameter ABI shape every future domain plan needing embedded-NUL or non-UTF-8 byte data (compression, crypto, binary serialization, images) must use in place of a bare `*const c_char`, on both the parameter and return side (a returning function takes an additional `out_len: *mut i64` out-parameter, since a bare two-word `#[repr(C)] struct` return is not guaranteed to pass in registers identically across every future host ABI this project may target, whereas an out-parameter is the same convention `emerald_string_length`-adjacent runtime helpers already use for multi-value returns). Document the exact, disclosed limitation this plan does not solve: an Emerald `String` value crossing this convention as an input is still bounded by `emerald_string_length`'s own `strlen`-based length (plan 59's own finding — `String` has no length header), so a domain plan built on this convention can *consume* arbitrary bytes a native call *produces*, but cannot yet accept an Emerald-source-literal `String` containing an embedded NUL byte — that requires a real Emerald-level `Bytes`/binary-literal type, named explicitly in 'Not yet decided' below rather than assumed solved."
-    status: pending
+    status: done
   - id: leaf-example-and-gate
     content: "Extend `examples/rust_native_runtime_proof.em` (or add `examples/ffi_abi_conventions_proof.em`, wired into `emerald-cli/tests/examples.rs`'s CI-checked table per plan 91's own precedent) with this plan's concrete proof below, exercising the renamed `.fnv1a_hash`, the new `.fnv1a_hash_checked` on both an empty and a non-empty input, and a deliberately panicking native call caught via `rescue NativeError => e`. Run the full `AGENTS.md` gate: `cargo nextest run --workspace`, `cargo clippy --workspace --all-targets`, `treefmt`, plus a clean-checkout `cargo build` end-to-end, matching plan 91's own `leaf-example-and-full-gate` bar exactly."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -294,3 +294,80 @@ the same "prove it in code, not just prose" posture plan 91 used for
    platform-library flag list, "confirm empirically" at the point a
    real domain plan first returns binary data, rather than asserted
    here with no function yet exercising it.
+
+## Update (2026-09-22, same-day session): implemented, all six leaves done
+
+Full workspace gate green: `cargo nextest run --workspace` (932/932,
+2 pre-existing skips), `cargo clippy --workspace --all-targets` (clean),
+`treefmt` (0 changed), a clean-checkout `cargo build -p emerald-cli`
+end to end. `examples/rust_native_runtime_proof.em` extended in place
+(not a new file) and run through the real CLI, printing the full
+expected six-line sequence.
+
+Three real, disclosed deviations from this plan's own text, each found
+only by actually building/running it:
+
+- **`emerald_rt_fn!` became a plain function, `catch_and_raise`, not a
+  `macro_rules!`.** The plan's own `leaf-panic-boundary-macro` asked
+  for a macro specifically so forgetting the panic boundary is a
+  compile error. A generic function (`fn catch_and_raise<T>(body: impl
+  FnOnce() -> T + UnwindSafe) -> T`) gives the identical "every export
+  calls one shared wrapper" shape with no macro-hygiene surface to
+  maintain across ~200 future call sites; `emerald_rt_string_fnv1a_
+  hash`/`_checked`/`_panic_for_test` all go through it identically to
+  how they'd go through a macro. Revisit if a future domain plan finds
+  a real case the function form can't express that a macro could.
+- **`NativeError` needed a synthesized `message` GETTER METHOD, not
+  just a registered field.** The plan's own Decision log registers
+  `NativeError` as a `ClassInfo`/`ClassDef` with a `message: String`
+  field and left it there. Tried first: `rescue NativeError => e; puts
+  e.message` — sema rejected it outright (`class NativeError has no
+  method message`), because this language's own field-access
+  convention (confirmed against `examples/exceptions.em`'s `MyError`,
+  which hand-writes `fn code: Int64 do @code end`) requires an
+  explicit getter METHOD for every external field read; there is no
+  bare-field-access expression form at all. Fixed by registering a
+  synthesized `message` method in both `emerald-sema`'s `ClassInfo.
+  methods` (a hand-built `FunctionSig`) and `emerald-codegen`'s
+  `build_method_call` (a special case reading
+  `ctx.classes["NativeError"].fields["message"]` directly via the
+  existing `load_field`/`field_ptr` helpers, checked before the
+  ordinary `method_owners`
+  lookup — the same pattern `to_cstring`'s own type-level-relabeling
+  special case and the actor `register` special case immediately above
+  it already establish) — no `AstFunction`/LLVM function body is ever
+  actually generated for it, since there's no source declaration to
+  compile one from.
+- **`catch_unwind`'s own `Err` payload did not reliably downcast to
+  `&str`/`String` in the actual `--release`-built archive this project
+  links in — despite an in-process `cargo test -p emerald-rt` unit test
+  of the IDENTICAL `panic!("literal")` shape succeeding.** Found only
+  by running the real `.em` example through the real CLI: `e.message`
+  printed the fixed fallback string ("native panic (no message)")
+  instead of the real panic text. A temporary debug probe (`payload.
+  is::<&str>()`/`.is::<String>()`, both false) confirmed the payload's
+  concrete type genuinely isn't either — root cause not fully
+  identified (a real, open question, not resolved by this plan), but
+  reproduced consistently across separate runs. Fixed by sidestepping
+  the payload downcast entirely: `install_panic_hook_once` installs a
+  real `std::panic::set_hook` (chaining to, not replacing, the previous
+  hook) that captures `PanicHookInfo`'s own rendered message into a
+  thread-local (`LAST_PANIC_MESSAGE`) `panic_message` reads first,
+  falling back to the original downcast only if the hook somehow never
+  ran. `PanicHookInfo` has no stable `.message()` accessor on this
+  project's rustc (confirmed by a real, empirical `E0599`), so the
+  message is recovered by splitting `info.to_string()`'s own `"panicked
+  at {location}:\n{message}"` rendering on its first newline — verified
+  correct against the real captured output, not assumed from
+  documentation.
+
+Also found and fixed along the way (not a plan-92 deviation, a plain
+mechanical necessity for its own Concrete Proof): a `Result[T, E]`
+`match` scrutinee must be a plain local per the grammar's own
+`<scrutinee:CondExpr>` production combined with codegen's own internal-
+error check ("`Ok`/`Err` match scrutinee must be a plain local"), so
+each `.fnv1a_hash_checked` call is bound to a `Let` before the `match`,
+not inlined — and the actual match syntax is `match <scrutinee> do
+Ok(<var>) do ... end Err(<var>) do ... end end`, not the plan text's
+own `case`/`when` sketch (`examples/rust_native_runtime_proof.em`'s own
+header comment discloses both).

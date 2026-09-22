@@ -2466,6 +2466,19 @@ fn string_intrinsic_signature(method: &str) -> Option<(Vec<Type>, Type)> {
     // system's own only integer width, per plan 59), same as every
     // other `Int64`-returning String intrinsic above.
     "fnv1a_hash" => Some((vec![], Type::Int64)),
+    // Plan 92's own concrete proof: the same hash, `Result`-shaped
+    // (`Err` for `""`, `Ok` with the identical value otherwise) —
+    // exercises `emerald-rt`'s `emerald_rt_result_ok`/`_err`
+    // construction helpers through a real String intrinsic.
+    "fnv1a_hash_checked" => Some((
+      vec![],
+      Type::Result(Box::new(Type::Int64), Box::new(Type::String)),
+    )),
+    // Plan 92's own concrete proof: a deliberately, unconditionally
+    // panicking intrinsic, demonstrating a genuine Rust panic
+    // converting into a real, rescuable `NativeError` via
+    // `catch_and_raise`. Void — no return value is ever produced.
+    "fnv1a_hash_panic_for_test" => Some((vec![], Type::Void)),
     _ => None,
   }
 }
@@ -10873,6 +10886,47 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // instantiation actually written somewhere in the program (this
   // struct's own doc comment).
   let mut generic_classes: HashMap<String, &ClassDef> = HashMap::new();
+  // Plan 92's Decision log: `NativeError` — a compiler-synthesized,
+  // single-field (`message: String`) class every caught `emerald-rt`
+  // panic raises, registered here the same way `Option[T]` already
+  // resolves against this registry with no matching source-level
+  // declaration anywhere. No `class_defs` entry needed (nothing ever
+  // looks up `NativeError` as an ancestor or re-derives its layout from
+  // a `ClassDef`) — a direct, self-contained `ClassInfo` is sufficient
+  // since it has no superclass, no methods, and no fields to flatten.
+  classes.insert(
+    "NativeError".to_string(),
+    ClassInfo {
+      fields: HashMap::from([("message".to_string(), Type::String)]),
+      // A getter, exactly as if the user had written `fn message:
+      // String do @message end` themselves (see every other rescued
+      // exception class in `examples/exceptions.em`, which all define
+      // their own) — `NativeError` has no source declaration to write
+      // one on, so it's synthesized here instead.
+      methods: HashMap::from([(
+        "message".to_string(),
+        FunctionSig {
+          params: vec![],
+          return_type: Type::String,
+          block_param: None,
+          param_names: vec![],
+          defaults: vec![],
+          splat_elem: None,
+          requires: vec![],
+          is_pure: true,
+          param_ownership: vec![],
+          return_ownership: None,
+        },
+      )]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
   for item in &program.items {
     if let Item::Class(c) = item {
       if !c.type_params.is_empty() {

@@ -44,9 +44,15 @@ fn rust_native_runtime_proof_em_prints_expected_sequence() {
   // hand-computed and independently verified against a from-scratch
   // Python re-implementation of the algorithm before being hard-coded
   // here, not copied from this crate's own output.
+  // Plan 92 extends the same example: `.fnv1a_hash_checked`'s Ok path
+  // on "hello" (the identical FNV-1a value a second time), its Err
+  // path on "" (`input must not be empty`), and a real panic from
+  // `.fnv1a_hash_panic_for_test` caught via `rescue NativeError => e`
+  // (`e.message` — the exact literal the panic! call in
+  // `crates/emerald-rt/src/lib.rs` uses).
   assert_eq!(
     compile_and_run("rust_native_runtime_proof.em"),
-    "1335831723\n3582672807\n2166136261\n"
+    "1335831723\n3582672807\n2166136261\n1335831723\ninput must not be empty\nnative panic in fnv1a_hash_panic_for_test\n"
   );
 }
 
