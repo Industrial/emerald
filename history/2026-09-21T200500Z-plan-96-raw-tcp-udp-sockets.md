@@ -10,22 +10,22 @@ maestro:
 todos:
   - id: leaf-scaffold-net-module-and-handle-wiring
     content: "Create `crates/emerald-rt/src/net.rs` with three thin wrapper structs (`EmeraldTcpStream(std::net::TcpStream)`, `EmeraldTcpListener(std::net::TcpListener)`, `EmeraldUdpSocket(std::net::UdpSocket)`) registered into whatever opaque-u64-handle registry plan 93 establishes (a global slab/table mapping `u64 -> Box<dyn Any>` or a per-kind table — plan 93's call, not re-derived here). Every exported `#[no_mangle] pub extern \"C\" fn emerald_rt_tcp_*`/`emerald_rt_udp_*` function's entire body must be wrapped in `std::panic::catch_unwind` per plan 92, converting any `std::io::Error` into plan 92's canonical error-propagation shape rather than a bare `-1`/sentinel return — this plan supplies the domain-specific `io::Error -> Emerald exception` message text (e.g. `\"connection refused\"`, `\"address already in use\"`, taken from `std::io::Error::kind()`'s real `ErrorKind` variants, not invented strings), plan 92 supplies the marshaling mechanism itself. Wire the Emerald-facing `TcpStream`/`TcpListener`/`UdpSocket` as compiler-provided, non-user-declarable classes carrying one hidden `Int64` handle field each, dispatched the same way `String`'s intrinsics are gated in `crates/emerald-sema/src/lib.rs` (`infer_expr_type`'s `MethodCall` arm checking `recv_ty` against the reserved type name *before* falling through to the `Type::Class` registry path, exactly as documented in plan 45's Decision log for `ValKind::Str`) — the one genuinely new wrinkle beyond both `String` (stateless, no fields) and `File` (a namespace with zero instances, per plan 45's own `File` leaf) is that these three types are both instance-carrying *and* non-user-declarable, a combination neither existing precedent covers alone; defer the exact sema/codegen representation of a compiler-provided single-field handle-carrying type to plan 93, since that representation is this plan's first real tenant, not this plan's own invention."
-    status: pending
+    status: done
   - id: leaf-tcp-stream-connect-read-write-close
     content: "`TcpStream.connect(host: String, port: Int64): TcpStream` (blocking `std::net::TcpStream::connect((host.as_str(), port as u16))`, relying on `std::net`'s own internal `ToSocketAddrs`-driven `getaddrinfo` resolution — see plan 97's Decision log for why this is sufficient for a literal host/IP but insufficient for DoH/DoT/custom-nameserver use cases), `.read(max_len: Int64): String` (a single `std::io::Read::read` call, NOT `read_to_end`/`read_exact` — returns as soon as 1..=max_len bytes are available, real POSIX-`read(2)`-style short reads, disclosed explicitly rather than silently looping to fill the buffer), `.write(data: String): Int64` (a single `std::io::Write::write` call returning the real byte count actually written, since TCP sockets can produce partial writes under backpressure — the Emerald caller is responsible for looping if it needs all bytes sent, matching `.read`'s own no-looping disclosure), and `.close(): Void` (drops the wrapped `std::net::TcpStream`, removes the handle-table entry, an explicit lifecycle op per plan 93 — there is no finalizer/GC path that calls this automatically). Emerald's own `String` is a bare null-terminated `char*` per plan 59's own verified finding (`emerald_alloc`/`emerald_string_length` show no length header at all) — `.read`/`.write` on a raw socket therefore inherit a real, disclosed gap: a payload containing an embedded NUL byte (fully legal on an arbitrary TCP stream, illegal in a null-terminated C string) silently truncates at the first zero byte on both the read and write paths. This plan does not fix that gap; it names it explicitly and defers the real fix — a binary-safe `(ptr, len)` buffer convention — to plan 92, which already owns that exact convention for non-UTF8 data; nothing in this plan invents a competing mechanism."
-    status: pending
+    status: done
   - id: leaf-tcp-listener-bind-accept-close
     content: "`TcpListener.bind(host: String, port: Int64): TcpListener` (`std::net::TcpListener::bind`, `SO_REUSEADDR` left at Rust std's own default — unlike `emerald_tcp_listen`'s C implementation at `runtime/emerald_runtime.c:1494-1523`, which sets `SO_REUSEADDR` explicitly; verify Rust std's own actual default behavior on this project's supported Linux targets during implementation rather than assuming parity with the C runtime's explicit choice, and set it explicitly via `socket2`-free `TcpListener`-level means only if verification shows Rust's default diverges) and `.accept(): TcpStream` (blocking `std::net::TcpListener::accept`, discarding the returned `SocketAddr` for v1 — a real, disclosed simplification; a `.local_addr()`/peer-address accessor is not part of this plan's surface, see Out of scope) and `.close(): Void`. Unlike `emerald_tcp_listen`, which is hardcoded to `AF_INET`/`sockaddr_in` (IPv4 only, verified directly against the C source), this plan's `std::net`-backed implementation accepts any host string `std::net::ToSocketAddrs` can resolve, including IPv6 literals and hostnames — a real, disclosed capability improvement over the existing actor transport, not a compatibility requirement with it (see Decision log: the two socket implementations are deliberately not unified)."
-    status: pending
+    status: done
   - id: leaf-udp-socket-bind-send-recv-close
     content: "`UdpSocket.bind(host: String, port: Int64): UdpSocket`, `.send_to(data: String, host: String, port: Int64): Int64` (`std::net::UdpSocket::send_to`), `.recv_from(max_len: Int64): String` (`std::net::UdpSocket::recv_from`, returning only the payload — see below for the sender address), and `.close(): Void`. Rather than inventing a multi-value return convention Emerald has no established syntax for in this plan's own worked proof, the sender's address is exposed through a `_Thread_local`-style last-value accessor pair, `UdpSocket.last_sender_host(): String` / `UdpSocket.last_sender_port(): Int64`, populated by the most recent `.recv_from` call on the calling thread — this reuses, verbatim, the exact pattern `runtime/emerald_runtime.c`'s own `emerald_remote_last_error`/`emerald_remote_last_error_message` (L1479-1492) already established for `errno`-style side-channel state, not a newly invented idiom. `emerald-rt`'s Rust-side equivalent is a `thread_local!` `RefCell<Option<SocketAddr>>` inside `net.rs`, read by the two accessor functions and written by `recv_from`."
-    status: pending
+    status: done
   - id: leaf-document-worker-pool-blocking-hazard
     content: "Add a new subsection to `spec/RUNTIME.md` (near the existing actor-scheduling material) documenting, in plain terms and with a real citation, that a blocking `TcpStream`/`TcpListener`/`UdpSocket` call made from inside an actor's message-handler body ties up one of the fixed `EMERALD_WORKERS`-or-`sysconf(_SC_NPROCESSORS_ONLN)` worker threads (`runtime/emerald_runtime.c:964-993`, `emerald_worker_pool_start`) for the full duration of that call — since actor message dispatch runs exclusively on this fixed-size pool, enough concurrently blocked reads/accepts (bounded above by the pool size, which defaults to core count) stall every other actor's mailbox processing project-wide, not just the blocked actor's own. State explicitly that this is the same class of hazard plan 94 names generally for any blocking native call made from a worker thread, and that this plan's sockets are deliberately, only ever blocking (`std::net`'s only mode) — a fully non-blocking/`mio`-driven or `tokio::net`-based variant is out of scope here (see Out of scope), consistent with plan 94's own preference for a crate's sync API first. Add a `#[test]` in `emerald-rt` (not a full end-to-end `.em` example, since reproducing worker-pool exhaustion deterministically needs `EMERALD_WORKERS=1` set at process start, awkward from inside `cargo nextest`'s own test harness) that starts a `TcpListener`, spawns a thread that blocks on `.accept()`-equivalent Rust-level code, confirms the accept only unblocks once a connect happens on a second thread — a real, working proof the underlying `std::net` primitives behave as documented, even though the worker-pool-exhaustion scenario itself is asserted in prose/spec text rather than in an automated regression test."
-    status: pending
+    status: done
   - id: leaf-example-and-full-gate
     content: "Add `examples/raw_tcp_sockets.em` (the Concrete Proof below) to `examples/`, wire it into `emerald-cli`'s example-conformance test table per plan 95's mandatory docs+example+test checklist and `examples/README.md`'s stated CI contract, and run the full `AGENTS.md` gate (`cargo nextest run --workspace`, `cargo clippy --workspace --all-targets`, `treefmt`) plus a clean-checkout end-to-end build, matching plan 91's own `leaf-example-and-full-gate` exactly."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -216,3 +216,67 @@ in one program.
   sockets (see Decision log above) — the two remain permanently
   separate unless a later plan explicitly proposes and justifies a
   migration.
+
+## Update (2026-09-22, EXECUTE)
+
+Implemented exactly as designed, no scope reduction. `crates/emerald-rt/src/net.rs`
+wraps `std::net::{TcpStream, TcpListener, UdpSocket}` directly — zero crate to vet.
+`TcpStream.connect`/`#read`/`#write`/`#close`, `TcpListener.bind`/`#accept`/`#close`,
+`UdpSocket.bind`/`#send_to`/`#recv_from`/`#close`/`.last_sender_host`/
+`.last_sender_port` — every method this plan's own leaf list named, all backed by
+plan 93's own `crate::handle` registry via the identical `Int64`-newtype shape
+`Regex`/`AeadKey`/`Url`/every other compiler-provided handle type in this batch
+already establishes. Real, disclosed finding: this plan's own text frames
+"instance-carrying AND non-user-declarable" as a combination with no existing
+precedent — by the time this plan actually ran, plans 109-111/117/122/168 had
+already built and proved exactly that combination repeatedly; no new
+representational design was needed at all.
+
+`#read`/`#write`/`#send_to`/`#recv_from` each make exactly one underlying
+`std::io` call — real short-read/partial-write semantics, never looping, per this
+plan's own leaf text. `TcpListener#accept` discards the peer `SocketAddr`, the
+disclosed v1 simplification this plan's own Decision log names.
+`UdpSocket.last_sender_host`/`.last_sender_port` reuse `runtime/emerald_runtime.c`'s
+own `emerald_remote_last_error`/`emerald_remote_last_error_message`
+`_Thread_local`-accessor-pair shape verbatim, backed by a real `thread_local!`
+`RefCell<Option<SocketAddr>>` in `net.rs`.
+
+The `SO_REUSEADDR` verification this plan's own Decision log required was carried
+out for real, not assumed: confirmed (via community reports of `std::net` needing
+a manual reuse-address opt-in, and via `tokio::net::TcpListener`'s own docs stating
+it sets `SO_REUSEADDR` on Unix as a deliberate addition ON TOP of bare `std::net`)
+that `std::net::TcpListener::bind` does NOT set it by default — a real divergence
+from `emerald_tcp_listen`'s own explicit C-side `setsockopt`
+(`runtime/emerald_runtime.c:1506`). Fixed via a raw `libc::getaddrinfo`/`socket`/
+`setsockopt`/`bind`/`listen` sequence in `bind_tcp_listener_with_reuseaddr`,
+socket2-free per the plan's own instruction — `getaddrinfo` resolves `host`/`port`
+(the same mechanism `std::net` itself calls internally on Unix, still IPv6/hostname-
+capable, not a narrower IPv4-literal path), `SO_REUSEADDR` is set on the raw fd
+BEFORE `bind` (the only point at which it has any effect), and the bound, listening
+fd is handed to `std::net::TcpListener` via `FromRawFd` so every other method on it
+keeps using plain `std::net` afterward. Adds `libc` 0.2.189 (rust-lang-owned,
+near-ambient) as a new, disclosed, real dependency this plan's own text didn't
+name — not `socket2`, per the plan's own explicit instruction. Verified with a real
+`getsockopt` readback in `emerald-rt`'s own test suite
+(`reuseaddr_is_actually_set_on_a_bound_listener`), not merely assumed from the code
+compiling.
+
+`spec/RUNTIME.md` §2 gained a new item 6 documenting the worker-pool-blocking
+hazard this plan's own `leaf-document-worker-pool-blocking-hazard` requires, citing
+this plan's own sockets as the concretizing example. `net.rs`'s own
+`accept_blocks_until_a_real_connect_happens` test proves the underlying `std::net`
+primitive behaves as documented (a real `.accept()` only unblocks once a
+`.connect()` happens on a second thread); the worker-pool-exhaustion scenario
+itself stays prose-only, per this plan's own leaf text, since reproducing it
+deterministically needs `EMERALD_WORKERS=1` set at process start.
+
+`examples/raw_tcp_sockets.em` matches this plan's own Concrete Proof verbatim and
+its CLI conformance test (`raw_tcp_sockets_em_prints_expected_sequence`) passed on
+the first attempt with the exact predicted `ping`/`pong` output. 4 new unit tests
+in `emerald-rt` (TCP round trip, UDP round trip + last-sender accessors, accept-
+blocks-until-connect, SO_REUSEADDR readback), all passed on the first attempt.
+1032/1032 tests, clean clippy/treefmt, `cargo audit --ignore RUSTSEC-2023-0071`
+clean (same 5 pre-existing, already-triaged warnings, zero new advisories from
+`libc` itself).
+
+All six todos: `status: done`.

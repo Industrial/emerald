@@ -4435,6 +4435,90 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 96's Decision log: `TcpStream.connect` — the same reserved-
+    // namespace static-call shape `Url`/`Regex` already use.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "TcpStream") =>
+    {
+      let stream_ty = Type::Newtype("TcpStream".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match method.as_str() {
+        "connect" => (vec![Type::String, Type::Int64], stream_ty),
+        other => {
+          return Err(Diagnostic::new(
+            format!("TcpStream has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
+    // Plan 96's Decision log: `TcpListener.bind`.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "TcpListener") =>
+    {
+      let listener_ty = Type::Newtype("TcpListener".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match method.as_str() {
+        "bind" => (vec![Type::String, Type::Int64], listener_ty),
+        other => {
+          return Err(Diagnostic::new(
+            format!("TcpListener has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
+    // Plan 96's Decision log: `UdpSocket.bind`/`.last_sender_host`/
+    // `.last_sender_port` — the last two are the `_Thread_local`-
+    // accessor-pair convention this plan's own text mandates in place
+    // of a tuple/struct-returning `.recv_from`.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "UdpSocket") =>
+    {
+      let socket_ty = Type::Newtype("UdpSocket".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match method.as_str() {
+        "bind" => (vec![Type::String, Type::Int64], socket_ty),
+        "last_sender_host" => (vec![], Type::String),
+        "last_sender_port" => (vec![], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("UdpSocket has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
@@ -5155,6 +5239,88 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("Url has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 96's Decision log: `TcpStream#read`/`#write`/`#close` —
+        // the identical carved-out shape `Url`/`AeadKey` already
+        // establish. `#read`/`#write` each make exactly one underlying
+        // `std::io` call (real short-read/partial-write semantics, no
+        // looping) per this plan's own leaf text.
+        if name == "TcpStream" {
+          let (expected_params, ret) = match method.as_str() {
+            "read" => (vec![Type::Int64], Type::String),
+            "write" => (vec![Type::String], Type::Int64),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("TcpStream has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 96's Decision log: `TcpListener#accept`/`#close` —
+        // `#accept` discards the peer `SocketAddr`, a real, disclosed
+        // v1 simplification.
+        if name == "TcpListener" {
+          let stream_ty = Type::Newtype("TcpStream".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "accept" => (vec![], stream_ty),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("TcpListener has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
+        // `#close`.
+        if name == "UdpSocket" {
+          let (expected_params, ret) = match method.as_str() {
+            "send_to" => (vec![Type::String, Type::String, Type::Int64], Type::Int64),
+            "recv_from" => (vec![Type::Int64], Type::String),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("UdpSocket has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -12174,12 +12340,23 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // *resource* (no OS handle, no `.close`) — stored the same way
   // regardless, for representational consistency with every other
   // compiler-provided handle-carrying type here.
+  // Plan 96's Decision log: `TcpStream`/`TcpListener`/`UdpSocket` — the
+  // identical "reserved name, zero-cost `Int64` handle" shape, backed
+  // by plan 93's own `crate::handle` registry (a boxed
+  // `std::net::TcpStream`/`TcpListener`/`UdpSocket` respectively). The
+  // "instance-carrying AND non-user-declarable" combination this
+  // plan's own text once worried had no existing precedent turns out
+  // to already be covered by every other newtype registered in this
+  // loop.
   for name in [
     "Ed25519KeyPair",
     "X25519EphemeralSecret",
     "X25519StaticSecret",
     "RsaKeyPair",
     "Url",
+    "TcpStream",
+    "TcpListener",
+    "UdpSocket",
   ] {
     classes.insert(
       name.to_string(),

@@ -465,3 +465,15 @@ fn url_parsing_em_prints_expected_sequence() {
     "https\nexample.com\n443\n/search\nq=emerald\nresults\n443\n/api\nid=42\n"
   );
 }
+
+// Plan 96 (Raw TCP/UDP Sockets): a real, deterministic, single-process
+// bind->connect->accept->read/write-both-ways->close proof — no actor
+// spawn, no second process. Works because TCP's own three-way
+// handshake completes as soon as `connect()` is called against a
+// listener that has already `bind`+`listen`ed (the kernel queues the
+// connection in the accept backlog regardless of whether the
+// application has called `accept()` yet).
+#[test]
+fn raw_tcp_sockets_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("raw_tcp_sockets.em"), "ping\npong\n");
+}

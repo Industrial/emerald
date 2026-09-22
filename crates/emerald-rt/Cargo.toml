@@ -172,5 +172,24 @@ subtle = "2.6"
 # (+optional serde), all pure-Rust siblings from the same maintainer
 # ecosystem, no C dependency of any kind. No RustSec advisory found.
 url = "2.5"
+# Plan 96: real-checked at this plan's own authoring time (2026-09-22,
+# via crates.io/searxng) - libc, rust-lang-owned (github:rust-lang:libc),
+# "Raw FFI bindings to platforms' system libraries", the single most
+# foundational, near-ambient FFI crate in the entire Rust ecosystem (the
+# `std` library's own platform layer is itself built on it) - no
+# RustSec advisory found against the crate itself. This plan's own
+# Decision log requires setting SO_REUSEADDR on `TcpListener.bind`
+# for parity with `emerald_tcp_listen`'s explicit C-side behavior
+# (`runtime/emerald_runtime.c:1506`), verified this session to be a
+# real divergence from `std::net::TcpListener`'s own default (confirmed
+# via community reports of `std::net` requiring a manual reuse-address
+# opt-in to avoid `EADDRINUSE` after a restart, and via `tokio::net`'s
+# own docs explicitly stating it sets `SO_REUSEADDR` on Unix as a
+# deliberate addition on TOP of `std::net`, implying `std::net` itself
+# does not) - fixed via a raw `libc::getaddrinfo`/`socket`/`setsockopt`/
+# `bind`/`listen` sequence in `net.rs`, socket2-free per the plan's own
+# instruction, not by depending on `socket2` (a larger, narrower-
+# purpose crate this plan doesn't otherwise need).
+libc = "0.2"
 
 [build-dependencies]

@@ -118,6 +118,38 @@ disclosed hypothesis there, not a proven root cause.
    (`emerald_supervisor_notify_terminated`), which respawns it with its
    original spawn arguments. No `one_for_all`/`rest_for_one` strategies
    (Erlang/OTP's other standard strategies) exist.
+6. **A blocking native call inside an actor's method body ties up one of
+   this fixed pool's threads for the call's entire duration — a real
+   hazard, concretized here by plan 96's raw sockets (`TcpStream`/
+   `TcpListener`/`UdpSocket`, `crates/emerald-rt/src/net.rs`), not
+   hypothetical.** `emerald_worker_pool_start`
+   (`emerald_runtime.c:964-993`) spawns exactly `EMERALD_WORKERS` (or
+   `sysconf(_SC_NPROCESSORS_ONLN)` when unset) `pthread`s, and item 2
+   above already establishes that every actor's method dispatch runs on
+   one of them. `std::net`'s blocking calls — `TcpStream::read`,
+   `TcpListener::accept`, `UdpSocket::recv_from` — have no non-blocking
+   mode in plan 96's scope (blocking is the only semantics `std::net`
+   offers without pulling in `mio`/`tokio::net`, which plan 96 declines,
+   matching plan 94's own crate-sync-API-first preference order). A call
+   made from inside an actor's message handler occupies that worker
+   thread — unavailable to any OTHER actor's scheduled message — for as
+   long as the call takes, unbounded for `.accept()`/`.read()` against a
+   peer that never sends. With a default pool sized to the machine's
+   core count, a modest number of actors each blocked on a socket read
+   is enough to stall the entire node's actor scheduling — not just the
+   blocked actor's own mailbox. The mitigation is architectural, not
+   mechanical: spread concurrent slow native calls across many actor
+   instances (each with its own mailbox, item 2 above) rather than
+   piling them onto one, the same shape plan 55's own multi-worker pool
+   already relies on for CPU-bound work, now generalized to I/O-bound
+   native calls. `emerald-rt`'s own `net.rs` tests prove the underlying
+   `std::net` primitives behave as documented (`accept_blocks_until_a_
+   real_connect_happens` — a real `.accept()` call only unblocks once a
+   `.connect()` happens on a second thread); the worker-pool-exhaustion
+   scenario itself is asserted here, in prose, rather than in an
+   automated regression test, since reproducing it deterministically
+   needs `EMERALD_WORKERS=1` set at process start — awkward from inside
+   `cargo nextest`'s own test harness.
 
 ---
 

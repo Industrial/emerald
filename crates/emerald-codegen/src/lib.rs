@@ -188,6 +188,11 @@ fn set_newtype_underlying(program: &Program) {
     "X25519StaticSecret",
     "RsaKeyPair",
     "Url",
+    // Plan 96's Decision log: `TcpStream`/`TcpListener`/`UdpSocket` —
+    // the identical shape.
+    "TcpStream",
+    "TcpListener",
+    "UdpSocket",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5090,6 +5095,21 @@ struct Ctx<'a, 'ctx> {
   url_with_path: FunctionValue<'ctx>,
   url_with_query: FunctionValue<'ctx>,
   url_with_port: FunctionValue<'ctx>,
+  /// Plan 96 (Raw TCP/UDP Sockets) — `TcpStream`/`TcpListener`/
+  /// `UdpSocket`, wrapping `std::net`.
+  tcp_stream_connect: FunctionValue<'ctx>,
+  tcp_stream_read: FunctionValue<'ctx>,
+  tcp_stream_write: FunctionValue<'ctx>,
+  tcp_stream_close: FunctionValue<'ctx>,
+  tcp_listener_bind: FunctionValue<'ctx>,
+  tcp_listener_accept: FunctionValue<'ctx>,
+  tcp_listener_close: FunctionValue<'ctx>,
+  udp_socket_bind: FunctionValue<'ctx>,
+  udp_socket_send_to: FunctionValue<'ctx>,
+  udp_socket_recv_from: FunctionValue<'ctx>,
+  udp_socket_close: FunctionValue<'ctx>,
+  udp_socket_last_sender_host: FunctionValue<'ctx>,
+  udp_socket_last_sender_port: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8178,6 +8198,131 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ret_kind));
     }
+    // Plan 96's Decision log: `TcpStream#read`/`#write`/`#close` — the
+    // identical carved-out shape `Url`/`AeadKey` already establish.
+    if local_classes.get(recv_name).map(String::as_str) == Some("TcpStream") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.tcp_stream_close,
+            &[recv_val.into()],
+            "tcpstreamclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "read" => (ctx.tcp_stream_read, ValKind::Str),
+        "write" => (ctx.tcp_stream_write, ValKind::Int64),
+        other => return Err(format!("codegen: unsupported TcpStream method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "tcpstreamtmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
+    // Plan 96's Decision log: `TcpListener#accept`/`#close`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("TcpListener") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.tcp_listener_close,
+            &[recv_val.into()],
+            "tcplistenerclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      if method != "accept" {
+        return Err(format!(
+          "codegen: unsupported TcpListener method `{method}`"
+        ));
+      }
+      let call = builder
+        .build_call(
+          ctx.tcp_listener_accept,
+          &[recv_val.into()],
+          "tcplisteneraccepttmp",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
+    // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
+    // `#close`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("UdpSocket") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.udp_socket_close,
+            &[recv_val.into()],
+            "udpsocketclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "send_to" => (ctx.udp_socket_send_to, ValKind::Int64),
+        "recv_from" => (ctx.udp_socket_recv_from, ValKind::Str),
+        other => return Err(format!("codegen: unsupported UdpSocket method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "udpsockettmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -8653,6 +8798,93 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "urlstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 96's Decision log: `TcpStream.connect` — the same reserved-
+  // namespace static-call shape immediately above.
+  if recv_name == "TcpStream" {
+    if method != "connect" {
+      return Err(format!(
+        "codegen: unsupported TcpStream static method `{method}`"
+      ));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let call = builder
+      .build_call(ctx.tcp_stream_connect, &call_args, "tcpstreamconnecttmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 96's Decision log: `TcpListener.bind`.
+  if recv_name == "TcpListener" {
+    if method != "bind" {
+      return Err(format!(
+        "codegen: unsupported TcpListener static method `{method}`"
+      ));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let call = builder
+      .build_call(ctx.tcp_listener_bind, &call_args, "tcplistenerbindtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 96's Decision log: `UdpSocket.bind`/`.last_sender_host`/
+  // `.last_sender_port` — the last two take no arguments and read the
+  // thread-local sender address the most recent `.recv_from` on this
+  // thread populated.
+  if recv_name == "UdpSocket" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "bind" => (ctx.udp_socket_bind, ValKind::Int64),
+      "last_sender_host" => (ctx.udp_socket_last_sender_host, ValKind::Str),
+      "last_sender_port" => (ctx.udp_socket_last_sender_port, ValKind::Int64),
+      other => {
+        return Err(format!(
+          "codegen: unsupported UdpSocket static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "udpsocketstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -19559,6 +19791,76 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 96 (Raw TCP/UDP Sockets): `TcpStream`/`TcpListener`/
+  // `UdpSocket` values cross every call here as a plain `i64_ty`.
+  let tcp_stream_connect = module.add_function(
+    "emerald_rt_tcp_stream_connect",
+    i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tcp_stream_read = module.add_function(
+    "emerald_rt_tcp_stream_read",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tcp_stream_write = module.add_function(
+    "emerald_rt_tcp_stream_write",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tcp_stream_close = module.add_function(
+    "emerald_rt_tcp_stream_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tcp_listener_bind = module.add_function(
+    "emerald_rt_tcp_listener_bind",
+    i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tcp_listener_accept = module.add_function(
+    "emerald_rt_tcp_listener_accept",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tcp_listener_close = module.add_function(
+    "emerald_rt_tcp_listener_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let udp_socket_bind = module.add_function(
+    "emerald_rt_udp_socket_bind",
+    i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let udp_socket_send_to = module.add_function(
+    "emerald_rt_udp_socket_send_to",
+    i64_ty.fn_type(
+      &[i64_ty.into(), ptr_ty.into(), ptr_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let udp_socket_recv_from = module.add_function(
+    "emerald_rt_udp_socket_recv_from",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let udp_socket_close = module.add_function(
+    "emerald_rt_udp_socket_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let udp_socket_last_sender_host = module.add_function(
+    "emerald_rt_udp_socket_last_sender_host",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let udp_socket_last_sender_port = module.add_function(
+    "emerald_rt_udp_socket_last_sender_port",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -20151,6 +20453,10 @@ fn compile_to_object_impl(
   newtypes.insert("X25519StaticSecret".to_string());
   newtypes.insert("RsaKeyPair".to_string());
   newtypes.insert("Url".to_string());
+  // Plan 96's Decision log: `TcpStream`/`TcpListener`/`UdpSocket`.
+  newtypes.insert("TcpStream".to_string());
+  newtypes.insert("TcpListener".to_string());
+  newtypes.insert("UdpSocket".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -20324,6 +20630,19 @@ fn compile_to_object_impl(
     url_with_path,
     url_with_query,
     url_with_port,
+    tcp_stream_connect,
+    tcp_stream_read,
+    tcp_stream_write,
+    tcp_stream_close,
+    tcp_listener_bind,
+    tcp_listener_accept,
+    tcp_listener_close,
+    udp_socket_bind,
+    udp_socket_send_to,
+    udp_socket_recv_from,
+    udp_socket_close,
+    udp_socket_last_sender_host,
+    udp_socket_last_sender_port,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

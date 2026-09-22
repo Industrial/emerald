@@ -137,6 +137,7 @@ mod humantime;
 mod json;
 mod log;
 mod math;
+mod net;
 mod random;
 mod regex;
 mod secure_compare;
@@ -1480,6 +1481,103 @@ pub unsafe extern "C" fn emerald_rt_url_with_query(id: i64, query: *const c_char
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_url_with_port(id: i64, port: i64) -> i64 {
   catch_and_raise(move || urls::url_with_port(id, port))
+}
+
+/// # Safety
+/// `host`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tcp_stream_connect(host: *const c_char, port: i64) -> i64 {
+  catch_and_raise(move || net::tcp_stream_connect(host, port))
+}
+
+/// # Safety
+/// Always safe to call for a live `TcpStream` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tcp_stream_read(id: i64, max_len: i64) -> *const c_char {
+  catch_and_raise(move || net::tcp_stream_read(id, max_len))
+}
+
+/// # Safety
+/// `data`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tcp_stream_write(id: i64, data: *const c_char) -> i64 {
+  catch_and_raise(move || net::tcp_stream_write(id, data))
+}
+
+/// # Safety
+/// Always safe to call for a live `TcpStream` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tcp_stream_close(id: i64) {
+  catch_and_raise(move || net::tcp_stream_close(id))
+}
+
+/// # Safety
+/// `host`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tcp_listener_bind(host: *const c_char, port: i64) -> i64 {
+  catch_and_raise(move || net::tcp_listener_bind(host, port))
+}
+
+/// # Safety
+/// Always safe to call for a live `TcpListener` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tcp_listener_accept(id: i64) -> i64 {
+  catch_and_raise(move || net::tcp_listener_accept(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `TcpListener` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tcp_listener_close(id: i64) {
+  catch_and_raise(move || net::tcp_listener_close(id))
+}
+
+/// # Safety
+/// `host`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_udp_socket_bind(host: *const c_char, port: i64) -> i64 {
+  catch_and_raise(move || net::udp_socket_bind(host, port))
+}
+
+/// # Safety
+/// `data`/`host`, if non-null, must point to valid, NUL-terminated C
+/// strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_udp_socket_send_to(
+  id: i64,
+  data: *const c_char,
+  host: *const c_char,
+  port: i64,
+) -> i64 {
+  catch_and_raise(move || net::udp_socket_send_to(id, data, host, port))
+}
+
+/// # Safety
+/// Always safe to call for a live `UdpSocket` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_udp_socket_recv_from(id: i64, max_len: i64) -> *const c_char {
+  catch_and_raise(move || net::udp_socket_recv_from(id, max_len))
+}
+
+/// # Safety
+/// Always safe to call for a live `UdpSocket` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_udp_socket_close(id: i64) {
+  catch_and_raise(move || net::udp_socket_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_udp_socket_last_sender_host() -> *const c_char {
+  catch_and_raise(net::udp_socket_last_sender_host)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_udp_socket_last_sender_port() -> i64 {
+  catch_and_raise(net::udp_socket_last_sender_port)
 }
 
 // Real, expected consequence of introducing genuine cross-archive
