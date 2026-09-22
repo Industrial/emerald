@@ -46,6 +46,7 @@ reasoning — add a new row instead.
 | `regex` | 1.13.1 | #1 in crates.io's Text processing category, 91.9M downloads/month, used in 105,388 crates, owned directly by rust-lang; RE2-derived finite-automata matching gives a real, verified worst-case `O(m*n)` time guarantee with no catastrophic-backtracking/ReDoS class at all. No RustSec advisory found | pure-Rust | 2026-09-22 | 122 |
 | `libm` | 0.2.16 | #2 in crates.io's No-std category, 41.8M downloads/month, used in 36,355 crates, owned by rust-lang-owner — the exact fallback `core`'s own float math already uses on targets with no OS-provided math library; portable to `wasm32-wasip1` with zero linker flag, unlike calling libc math via `extern "C"`. No RustSec advisory found | pure-Rust | 2026-09-22 | 164 |
 | `humantime` | 2.4.0 | #2 in crates.io's Date and time category, 22.0M downloads/month, used in 14,490 crates, "No runtime deps"; stable, unchanged API surface for years. No RustSec advisory found | pure-Rust | 2026-09-22 | 162 |
+| `sysinfo` | 0.39.6 | #1 in crates.io's #process category, 16.8M downloads/month, used in 6,472 crates, MSRV 1.95; abstracts over `/proc`, `sysctl`, and Windows performance-counter APIs behind one cross-platform interface. No RustSec advisory found | C-exception: links libc and platform-native APIs (`ntapi` on Windows, `objc2`/IOKit on macOS) — no pure-Rust alternative exists for cross-platform system introspection | 2026-09-22 | 152 |
 
 ## Pre-existing transitive dependencies (out of scope, triaged)
 

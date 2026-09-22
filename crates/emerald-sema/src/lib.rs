@@ -4304,6 +4304,48 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 152's Decision log: `System.*` — read-only CPU/memory/
+    // disk/process introspection, the same reserved-namespace static-
+    // call shape `Json`/`Env`/`Math`/`Duration` use. `.process_ids`
+    // returns `Array[Int64]` — this batch's first array-of-scalars
+    // intrinsic (every prior `Array[T]`-returning function returned
+    // `Array[String]`), mechanically identical at the type-system
+    // level. `.process_name` returns `Option[String]` (a real, TOCTOU-
+    // shaped miss — the process may have exited between enumeration
+    // and lookup — surfaces as `None`, never a raise);
+    // `.process_memory_bytes`'s own miss is a provisional `-1`
+    // sentinel instead, pending plan 92's general scalar-return error
+    // convention, per this plan's own Decision log.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "System") =>
+    {
+      let option_string = Type::Enum("Option$String".to_string());
+      let (expected_params, ret) = match method.as_str() {
+        "cpu_count" | "total_memory_bytes" | "used_memory_bytes" | "disk_names_count"
+        | "process_ids_count" => (vec![], Type::Int64),
+        "disk_names" => (vec![], Type::Array(Box::new(Type::String))),
+        "process_ids" => (vec![], Type::Array(Box::new(Type::Int64))),
+        "disk_total_bytes" | "disk_available_bytes" => (vec![Type::String], Type::Int64),
+        "process_memory_bytes" => (vec![Type::Int64], Type::Int64),
+        "process_name" => (vec![Type::Int64], option_string),
+        other => {
+          return Err(Diagnostic::new(
+            format!("System has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 168's Decision log: `Log.configure`/`.<level>`/
     // `.<level>_fields` — the same reserved-namespace static-call
     // shape `File`/`Json` immediately below use, for the same reason

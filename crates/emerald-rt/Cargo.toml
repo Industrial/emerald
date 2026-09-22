@@ -80,5 +80,13 @@ libm = "0.2"
 # 22.0M downloads/month, used in 14,490 crates, "No runtime deps".
 # No RustSec advisory found.
 humantime = "2"
+# Plan 152: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - sysinfo 0.39.6 (Jul 9, 2026), #1 in #process, 16.8M
+# downloads/month, used in 6,472 crates, MIT license, MSRV 1.95. No
+# RustSec advisory found. C-exception: links libc (and platform-native
+# APIs - ntapi on Windows, objc2/IOKit on macOS) to reach OS-specific
+# CPU/memory/disk/process introspection - no pure-Rust alternative
+# exists for this class of cross-platform system introspection.
+sysinfo = "0.39"
 
 [build-dependencies]

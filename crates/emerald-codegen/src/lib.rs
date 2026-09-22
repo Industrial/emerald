@@ -4979,6 +4979,19 @@ struct Ctx<'a, 'ctx> {
   humantime_parse_duration: FunctionValue<'ctx>,
   humantime_format_rfc3339: FunctionValue<'ctx>,
   humantime_parse_rfc3339: FunctionValue<'ctx>,
+  /// Plan 152 (System Information) — `System.*`, read-only CPU/
+  /// memory/disk/process introspection.
+  system_cpu_count: FunctionValue<'ctx>,
+  system_total_memory_bytes: FunctionValue<'ctx>,
+  system_used_memory_bytes: FunctionValue<'ctx>,
+  system_disk_names: FunctionValue<'ctx>,
+  system_disk_names_count: FunctionValue<'ctx>,
+  system_disk_total_bytes: FunctionValue<'ctx>,
+  system_disk_available_bytes: FunctionValue<'ctx>,
+  system_process_ids: FunctionValue<'ctx>,
+  system_process_ids_count: FunctionValue<'ctx>,
+  system_process_name: FunctionValue<'ctx>,
+  system_process_memory_bytes: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8214,6 +8227,141 @@ fn build_method_call<'ctx>(
     };
     let call = builder
       .build_call(fv, &[v.into()], "humantimetmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 152's Decision log: `System.*` — the same reserved-namespace
+  // static-call shape `Json`/`Env`/`Math`/`Duration` use. `.process_
+  // name` is the only method here returning `Option[String]` — built
+  // via the same `is_null`-branch-plus-`phi` pattern `String.from_
+  // cstring`/`Env.get` immediately above already establish, since the
+  // Rust side returns a bare nullable pointer.
+  if recv_name == "System" {
+    if method == "process_name" {
+      let arg = args
+        .first()
+        .ok_or_else(|| "codegen: `System.process_name` expects 1 argument".to_string())?;
+      let (v, _) = build_expr(
+        context,
+        builder,
+        arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call = builder
+        .build_call(ctx.system_process_name, &[v.into()], "sysprocnametmp")
+        .map_err(|e| e.to_string())?;
+      let ptr_val = call_result(call)?.into_pointer_value();
+      let enum_name = "Option$String";
+      let layout = ctx.enums.get(enum_name).ok_or_else(|| {
+        "codegen: internal error — `Option$String` was not pre-instantiated for `System.process_name`"
+          .to_string()
+      })?;
+      let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `Some` variant".to_string()
+      })?;
+      let none_tag = *layout.variant_tags.get("None").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `None` variant".to_string()
+      })?;
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let is_null = builder
+        .build_is_null(ptr_val, "sysprocnameisnull")
+        .map_err(|e| e.to_string())?;
+
+      let entry_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block")?;
+      let func = entry_block
+        .get_parent()
+        .ok_or("codegen: internal error — block has no parent function")?;
+      let some_block = context.append_basic_block(func, "sysprocname.some");
+      let none_block = context.append_basic_block(func, "sysprocname.none");
+      let merge_block = context.append_basic_block(func, "sysprocname.merge");
+      builder
+        .build_conditional_branch(is_null, none_block, some_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(some_block);
+      let some_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "sysprocnamesome")
+        .map_err(|e| e.to_string())?;
+      let some_ptr = call_result(some_alloc)?.into_pointer_value();
+      let some_tag_ptr = field_ptr(context, builder, some_ptr, 0)?;
+      builder
+        .build_store(some_tag_ptr, context.i64_type().const_int(some_tag, false))
+        .map_err(|e| e.to_string())?;
+      let some_field_ptr = field_ptr(context, builder, some_ptr, 8)?;
+      builder
+        .build_store(some_field_ptr, ptr_val)
+        .map_err(|e| e.to_string())?;
+      let some_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after some")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(none_block);
+      let none_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "sysprocnamenone")
+        .map_err(|e| e.to_string())?;
+      let none_ptr = call_result(none_alloc)?.into_pointer_value();
+      let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
+      builder
+        .build_store(none_tag_ptr, context.i64_type().const_int(none_tag, false))
+        .map_err(|e| e.to_string())?;
+      let none_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after none")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
+      let phi = builder
+        .build_phi(local_llvm_type(context, &ValKind::Ptr), "sysprocnameresult")
+        .map_err(|e| e.to_string())?;
+      let some_val: BasicValueEnum = some_ptr.into();
+      let none_val: BasicValueEnum = none_ptr.into();
+      phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
+      return Ok((phi.as_basic_value(), ValKind::Ptr));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "cpu_count" => (ctx.system_cpu_count, ValKind::Int64),
+      "total_memory_bytes" => (ctx.system_total_memory_bytes, ValKind::Int64),
+      "used_memory_bytes" => (ctx.system_used_memory_bytes, ValKind::Int64),
+      "disk_names" => (ctx.system_disk_names, ValKind::Ptr),
+      "disk_names_count" => (ctx.system_disk_names_count, ValKind::Int64),
+      "disk_total_bytes" => (ctx.system_disk_total_bytes, ValKind::Int64),
+      "disk_available_bytes" => (ctx.system_disk_available_bytes, ValKind::Int64),
+      "process_ids" => (ctx.system_process_ids, ValKind::Ptr),
+      "process_ids_count" => (ctx.system_process_ids_count, ValKind::Int64),
+      "process_memory_bytes" => (ctx.system_process_memory_bytes, ValKind::Int64),
+      other => {
+        return Err(format!(
+          "codegen: unsupported System static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "systmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
   }
@@ -18385,6 +18533,67 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 152 (System Information): scalar `Int64` getters take no
+  // arguments; `.disk_total_bytes`/`.disk_available_bytes` take a
+  // `String` name; `.process_name`/`.process_memory_bytes` take an
+  // `Int64` pid; `.disk_names`/`.process_ids` return a heap-allocated
+  // `Array[T]` pointer; `.process_name` returns a bare nullable
+  // pointer (this call site builds the real `Option[String]`).
+  let system_cpu_count = module.add_function(
+    "emerald_rt_system_cpu_count",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let system_total_memory_bytes = module.add_function(
+    "emerald_rt_system_total_memory_bytes",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let system_used_memory_bytes = module.add_function(
+    "emerald_rt_system_used_memory_bytes",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let system_disk_names = module.add_function(
+    "emerald_rt_system_disk_names",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let system_disk_names_count = module.add_function(
+    "emerald_rt_system_disk_names_count",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let system_disk_total_bytes = module.add_function(
+    "emerald_rt_system_disk_total_bytes",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let system_disk_available_bytes = module.add_function(
+    "emerald_rt_system_disk_available_bytes",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let system_process_ids = module.add_function(
+    "emerald_rt_system_process_ids",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let system_process_ids_count = module.add_function(
+    "emerald_rt_system_process_ids_count",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let system_process_name = module.add_function(
+    "emerald_rt_system_process_name",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let system_process_memory_bytes = module.add_function(
+    "emerald_rt_system_process_memory_bytes",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -19074,6 +19283,17 @@ fn compile_to_object_impl(
     humantime_parse_duration,
     humantime_format_rfc3339,
     humantime_parse_rfc3339,
+    system_cpu_count,
+    system_total_memory_bytes,
+    system_used_memory_bytes,
+    system_disk_names,
+    system_disk_names_count,
+    system_disk_total_bytes,
+    system_disk_available_bytes,
+    system_process_ids,
+    system_process_ids_count,
+    system_process_name,
+    system_process_memory_bytes,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

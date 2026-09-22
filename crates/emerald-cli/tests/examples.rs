@@ -372,3 +372,26 @@ fn humantime_proof_em_prints_expected_sequence() {
     "3days 2h\n266400\nexpected number at 0\n2026-05-28T20:26:40Z\n1780000000\n"
   );
 }
+
+// Plan 152 (System Information): `System.*` read-only CPU/memory/
+// disk/process introspection — every assertion is relative/derived
+// (`> 0`, `>=`), true on any real machine this runs on, per this
+// plan's own Decision log.
+#[test]
+fn system_info_proof_em_prints_expected_sequence() {
+  let output = compile_and_run("system_info_proof.em");
+  let mut lines = output.lines();
+  assert_eq!(lines.next(), Some("true"), "cpu_count > 0");
+  assert_eq!(lines.next(), Some("true"), "total_memory >= used_memory");
+  assert_eq!(lines.next(), Some("true"), "used_memory >= 0");
+  assert_eq!(lines.next(), Some("true"), "disk_names_count >= 0");
+  assert_eq!(lines.next(), Some("true"), "process_ids_count > 0");
+  let last = lines
+    .next()
+    .expect("expected a sixth line (process_name result)");
+  assert!(
+    last == "true" || last == "unknown",
+    "unexpected process_name line: {last:?}"
+  );
+  assert_eq!(lines.next(), None);
+}

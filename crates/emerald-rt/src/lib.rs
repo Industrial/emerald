@@ -134,6 +134,7 @@ mod json;
 mod log;
 mod math;
 mod regex;
+mod system;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -853,6 +854,88 @@ pub unsafe extern "C" fn emerald_rt_humantime_format_rfc3339(unix_secs: i64) -> 
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_humantime_parse_rfc3339(s: *const c_char) -> *mut c_void {
   catch_and_raise(move || humantime::parse_rfc3339(s))
+}
+
+// Plan 152 (System Information): `System.*` — read-only CPU/memory/
+// disk/process introspection, see `system.rs`'s own module doc.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_cpu_count() -> i64 {
+  catch_and_raise(system::cpu_count)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_total_memory_bytes() -> i64 {
+  catch_and_raise(system::total_memory_bytes)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_used_memory_bytes() -> i64 {
+  catch_and_raise(system::used_memory_bytes)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_disk_names() -> *mut c_void {
+  catch_and_raise(system::disk_names)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_disk_names_count() -> i64 {
+  catch_and_raise(system::disk_names_count)
+}
+
+/// # Safety
+/// `name`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_disk_total_bytes(name: *const c_char) -> i64 {
+  catch_and_raise(move || system::disk_total_bytes(name))
+}
+
+/// # Safety
+/// `name`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_disk_available_bytes(name: *const c_char) -> i64 {
+  catch_and_raise(move || system::disk_available_bytes(name))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_process_ids() -> *mut c_void {
+  catch_and_raise(system::process_ids)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_process_ids_count() -> i64 {
+  catch_and_raise(system::process_ids_count)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_process_name(pid: i64) -> *mut c_char {
+  catch_and_raise(move || system::process_name(pid))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_system_process_memory_bytes(pid: i64) -> i64 {
+  catch_and_raise(move || system::process_memory_bytes(pid))
 }
 
 // Plan 168 (Structured Logging): `Log.configure`/`.trace`/`.debug`/
