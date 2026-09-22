@@ -187,6 +187,41 @@ fn enumerable_em_prints_expected_sequence() {
   );
 }
 
+// Plan 194's leaf 1: a real end-to-end proof that `ChainCallExpr`
+// do-block chaining (`recv.method do ... end.method do ... end`, no
+// parens) already works with typed block params — plan 192's own
+// "real grammar bug" finding was a misdiagnosis of unrelated,
+// pre-existing, already-documented untyped-block-param syntax (see
+// `examples/chain_call_do_block.em`'s own header comment and
+// `history/2026-09-22T224000Z-plan-194-iterable-iterator-protocol.md`).
+// `[1..6].select(even).map(*10)` = `[2,4,6] -> [20,40,60]`, printed as
+// a count then one value per line (`Array[T]` has no `.to_s`/`.join`).
+#[test]
+fn chain_call_do_block_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("chain_call_do_block.em"), "3\n20\n40\n60\n");
+}
+
+// Plan 194's leaf 2: a real, end-to-end `Reader`/`Writer` interface
+// pair (Go's `io.Reader`/`io.Writer` as named precedent), built
+// entirely with the existing plain-interface (plan 41) and single-
+// type-parameter generic-function (plan 41/88/89) mechanisms — see
+// `examples/reader_writer_copy.em`'s own header comment for the five
+// real, disclosed adaptations this session found necessary (no
+// `UInt8`/`Bytes` type, no plain interface-typed parameter, no
+// multiple type parameters, no direct method/index access on an
+// instance variable, generic-function default parameters not honored).
+// `copy(src, dst, 2)` on "Hello" (`[72,101,108,108,111]`) forces three
+// real `read_chunk`/`write_chunk` round trips (2+2+1 bytes); a second
+// call with a one-chunk-covers-everything size proves the same `copy`
+// works for both shapes.
+#[test]
+fn reader_writer_copy_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("reader_writer_copy.em"),
+    "5\n72\n101\n108\n108\n111\n5\n"
+  );
+}
+
 #[test]
 fn doc_comments_em_prints_expected_sequence() {
   assert_eq!(

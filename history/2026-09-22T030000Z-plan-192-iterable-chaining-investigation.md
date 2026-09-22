@@ -22,6 +22,38 @@ isProject: false
 
 # Plan 192 — Iterable[T]/Iterator[T] Investigation
 
+## Correction (plan 194, 2026-09-23)
+
+**The "real, previously-undisclosed grammar bug" this document reports
+below is not a real bug.** Plan 194 re-verified it directly (LALR
+state-splitting experiment, immediately falsified — see plan 194's own
+Decision log) and found the true cause: this document's own repro,
+`nums.select do |x| x % 2 == 0 end.map do |x| x * 10 end.sort()`, uses
+**untyped block parameters** (`|x|`). This language's grammar has never
+supported that shape — `Param: <name:Ident> ":" <ty:TypeExpr>`
+(`grammar.lalrpop`) requires an explicit type on every block parameter,
+a restriction already documented in this very repo,
+pre-dating this investigation, in `examples/enumerable.em`'s own header
+comment ("A block's parameters need an explicit type (`|x: Int64|`, not
+a bare `|x|`)"). The parse errors this session attributed to a chaining
+conflict were a downstream symptom of that unrelated, already-known,
+pre-existing syntax requirement, not evidence of a `ChainCallExpr`
+defect. With correctly typed params
+(`nums.select do |x: Int64| x % 2 == 0 end.map do |x: Int64| x * 10 end`),
+the identical chain shape parses, type-checks, compiles, links, and
+runs correctly on the grammar exactly as it stood before this
+document was written — confirmed two ways: an existing, already-
+passing test in `crates/emerald-parser/src/lib.rs`
+(`plan_87_chain_of_at_least_three_do_end_calls_binds_tight_and_chains`,
+which chains THREE unparenthesized do-block-attached calls) that this
+investigation apparently never ran, and a new end-to-end
+compile-and-run regression test plan 194 added
+(`crates/emerald-cli/tests/chain_call_do_block_em.rs`). No grammar
+change was needed or made. See plan 194's own record for the full
+diagnosis, including the disproven cross-tier-LALR-merge hypothesis
+this document's own `leaf-diagnose-chain-call-expr-conflict` todo
+suggested as a starting point.
+
 inception-3 (`history/2026-09-21T195000Z-inception-3-stdlib-supremacy.md`
 §4.2) names `Iterable[T]`/`Iterator[T]` as the more foundational of two
 real language-surface gaps this batch should close, ahead of plan 118
@@ -55,10 +87,13 @@ the plan text").
    `Array[Int64]` to it today; `Array`/`Hash` and a user's own
    `interface Iterable[T]` declaration are two unrelated mechanisms
    that happen to share a name in one worked example.
-3. **A real, previously-undisclosed bug: chained `do...end`-attached
+3. ~~**A real, previously-undisclosed bug: chained `do...end`-attached
    calls do not actually work, despite `ChainCallExpr`'s own doc
    comment (plan 87, `grammar.lalrpop` lines 1185-1215) claiming they
-   do.** Verified directly, in every context tried:
+   do.**~~ — **Not a real bug (see the Correction at the top of this
+   document).** The repro below used untyped block params (`|x|`),
+   already-invalid syntax unrelated to `ChainCallExpr`. Verified
+   directly, in every context tried:
    ```
    nums.select do |x| x % 2 == 0 end.map do |x| x * 10 end.sort()
    ```
