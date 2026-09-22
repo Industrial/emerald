@@ -127,6 +127,7 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 
 mod encoding;
+mod env;
 mod handle;
 mod json;
 mod log;
@@ -650,6 +651,47 @@ pub unsafe extern "C" fn emerald_rt_regex_split(id: i64, s: *const c_char) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_regex_split_count(id: i64, s: *const c_char) -> i64 {
   catch_and_raise(move || regex::regex_split_count(id, s))
+}
+
+// Plan 146 (Environment Variables): `Env.get`/`.set`/`.remove`/
+// `.keys`/`.keys_count` — see `env.rs`'s own module doc for the
+// mutex-serialization design (Rust 2024's `unsafe fn` reclassification
+// of `set_var`/`remove_var`).
+
+/// # Safety
+/// `key`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_env_get(key: *const c_char) -> *mut c_char {
+  catch_and_raise(move || env::env_get(key))
+}
+
+/// # Safety
+/// `key`/`value`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_env_set(key: *const c_char, value: *const c_char) {
+  catch_and_raise(move || env::env_set(key, value))
+}
+
+/// # Safety
+/// `key`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_env_remove(key: *const c_char) {
+  catch_and_raise(move || env::env_remove(key))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_env_keys() -> *mut c_void {
+  catch_and_raise(move || env::env_keys())
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_env_keys_count() -> i64 {
+  catch_and_raise(move || env::env_keys_count())
 }
 
 // Plan 168 (Structured Logging): `Log.configure`/`.trace`/`.debug`/

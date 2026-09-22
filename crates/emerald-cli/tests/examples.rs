@@ -333,3 +333,16 @@ fn regex_dates_em_prints_expected_sequence() {
     "true\n2026-09-21\n2026\n21/09/2026 and 08/01/2026\n"
   );
 }
+
+// Plan 146 (Environment Variables): `Env.set`/`.get`/`.keys_count`/
+// `.remove` round-tripping a real process environment variable — not
+// an in-process shadow table, a genuine OS-level mutation. Adapted
+// only for two real, disclosed syntax corrections (see `examples/
+// environment_variables_proof.em`'s own header comment).
+#[test]
+fn environment_variables_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("environment_variables_proof.em"),
+    "hello\ntrue\nunset\n"
+  );
+}

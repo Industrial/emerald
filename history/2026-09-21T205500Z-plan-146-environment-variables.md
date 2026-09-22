@@ -10,16 +10,16 @@ maestro:
 todos:
   - id: leaf-env-mutex-and-get-set-remove
     content: "In `crates/emerald-rt`, a single `static EMERALD_RT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(())` guarding every one of this plan's functions' bodies. `emerald_rt_env_get(key: *const c_char) -> *mut c_char` (nullable, `std::env::var` mapped `Ok -> owned CString`, `Err(NotPresent)`/`Err(NotUnicode)` -> null pointer, reusing plan 43/59's zero-cost nullable-pointer convention). `emerald_rt_env_set(key, value)` / `emerald_rt_env_remove(key)`, each acquiring the mutex, then calling the real `unsafe { std::env::set_var(...) }` / `unsafe { std::env::remove_var(...) }` inside the held lock — the `unsafe` block is real and load-bearing here (see Decision log), not boilerplate. Every function wrapped in `std::panic::catch_unwind` per plan 91's proven pattern, applied *outside* the mutex acquisition so a poisoned lock from a panicking holder cannot wedge every subsequent `Env` call."
-    status: pending
+    status: done
   - id: leaf-env-keys-enumeration
     content: "`emerald_rt_env_keys() -> *mut *mut c_char` / `emerald_rt_env_keys_count() -> i64`, both also mutex-guarded, backed by `std::env::vars()` collected under the lock — the same paired-count-with-array convention plans 45/144/145 already established for every other `Array[T]`-returning intrinsic in this batch."
-    status: pending
+    status: done
   - id: leaf-sema-and-codegen-wiring
     content: "Add the `Env` compiler-known namespace arm to `emerald-sema`'s `infer_expr_type` and `emerald-codegen`'s `build_method_call`, matching `File`/`Dir`/`Path`/`Process`'s established hard-coded-arm shape; declare the four `emerald_rt_env_*` symbols via `module.add_function(..., Some(Linkage::External))`."
-    status: pending
+    status: done
   - id: leaf-example-and-tests
     content: "Add `examples/environment_variables_proof.em` (the Concrete Proof below). Add `#[test]`s inside `crates/emerald-rt`: one asserting `Env.set`+`Env.get` round-trips a real value; one asserting `Env.remove` then `Env.get` returns null; one asserting concurrent `Env.set` calls from multiple `std::thread::spawn`'d threads (simulating Emerald's own multi-worker actor pool) complete without a panic or a poisoned-mutex failure, the direct proof this plan's mutex-serialization actually closes the Rust-2024-flagged soundness hole rather than merely citing it."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -165,3 +165,35 @@ returns `nil`, defaulted through plan 43's `||=` exactly as plan 59's
   or redaction mechanism (see the security-caveat bullet above); any
   change to `Process.run`'s (plan 145) own default environment-
   inheritance behavior or to `runtime/emerald_runtime.c`.
+
+## Update (2026-09-22, same-day session): implemented, all four leaves done
+
+Zero third-party dependency, exactly as designed — no `DEPENDENCIES.md`
+row needed. `crates/emerald-rt/src/env.rs` implements all five
+functions behind one `static ENV_LOCK: Mutex<()>`, acquired via
+`.lock().unwrap_or_else(|p| p.into_inner())` (recovering even a
+poisoned lock, per this plan's own Decision log) inside every function
+body, reads included. 4 `#[test]`s: round-trip, remove-then-null,
+`keys_count` reflecting a real set variable, and a real 8-thread ×
+200-iteration concurrent `Env.set`/`.get` proof that completes without
+a panic or a poisoned-mutex failure — the direct proof this plan's own
+text calls for, not merely cited.
+
+`Env.get`'s nullable-`*mut c_char`-to-`Option[String]` marshaling
+reuses `String.from_cstring`'s own established `is_null`-branch-plus-
+`phi` codegen pattern (plan 73) verbatim, rather than inventing a
+second construction site for the identical shape.
+
+Two real, disclosed corrections found writing the Concrete Proof
+example, neither `Env`-specific: (1) the plan's own text used `T?`
+(`String?`) — that nullable sugar was removed (plan 71/73); the real,
+current annotation is `Option[String]`, matched via `match ... do
+Some(v) do ... end None do ... end end`. (2) `puts` accepts only
+`Int64`/`Float64`/`String` (`emerald-sema`'s own `puts` arm, unchanged
+by this plan) — the plan's own `puts n > 0` is a bare `Boolean` and is
+rejected outright; string interpolation (`"#{...}"`), which does
+support `Boolean`, is the real, current way to print one.
+
+Full workspace gate: `cargo nextest run --workspace` (977/977, 2
+skipped — 5 new: 4 in `emerald-rt`, 1 in `emerald-cli`), `cargo clippy
+--workspace --all-targets` (clean), `treefmt` (0 changed).

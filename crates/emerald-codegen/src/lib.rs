@@ -4944,6 +4944,13 @@ struct Ctx<'a, 'ctx> {
   regex_replace_all: FunctionValue<'ctx>,
   regex_split: FunctionValue<'ctx>,
   regex_split_count: FunctionValue<'ctx>,
+  /// Plan 146 (Environment Variables) — `Env.get`/`.set`/`.remove`/
+  /// `.keys`/`.keys_count`.
+  env_get: FunctionValue<'ctx>,
+  env_set: FunctionValue<'ctx>,
+  env_remove: FunctionValue<'ctx>,
+  env_keys: FunctionValue<'ctx>,
+  env_keys_count: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7930,6 +7937,148 @@ fn build_method_call<'ctx>(
       .build_call(ctx.regex_compile, &[v.into()], "regexcompiletmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
+  // `.keys_count` — the same reserved-namespace static-call shape
+  // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns a bare nullable
+  // `*mut c_char` from the Rust side; this call site builds the real
+  // tagged `Option[String]` value from it, the identical `is_null`-
+  // branch-plus-`phi` pattern `String.from_cstring` immediately above
+  // already establishes — reused verbatim, not re-derived.
+  if recv_name == "Env" {
+    if method == "get" {
+      let arg = args
+        .first()
+        .ok_or_else(|| "codegen: `Env.get` expects 1 argument".to_string())?;
+      let (v, _) = build_expr(
+        context,
+        builder,
+        arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call = builder
+        .build_call(ctx.env_get, &[v.into()], "envgettmp")
+        .map_err(|e| e.to_string())?;
+      let ptr_val = call_result(call)?.into_pointer_value();
+      let enum_name = "Option$String";
+      let layout = ctx.enums.get(enum_name).ok_or_else(|| {
+        "codegen: internal error — `Option$String` was not pre-instantiated for `Env.get`"
+          .to_string()
+      })?;
+      let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `Some` variant".to_string()
+      })?;
+      let none_tag = *layout.variant_tags.get("None").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `None` variant".to_string()
+      })?;
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let is_null = builder
+        .build_is_null(ptr_val, "envgetisnull")
+        .map_err(|e| e.to_string())?;
+
+      let entry_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block")?;
+      let func = entry_block
+        .get_parent()
+        .ok_or("codegen: internal error — block has no parent function")?;
+      let some_block = context.append_basic_block(func, "envget.some");
+      let none_block = context.append_basic_block(func, "envget.none");
+      let merge_block = context.append_basic_block(func, "envget.merge");
+      builder
+        .build_conditional_branch(is_null, none_block, some_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(some_block);
+      let some_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "envgetsome")
+        .map_err(|e| e.to_string())?;
+      let some_ptr = call_result(some_alloc)?.into_pointer_value();
+      let some_tag_ptr = field_ptr(context, builder, some_ptr, 0)?;
+      builder
+        .build_store(some_tag_ptr, context.i64_type().const_int(some_tag, false))
+        .map_err(|e| e.to_string())?;
+      let some_field_ptr = field_ptr(context, builder, some_ptr, 8)?;
+      builder
+        .build_store(some_field_ptr, ptr_val)
+        .map_err(|e| e.to_string())?;
+      let some_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after some")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(none_block);
+      let none_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "envgetnone")
+        .map_err(|e| e.to_string())?;
+      let none_ptr = call_result(none_alloc)?.into_pointer_value();
+      let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
+      builder
+        .build_store(none_tag_ptr, context.i64_type().const_int(none_tag, false))
+        .map_err(|e| e.to_string())?;
+      let none_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after none")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
+      let phi = builder
+        .build_phi(local_llvm_type(context, &ValKind::Ptr), "envgetresult")
+        .map_err(|e| e.to_string())?;
+      let some_val: BasicValueEnum = some_ptr.into();
+      let none_val: BasicValueEnum = none_ptr.into();
+      phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
+      return Ok((phi.as_basic_value(), ValKind::Ptr));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    return match method {
+      "set" => {
+        builder
+          .build_call(ctx.env_set, &call_args, "envsettmp")
+          .map_err(|e| e.to_string())?;
+        Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
+      }
+      "remove" => {
+        builder
+          .build_call(ctx.env_remove, &call_args, "envremovetmp")
+          .map_err(|e| e.to_string())?;
+        Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
+      }
+      "keys" => {
+        let call = builder
+          .build_call(ctx.env_keys, &call_args, "envkeystmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Ptr))
+      }
+      "keys_count" => {
+        let call = builder
+          .build_call(ctx.env_keys_count, &call_args, "envkeyscounttmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Int64))
+      }
+      other => Err(format!("codegen: unsupported Env static method `{other}`")),
+    };
   }
 
   // Plan 168's Decision log: `Log.configure`/`.<level>`/
@@ -17943,6 +18092,35 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 146 (Environment Variables): `.get` returns a bare nullable
+  // pointer (this call site itself builds the real `Option[String]`
+  // value from it); `.set`/`.remove` return `Void`; `.keys` returns an
+  // `Array[String]` pointer; `.keys_count` a plain `i64`.
+  let env_get = module.add_function(
+    "emerald_rt_env_get",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let env_set = module.add_function(
+    "emerald_rt_env_set",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let env_remove = module.add_function(
+    "emerald_rt_env_remove",
+    void_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let env_keys = module.add_function(
+    "emerald_rt_env_keys",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let env_keys_count = module.add_function(
+    "emerald_rt_env_keys_count",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -18603,6 +18781,11 @@ fn compile_to_object_impl(
     regex_replace_all,
     regex_split,
     regex_split_count,
+    env_get,
+    env_set,
+    env_remove,
+    env_keys,
+    env_keys_count,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

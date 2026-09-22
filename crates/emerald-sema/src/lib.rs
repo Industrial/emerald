@@ -4155,6 +4155,39 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
+    // `.keys_count` — the same reserved-namespace static-call shape
+    // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
+    // (`nil` for both "unset" and "not valid Unicode" — a real,
+    // disclosed conflation this plan's own Decision log names, the
+    // same all-failures-become-`nil` posture plan 144 already took).
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Env") => {
+      let option_string = Type::Enum("Option$String".to_string());
+      let (expected_params, ret) = match method.as_str() {
+        "get" => (vec![Type::String], option_string),
+        "set" => (vec![Type::String, Type::String], Type::Void),
+        "remove" => (vec![Type::String], Type::Void),
+        "keys" => (vec![], Type::Array(Box::new(Type::String))),
+        "keys_count" => (vec![], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Env has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 168's Decision log: `Log.configure`/`.<level>`/
     // `.<level>_fields` — the same reserved-namespace static-call
     // shape `File`/`Json` immediately below use, for the same reason
