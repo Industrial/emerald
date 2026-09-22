@@ -11,8 +11,22 @@ feature boundaries.
 # test:    cargo nextest run --workspace   (falls back to `cargo test --workspace`)
 # lint:    cargo clippy --workspace --all-targets
 # format:  treefmt
-# audit:   cargo audit
+# audit:   cargo audit --ignore RUSTSEC-2023-0071
 ```
+
+`--ignore RUSTSEC-2023-0071` is a deliberate, scoped exception, not a
+blanket suppression habit: plan 111 (`history/2026-09-21T202000Z-plan-
+111-crypto-asymmetric.md`) knowingly depends on the `rsa` crate despite
+its real, currently unpatched Marvin Attack advisory (`patched = []` —
+no fixed version exists to upgrade to), restricting the affected
+private-key operations (`Rsa.decrypt`/`RsaKeyPair#sign`) to non-network-
+timing-observable use and reproducing the advisory's own stated
+workaround verbatim in their doc comments. The installed `cargo-audit`
+binary in this environment has no config-file support (`--help` lists
+no `-c`/`--config` flag), so `--ignore` on the command line is the only
+working mechanism — a future advisory being added to this line must
+carry the same kind of documented justification, not be added
+silently.
 
 ## Layout
 

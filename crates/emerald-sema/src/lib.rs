@@ -4270,6 +4270,80 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 111's Decision log: `Ed25519`/`X25519`/`Rsa` — three
+    // distinct problems, three distinct reserved namespaces,
+    // deliberately not conflated (this plan's own Decision log).
+    // `SignatureError`/`RsaError` are plain `String`, the same
+    // convention plans 109/110 already established.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "Ed25519" | "X25519" | "Rsa")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match (recv_name, method.as_str()) {
+        ("Ed25519", "generate_key") => (
+          vec![],
+          Type::Newtype("Ed25519KeyPair".to_string(), Box::new(Type::Int64)),
+        ),
+        ("Ed25519", "verify") => (
+          vec![bytes_ty.clone(), bytes_ty.clone(), bytes_ty.clone()],
+          Type::Result(Box::new(Type::Void), Box::new(Type::String)),
+        ),
+        ("X25519", "generate_ephemeral") => (
+          vec![],
+          Type::Newtype(
+            "X25519EphemeralSecret".to_string(),
+            Box::new(Type::Int64),
+          ),
+        ),
+        ("X25519", "generate_static") => (
+          vec![],
+          Type::Newtype("X25519StaticSecret".to_string(), Box::new(Type::Int64)),
+        ),
+        ("Rsa", "generate_key") => (
+          vec![Type::Int64],
+          Type::Result(
+            Box::new(Type::Newtype("RsaKeyPair".to_string(), Box::new(Type::Int64))),
+            Box::new(Type::String),
+          ),
+        ),
+        ("Rsa", "encrypt") => (
+          vec![
+            Type::Newtype("RsaKeyPair".to_string(), Box::new(Type::Int64)),
+            bytes_ty.clone(),
+          ],
+          Type::Result(Box::new(bytes_ty.clone()), Box::new(Type::String)),
+        ),
+        ("Rsa", "verify") => (
+          vec![
+            Type::Newtype("RsaKeyPair".to_string(), Box::new(Type::Int64)),
+            bytes_ty.clone(),
+            bytes_ty.clone(),
+          ],
+          Type::Result(Box::new(Type::Void), Box::new(Type::String)),
+        ),
+        (_, other) => {
+          return Err(Diagnostic::new(
+            format!("{recv_name} has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
@@ -4888,6 +4962,92 @@ fn infer_expr_type(
           }
           check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
           return Ok(Type::Void);
+        }
+        // Plan 111's Decision log: `Ed25519KeyPair#sign`/`#public_key`
+        // — the identical carved-out shape `Sha256Hasher`/`AeadKey`
+        // already establish.
+        if name == "Ed25519KeyPair" {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "sign" => (vec![bytes_ty.clone()], bytes_ty),
+            "public_key" => (vec![], bytes_ty),
+            other => {
+              return Err(Diagnostic::new(
+                format!("Ed25519KeyPair has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 111's Decision log: `X25519EphemeralSecret`/
+        // `X25519StaticSecret#public_key`/`#diffie_hellman` — two
+        // distinct newtypes sharing one method table (both real usage
+        // contracts differ only in whether the underlying Rust value
+        // is consumed, a codegen/runtime distinction, not a sema one).
+        if name == "X25519EphemeralSecret" || name == "X25519StaticSecret" {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "public_key" => (vec![], bytes_ty),
+            "diffie_hellman" => (vec![bytes_ty.clone()], bytes_ty),
+            other => {
+              return Err(Diagnostic::new(
+                format!("{name} has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 111's Decision log: `RsaKeyPair#decrypt`/`#sign` —
+        // the private-key, timing-observable operations; `.encrypt`/
+        // `Rsa.verify` are the public-key-only reserved-namespace
+        // statics above, unaffected by RUSTSEC-2023-0071 (Marvin
+        // Attack).
+        if name == "RsaKeyPair" {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let bytes_result = Type::Result(Box::new(bytes_ty.clone()), Box::new(Type::String));
+          let (expected_params, ret) = match method.as_str() {
+            "decrypt" => (vec![bytes_ty.clone()], bytes_result),
+            "sign" => (vec![bytes_ty], bytes_result),
+            other => {
+              return Err(Diagnostic::new(
+                format!("RsaKeyPair has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
         }
         if name == "LogFields" && method == "set" {
           if args.len() != 2 {
@@ -11880,6 +12040,33 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       newtype_underlying: Some(Type::Int64),
     },
   );
+  // Plan 111's Decision log: `Ed25519KeyPair`/`X25519EphemeralSecret`/
+  // `X25519StaticSecret`/`RsaKeyPair` — the identical "reserved name,
+  // zero-cost `Int64` handle" shape as `AeadKey`/`Sha256Hasher` above,
+  // each backed by plan 93's own `crate::handle` registry in
+  // `emerald-rt` (a boxed `SigningKey`/`EphemeralSecret`/
+  // `StaticSecret`/`RsaPrivateKey` respectively).
+  for name in [
+    "Ed25519KeyPair",
+    "X25519EphemeralSecret",
+    "X25519StaticSecret",
+    "RsaKeyPair",
+  ] {
+    classes.insert(
+      name.to_string(),
+      ClassInfo {
+        fields: HashMap::new(),
+        methods: HashMap::new(),
+        is_module: false,
+        superclass: None,
+        implements: None,
+        enum_variants: None,
+        is_actor: false,
+        generic_methods: HashMap::new(),
+        newtype_underlying: Some(Type::Int64),
+      },
+    );
+  }
   for item in &program.items {
     if let Item::Class(c) = item {
       if !c.type_params.is_empty() {

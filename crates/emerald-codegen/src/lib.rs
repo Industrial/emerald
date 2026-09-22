@@ -180,6 +180,16 @@ fn set_newtype_underlying(program: &Program) {
   );
   // Plan 110's Decision log: `AeadKey` — the identical shape.
   map.insert("AeadKey".to_string(), TypeExpr::Named("Int64".to_string()));
+  // Plan 111's Decision log: `Ed25519KeyPair`/`X25519EphemeralSecret`/
+  // `X25519StaticSecret`/`RsaKeyPair` — the identical shape.
+  for name in [
+    "Ed25519KeyPair",
+    "X25519EphemeralSecret",
+    "X25519StaticSecret",
+    "RsaKeyPair",
+  ] {
+    map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
+  }
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
@@ -5040,6 +5050,23 @@ struct Ctx<'a, 'ctx> {
   xchacha_decrypt: FunctionValue<'ctx>,
   xchacha_encrypt_with_nonce: FunctionValue<'ctx>,
   xchacha_decrypt_with_nonce: FunctionValue<'ctx>,
+  /// Plan 111 (Asymmetric Cryptography and Digital Signatures) —
+  /// `Ed25519`/`X25519`/`Rsa`.
+  ed25519_generate_key: FunctionValue<'ctx>,
+  ed25519_sign: FunctionValue<'ctx>,
+  ed25519_public_key: FunctionValue<'ctx>,
+  ed25519_verify: FunctionValue<'ctx>,
+  x25519_generate_ephemeral: FunctionValue<'ctx>,
+  x25519_generate_static: FunctionValue<'ctx>,
+  x25519_ephemeral_public_key: FunctionValue<'ctx>,
+  x25519_static_public_key: FunctionValue<'ctx>,
+  x25519_ephemeral_diffie_hellman: FunctionValue<'ctx>,
+  x25519_static_diffie_hellman: FunctionValue<'ctx>,
+  rsa_generate_key: FunctionValue<'ctx>,
+  rsa_encrypt: FunctionValue<'ctx>,
+  rsa_decrypt: FunctionValue<'ctx>,
+  rsa_sign: FunctionValue<'ctx>,
+  rsa_verify: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7963,6 +7990,130 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
     }
+    // Plan 111's Decision log: `Ed25519KeyPair#sign`/`#public_key`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("Ed25519KeyPair") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let fv = match method {
+        "sign" => ctx.ed25519_sign,
+        "public_key" => ctx.ed25519_public_key,
+        other => {
+          return Err(format!(
+            "codegen: unsupported Ed25519KeyPair method `{other}`"
+          ))
+        }
+      };
+      let call = builder
+        .build_call(fv, &call_args, "ed25519tmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
+    // Plan 111's Decision log: `X25519EphemeralSecret`/
+    // `X25519StaticSecret#public_key`/`#diffie_hellman` — two
+    // distinct newtypes sharing one dispatch arm, resolved to distinct
+    // native functions by the receiver's own tracked class name.
+    let x25519_funcs = match local_classes.get(recv_name).map(String::as_str) {
+      Some("X25519EphemeralSecret") => Some((
+        ctx.x25519_ephemeral_public_key,
+        ctx.x25519_ephemeral_diffie_hellman,
+      )),
+      Some("X25519StaticSecret") => Some((
+        ctx.x25519_static_public_key,
+        ctx.x25519_static_diffie_hellman,
+      )),
+      _ => None,
+    };
+    if let Some((public_key_fn, dh_fn)) = x25519_funcs {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      match method {
+        "public_key" => {
+          let call = builder
+            .build_call(public_key_fn, &[recv_val.into()], "x25519pubtmp")
+            .map_err(|e| e.to_string())?;
+          return Ok((call_result(call)?, ValKind::Int64));
+        }
+        "diffie_hellman" => {
+          let arg = args
+            .first()
+            .ok_or_else(|| "codegen: `.diffie_hellman` expects 1 argument".to_string())?;
+          let (arg_val, _) = build_expr(
+            context,
+            builder,
+            arg,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          let call = builder
+            .build_call(dh_fn, &[recv_val.into(), arg_val.into()], "x25519dhtmp")
+            .map_err(|e| e.to_string())?;
+          return Ok((call_result(call)?, ValKind::Int64));
+        }
+        other => return Err(format!("codegen: unsupported X25519 method `{other}`")),
+      }
+    }
+    // Plan 111's Decision log: `RsaKeyPair#decrypt`/`#sign`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("RsaKeyPair") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let arg = args
+        .first()
+        .ok_or_else(|| format!("codegen: `RsaKeyPair#{method}` expects 1 argument"))?;
+      let (arg_val, _) = build_expr(
+        context,
+        builder,
+        arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let fv = match method {
+        "decrypt" => ctx.rsa_decrypt,
+        "sign" => ctx.rsa_sign,
+        other => return Err(format!("codegen: unsupported RsaKeyPair method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into(), arg_val.into()], "rsatmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Ptr));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -8288,6 +8439,56 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "aeadtmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 111's Decision log: `Ed25519`/`X25519`/`Rsa` — three
+  // distinct reserved namespaces, deliberately not conflated.
+  if matches!(recv_name.as_str(), "Ed25519" | "X25519" | "Rsa") {
+    if method == "generate_ephemeral" || method == "generate_static" {
+      let fv = if method == "generate_ephemeral" {
+        ctx.x25519_generate_ephemeral
+      } else {
+        ctx.x25519_generate_static
+      };
+      let call = builder
+        .build_call(fv, &[], "x25519generatetmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
+    if recv_name == "Ed25519" && method == "generate_key" {
+      let call = builder
+        .build_call(ctx.ed25519_generate_key, &[], "ed25519generatetmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match (recv_name.as_str(), method) {
+      ("Ed25519", "verify") => (ctx.ed25519_verify, ValKind::Ptr),
+      ("Rsa", "generate_key") => (ctx.rsa_generate_key, ValKind::Ptr),
+      ("Rsa", "encrypt") => (ctx.rsa_encrypt, ValKind::Ptr),
+      ("Rsa", "verify") => (ctx.rsa_verify, ValKind::Ptr),
+      (_, other) => {
+        return Err(format!(
+          "codegen: unsupported {recv_name} static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "asymmetrictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -19026,6 +19227,86 @@ fn compile_to_object_impl(
     ),
     Some(Linkage::External),
   );
+  // Plan 111 (Asymmetric Cryptography and Digital Signatures):
+  // `Bytes`/`Ed25519KeyPair`/`X25519EphemeralSecret`/
+  // `X25519StaticSecret`/`RsaKeyPair` values cross every call here as
+  // a plain `i64_ty` (see `bytes.rs`'s/`asymmetric.rs`'s own module
+  // docs).
+  let ed25519_generate_key = module.add_function(
+    "emerald_rt_ed25519_generate_key",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let ed25519_sign = module.add_function(
+    "emerald_rt_ed25519_sign",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ed25519_public_key = module.add_function(
+    "emerald_rt_ed25519_public_key",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ed25519_verify = module.add_function(
+    "emerald_rt_ed25519_verify",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x25519_generate_ephemeral = module.add_function(
+    "emerald_rt_x25519_generate_ephemeral",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let x25519_generate_static = module.add_function(
+    "emerald_rt_x25519_generate_static",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let x25519_ephemeral_public_key = module.add_function(
+    "emerald_rt_x25519_ephemeral_public_key",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x25519_static_public_key = module.add_function(
+    "emerald_rt_x25519_static_public_key",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x25519_ephemeral_diffie_hellman = module.add_function(
+    "emerald_rt_x25519_ephemeral_diffie_hellman",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x25519_static_diffie_hellman = module.add_function(
+    "emerald_rt_x25519_static_diffie_hellman",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rsa_generate_key = module.add_function(
+    "emerald_rt_rsa_generate_key",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rsa_encrypt = module.add_function(
+    "emerald_rt_rsa_encrypt",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rsa_decrypt = module.add_function(
+    "emerald_rt_rsa_decrypt",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rsa_sign = module.add_function(
+    "emerald_rt_rsa_sign",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let rsa_verify = module.add_function(
+    "emerald_rt_rsa_verify",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -19613,6 +19894,10 @@ fn compile_to_object_impl(
   newtypes.insert("Sha256Hasher".to_string());
   newtypes.insert("Blake3Hasher".to_string());
   newtypes.insert("AeadKey".to_string());
+  newtypes.insert("Ed25519KeyPair".to_string());
+  newtypes.insert("X25519EphemeralSecret".to_string());
+  newtypes.insert("X25519StaticSecret".to_string());
+  newtypes.insert("RsaKeyPair".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -19755,6 +20040,21 @@ fn compile_to_object_impl(
     xchacha_decrypt,
     xchacha_encrypt_with_nonce,
     xchacha_decrypt_with_nonce,
+    ed25519_generate_key,
+    ed25519_sign,
+    ed25519_public_key,
+    ed25519_verify,
+    x25519_generate_ephemeral,
+    x25519_generate_static,
+    x25519_ephemeral_public_key,
+    x25519_static_public_key,
+    x25519_ephemeral_diffie_hellman,
+    x25519_static_diffie_hellman,
+    rsa_generate_key,
+    rsa_encrypt,
+    rsa_decrypt,
+    rsa_sign,
+    rsa_verify,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

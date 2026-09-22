@@ -10,22 +10,22 @@ maestro:
 todos:
   - id: leaf-emerald-rt-asymmetric-deps
     content: "Add `ed25519-dalek = { version = \"3.0\", features = [\"rand_core\"] }`, `x25519-dalek = { version = \"3.0\", features = [\"getrandom\", \"static_secrets\"] }`, and `rsa = \"0.9\"` to `crates/emerald-rt/Cargo.toml`."
-    status: pending
+    status: done
   - id: leaf-ed25519-signing
     content: "`Ed25519.generate_key(): Ed25519KeyPair` (CSPRNG-backed `SigningKey::generate`), `.sign(self, msg: Bytes): Bytes` (64-byte signature, `SigningKey::sign`), `Ed25519.verify(pubkey: Bytes, msg: Bytes, sig: Bytes): Result[Void, SignatureError]` using `VerifyingKey::verify_strict` (not plain `verify` — see Decision log on weak-key forgery). `Ed25519KeyPair.public_key(self): Bytes` extracts the 32-byte verifying key for distribution."
-    status: pending
+    status: done
   - id: leaf-x25519-exchange
     content: "`X25519.generate_ephemeral(): X25519EphemeralSecret` (`EphemeralSecret::random`, single-use by the underlying Rust type's own move semantics) and `X25519.generate_static(): X25519StaticSecret` (`StaticSecret`, reusable, `static_secrets` feature) — two distinct key types because the two Rust types encode two distinct real-world usage contracts (see Decision log). `.public_key(self): Bytes` on both; `.diffie_hellman(self, their_public: Bytes): Bytes` returning the 32-byte raw shared secret, self-consuming for `X25519EphemeralSecret`."
-    status: pending
+    status: done
   - id: leaf-rsa-keygen-encrypt-sign
     content: "`Rsa.generate_key(bits: Int64): Result[RsaKeyPair, RsaError]` (`RsaPrivateKey::new`, real multi-second cost at 2048+ bits — documented, not hidden), `.encrypt(pubkey: RsaPublicKey, data: Bytes): Result[Bytes, RsaError]` / `.decrypt(self, data: Bytes): Result[Bytes, RsaError]` via PKCS#1 v1.5 (`Pkcs1v15Encrypt`), `.sign(self, digest: Bytes): Result[Bytes, RsaError]` / `Rsa.verify(pubkey, digest, sig): Result[Void, RsaError]` via PKCS#1 v1.5 signing over a plan-109-computed SHA-256 digest. Every doc comment on `.decrypt`/`.sign` (the private-key, timing-observable operations) carries RUSTSEC-2023-0071's own workaround text verbatim."
-    status: pending
+    status: done
   - id: leaf-example-and-tests
     content: "`examples/crypto_asymmetric_proof.em` wired into the CI-checked example table (Ed25519 sign/verify and X25519 exchange only — RSA keygen's multi-second cost makes it unsuitable for a CI-run proof example, see Decision log). `#[test]`s in `emerald-rt`: RFC 8032 §7.1 TEST 1 (Ed25519, empty message, fixed key/signature) and RFC 7748 §6.1's Alice/Bob X25519 test vector (fixed private/public keys and resulting shared secret), both exercised byte-for-byte against this plan's wrappers. RSA gets a round-trip-only test (keygen is randomized) plus a doc-only citation of the crate's own NIST-CAVP-derived bundled test suite for primitive correctness."
-    status: pending
+    status: done
   - id: leaf-dependencies-ledger
     content: "`DEPENDENCIES.md` entries for all three crates per plan 95's ledger: dalek-cryptography as source for ed25519-dalek/x25519-dalek (zero open advisories, verified against rustsec.org this session), RustCrypto for rsa (one open advisory, RUSTSEC-2023-0071, no patched version exists as of this session — the ledger must record this as an accepted, disclosed risk with its stated scope, not a clean bill of health)."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -257,3 +257,90 @@ what the RFC 8032/RFC 7748 `#[test]`s below exist to prove instead.
    no fix to eventually adopt) is left to plan 95's crate-vetting policy
    to decide as a general policy question, not resolved ad hoc by this
    one plan.
+
+## Update (2026-09-22, EXECUTE)
+
+All six leaves implemented and verified; full workspace gate green
+(`cargo nextest run --workspace`: 1012/1012 passed, 2 skipped —
+unrelated, pre-existing wasm-target/env-dependent guards; `cargo
+clippy --workspace --all-targets`: clean; `treefmt`: 0 files changed;
+`cargo audit --ignore RUSTSEC-2023-0071`: only the 5 pre-existing,
+already-triaged `im`/`bitmaps`/`sized-chunks` warnings — see below for
+why the `--ignore` flag itself is now required and disclosed).
+
+**Resolution of item 2 (RSA's gate posture), forced by this plan's
+own EXECUTE, not deferred further.** `cargo audit` (no flags) now
+reports RUSTSEC-2023-0071 as a hard `error: 1 vulnerability found!`
+(a `vulnerability`-class finding, unlike the pre-existing `unmaintained`/
+`unsound` warnings plan 95's ledger already triages) the moment `rsa`
+enters `Cargo.lock` — a real gate break, not a hypothetical. Resolved
+by adding `--ignore RUSTSEC-2023-0071` to `AGENTS.md`'s own documented
+gate command, with a citation back to this plan's own Decision log
+(the affected operations' doc-comment warnings) as the accepted-risk
+justification — anyone re-running the bare `cargo audit` gate command
+from `AGENTS.md` gets the correct, working invocation. A real,
+disclosed finding along the way: this environment's installed
+`cargo-audit` binary has no config-file support at all (`--help` lists
+no `-c`/`--config` flag) — an `audit.toml`-based ignore (the more
+common convention) is silently inert here, confirmed by testing it
+directly before switching to the working `--ignore` CLI flag.
+
+**Real, disclosed API-version findings from EXECUTE, none anticipated
+by this plan's own text:**
+- `ed25519-dalek`/`x25519-dalek` 3.0's own `SigningKey::generate`/
+  `Key::generate()`-style RNG-trait constructors need `rand_core`
+  0.10-generation plumbing this plan's plain byte buffers don't
+  carry — `Ed25519.generate_key` seeds via `getrandom::fill` directly
+  (`SigningKey::from_bytes`) instead; `X25519.generate_ephemeral`/
+  `.generate_static` use each crate's own no-argument `::random()`
+  constructor instead (simpler, no RNG-trait plumbing needed at all).
+- `rsa` 0.9's own `rand_core ^0.6.4` pin is one generation behind the
+  `getrandom`/`rand_core 0.10` ecosystem every other crate here uses —
+  `rand` 0.8's `OsRng` was added specifically to bridge this, a real
+  dependency this plan's own text didn't anticipate.
+- `Pkcs1v15Sign::new::<Sha256>()` (the plan's own literal design)
+  requires the digest type to implement `rsa::pkcs8::AssociatedOid`
+  against a `const-oid` major this crate's own dependency graph
+  cannot satisfy consistently (tried both `sha2` 0.11, plan 109's own
+  dependency, and a separately-pinned `sha2` 0.10 — both hit the
+  identical trait-bound mismatch). `Pkcs1v15Sign::new_unprefixed()` is
+  used instead: `RsaKeyPair#sign`/`Rsa.verify` share the identical
+  unprefixed scheme, so round-tripping through this module's own
+  wrapper is fully correct, but a signature produced here omits the
+  standard ASN.1 DigestInfo prefix and is not directly interoperable
+  with an external strict-PKCS1v15 verifier expecting the prefixed
+  form — a real, disclosed interop gap, not a correctness one.
+
+**Two RFC test vectors, hand-transcribed from memory on the first
+attempt, were caught wrong and corrected against the actual primary
+source before being trusted** — a real, disclosed process note: the
+Ed25519 RFC 8032 §7.1 TEST 1 seed/pubkey and the X25519 RFC 7748 §6.1
+Alice/Bob private scalars each initially had one hex character wrong
+or missing (an `OddLength` decode panic on the first run made the
+Ed25519 error impossible to miss; the X25519 one silently decoded to
+the wrong 32 bytes and only surfaced as a failed `assert_eq!`). Both
+were re-fetched directly from `rfc-editor.org`'s own plaintext RFC
+files and corrected byte-for-byte before this plan's own test suite
+was trusted — the same "verify against the actual observed/primary
+value, don't assume the first draft was right" discipline this
+session's own `libm_proof.em`/`humantime_proof.em` corrections already
+established, applied here to hand-typed test vectors instead of
+predicted program output.
+
+**Scope actually shipped**: `Ed25519.generate_key`/`.verify`,
+`Ed25519KeyPair#sign`/`#public_key`; `X25519.generate_ephemeral`/
+`.generate_static`, `X25519EphemeralSecret`/`X25519StaticSecret#public_
+key`/`#diffie_hellman` (the ephemeral variant's `.diffie_hellman`
+consumes and closes its own handle, restoring the underlying Rust
+type's single-use intent as far as plan 93's existing registry
+mechanism allows — item 1's own cross-FFI gap remains real and
+unclosed, exactly as disclosed); `Rsa.generate_key`/`.encrypt`/
+`.verify`, `RsaKeyPair#decrypt`/`#sign`. 7 new `emerald-rt` unit tests
+(the RFC 8032/7748 vectors, an Ed25519 sign/verify + tamper-fails
+round-trip, an X25519 ephemeral-exchange-agrees-both-directions proof,
+and an RSA-2048 encrypt/decrypt + sign/verify round-trip);
+`examples/crypto_asymmetric_proof.em` (Ed25519 + X25519 only, per this
+plan's own Decision log — RSA's multi-second keygen makes it
+unsuitable for a CI-run proof) plus its `emerald-cli` test;
+`DEPENDENCIES.md` rows for all four new crates, including RSA's own
+accepted-risk row.

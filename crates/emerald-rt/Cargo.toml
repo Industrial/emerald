@@ -134,5 +134,27 @@ zeroize = "1"
 # trait API (found, empirically, to require type-level plumbing this
 # plan's own simple byte-buffer needs don't warrant).
 getrandom = "0.4"
+# Plan 111: real-checked at this plan's own authoring time (2026-09-22,
+# via docs.rs) - ed25519-dalek 3.0.0 (Jul/Sep 2026) and x25519-dalek
+# 3.0.0 (Jul/Sep 2026), both dalek-cryptography-owned sibling crates,
+# zero open RustSec advisories (ed25519-dalek's one historical
+# advisory, RUSTSEC-2022-0093, patched in >=2 - this plan's 3.0 pin is
+# two majors past the fix; x25519-dalek's own rustsec.org page 404s -
+# no advisory ever filed). rsa 0.9.10 - RustCrypto, one open,
+# currently-unpatched advisory (RUSTSEC-2023-0071, the Marvin Attack,
+# `patched = []`) - disclosed prominently in asymmetric.rs's own module
+# doc and every affected doc comment, not pinned around (no version
+# exists to pin around it). All three pure Rust.
+ed25519-dalek = "3.0"
+x25519-dalek = { version = "3.0", features = ["getrandom", "static_secrets"] }
+rsa = "0.9"
+# `rand` 0.8 - added specifically because `rsa` 0.9's own `rand_core`
+# dependency is pinned to `^0.6.4`, one generation behind the
+# `getrandom`/`rand_core 0.10` ecosystem every other crate in this file
+# already uses - `rand::rngs::OsRng` is the standard CSPRNG source
+# compatible with that older trait generation (the same pairing `rsa`'s
+# own README example uses). A real, disclosed extra dependency this
+# plan's own text didn't anticipate.
+rand = "0.8"
 
 [build-dependencies]

@@ -422,3 +422,14 @@ fn crypto_hashing_proof_em_prints_expected_sequence() {
 fn crypto_aead_proof_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("crypto_aead_proof.em"), "true\ntrue\n");
 }
+
+// Plan 111 (Asymmetric Cryptography and Digital Signatures): another
+// correctness-property proof — key generation is randomized by
+// design, so there is no fixed signature/shared-secret to assert.
+#[test]
+fn crypto_asymmetric_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("crypto_asymmetric_proof.em"),
+    "true\ntrue\ntrue\n"
+  );
+}

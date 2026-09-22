@@ -127,6 +127,7 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 
 mod aead;
+mod asymmetric;
 mod bytes;
 mod encoding;
 mod env;
@@ -1217,6 +1218,128 @@ pub unsafe extern "C" fn emerald_rt_xchacha_decrypt_with_nonce(
   aad_id: i64,
 ) -> *mut c_void {
   catch_and_raise(move || aead::xchacha_decrypt_with_nonce(key_id, nonce_id, sealed_id, aad_id))
+}
+
+// Plan 111 (Asymmetric Cryptography and Digital Signatures):
+// `Ed25519`/`X25519`/`Rsa` — see `asymmetric.rs`'s own module doc.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ed25519_generate_key() -> i64 {
+  catch_and_raise(asymmetric::ed25519_generate_key)
+}
+
+/// # Safety
+/// `msg_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ed25519_sign(id: i64, msg_id: i64) -> i64 {
+  catch_and_raise(move || asymmetric::ed25519_sign(id, msg_id))
+}
+
+/// # Safety
+/// Always safe to call for a live `Ed25519KeyPair` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ed25519_public_key(id: i64) -> i64 {
+  catch_and_raise(move || asymmetric::ed25519_public_key(id))
+}
+
+/// # Safety
+/// `pubkey_id`/`msg_id`/`sig_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ed25519_verify(
+  pubkey_id: i64,
+  msg_id: i64,
+  sig_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || asymmetric::ed25519_verify(pubkey_id, msg_id, sig_id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x25519_generate_ephemeral() -> i64 {
+  catch_and_raise(asymmetric::x25519_generate_ephemeral)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x25519_generate_static() -> i64 {
+  catch_and_raise(asymmetric::x25519_generate_static)
+}
+
+/// # Safety
+/// Always safe to call for a live `X25519EphemeralSecret` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x25519_ephemeral_public_key(id: i64) -> i64 {
+  catch_and_raise(move || asymmetric::x25519_ephemeral_public_key(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `X25519StaticSecret` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x25519_static_public_key(id: i64) -> i64 {
+  catch_and_raise(move || asymmetric::x25519_static_public_key(id))
+}
+
+/// # Safety
+/// `their_public_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x25519_ephemeral_diffie_hellman(
+  id: i64,
+  their_public_id: i64,
+) -> i64 {
+  catch_and_raise(move || asymmetric::x25519_ephemeral_diffie_hellman(id, their_public_id))
+}
+
+/// # Safety
+/// `their_public_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x25519_static_diffie_hellman(
+  id: i64,
+  their_public_id: i64,
+) -> i64 {
+  catch_and_raise(move || asymmetric::x25519_static_diffie_hellman(id, their_public_id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_rsa_generate_key(bits: i64) -> *mut c_void {
+  catch_and_raise(move || asymmetric::rsa_generate_key(bits))
+}
+
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_rsa_encrypt(keypair_id: i64, data_id: i64) -> *mut c_void {
+  catch_and_raise(move || asymmetric::rsa_encrypt(keypair_id, data_id))
+}
+
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_rsa_decrypt(keypair_id: i64, data_id: i64) -> *mut c_void {
+  catch_and_raise(move || asymmetric::rsa_decrypt(keypair_id, data_id))
+}
+
+/// # Safety
+/// `digest_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_rsa_sign(keypair_id: i64, digest_id: i64) -> *mut c_void {
+  catch_and_raise(move || asymmetric::rsa_sign(keypair_id, digest_id))
+}
+
+/// # Safety
+/// `digest_id`/`sig_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_rsa_verify(
+  keypair_id: i64,
+  digest_id: i64,
+  sig_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || asymmetric::rsa_verify(keypair_id, digest_id, sig_id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive
