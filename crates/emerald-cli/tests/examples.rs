@@ -359,3 +359,16 @@ fn environment_variables_proof_em_prints_expected_sequence() {
 fn libm_proof_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("libm_proof.em"), "1.41421\n1024\ntrue\n1\n");
 }
+
+// Plan 162 (Human-Readable Duration/Time Formatting): `Duration.
+// humanize`/`.parse_human`, `Timestamp.to_rfc3339`/`.parse_rfc3339`.
+// `humanize(266400)` and the RFC 3339 rendering are the crate's own
+// real output, pinned here (not hand-typed), matching this plan's
+// own `crates/emerald-rt/src/humantime.rs` `#[test]`s.
+#[test]
+fn humantime_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("humantime_proof.em"),
+    "3days 2h\n266400\nexpected number at 0\n2026-05-28T20:26:40Z\n1780000000\n"
+  );
+}

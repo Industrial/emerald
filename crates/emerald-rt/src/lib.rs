@@ -129,6 +129,7 @@ use std::os::raw::c_char;
 mod encoding;
 mod env;
 mod handle;
+mod humantime;
 mod json;
 mod log;
 mod math;
@@ -820,6 +821,38 @@ pub unsafe extern "C" fn emerald_rt_math_round(x: f64) -> f64 {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_math_trunc(x: f64) -> f64 {
   catch_and_raise(move || math::trunc(x))
+}
+
+// Plan 162 (Human-Readable Duration/Time Formatting): `Duration.
+// humanize`/`.parse_human`, `Timestamp.to_rfc3339`/`.parse_rfc3339` —
+// see `humantime.rs`'s own module doc.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_humantime_format_duration(seconds: i64) -> *const c_char {
+  catch_and_raise(move || humantime::format_duration(seconds))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_humantime_parse_duration(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || humantime::parse_duration(s))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_humantime_format_rfc3339(unix_secs: i64) -> *const c_char {
+  catch_and_raise(move || humantime::format_rfc3339(unix_secs))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_humantime_parse_rfc3339(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || humantime::parse_rfc3339(s))
 }
 
 // Plan 168 (Structured Logging): `Log.configure`/`.trace`/`.debug`/

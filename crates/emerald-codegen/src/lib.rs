@@ -4973,6 +4973,12 @@ struct Ctx<'a, 'ctx> {
   math_ceil: FunctionValue<'ctx>,
   math_round: FunctionValue<'ctx>,
   math_trunc: FunctionValue<'ctx>,
+  /// Plan 162 (Human-Readable Duration/Time Formatting) — `Duration.
+  /// humanize`/`.parse_human`, `Timestamp.to_rfc3339`/`.parse_rfc3339`.
+  humantime_format_duration: FunctionValue<'ctx>,
+  humantime_parse_duration: FunctionValue<'ctx>,
+  humantime_format_rfc3339: FunctionValue<'ctx>,
+  humantime_parse_rfc3339: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8174,6 +8180,42 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "mathtmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Float64));
+  }
+
+  // Plan 162's Decision log: `Duration.humanize`/`.parse_human`,
+  // `Timestamp.to_rfc3339`/`.parse_rfc3339` — the same reserved-
+  // namespace static-call shape `Json`/`Env`/`Math` use.
+  // `.humanize`/`.to_rfc3339` return a plain `String`; `.parse_human`/
+  // `.parse_rfc3339` return `Result[Int64, String]`, already built by
+  // the Rust side (plan 53's own layout), zero additional marshaling.
+  if recv_name == "Duration" || recv_name == "Timestamp" {
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `{recv_name}.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (fv, ret_kind) = match (recv_name.as_str(), method) {
+      ("Duration", "humanize") => (ctx.humantime_format_duration, ValKind::Str),
+      ("Duration", "parse_human") => (ctx.humantime_parse_duration, ValKind::Ptr),
+      ("Timestamp", "to_rfc3339") => (ctx.humantime_format_rfc3339, ValKind::Str),
+      ("Timestamp", "parse_rfc3339") => (ctx.humantime_parse_rfc3339, ValKind::Ptr),
+      _ => {
+        return Err(format!(
+          "codegen: unsupported {recv_name} static method `{method}`"
+        ));
+      }
+    };
+    let call = builder
+      .build_call(fv, &[v.into()], "humantimetmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
   }
 
   // Plan 168's Decision log: `Log.configure`/`.<level>`/
@@ -18320,6 +18362,29 @@ fn compile_to_object_impl(
     one_f64_to_f64,
     Some(Linkage::External),
   );
+  // Plan 162 (Human-Readable Duration/Time Formatting): `.humanize`/
+  // `.to_rfc3339` return a `String` pointer; `.parse_human`/`.parse_
+  // rfc3339` return plan 53's own `Result` layout (a heap pointer).
+  let humantime_format_duration = module.add_function(
+    "emerald_rt_humantime_format_duration",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let humantime_parse_duration = module.add_function(
+    "emerald_rt_humantime_parse_duration",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let humantime_format_rfc3339 = module.add_function(
+    "emerald_rt_humantime_format_rfc3339",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let humantime_parse_rfc3339 = module.add_function(
+    "emerald_rt_humantime_parse_rfc3339",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -19005,6 +19070,10 @@ fn compile_to_object_impl(
     math_ceil,
     math_round,
     math_trunc,
+    humantime_format_duration,
+    humantime_parse_duration,
+    humantime_format_rfc3339,
+    humantime_parse_rfc3339,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

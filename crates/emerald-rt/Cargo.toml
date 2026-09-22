@@ -75,5 +75,10 @@ regex = "1.13"
 # found. Pure Rust, no_std-compatible - portable to wasm32-wasip1
 # with zero linker flag, unlike calling libc math via extern "C".
 libm = "0.2"
+# Plan 162: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - humantime 2.4.0 (Jul 2, 2026), #2 in Date and time,
+# 22.0M downloads/month, used in 14,490 crates, "No runtime deps".
+# No RustSec advisory found.
+humantime = "2"
 
 [build-dependencies]

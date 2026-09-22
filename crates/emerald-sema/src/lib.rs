@@ -4239,6 +4239,71 @@ fn infer_expr_type(
       )?;
       Ok(Type::Float64)
     }
+    // Plan 162's Decision log: `Duration.humanize`/`.parse_human` —
+    // the same reserved-namespace static-call shape `Json`/`Env`/
+    // `Math` use. No new `Type` anywhere — a duration is already
+    // exactly representable as this language's own `Int64` (whole
+    // seconds).
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Duration") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "humanize" => (vec![Type::Int64], Type::String),
+        "parse_human" => (
+          vec![Type::String],
+          Type::Result(Box::new(Type::Int64), Box::new(Type::String)),
+        ),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Duration has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
+    // Plan 162's Decision log: `Timestamp.to_rfc3339`/`.parse_rfc3339`
+    // — the same reserved-namespace static-call shape `Duration`
+    // immediately above uses; kept distinct from `Duration` (a
+    // separate reserved name) since a timestamp and a duration are
+    // different concepts sharing only their `Int64`-seconds
+    // representation.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Timestamp") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "to_rfc3339" => (vec![Type::Int64], Type::String),
+        "parse_rfc3339" => (
+          vec![Type::String],
+          Type::Result(Box::new(Type::Int64), Box::new(Type::String)),
+        ),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Timestamp has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 168's Decision log: `Log.configure`/`.<level>`/
     // `.<level>_fields` — the same reserved-namespace static-call
     // shape `File`/`Json` immediately below use, for the same reason
