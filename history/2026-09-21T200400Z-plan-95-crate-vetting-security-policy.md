@@ -10,19 +10,19 @@ maestro:
 todos:
   - id: leaf-dependencies-ledger
     content: "Create `crates/emerald-rt/DEPENDENCIES.md` with a fixed Markdown table header — columns `Crate`, `Version`, `Why chosen`, `Pure-Rust or C-exception (+ justification)`, `Date added`, `Plan #` — and zero data rows beneath it, since no third-party crate has been added to `emerald-rt` as of this plan's own authoring (plan 91's own proof function and plan 92's checked/panic variants and plan 93's handle registry are all zero-dependency, verified against each plan's own Decision log). Each row-columns' exact contract, stated in the file's own preamble: `Why chosen` is a one-line summary, not a full justification (the full justification lives in that crate-adding plan's own Decision log, cited by `Plan #`); `Pure-Rust or C-exception (+ justification)` is either the literal word `pure-Rust` or `C-exception:` followed by a short reason (`links libsqlite3`, `wraps zlib`, etc.); `Date added` is the ISO date of the plan history file that added it, not the date the row was edited. State plainly in the preamble that this file is append-only in spirit — a later plan replacing crate X with crate Y adds a new row and marks the old one `superseded by plan N`, rather than deleting history."
-    status: pending
+    status: done
   - id: leaf-pure-rust-preference-and-exception-process
     content: "Document the pure-Rust-first preference and its exception process in `DEPENDENCIES.md`'s own preamble (the ledger is the natural home for the policy that governs its own rows) and restated in this plan's Decision log below: prefer `rustls` over `native-tls`/`openssl` for TLS, prefer a pure-Rust parser/codec over one that shells out to or links a C library, for every domain this batch adds. Where no mature pure-Rust alternative exists for a domain that genuinely needs one (the plan's own worked example: SQLite — no mature pure-Rust SQLite *engine* exists as of this session, only pure-Rust *drivers* for other databases; `rusqlite` links `libsqlite3` as a real, disclosed C exception), the plan adding that crate must name the pure-Rust alternative(s) it actually considered (not a rhetorical strawman) and state why each was rejected (immaturity, a missing feature the domain genuinely needs, no maintained crate at all) — and must back that claim with a real `WebSearch`/`WebFetch` check performed at that plan's own authoring time, not an assumption carried over from training data, since crate maturity is exactly the kind of fact that goes stale between this session and whenever a given domain plan is actually authored or executed."
-    status: pending
+    status: done
   - id: leaf-maintenance-bar-and-verification-mandate
     content: "Document the maintenance/adoption bar every crate added to `emerald-rt` must clear: real, current (checked at authoring time, not assumed) crates.io signals — non-trivial download counts, a release within a reasonable recency window, more than one maintainer or a maintainer with a real track record — and zero open, unpatched RustSec advisories against the exact version being pinned, checked against the real RustSec advisory database (`https://rustsec.org`/`cargo audit`'s own database) at authoring time. State the mandate explicitly and by name: every domain plan from 96 onward that adds or upgrades a crate must perform a real `WebSearch`/`WebFetch` against crates.io and the RustSec database as part of its own authoring, cite what it found (current version, last-release date, any advisory IDs checked and their status) directly in its own Decision log the same way plan 59 cites real file:line evidence — a plan asserting a crate's maintenance status or safety without that check is exactly the fabricated-citation failure mode `AGENTS.md`'s own 'Known tooling gotchas' section already warns this project has produced once before (plan 68's false compiler-bug report), applied here to dependency claims instead of test-output claims."
-    status: pending
+    status: done
   - id: leaf-cargo-audit-ci-gate
     content: "Add `cargo audit` (RustSec-advisory-database scanning, the more narrowly-scoped and lower-friction of the two real options weighed in the Decision log below) to this project's quality gate, run alongside the three commands `AGENTS.md`'s own 'Build / test / verify' section already documents (`cargo nextest run --workspace`, `cargo clippy --workspace --all-targets`, `treefmt`), and update that section of `AGENTS.md` itself to list it as a fourth line (`audit: cargo audit`) — the one file-outside-`history/` edit this plan's own EXECUTE phase makes, small and additive, matching every prior plan's own light-touch `AGENTS.md` precedent. No `Cargo.lock`-pinning or `deny.toml` policy-file machinery is added in this plan beyond what `cargo audit` itself needs (it reads the workspace's existing `Cargo.lock` directly) — `cargo-deny`'s broader license/duplicate-version/banned-crate policy surface is named and declined for v1 in the Decision log, not silently assumed equivalent."
-    status: pending
+    status: done
   - id: leaf-acceptance-checklist
     content: "Write the eight-item mandatory acceptance checklist, itemized exactly as follows, as this plan's own canonical, numbered list every domain plan (96-191) must satisfy and every reviewer checks a domain plan against: (1) real crate justification backed by `WebSearch`-verified current facts, not training-data assumptions, per `leaf-maintenance-bar-and-verification-mandate`; (2) the exact Emerald-facing API surface the plan adds (method/function signatures, types, module names); (3) FFI/ABI notes citing plan 92 (naming, panic-boundary macro usage, String vs. binary-safe convention, Result-vs-exception choice made explicit); (4) an ownership/error-handling story citing plan 93 for any long-lived native resource the domain introduces (or an explicit statement that the domain holds no such resource, if true); (5) a `## Concrete proof this plan targets` `.em` example wired into `examples/`'s CI-checked table, per plan 91's own precedent; (6) real Rust-side `#[test]`s inside `emerald-rt`, runnable via `cargo nextest run --workspace`, not merely asserted to exist; (7) doc comments on every new public/exported item, surfaced via the existing `emerald doc` subcommand (`crates/emerald-cli/src/doc_runner.rs`, verified present in the real source this session) — a domain plan adding undocumented surface fails this item even if every other item passes; (8) an explicit `Out of scope` section naming what the plan deliberately does not build. State plainly that item (3) is conditionally applicable (a domain with no async-backed dependency need not cite plan 94, but must say so rather than omit it silently) while items (1)-(2) and (5)-(8) are unconditional for every domain plan with any new stdlib surface at all."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -249,3 +249,43 @@ individually.
    `.github/workflows/` (or equivalent) directory before assuming
    `AGENTS.md`'s own documented command list is the only place this
    needs to be wired in.
+
+## Update (2026-09-22, same-day session): implemented, all five leaves done
+
+`crates/emerald-rt/DEPENDENCIES.md` created with the six-column header,
+its own preamble stating the column contract and append-only
+convention, and zero data rows (`grep -c '^|'` returns `2` — the header
+row plus its GFM separator row — not the `1` this plan's own text
+predicted; a real, disclosed correction: valid Markdown table syntax
+needs both, and "zero data rows beneath it" is what actually matters,
+which holds). `AGENTS.md`'s "Build / test / verify" section gained a
+fourth `# audit: cargo audit` line. `cargo audit` itself: already
+installed in this environment (`cargo-audit 0.22.2`), runs against the
+real workspace `Cargo.lock` (260 crate dependencies scanned), exits 0
+— five RustSec advisories surfaced, all `unmaintained`/`unsound`
+warnings (not the `vulnerability`-class finding that would make `cargo
+audit` exit nonzero by default), every one transitive via
+`emerald-driver`'s pre-existing `id_effect` dependency (`im` 15.1.0,
+`bitmaps` 2.1.0, `sized-chunks` 0.6.5) — pre-dating this whole batch,
+unrelated to `emerald-rt` (still zero dependencies, confirmed), and
+explicitly triaged as out-of-scope in `DEPENDENCIES.md`'s own closing
+section rather than silently passed over. This also resolves "Not yet
+decided" item 1 above by the encounter it deferred to: `cargo audit`'s
+own default (warnings don't block, only a real vulnerability does) is
+accepted as this project's policy, since the first real findings this
+project has actually seen are exactly warning-class and a hard-gate
+policy authored against zero real cases would have been speculative.
+
+"Not yet decided" item 2, above, is answered too: `.github/workflows/
+ci.yml` already exists (mirroring this project's own local devenv/moon
+pipeline) and its `pipeline` job already runs `moon run :format :check
+:lint :build :test :audit :check-docs` — `moon.yml`'s own `audit` task
+(`cargo audit`, `outputStyle: buffer-only-failure`) predates this
+plan's own authoring, discovered rather than added. This plan's
+`AGENTS.md` line documents an already-real gate command, not a new one
+this session had to additionally wire into CI.
+
+Full workspace gate re-verified after these changes (no source code
+touched by this plan, docs/ledger only): `cargo nextest run --workspace`
+(932/932, 2 skipped), `cargo clippy --workspace --all-targets` (clean),
+`treefmt` (0 changed), `cargo audit` (exit 0, findings triaged above).

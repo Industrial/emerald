@@ -11,6 +11,7 @@ feature boundaries.
 # test:    cargo nextest run --workspace   (falls back to `cargo test --workspace`)
 # lint:    cargo clippy --workspace --all-targets
 # format:  treefmt
+# audit:   cargo audit
 ```
 
 ## Layout
