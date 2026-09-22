@@ -410,6 +410,36 @@ fn strip_ownership_annotations_in_items(items: &mut [Item]) {
   }
 }
 
+// Plan 121's own real, disclosed finding: `Stmt::MatchResult`'s own
+// `"Result[T, E]"` string parsing used a naive `str::split_once(", ")`
+// to separate `T` from `E` — correct only when neither `T` nor `E`
+// itself contains a ", " substring. A multi-param generic nested
+// inside `T` (`Result[Hash[String, String], String]`, `Csv.
+// parse_with_headers`'s own real return type) breaks it: the FIRST
+// ", " in `"Hash[String, String], String"` falls INSIDE `Hash`'s own
+// two type arguments, well before the real top-level split point,
+// producing two garbled, unbalanced-bracket strings for `t_name`/
+// `e_name` rather than an error — a real, previously-undisclosed,
+// silent-corruption-shaped bug, not merely a missing feature. This
+// scans for the first ", " at bracket depth zero instead.
+fn split_top_level_comma_space(s: &str) -> Option<(&str, &str)> {
+  let mut depth = 0i32;
+  let bytes = s.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    match bytes[i] {
+      b'[' => depth += 1,
+      b']' => depth -= 1,
+      b',' if depth == 0 && bytes.get(i + 1) == Some(&b' ') => {
+        return Some((&s[..i], &s[i + 2..]));
+      }
+      _ => {}
+    }
+    i += 1;
+  }
+  None
+}
+
 fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
   match ty {
     TypeExpr::Named(name) => match name.as_str() {
@@ -4957,6 +4987,10 @@ struct Ctx<'a, 'ctx> {
   /// Plan 119 (TOML) — `Toml.parse`, `JsonValue.to_toml`.
   toml_parse: FunctionValue<'ctx>,
   json_to_toml: FunctionValue<'ctx>,
+  /// Plan 121 (CSV) — `Csv.parse`/`.parse_with_headers`/`.write`.
+  csv_parse: FunctionValue<'ctx>,
+  csv_parse_with_headers: FunctionValue<'ctx>,
+  csv_write: FunctionValue<'ctx>,
   /// Plan 168 (Structured Logging).
   log_configure: FunctionValue<'ctx>,
   log_event: FunctionValue<'ctx>,
@@ -9324,6 +9358,36 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ValKind::Int64));
   }
 
+  // Plan 121's Decision log: `Csv.parse`/`.parse_with_headers`/
+  // `.write` — `.parse`/`.parse_with_headers` already return plan 53's
+  // own `Result` layout directly from the Rust side (`ValKind::Ptr`);
+  // `.write` returns a plain `String` (`ValKind::Str`).
+  if recv_name == "Csv" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "parse" => (ctx.csv_parse, ValKind::Ptr),
+      "parse_with_headers" => (ctx.csv_parse_with_headers, ValKind::Ptr),
+      "write" => (ctx.csv_write, ValKind::Str),
+      other => return Err(format!("codegen: unsupported Csv static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "csvstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
+
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
   // `.keys_count` — the same reserved-namespace static-call shape
   // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns a bare nullable
@@ -12978,7 +13042,11 @@ fn build_call_kw_expr<'ctx>(
 /// Decision log on `local_classes` doubling for this).
 fn parse_hash_type(s: &str) -> Option<(ValKind, ValKind)> {
   let inner = s.strip_prefix("Hash[")?.strip_suffix(']')?;
-  let (k, v) = inner.split_once(", ")?;
+  // Plan 121's own real, disclosed finding (see `split_top_level_
+  // comma_space`'s own doc comment above): a naive `split_once(", ")`
+  // here breaks for `Hash[String, Hash[String, String]]`-shaped
+  // nesting — a bracket-depth-aware split, not a plain first-match.
+  let (k, v) = split_top_level_comma_space(inner)?;
   Some((
     value_kind_for_type(&TypeExpr::Named(k.to_string())),
     value_kind_for_type(&TypeExpr::Named(v.to_string())),
@@ -12991,7 +13059,7 @@ fn parse_hash_type(s: &str) -> Option<(ValKind, ValKind)> {
 /// source of a `Pair` value.
 fn parse_pair_type(s: &str) -> Option<(ValKind, ValKind)> {
   let inner = s.strip_prefix("Pair[")?.strip_suffix(']')?;
-  let (k, v) = inner.split_once(", ")?;
+  let (k, v) = split_top_level_comma_space(inner)?;
   Some((
     value_kind_for_type(&TypeExpr::Named(k.to_string())),
     value_kind_for_type(&TypeExpr::Named(v.to_string())),
@@ -15633,7 +15701,7 @@ fn build_stmt<'a, 'ctx>(
         .ok_or_else(|| {
           format!("codegen: internal error — `{scrut_name}` is not `Result[T, E]`-typed")
         })?;
-      let (t_name, e_name) = inner.split_once(", ").ok_or_else(|| {
+      let (t_name, e_name) = split_top_level_comma_space(inner).ok_or_else(|| {
         format!("codegen: internal error — malformed `Result[T, E]` type `{result_ty}`")
       })?;
       let ok_kind = value_kind_for_type(&TypeExpr::Named(t_name.to_string()));
@@ -16252,11 +16320,53 @@ fn build_match_result<'a, 'ctx>(
     vars.insert(ok_var.to_string(), (ok_alloca, ok_kind));
   }
   let prior_ok_class = local_classes.get(ok_var).cloned();
+  // Real, disclosed extension of the same gap this plan's own history
+  // doc already names: a compound `Hash[K, V]`/`Pair[K, V]` `T` also
+  // needs its full `Display` string recorded in `local_classes` — not
+  // just a real class/enum/newtype name — since `.each`/
+  // `parse_hash_type`/`parse_pair_type`'s own dispatch key off that
+  // exact string shape. Deliberately NOT extended to `Array[` too: an
+  // `Array[T]`-typed `Ok(v)` binding must be left OUT of
+  // `local_classes` — indexing (`v[i]`) dispatches through a dedicated
+  // fast path keyed on `local_array_elem_types` alone (already fixed
+  // above), and giving it a `local_classes` entry as well makes that
+  // indexing incorrectly fall through to generic method-call dispatch
+  // instead (`codegen: unsupported method call
+  // \`Array[Array[String]].[]\``, found empirically by trying exactly
+  // that broader condition first).
   if ctx.classes.contains_key(t_name)
     || ctx.enums.contains_key(t_name)
     || ctx.newtypes.contains(t_name)
+    || t_name.starts_with("Hash[")
+    || t_name.starts_with("Pair[")
   {
     local_classes.insert(ok_var.to_string(), t_name.to_string());
+  }
+  // Plan 121's own real, disclosed finding: unlike the sibling
+  // `match X do Variant(field) do ... end end` enum-field-binding path
+  // (which already threads a real `TypeExpr` through to populate
+  // `local_array_elem_types` for an `Array[T]`-typed field), this
+  // `Ok(v)`/`Err(e)` binding path never populated it at all — a
+  // `Result[Array[T], E]`'s own `Ok(rows)` binding left `rows` unable
+  // to be indexed (`rows[0]`) at all, "cannot determine the element
+  // type," never previously reachable until `Csv.parse`'s own
+  // `Array[Array[String]]`. `t_name` here is a plain `Display` string
+  // (`build_match_result`'s own doc comment), not a structured
+  // `TypeExpr` — but `value_kind_for_type(&TypeExpr::Named(inner))`
+  // still resolves correctly for any inner type name, primitive or
+  // not: an unrecognized bare name (any class/enum/nested-generic
+  // string, `"Array[String]"` included) already falls through to the
+  // same `ValKind::Ptr` catch-all a real element type of that shape
+  // would resolve to anyway.
+  let prior_ok_array_elem = local_array_elem_types.get(ok_var).cloned();
+  if let Some(inner) = t_name
+    .strip_prefix("Array[")
+    .and_then(|s| s.strip_suffix(']'))
+  {
+    local_array_elem_types.insert(
+      ok_var.to_string(),
+      value_kind_for_type(&TypeExpr::Named(inner.to_string())),
+    );
   }
   let ok_terminated = build_block(
     context,
@@ -16286,6 +16396,14 @@ fn build_match_result<'a, 'ctx>(
     }
     None => {
       local_classes.remove(ok_var);
+    }
+  }
+  match prior_ok_array_elem {
+    Some(k) => {
+      local_array_elem_types.insert(ok_var.to_string(), k);
+    }
+    None => {
+      local_array_elem_types.remove(ok_var);
     }
   }
   if !ok_terminated {
@@ -19651,6 +19769,22 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 121 (CSV).
+  let csv_parse = module.add_function(
+    "emerald_rt_csv_parse",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let csv_parse_with_headers = module.add_function(
+    "emerald_rt_csv_parse_with_headers",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let csv_write = module.add_function(
+    "emerald_rt_csv_write",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 168 (Structured Logging).
   let log_configure = module.add_function(
     "emerald_rt_log_configure",
@@ -21132,6 +21266,9 @@ fn compile_to_object_impl(
     json_to_string,
     toml_parse,
     json_to_toml,
+    csv_parse,
+    csv_parse_with_headers,
+    csv_write,
     log_configure,
     log_event,
     log_fields_new,

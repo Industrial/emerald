@@ -4720,6 +4720,49 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 121's Decision log: `Csv.parse`/`.parse_with_headers`/
+    // `.write` — the same reserved-namespace static-call shape `Json`/
+    // `Toml` already use. Deliberately does NOT reuse `JsonValue` — a
+    // CSV document is a flat table, never nested, so `Array[Array[
+    // String]]`/`Array[Hash[String,String]]` say exactly what it is
+    // directly in Emerald's own existing collection types.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Csv") =>
+    {
+      let rows_ty = Type::Array(Box::new(Type::Array(Box::new(Type::String))));
+      let records_ty = Type::Array(Box::new(Type::Hash(
+        Box::new(Type::String),
+        Box::new(Type::String),
+      )));
+      let (expected_params, ret) = match method.as_str() {
+        "parse" => (
+          vec![Type::String],
+          Type::Result(Box::new(rows_ty), Box::new(Type::String)),
+        ),
+        "parse_with_headers" => (
+          vec![Type::String],
+          Type::Result(Box::new(records_ty), Box::new(Type::String)),
+        ),
+        "write" => (vec![rows_ty], Type::String),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Csv has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`

@@ -530,6 +530,18 @@ fn key_derivation_proof_em_prints_expected_sequence() {
 // pretty-printed diagnostic (a source snippet plus a `|`/`^` caret
 // line) — this assertion checks the first line and that real,
 // non-empty diagnostic text follows, not an exact single-line shape.
+// Plan 121 (CSV): the three classic CSV edge cases — a quoted field
+// containing the delimiter, a quoted field containing an embedded
+// newline, and doubled-quote escaping — all handled by the `csv`
+// crate's own real, standard-compliant parser, none hand-rolled here.
+#[test]
+fn csv_demo_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("csv_demo.em"),
+    "role\nengineer, lead\nwrote \"the\nfirst\" program\nengineer, lead\n"
+  );
+}
+
 #[test]
 fn toml_demo_em_prints_expected_sequence() {
   let output = compile_and_run("toml_demo.em");

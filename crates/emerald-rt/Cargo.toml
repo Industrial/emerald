@@ -291,5 +291,12 @@ pbkdf2 = { version = "0.13", features = ["sha2"] }
 # scope follow-up work, not folded in here. `Toml.parse`/`JsonValue.
 # to_toml`'s direct backing.
 toml = "1"
+# Plan 121: real-checked at this plan's own authoring time (2026-09-22,
+# via docs.rs) - csv 1.4.0, BurntSushi-owned (the author of ripgrep),
+# the canonical, official Rust CSV reader/writer, #6 in Encoding,
+# 17.9M downloads/month, used directly in 3,392 crates. `Csv.parse`/
+# `.parse_with_headers`/`.write`'s direct backing. No RustSec advisory
+# found.
+csv = "1"
 
 [build-dependencies]

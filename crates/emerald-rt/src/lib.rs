@@ -145,6 +145,11 @@ pub(crate) fn tokio_rt() -> &'static tokio::runtime::Runtime {
 mod aead;
 mod asymmetric;
 mod bytes;
+// Named `csvs`, not `csv` — this crate's own `mod csv` would shadow
+// the external `csv` crate this module wraps, the identical collision
+// `aead.rs`/`url.rs`/`toml.rs` already hit and disclosed.
+#[path = "csv.rs"]
+mod csvs;
 mod dns;
 mod encoding;
 mod env;
@@ -1744,6 +1749,27 @@ pub unsafe extern "C" fn emerald_rt_toml_parse(s: *const c_char) -> *mut c_void 
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_json_to_toml(obj: *const c_void) -> *mut c_void {
   catch_and_raise(move || tomls::json_to_toml(obj))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_csv_parse(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || csvs::csv_parse(s))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_csv_parse_with_headers(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || csvs::csv_parse_with_headers(s))
+}
+
+/// # Safety
+/// `rows` must point to a real `Array[Array[String]]` buffer.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_csv_write(rows: *const c_void) -> *const c_char {
+  catch_and_raise(move || csvs::csv_write(rows))
 }
 
 // Real, expected consequence of introducing genuine cross-archive
