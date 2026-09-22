@@ -4214,6 +4214,62 @@ fn infer_expr_type(
         expr.span,
       ))
     }
+    // Plan 110's Decision log: `AesGcm256`/`XChaCha20Poly1305` — the
+    // same reserved-namespace static-call shape plan 109's hash
+    // functions immediately above use. `AeadError` is plain `String`
+    // (this plan's own real, disclosed simplification — see
+    // `aead.rs`'s own module doc in `emerald-rt`), so every fallible
+    // operation here returns `Result[Bytes, String]`/`Result[AeadKey,
+    // String]`, the identical shape every other fallible native
+    // intrinsic in this compiler already returns.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "AesGcm256" | "XChaCha20Poly1305")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      let key_ty = Type::Newtype("AeadKey".to_string(), Box::new(Type::Int64));
+      let bytes_result = Type::Result(Box::new(bytes_ty.clone()), Box::new(Type::String));
+      let (expected_params, ret) = match method.as_str() {
+        "generate_key" => (vec![], key_ty.clone()),
+        "key_from_bytes" => (
+          vec![bytes_ty.clone()],
+          Type::Result(Box::new(key_ty.clone()), Box::new(Type::String)),
+        ),
+        "encrypt" | "decrypt" => (
+          vec![key_ty.clone(), bytes_ty.clone(), bytes_ty.clone()],
+          bytes_result.clone(),
+        ),
+        "encrypt_with_nonce" | "decrypt_with_nonce" => (
+          vec![
+            key_ty.clone(),
+            bytes_ty.clone(),
+            bytes_ty.clone(),
+            bytes_ty.clone(),
+          ],
+          bytes_result.clone(),
+        ),
+        other => {
+          return Err(Diagnostic::new(
+            format!("{recv_name} has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
@@ -4816,6 +4872,22 @@ fn infer_expr_type(
             gctx,
           )?;
           return Ok(ret);
+        }
+        // Plan 110's Decision log: `AeadKey#free` — resolves this
+        // plan's own "Not yet decided item 1" EXECUTE blocker (a real,
+        // explicit consuming-free operation, backed by plan 93's
+        // `crate::handle::handle_close`, the same mechanism
+        // `Sha256Hasher`/`Blake3Hasher#finalize` already use to make
+        // their own zeroize/free story real).
+        if name == "AeadKey" {
+          if method != "free" {
+            return Err(Diagnostic::new(
+              format!("AeadKey has no method `{method}`"),
+              expr.span,
+            ));
+          }
+          check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+          return Ok(Type::Void);
         }
         if name == "LogFields" && method == "set" {
           if args.len() != 2 {
@@ -11772,6 +11844,30 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   );
   classes.insert(
     "Blake3Hasher".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 110's Decision log: `AeadKey` — the identical "reserved name,
+  // zero-cost `Int64` handle" shape as `Sha256Hasher`/`Blake3Hasher`
+  // immediately above, backed by plan 93's own `crate::handle`
+  // registry in `emerald-rt` (a boxed `zeroize::Zeroizing<[u8; 32]>`).
+  // Deliberately untagged per-algorithm (one shape shared by both
+  // `AesGcm256` and `XChaCha20Poly1305`, both 256-bit keys) — a real,
+  // disclosed simplification vs. this plan's own "per-algorithm-
+  // tagged" framing; see `aead.rs`'s own module doc. `.free` is
+  // carved out of the ordinary newtype `.value`-only restriction, the
+  // same mechanism `Regex`/`Sha256Hasher` already establish.
+  classes.insert(
+    "AeadKey".to_string(),
     ClassInfo {
       fields: HashMap::new(),
       methods: HashMap::new(),

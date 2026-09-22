@@ -104,5 +104,35 @@ sha2 = "0.11"
 sha3 = "0.12"
 blake3 = "1.8"
 md-5 = "0.11"
+# Plan 110: real-checked at this plan's own authoring time (2026-09-22,
+# via docs.rs) - aes-gcm 0.11.1 (Aug 21 2026), chacha20poly1305 0.11.0
+# (Sep 17 2026), both RustCrypto (github:rustcrypto:aeads), both pure
+# Rust, both carrying one NCC Group security audit (2020, funded by
+# MobileCoin, no significant findings, per each crate's own README).
+# RUSTSEC-2023-0096 (decrypt_in_place_detached exposing unauthenticated
+# plaintext) checked - this plan's own `.decrypt` wrapper is built on
+# the safe, Vec-returning `aead::Aead::decrypt` only, never the
+# in-place/detached API the advisory names, and never affected
+# regardless of version. No other open RustSec advisory found against
+# either crate. `zeroize` 1.x - RustCrypto-owned, the same
+# already-widely-used crate both AEAD crates' own `zeroize` feature
+# already pulls in transitively; added here directly so `AeadKey`'s own
+# key-material storage in emerald-rt can use `Zeroizing<[u8; 32]>`
+# itself, not just rely on it inside the cipher structs. Real, disclosed
+# correction found compiling this: neither crate actually has a "std"
+# feature (this plan's own text named one) - dropped from both;
+# `alloc`/`default` already cover the `Vec`-returning API this plan
+# uses.
+aead = { version = "0.6", features = ["getrandom"] }
+aes-gcm = { version = "0.11", features = ["getrandom", "zeroize"] }
+chacha20poly1305 = { version = "0.11", features = ["getrandom", "zeroize"] }
+zeroize = "1"
+# `getrandom` 0.4.3 - already pulled in transitively by aes-gcm's/
+# chacha20poly1305's own "getrandom" feature; added directly here so
+# this plan's own nonce/key generation can call `getrandom::fill`
+# itself rather than fight the AEAD crates' own generic `Generate`
+# trait API (found, empirically, to require type-level plumbing this
+# plan's own simple byte-buffer needs don't warrant).
+getrandom = "0.4"
 
 [build-dependencies]

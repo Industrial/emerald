@@ -126,6 +126,7 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+mod aead;
 mod bytes;
 mod encoding;
 mod env;
@@ -1098,6 +1099,124 @@ pub unsafe extern "C" fn emerald_rt_blake3_hasher_update(id: i64, bytes_id: i64)
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_blake3_hasher_finalize(id: i64) -> i64 {
   catch_and_raise(move || hashing::blake3_hasher_finalize(id))
+}
+
+// Plan 110 (Symmetric AEAD Encryption): `AesGcm256`/`XChaCha20Poly1305`
+// `.generate_key`/`.key_from_bytes`/`.encrypt`/`.decrypt`/
+// `.encrypt_with_nonce`/`.decrypt_with_nonce`, `AeadKey#free` — see
+// `aead.rs`'s own module doc.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_aead_generate_key() -> i64 {
+  catch_and_raise(aead::generate_key)
+}
+
+/// # Safety
+/// `bytes_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_aead_key_from_bytes(bytes_id: i64) -> *mut c_void {
+  catch_and_raise(move || aead::key_from_bytes(bytes_id))
+}
+
+/// # Safety
+/// `id` must be a live `AeadKey` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_aead_key_free(id: i64) {
+  catch_and_raise(move || aead::key_free(id))
+}
+
+/// # Safety
+/// `plaintext_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_aes_gcm_encrypt(
+  key_id: i64,
+  plaintext_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::aes_gcm_encrypt(key_id, plaintext_id, aad_id))
+}
+
+/// # Safety
+/// `sealed_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_aes_gcm_decrypt(
+  key_id: i64,
+  sealed_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::aes_gcm_decrypt(key_id, sealed_id, aad_id))
+}
+
+/// # Safety
+/// `nonce_id`/`plaintext_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_aes_gcm_encrypt_with_nonce(
+  key_id: i64,
+  nonce_id: i64,
+  plaintext_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::aes_gcm_encrypt_with_nonce(key_id, nonce_id, plaintext_id, aad_id))
+}
+
+/// # Safety
+/// `nonce_id`/`sealed_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_aes_gcm_decrypt_with_nonce(
+  key_id: i64,
+  nonce_id: i64,
+  sealed_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::aes_gcm_decrypt_with_nonce(key_id, nonce_id, sealed_id, aad_id))
+}
+
+/// # Safety
+/// `plaintext_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xchacha_encrypt(
+  key_id: i64,
+  plaintext_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::xchacha_encrypt(key_id, plaintext_id, aad_id))
+}
+
+/// # Safety
+/// `sealed_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xchacha_decrypt(
+  key_id: i64,
+  sealed_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::xchacha_decrypt(key_id, sealed_id, aad_id))
+}
+
+/// # Safety
+/// `nonce_id`/`plaintext_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xchacha_encrypt_with_nonce(
+  key_id: i64,
+  nonce_id: i64,
+  plaintext_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::xchacha_encrypt_with_nonce(key_id, nonce_id, plaintext_id, aad_id))
+}
+
+/// # Safety
+/// `nonce_id`/`sealed_id`/`aad_id` must be live `Bytes` values.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_xchacha_decrypt_with_nonce(
+  key_id: i64,
+  nonce_id: i64,
+  sealed_id: i64,
+  aad_id: i64,
+) -> *mut c_void {
+  catch_and_raise(move || aead::xchacha_decrypt_with_nonce(key_id, nonce_id, sealed_id, aad_id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

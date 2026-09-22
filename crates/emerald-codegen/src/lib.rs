@@ -178,6 +178,8 @@ fn set_newtype_underlying(program: &Program) {
     "Blake3Hasher".to_string(),
     TypeExpr::Named("Int64".to_string()),
   );
+  // Plan 110's Decision log: `AeadKey` — the identical shape.
+  map.insert("AeadKey".to_string(), TypeExpr::Named("Int64".to_string()));
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
@@ -5023,6 +5025,21 @@ struct Ctx<'a, 'ctx> {
   blake3_hasher_new: FunctionValue<'ctx>,
   blake3_hasher_update: FunctionValue<'ctx>,
   blake3_hasher_finalize: FunctionValue<'ctx>,
+  /// Plan 110 (Symmetric AEAD Encryption) — `AesGcm256`/
+  /// `XChaCha20Poly1305`'s `.generate_key`/`.key_from_bytes`/
+  /// `.encrypt`/`.decrypt`/`.encrypt_with_nonce`/`.decrypt_with_nonce`,
+  /// `AeadKey#free`.
+  aead_generate_key: FunctionValue<'ctx>,
+  aead_key_from_bytes: FunctionValue<'ctx>,
+  aead_key_free: FunctionValue<'ctx>,
+  aes_gcm_encrypt: FunctionValue<'ctx>,
+  aes_gcm_decrypt: FunctionValue<'ctx>,
+  aes_gcm_encrypt_with_nonce: FunctionValue<'ctx>,
+  aes_gcm_decrypt_with_nonce: FunctionValue<'ctx>,
+  xchacha_encrypt: FunctionValue<'ctx>,
+  xchacha_decrypt: FunctionValue<'ctx>,
+  xchacha_encrypt_with_nonce: FunctionValue<'ctx>,
+  xchacha_decrypt_with_nonce: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7926,6 +7943,26 @@ fn build_method_call<'ctx>(
         }
       }
     }
+    // Plan 110's Decision log: `AeadKey#free` — resolves the plan's own
+    // EXECUTE blocker on a real, working consuming-free mechanism.
+    if local_classes.get(recv_name).map(String::as_str) == Some("AeadKey") {
+      if method != "free" {
+        return Err(format!("codegen: unsupported AeadKey method `{method}`"));
+      }
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      builder
+        .build_call(ctx.aead_key_free, &[recv_val.into()], "aeadkeyfreetmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -8183,6 +8220,74 @@ fn build_method_call<'ctx>(
       .build_call(fv, &[v.into()], "hashtmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 110's Decision log: `AesGcm256`/`XChaCha20Poly1305` — the
+  // same reserved-namespace static-call shape immediately above.
+  // Every argument (`AeadKey`/`Bytes`) is a plain `i64_ty` (see
+  // `bytes.rs`'s/`aead.rs`'s own module docs), so this dispatch just
+  // builds each arg in order and forwards them.
+  if matches!(recv_name.as_str(), "AesGcm256" | "XChaCha20Poly1305") {
+    if method == "generate_key" {
+      let call = builder
+        .build_call(ctx.aead_generate_key, &[], "aeadgeneratekeytmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let is_gcm = recv_name == "AesGcm256";
+    let fv = match method {
+      "key_from_bytes" => ctx.aead_key_from_bytes,
+      "encrypt" => {
+        if is_gcm {
+          ctx.aes_gcm_encrypt
+        } else {
+          ctx.xchacha_encrypt
+        }
+      }
+      "decrypt" => {
+        if is_gcm {
+          ctx.aes_gcm_decrypt
+        } else {
+          ctx.xchacha_decrypt
+        }
+      }
+      "encrypt_with_nonce" => {
+        if is_gcm {
+          ctx.aes_gcm_encrypt_with_nonce
+        } else {
+          ctx.xchacha_encrypt_with_nonce
+        }
+      }
+      "decrypt_with_nonce" => {
+        if is_gcm {
+          ctx.aes_gcm_decrypt_with_nonce
+        } else {
+          ctx.xchacha_decrypt_with_nonce
+        }
+      }
+      other => {
+        return Err(format!(
+          "codegen: unsupported {recv_name} static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "aeadtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -18851,6 +18956,76 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 110 (Symmetric AEAD Encryption): `Bytes`/`AeadKey` values
+  // cross every call here as a plain `i64_ty` (see `bytes.rs`'s/
+  // `aead.rs`'s own module docs), zero additional marshaling.
+  let aead_generate_key = module.add_function(
+    "emerald_rt_aead_generate_key",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let aead_key_from_bytes = module.add_function(
+    "emerald_rt_aead_key_from_bytes",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let aead_key_free = module.add_function(
+    "emerald_rt_aead_key_free",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let aes_gcm_encrypt = module.add_function(
+    "emerald_rt_aes_gcm_encrypt",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let aes_gcm_decrypt = module.add_function(
+    "emerald_rt_aes_gcm_decrypt",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let aes_gcm_encrypt_with_nonce = module.add_function(
+    "emerald_rt_aes_gcm_encrypt_with_nonce",
+    ptr_ty.fn_type(
+      &[i64_ty.into(), i64_ty.into(), i64_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let aes_gcm_decrypt_with_nonce = module.add_function(
+    "emerald_rt_aes_gcm_decrypt_with_nonce",
+    ptr_ty.fn_type(
+      &[i64_ty.into(), i64_ty.into(), i64_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let xchacha_encrypt = module.add_function(
+    "emerald_rt_xchacha_encrypt",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let xchacha_decrypt = module.add_function(
+    "emerald_rt_xchacha_decrypt",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let xchacha_encrypt_with_nonce = module.add_function(
+    "emerald_rt_xchacha_encrypt_with_nonce",
+    ptr_ty.fn_type(
+      &[i64_ty.into(), i64_ty.into(), i64_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let xchacha_decrypt_with_nonce = module.add_function(
+    "emerald_rt_xchacha_decrypt_with_nonce",
+    ptr_ty.fn_type(
+      &[i64_ty.into(), i64_ty.into(), i64_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -19437,6 +19612,7 @@ fn compile_to_object_impl(
   newtypes.insert("Bytes".to_string());
   newtypes.insert("Sha256Hasher".to_string());
   newtypes.insert("Blake3Hasher".to_string());
+  newtypes.insert("AeadKey".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -19568,6 +19744,17 @@ fn compile_to_object_impl(
     blake3_hasher_new,
     blake3_hasher_update,
     blake3_hasher_finalize,
+    aead_generate_key,
+    aead_key_from_bytes,
+    aead_key_free,
+    aes_gcm_encrypt,
+    aes_gcm_decrypt,
+    aes_gcm_encrypt_with_nonce,
+    aes_gcm_decrypt_with_nonce,
+    xchacha_encrypt,
+    xchacha_decrypt,
+    xchacha_encrypt_with_nonce,
+    xchacha_decrypt_with_nonce,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

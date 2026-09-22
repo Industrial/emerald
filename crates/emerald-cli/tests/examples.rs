@@ -411,3 +411,14 @@ fn crypto_hashing_proof_em_prints_expected_sequence() {
      b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\n"
   );
 }
+
+// Plan 110 (Symmetric AEAD Encryption): a correctness-PROPERTY proof,
+// not a fixed-ciphertext assertion — the auto-nonce path is
+// intentionally non-deterministic run-to-run (this plan's own
+// Decision log). What's checked: decrypting with the right key
+// recovers the exact original plaintext, and decrypting with a
+// different, unrelated key fails closed every time.
+#[test]
+fn crypto_aead_proof_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("crypto_aead_proof.em"), "true\ntrue\n");
+}
