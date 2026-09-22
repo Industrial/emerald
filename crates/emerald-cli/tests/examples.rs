@@ -284,3 +284,19 @@ fn structured_logging_proof_em_prints_expected_sequence() {
     "{\"level\":\"INFO\",\"message\":\"service starting\"}\n{\"level\":\"INFO\",\"message\":\"user signed in\",\"fields\":{\"user_id\":\"42\",\"plan\":\"pro\"}}\n{\"level\":\"WARN\",\"message\":\"cache miss\"}\n"
   );
 }
+
+// `derive Serializable` (this session's `derive-serializable` leaf):
+// a real class's synthesized `to_json_value` round-tripped through
+// `.to_s`. Field order is alphabetical (`active`, `age`, `gpa`,
+// `name`) — the same determinism convention `derive Comparable`'s
+// own field-name sort already established, reused here rather than
+// declaration order. `age` (`Int64`) widens to `36.0` through the
+// new `.to_f` conversion this leaf adds; `gpa` (already `Float64`)
+// does not.
+#[test]
+fn derive_serializable_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("derive_serializable.em"),
+    "{\"active\":true,\"age\":36.0,\"gpa\":3.9,\"name\":\"Ada\"}\n"
+  );
+}

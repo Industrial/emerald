@@ -4124,10 +4124,71 @@ mod tests {
 
   #[test]
   fn expand_derives_rejects_an_unknown_derive_target() {
-    let src = "class Point derive Serializable\n  x: Int64\nend\n";
+    let src = "class Point derive Frobnicatable\n  x: Int64\nend\n";
     let mut program = parse(src).expect("should parse");
     let err = crate::expand_derives(&mut program).expect_err("should reject");
-    assert!(err.contains("Serializable"));
+    assert!(err.contains("Frobnicatable"));
+  }
+
+  // `derive-serializable`'s own Decision log.
+
+  #[test]
+  fn expand_derives_synthesizes_to_json_value_from_alphabetized_fields() {
+    let src = "class Person derive Serializable\n  name: String\n  age: Int64\nend\n";
+    let mut program = parse(src).expect("should parse");
+    crate::expand_derives(&mut program).expect("should expand");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    let to_json = c
+      .methods
+      .iter()
+      .find(|m| m.name == "to_json_value")
+      .expect("expected a synthesized to_json_value");
+    assert!(to_json.params.is_empty());
+    assert_eq!(to_json.return_type, "JsonValue");
+    let expected_body = vec![s(Stmt::Return(Some(s(Expr::Call(
+      "JsonObject".to_string(),
+      vec![s(Expr::HashLit(vec![
+        (
+          s(Expr::StringLit("age".to_string())),
+          s(Expr::Call(
+            "JsonNumber".to_string(),
+            vec![s(Expr::MethodCall(
+              Box::new(s(Expr::InstanceVar("age".to_string()))),
+              "to_f".to_string(),
+              vec![],
+            ))],
+          )),
+        ),
+        (
+          s(Expr::StringLit("name".to_string())),
+          s(Expr::Call(
+            "JsonString".to_string(),
+            vec![s(Expr::InstanceVar("name".to_string()))],
+          )),
+        ),
+      ]))],
+    )))))];
+    assert_eq!(to_json.body, expected_body);
+  }
+
+  #[test]
+  fn expand_derives_rejects_a_serializable_field_of_unsupported_type() {
+    let src = "class Wrapper derive Serializable\n  items: Array[Int64]\nend\n";
+    let mut program = parse(src).expect("should parse");
+    let err = crate::expand_derives(&mut program).expect_err("should reject");
+    assert!(err.contains("Wrapper"));
+    assert!(err.contains("items"));
+  }
+
+  #[test]
+  fn expand_derives_rejects_a_class_that_already_hand_writes_to_json_value() {
+    let src = "class Point derive Serializable\n  x: Int64\n  fn to_json_value: JsonValue do\n    JsonNull()\n  end\nend\n";
+    let mut program = parse(src).expect("should parse");
+    let err = crate::expand_derives(&mut program).expect_err("should reject");
+    assert!(err.contains("Point"));
+    assert!(err.contains("to_json_value"));
   }
 
   #[test]

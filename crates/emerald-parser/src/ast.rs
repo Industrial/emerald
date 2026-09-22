@@ -335,19 +335,31 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
       ),
       _ => unreachable!("indices were collected from Item::Class matches above"),
     };
-    if derive_name != "Comparable" {
+    if derive_name != "Comparable" && derive_name != "Serializable" {
       return Err(format!(
-        "class `{class_name}` declares an unsupported derive target `{derive_name}` — only `Comparable` is supported"
+        "class `{class_name}` declares an unsupported derive target `{derive_name}` — only `Comparable`/`Serializable` are supported"
       ));
     }
-    let already_has_eq = match &program.items[i] {
-      Item::Class(c) => c.methods.iter().any(|m| m.name == "=="),
-      _ => unreachable!(),
-    };
-    if already_has_eq {
-      return Err(format!(
-        "class `{class_name}` already defines `==`; remove it or drop `derive Comparable`"
-      ));
+    if derive_name == "Comparable" {
+      let already_has_eq = match &program.items[i] {
+        Item::Class(c) => c.methods.iter().any(|m| m.name == "=="),
+        _ => unreachable!(),
+      };
+      if already_has_eq {
+        return Err(format!(
+          "class `{class_name}` already defines `==`; remove it or drop `derive Comparable`"
+        ));
+      }
+    } else {
+      let already_has_to_json = match &program.items[i] {
+        Item::Class(c) => c.methods.iter().any(|m| m.name == "to_json_value"),
+        _ => unreachable!(),
+      };
+      if already_has_to_json {
+        return Err(format!(
+          "class `{class_name}` already defines `to_json_value`; remove it or drop `derive Serializable`"
+        ));
+      }
     }
 
     // Walk `superclass` across the already-`require`-merged `Program.
@@ -393,73 +405,53 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
     let mut field_names: Vec<String> = fields.keys().cloned().collect();
     field_names.sort();
 
-    let has_accessor = |field: &str| -> bool {
-      let self_has = match &program.items[i] {
-        Item::Class(c) => c
-          .methods
-          .iter()
-          .any(|m| m.name == field && m.params.is_empty()),
-        _ => unreachable!(),
-      };
-      self_has
-        || ancestors.iter().any(|a| {
-          a.methods
+    if derive_name == "Comparable" {
+      let has_accessor = |field: &str| -> bool {
+        let self_has = match &program.items[i] {
+          Item::Class(c) => c
+            .methods
             .iter()
-            .any(|m| m.name == field && m.params.is_empty())
-        })
-    };
-    let missing_accessors: Vec<(String, TypeExpr)> = field_names
-      .iter()
-      .filter(|f| !has_accessor(f))
-      .map(|f| (f.clone(), fields[f].clone()))
-      .collect();
+            .any(|m| m.name == field && m.params.is_empty()),
+          _ => unreachable!(),
+        };
+        self_has
+          || ancestors.iter().any(|a| {
+            a.methods
+              .iter()
+              .any(|m| m.name == field && m.params.is_empty())
+          })
+      };
+      let missing_accessors: Vec<(String, TypeExpr)> = field_names
+        .iter()
+        .filter(|f| !has_accessor(f))
+        .map(|f| (f.clone(), fields[f].clone()))
+        .collect();
 
-    let cmp_chain = field_names.iter().fold(None, |acc, name| {
-      let cmp = Spanned::synthetic(Expr::Compare(
-        Box::new(Spanned::synthetic(Expr::InstanceVar(name.clone()))),
-        CompareOp::Eq,
-        Box::new(Spanned::synthetic(Expr::MethodCall(
-          Box::new(Spanned::synthetic(Expr::Ident("other".to_string()))),
-          name.clone(),
-          vec![],
-        ))),
-      ));
-      match acc {
-        None => Some(cmp),
-        Some(prev) => Some(Spanned::synthetic(Expr::And(Box::new(prev), Box::new(cmp)))),
-      }
-    });
-    let body_expr = cmp_chain.unwrap_or_else(|| Spanned::synthetic(Expr::Bool(true)));
-    let eq_fn = Function {
-      name: "==".to_string(),
-      params: vec![Param {
-        name: "other".to_string(),
-        ty: TypeExpr::Named(class_name.clone()),
-        default: None,
-      }],
-      return_type: TypeExpr::Named("Boolean".to_string()),
-      body: vec![Spanned::synthetic(Stmt::Return(Some(body_expr)))],
-      block_param: None,
-      splat_param: None,
-      type_params: Vec::new(),
-      is_comptime: false,
-      requires: Vec::new(),
-      ensures: Vec::new(),
-      is_pure: false,
-      doc: None,
-    };
-
-    let Item::Class(c) = &mut program.items[i] else {
-      unreachable!("indices were collected from Item::Class matches above")
-    };
-    for (fname, fty) in missing_accessors {
-      c.methods.push(Function {
-        name: fname.clone(),
-        params: vec![],
-        return_type: fty,
-        body: vec![Spanned::synthetic(Stmt::Expr(Spanned::synthetic(
-          Expr::InstanceVar(fname),
-        )))],
+      let cmp_chain = field_names.iter().fold(None, |acc, name| {
+        let cmp = Spanned::synthetic(Expr::Compare(
+          Box::new(Spanned::synthetic(Expr::InstanceVar(name.clone()))),
+          CompareOp::Eq,
+          Box::new(Spanned::synthetic(Expr::MethodCall(
+            Box::new(Spanned::synthetic(Expr::Ident("other".to_string()))),
+            name.clone(),
+            vec![],
+          ))),
+        ));
+        match acc {
+          None => Some(cmp),
+          Some(prev) => Some(Spanned::synthetic(Expr::And(Box::new(prev), Box::new(cmp)))),
+        }
+      });
+      let body_expr = cmp_chain.unwrap_or_else(|| Spanned::synthetic(Expr::Bool(true)));
+      let eq_fn = Function {
+        name: "==".to_string(),
+        params: vec![Param {
+          name: "other".to_string(),
+          ty: TypeExpr::Named(class_name.clone()),
+          default: None,
+        }],
+        return_type: TypeExpr::Named("Boolean".to_string()),
+        body: vec![Spanned::synthetic(Stmt::Return(Some(body_expr)))],
         block_param: None,
         splat_param: None,
         type_params: Vec::new(),
@@ -468,9 +460,124 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
         ensures: Vec::new(),
         is_pure: false,
         doc: None,
-      });
+      };
+
+      let Item::Class(c) = &mut program.items[i] else {
+        unreachable!("indices were collected from Item::Class matches above")
+      };
+      for (fname, fty) in missing_accessors {
+        c.methods.push(Function {
+          name: fname.clone(),
+          params: vec![],
+          return_type: fty,
+          body: vec![Spanned::synthetic(Stmt::Expr(Spanned::synthetic(
+            Expr::InstanceVar(fname),
+          )))],
+          block_param: None,
+          splat_param: None,
+          type_params: Vec::new(),
+          is_comptime: false,
+          requires: Vec::new(),
+          ensures: Vec::new(),
+          is_pure: false,
+          doc: None,
+        });
+      }
+      c.methods.push(eq_fn);
+    } else {
+      // `derive Serializable` (this plan's own Decision log):
+      // synthesizes `to_json_value(self): JsonValue`, building a real
+      // `JsonObject({...})` (plan 118's own tagged-union enum) whose
+      // keys are each field's own name (a `StringLit`, matching
+      // `field_names`' identical alphabetical-determinism precedent
+      // `Comparable`'s `cmp_chain` above already established) and
+      // whose values are a per-field-type conversion into a `JsonValue`
+      // variant — reusing `Expr::Call("JsonNumber"/"JsonString"/
+      // "JsonBool", ...)`, the exact same bare-name enum-variant-
+      // construction shape `Some(x)`/`None()` already use (see
+      // `emerald-sema`'s `find_all_variants`-gated `Expr::Call` arm).
+      //
+      // Deliberately scoped to four field types only — `Int64`,
+      // `Float64`, `String`, `Boolean` — erroring by name on anything
+      // else (a nested class, `Array[T]`, `Hash[K,V]`, `Option[T]`,
+      // ...). This is a real, disclosed v1 limitation, not an
+      // oversight: recursing into a field's own type (calling ITS
+      // `to_json_value` in turn, or lowering an `Array[T]` element-
+      // wise into a `JsonArray`) is a straightforward but real
+      // follow-up this leaf does not attempt.
+      //
+      // The reverse direction — `from_json_value` — is NOT synthesized
+      // here at all, and this is a verified compiler limitation, not a
+      // choice: constructing `Self` from a parsed `JsonValue` needs a
+      // `ClassName.from_json_value(v)` call with NO receiver instance,
+      // and this compiler has no such dispatch path for a real user
+      // class today (`crates/emerald-sema/src/lib.rs`'s own `Expr::New`
+      // arm is the ONLY way a class is ever constructed — `.new`/
+      // `.spawn`/`.remote`/`.locate` are the sole reserved call forms
+      // on a bare class name; there is no user-class-level static-
+      // method grammar or dispatch at all, confirmed directly against
+      // `grammar.lalrpop`'s `MethodDef`, which admits only ordinary,
+      // implicitly-`self`-taking methods). Deserialization is deferred,
+      // pending a future "class-level static methods" prerequisite
+      // plan — the identical "disclosed, not silently dodged" discipline
+      // plan 118's own deferred `leaf-fix-hash-generic-indexing` item
+      // already established.
+      let mut pairs: Vec<(Spanned<Expr>, Spanned<Expr>)> = Vec::new();
+      for name in &field_names {
+        let fty = &fields[name];
+        let field_read = Spanned::synthetic(Expr::InstanceVar(name.clone()));
+        let json_val_expr = match fty {
+          TypeExpr::Named(n) if n == "Int64" => Spanned::synthetic(Expr::Call(
+            "JsonNumber".to_string(),
+            vec![Spanned::synthetic(Expr::MethodCall(
+              Box::new(field_read),
+              "to_f".to_string(),
+              vec![],
+            ))],
+          )),
+          TypeExpr::Named(n) if n == "Float64" => {
+            Spanned::synthetic(Expr::Call("JsonNumber".to_string(), vec![field_read]))
+          }
+          TypeExpr::Named(n) if n == "String" => {
+            Spanned::synthetic(Expr::Call("JsonString".to_string(), vec![field_read]))
+          }
+          TypeExpr::Named(n) if n == "Boolean" => {
+            Spanned::synthetic(Expr::Call("JsonBool".to_string(), vec![field_read]))
+          }
+          other => {
+            return Err(format!(
+              "class `{class_name}` derives `Serializable` but field `{name}` has type `{other}`, which `derive Serializable` does not yet support — only `Int64`/`Float64`/`String`/`Boolean` fields are supported"
+            ));
+          }
+        };
+        pairs.push((
+          Spanned::synthetic(Expr::StringLit(name.clone())),
+          json_val_expr,
+        ));
+      }
+      let json_object_expr = Spanned::synthetic(Expr::Call(
+        "JsonObject".to_string(),
+        vec![Spanned::synthetic(Expr::HashLit(pairs))],
+      ));
+      let to_json_fn = Function {
+        name: "to_json_value".to_string(),
+        params: vec![],
+        return_type: TypeExpr::Named("JsonValue".to_string()),
+        body: vec![Spanned::synthetic(Stmt::Return(Some(json_object_expr)))],
+        block_param: None,
+        splat_param: None,
+        type_params: Vec::new(),
+        is_comptime: false,
+        requires: Vec::new(),
+        ensures: Vec::new(),
+        is_pure: false,
+        doc: None,
+      };
+      let Item::Class(c) = &mut program.items[i] else {
+        unreachable!("indices were collected from Item::Class matches above")
+      };
+      c.methods.push(to_json_fn);
     }
-    c.methods.push(eq_fn);
   }
 
   Ok(())

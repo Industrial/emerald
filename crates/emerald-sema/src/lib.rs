@@ -4506,6 +4506,44 @@ fn infer_expr_type(
         )?;
         return Ok(ret);
       }
+      // Plan `derive-serializable`'s Decision log: `.to_f`/`.to_i` — a
+      // real, previously-nonexistent `Int64`<->`Float64` conversion,
+      // added as a narrow prerequisite for `derive Serializable`'s own
+      // `to_json_value` synthesis (`JsonNumber` only ever carries a
+      // `Float64`, per plan 118, and there was verified to be no way to
+      // produce one from an `Int64` field anywhere in this compiler
+      // before this). Same receiver-inferred-type dispatch shape
+      // `JsonValue`'s own `.get`/`.to_s` immediately above use.
+      if recv_ty == Type::Int64 {
+        if method != "to_f" {
+          return Err(Diagnostic::new(
+            format!("Int64 has no method `{method}`"),
+            expr.span,
+          ));
+        }
+        if !args.is_empty() {
+          return Err(Diagnostic::new(
+            format!("`.to_f` takes no arguments, found {}", args.len()),
+            expr.span,
+          ));
+        }
+        return Ok(Type::Float64);
+      }
+      if recv_ty == Type::Float64 {
+        if method != "to_i" {
+          return Err(Diagnostic::new(
+            format!("Float64 has no method `{method}`"),
+            expr.span,
+          ));
+        }
+        if !args.is_empty() {
+          return Err(Diagnostic::new(
+            format!("`.to_i` takes no arguments, found {}", args.len()),
+            expr.span,
+          ));
+        }
+        return Ok(Type::Int64);
+      }
       let Type::Class(class_name) = &recv_ty else {
         return Err(Diagnostic::new(
           format!("method call `.{method}` on non-class type {recv_ty:?}"),
@@ -12414,10 +12452,23 @@ mod tests {
 
   #[test]
   fn rejects_method_call_on_non_class_receiver() {
+    // Real, disclosed correction (`derive-serializable`'s own leaf,
+    // adding a real `Int64`-receiver dispatch arm for `.to_f` — see
+    // that arm's own Decision log): `.sum` on a plain `Int64` receiver
+    // is now rejected by THAT arm's own "no method" message, not the
+    // generic non-class fallthrough this test originally named — an
+    // `Int64` receiver of any kind now always lands in the dedicated
+    // arm, the same "receiver's own inferred type wins" precedent this
+    // codebase already established for `String`/`JsonValue`/newtypes.
     let src = "x: Int64 = 5\nputs x.sum\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs = check_program(&program).expect_err("must reject .sum on an Int64 receiver");
-    assert!(errs.iter().any(|d| d.message.contains("non-class type")));
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Int64 has no method `sum`")),
+      "{errs:?}"
+    );
   }
 
   const ARRAY_EXAMPLE: &str =
@@ -14867,11 +14918,23 @@ mod tests {
     // same fix `.value`/`.sum` needed after an earlier, name-guarded
     // version broke `examples/classes.em`'s own real `Counter`/`Point`
     // methods.
+    //
+    // Second, later correction (`derive-serializable`'s own leaf): an
+    // `Int64` receiver now has its OWN dedicated dispatch arm (for
+    // `.to_f`), so `.each` on one is rejected by that arm's own "no
+    // method" message instead of the generic non-class fallthrough —
+    // still a real, named rejection, just a different (more specific)
+    // message than the one originally asserted here.
     let src = "printer: Proc = do |x: Int64| puts x end\nn: Int64 = 5\nn.each(printer)\n";
     let program = emerald_parser::parse(src).expect("should parse");
     let errs =
       check_program(&program).expect_err("`.each` on a non-Array/Hash receiver must be rejected");
-    assert!(errs.iter().any(|d| d.message.contains(".each")), "{errs:?}");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Int64 has no method `each`")),
+      "{errs:?}"
+    );
   }
 
   #[test]

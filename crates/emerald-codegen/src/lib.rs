@@ -7444,6 +7444,44 @@ fn build_method_call<'ctx>(
     }
   }
 
+  // Plan `derive-serializable`'s Decision log: `.to_f`/`.to_i` — a real
+  // LLVM `sitofp`/`fptosi` conversion, not a runtime call (there's no
+  // `emerald-rt`/C-runtime symbol for this — a plain scalar cast needs
+  // none). Checked here, before the `Expr::Ident`-only receiver guard
+  // below, for the identical reason the `InstanceVar` special cases
+  // immediately above are: `derive Serializable`'s own synthesized
+  // `to_json_value` calls this on a bare `@field` (an `Int64`/`Float64`
+  // CLASS FIELD, never a named local) — dispatched by the receiver's
+  // own actually-produced `ValKind` (evaluated once, via the ordinary
+  // `build_expr`), not by requiring a plain local first. A receiver of
+  // any other kind (a `String` local's own, separately-dispatched
+  // `.to_f`/`.to_i` included — see the `ValKind::Str` block further
+  // below) simply doesn't match either arm and falls through here,
+  // unaffected.
+  if method == "to_f" || method == "to_i" {
+    let (recv_val, recv_kind) = build_expr(
+      context,
+      builder,
+      recv,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    if method == "to_f" && recv_kind == ValKind::Int64 {
+      let f = builder
+        .build_signed_int_to_float(recv_val.into_int_value(), context.f64_type(), "toftmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((f.into(), ValKind::Float64));
+    }
+    if method == "to_i" && recv_kind == ValKind::Float64 {
+      let iv = builder
+        .build_float_to_signed_int(recv_val.into_float_value(), context.i64_type(), "toitmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((iv.into(), ValKind::Int64));
+    }
+  }
+
   // Plan 74 (enumerable chaining): resolve a chained-enumerable-call
   // receiver (`nums.select do ... end.map do ... end`) down to a plain
   // Ident first — see `resolve_chained_enumerable_receiver`'s own doc
