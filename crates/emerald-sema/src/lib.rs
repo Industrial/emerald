@@ -4166,6 +4166,55 @@ fn infer_expr_type(
         )),
       }
     }
+    // Plan 153's Decision log: `Encoding.decode`/`.decode_strict`/
+    // `.encode` — the same reserved-namespace static-call shape
+    // `Base64`/`Hex` immediately above use. `Encoding` is never
+    // declared via a real `module ... end`, so this arm (checked
+    // before the real `ModuleDef`-backed dispatch arm further below)
+    // can never collide with `classes`/`module_names`, the identical
+    // reasoning plan 45's `File` arm already established. `.decode`/
+    // `.encode` are total (`Type::String`, per the WHATWG spec's own
+    // "decoding never fails" guarantee — malformed bytes become
+    // U+FFFD); `.decode_strict` returns `Option[String]` (`nil` on
+    // malformed input or an unresolvable label), the same `Option$
+    // String` nilable shape `Env.get`/`String.from_cstring` already
+    // use.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Encoding") =>
+    {
+      let option_string = Type::Enum("Option$String".to_string());
+      match method.as_str() {
+        "decode" | "encode" => {
+          check_args(
+            method,
+            args,
+            &[Type::String, Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::String)
+        }
+        "decode_strict" => {
+          check_args(
+            method,
+            args,
+            &[Type::String, Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(option_string)
+        }
+        other => Err(Diagnostic::new(
+          format!("Encoding has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
     // Plan 122's Decision log: `Regex.compile(pattern)` — the same
     // reserved-namespace static-call shape `Json`/`Base64`/`Hex` use.
     // Every OTHER `Regex` method is an instance method on an already-

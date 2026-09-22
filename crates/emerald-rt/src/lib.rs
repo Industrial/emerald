@@ -145,6 +145,14 @@ pub(crate) fn tokio_rt() -> &'static tokio::runtime::Runtime {
 mod aead;
 mod asymmetric;
 mod bytes;
+// Plan 153 (Character Set / Encoding Conversion) — named `charset`,
+// not `encoding`: `mod encoding` below is already plan 123's Base64/
+// Hex module (its own file predates this plan and wraps a different
+// pair of namespaces entirely) — see `charset.rs`'s own module doc
+// for the full account of this collision and how it's dodged, the
+// same way `csvs`/`tomls`/`urls` already dodge their own external-
+// crate-name collisions.
+mod charset;
 // Named `csvs`, not `csv` — this crate's own `mod csv` would shadow
 // the external `csv` crate this module wraps, the identical collision
 // `aead.rs`/`url.rs`/`toml.rs` already hit and disclosed.
@@ -1777,6 +1785,47 @@ pub unsafe extern "C" fn emerald_rt_kdf_pbkdf2(
   length: i64,
 ) -> *const c_char {
   catch_and_raise(move || kdf::kdf_pbkdf2(password, salt, iterations, length))
+}
+
+/// # Safety
+/// `raw`/`label`, if non-null, must point to valid, NUL-terminated C
+/// strings. `raw` is read as a raw byte sequence, not required to be
+/// valid UTF-8 (plan 153's own disclosed `String`-UTF-8-invariant
+/// exception — see `charset.rs`'s own module doc). An unresolvable
+/// `label` is a real, disclosed runtime abort (`process::exit(1)`),
+/// not a panic caught by `catch_and_raise` — `charset::encoding_decode`
+/// itself never unwinds on that path.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_encoding_decode(
+  raw: *const c_char,
+  label: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || charset::encoding_decode(raw, label))
+}
+
+/// # Safety
+/// `raw`/`label`, if non-null, must point to valid, NUL-terminated C
+/// strings. `raw` is read as a raw byte sequence, not required to be
+/// valid UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_encoding_decode_strict(
+  raw: *const c_char,
+  label: *const c_char,
+) -> *mut c_char {
+  catch_and_raise(move || charset::encoding_decode_strict(raw, label))
+}
+
+/// # Safety
+/// `text`/`label`, if non-null, must point to valid, NUL-terminated C
+/// strings. The returned `String` is, in general, NOT valid UTF-8 —
+/// see `charset.rs`'s own module doc for this plan's disclosed
+/// deliberate exception to `String`'s documented invariant.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_encoding_encode(
+  text: *const c_char,
+  label: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || charset::encoding_encode(text, label))
 }
 
 /// # Safety

@@ -5201,6 +5201,18 @@ struct Ctx<'a, 'ctx> {
   /// Plan 115 (Key Derivation Functions) — `Kdf.hkdf`/`.pbkdf2`.
   kdf_hkdf: FunctionValue<'ctx>,
   kdf_pbkdf2: FunctionValue<'ctx>,
+  /// Plan 153 (Character Set / Encoding Conversion) — `Encoding.
+  /// decode`/`.decode_strict`/`.encode`, wrapping `encoding_rs`.
+  /// `.decode`/`.encode` return a bare `*const c_char` (`.decode` never
+  /// fails per the WHATWG spec; an unresolvable label aborts rather
+  /// than raising, matching `File.read`'s own fatal-misconfiguration
+  /// posture). `.decode_strict` returns a bare nullable pointer — this
+  /// call site itself builds the real tagged `Option[String]` value
+  /// from it, the identical `is_null`-branch-plus-`phi` pattern
+  /// `Env.get`/`String.from_cstring` already establish.
+  encoding_decode: FunctionValue<'ctx>,
+  encoding_decode_strict: FunctionValue<'ctx>,
+  encoding_encode: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -8683,6 +8695,143 @@ fn build_method_call<'ctx>(
       .build_call(fv, &[v.into()], "hextmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 153's Decision log: `Encoding.decode`/`.decode_strict`/
+  // `.encode` — the same reserved-namespace static-call shape
+  // `Base64`/`Hex` immediately above use. `.decode`/`.encode` return a
+  // bare `*const c_char` (an unresolvable label aborts inside
+  // `charset::encoding_decode`/`encoding_encode` themselves, matching
+  // `File.read`'s own fatal-misconfiguration posture — no Rust panic
+  // ever reaches this call site on that path). `.decode_strict`
+  // returns a bare nullable pointer — this call site itself builds the
+  // real tagged `Option[String]` value from it, the identical
+  // `is_null`-branch-plus-`phi` pattern `Env.get`/`String.from_cstring`
+  // already establish, reused verbatim.
+  if recv_name == "Encoding" {
+    let raw_arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `Encoding.{method}` expects 2 arguments"))?;
+    let label_arg = args
+      .get(1)
+      .ok_or_else(|| format!("codegen: `Encoding.{method}` expects 2 arguments"))?;
+    let (raw_v, _) = build_expr(
+      context,
+      builder,
+      raw_arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (label_v, _) = build_expr(
+      context,
+      builder,
+      label_arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    if method == "decode_strict" {
+      let call = builder
+        .build_call(
+          ctx.encoding_decode_strict,
+          &[raw_v.into(), label_v.into()],
+          "encodingdecodestricttmp",
+        )
+        .map_err(|e| e.to_string())?;
+      let ptr_val = call_result(call)?.into_pointer_value();
+      let enum_name = "Option$String";
+      let layout = ctx.enums.get(enum_name).ok_or_else(|| {
+        "codegen: internal error — `Option$String` was not pre-instantiated for `Encoding.decode_strict`"
+          .to_string()
+      })?;
+      let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `Some` variant".to_string()
+      })?;
+      let none_tag = *layout.variant_tags.get("None").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `None` variant".to_string()
+      })?;
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let is_null = builder
+        .build_is_null(ptr_val, "encodingdecodestrictisnull")
+        .map_err(|e| e.to_string())?;
+
+      let entry_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block")?;
+      let func = entry_block
+        .get_parent()
+        .ok_or("codegen: internal error — block has no parent function")?;
+      let some_block = context.append_basic_block(func, "encodingdecodestrict.some");
+      let none_block = context.append_basic_block(func, "encodingdecodestrict.none");
+      let merge_block = context.append_basic_block(func, "encodingdecodestrict.merge");
+      builder
+        .build_conditional_branch(is_null, none_block, some_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(some_block);
+      let some_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "encodingdecodestrictsome")
+        .map_err(|e| e.to_string())?;
+      let some_ptr = call_result(some_alloc)?.into_pointer_value();
+      let some_tag_ptr = field_ptr(context, builder, some_ptr, 0)?;
+      builder
+        .build_store(some_tag_ptr, context.i64_type().const_int(some_tag, false))
+        .map_err(|e| e.to_string())?;
+      let some_field_ptr = field_ptr(context, builder, some_ptr, 8)?;
+      builder
+        .build_store(some_field_ptr, ptr_val)
+        .map_err(|e| e.to_string())?;
+      let some_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after some")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(none_block);
+      let none_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "encodingdecodestrictnone")
+        .map_err(|e| e.to_string())?;
+      let none_ptr = call_result(none_alloc)?.into_pointer_value();
+      let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
+      builder
+        .build_store(none_tag_ptr, context.i64_type().const_int(none_tag, false))
+        .map_err(|e| e.to_string())?;
+      let none_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after none")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
+      let phi = builder
+        .build_phi(
+          local_llvm_type(context, &ValKind::Ptr),
+          "encodingdecodestrictresult",
+        )
+        .map_err(|e| e.to_string())?;
+      let some_val: BasicValueEnum = some_ptr.into();
+      let none_val: BasicValueEnum = none_ptr.into();
+      phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
+      return Ok((phi.as_basic_value(), ValKind::Ptr));
+    }
+    let fv = match method {
+      "decode" => ctx.encoding_decode,
+      "encode" => ctx.encoding_encode,
+      other => {
+        return Err(format!(
+          "codegen: unsupported Encoding static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &[raw_v.into(), label_v.into()], "encodingtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Str));
   }
 
   // Plan 122's Decision log: `Regex.compile(pattern)` — the same
@@ -20732,6 +20881,27 @@ fn compile_to_object_impl(
     ),
     Some(Linkage::External),
   );
+  // Plan 153 (Character Set / Encoding Conversion): `Encoding.decode`/
+  // `.decode_strict`/`.encode` all take two `String` args (the raw/
+  // text payload plus the WHATWG label) and return a bare pointer —
+  // `.decode`/`.encode` a non-null `*const c_char`, `.decode_strict` a
+  // possibly-null one this call site itself turns into a real
+  // `Option[String]` value.
+  let encoding_decode = module.add_function(
+    "emerald_rt_encoding_decode",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let encoding_decode_strict = module.add_function(
+    "emerald_rt_encoding_decode_strict",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let encoding_encode = module.add_function(
+    "emerald_rt_encoding_encode",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -21625,6 +21795,9 @@ fn compile_to_object_impl(
     http_request_body,
     kdf_hkdf,
     kdf_pbkdf2,
+    encoding_decode,
+    encoding_decode_strict,
+    encoding_encode,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

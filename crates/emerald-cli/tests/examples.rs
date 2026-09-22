@@ -577,3 +577,20 @@ fn xml_demo_em_prints_expected_sequence() {
     "library\nDune\n1984\nlibrary\n"
   );
 }
+
+// Plan 153 (Character Set / Encoding Conversion): `Encoding.encode`
+// transcodes "café" to real windows-1252 bytes (`63 61 66 e9` — the
+// trailing `e9` is not valid standalone UTF-8), `Encoding.decode`
+// transcodes it back to "café" exactly. `Encoding.decode_strict`
+// proves the asymmetry: asking whether those same bytes are already
+// valid UTF-8 (label `"utf-8"`) is `None` (`e9` alone is malformed
+// UTF-8), while asking under the correct `"windows-1252"` label
+// round-trips successfully — `??` (`Expr::Coalesce`) substitutes the
+// fallback text only on the genuine `None` case.
+#[test]
+fn charset_encoding_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("charset_encoding_proof.em"),
+    "café\nnot valid utf-8\ncafé\n"
+  );
+}
