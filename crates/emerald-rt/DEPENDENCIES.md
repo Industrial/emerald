@@ -44,6 +44,7 @@ reasoning — add a new row instead.
 | `base64` | 0.23.1 | #4 in crates.io's Encoding category, 123.7M downloads/month, used in 95,248 crates; `Engine`-trait API's four predefined `general_purpose` constants map 1:1 onto `Base64`'s own four variant pairs. No RustSec advisory found | pure-Rust (default-on `simd-unsafe` feature is internal-only `unsafe`, invisible at this API level) | 2026-09-22 | 123 |
 | `hex` | 0.4.3 | #52 in crates.io's Encoding category, 53.9M downloads/month, used in 44,269 crates; stable/essentially unchanged since 2021, case-insensitive `decode` matching this plan's own wrapper design. No RustSec advisory found | pure-Rust | 2026-09-22 | 123 |
 | `regex` | 1.13.1 | #1 in crates.io's Text processing category, 91.9M downloads/month, used in 105,388 crates, owned directly by rust-lang; RE2-derived finite-automata matching gives a real, verified worst-case `O(m*n)` time guarantee with no catastrophic-backtracking/ReDoS class at all. No RustSec advisory found | pure-Rust | 2026-09-22 | 122 |
+| `libm` | 0.2.16 | #2 in crates.io's No-std category, 41.8M downloads/month, used in 36,355 crates, owned by rust-lang-owner — the exact fallback `core`'s own float math already uses on targets with no OS-provided math library; portable to `wasm32-wasip1` with zero linker flag, unlike calling libc math via `extern "C"`. No RustSec advisory found | pure-Rust | 2026-09-22 | 164 |
 
 ## Pre-existing transitive dependencies (out of scope, triaged)
 

@@ -4188,6 +4188,57 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 164's Decision log: `Math.<name>` — the same reserved-
+    // namespace static-call shape `Json`/`Env`/`Base64`/`Hex`/`Regex`
+    // use. Every function is a plain `Float64 -> Float64` (or `(Float64,
+    // Float64) -> Float64`) total function — no `Result`/`Option`
+    // anywhere, since `libm` itself is total over `f64`'s full domain
+    // (`NaN`/`±Infinity` for out-of-domain input, never a panic).
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Math") => {
+      let two_arg = matches!(method.as_str(), "atan2" | "pow" | "hypot");
+      let one_arg = matches!(
+        method.as_str(),
+        "sin"
+          | "cos"
+          | "tan"
+          | "asin"
+          | "acos"
+          | "atan"
+          | "exp"
+          | "exp2"
+          | "ln"
+          | "log2"
+          | "log10"
+          | "sqrt"
+          | "cbrt"
+          | "floor"
+          | "ceil"
+          | "round"
+          | "trunc"
+      );
+      if !one_arg && !two_arg {
+        return Err(Diagnostic::new(
+          format!("Math has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      let expected_params = if two_arg {
+        vec![Type::Float64, Type::Float64]
+      } else {
+        vec![Type::Float64]
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Float64)
+    }
     // Plan 168's Decision log: `Log.configure`/`.<level>`/
     // `.<level>_fields` — the same reserved-namespace static-call
     // shape `File`/`Json` immediately below use, for the same reason
@@ -4717,6 +4768,19 @@ fn infer_expr_type(
         return Ok(Type::Float64);
       }
       if recv_ty == Type::Float64 {
+        // Plan 164's Decision log: `.is_nan` — a one-line prerequisite
+        // that plan's own text calls for directly, checking `libm`'s
+        // real IEEE 754 domain-error convention (`sqrt(-1.0)` is a
+        // valid `NaN`, not a crash) without inventing a new one.
+        if method == "is_nan" {
+          if !args.is_empty() {
+            return Err(Diagnostic::new(
+              format!("`.is_nan` takes no arguments, found {}", args.len()),
+              expr.span,
+            ));
+          }
+          return Ok(Type::Boolean);
+        }
         if method != "to_i" {
           return Err(Diagnostic::new(
             format!("Float64 has no method `{method}`"),

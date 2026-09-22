@@ -4951,6 +4951,28 @@ struct Ctx<'a, 'ctx> {
   env_remove: FunctionValue<'ctx>,
   env_keys: FunctionValue<'ctx>,
   env_keys_count: FunctionValue<'ctx>,
+  /// Plan 164 (Portable Math Functions) — `Math.<name>`, a thin
+  /// `Float64`-in-`Float64`-out wrapping of `libm`.
+  math_sin: FunctionValue<'ctx>,
+  math_cos: FunctionValue<'ctx>,
+  math_tan: FunctionValue<'ctx>,
+  math_asin: FunctionValue<'ctx>,
+  math_acos: FunctionValue<'ctx>,
+  math_atan: FunctionValue<'ctx>,
+  math_atan2: FunctionValue<'ctx>,
+  math_exp: FunctionValue<'ctx>,
+  math_exp2: FunctionValue<'ctx>,
+  math_ln: FunctionValue<'ctx>,
+  math_log2: FunctionValue<'ctx>,
+  math_log10: FunctionValue<'ctx>,
+  math_pow: FunctionValue<'ctx>,
+  math_sqrt: FunctionValue<'ctx>,
+  math_cbrt: FunctionValue<'ctx>,
+  math_hypot: FunctionValue<'ctx>,
+  math_floor: FunctionValue<'ctx>,
+  math_ceil: FunctionValue<'ctx>,
+  math_round: FunctionValue<'ctx>,
+  math_trunc: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -7519,6 +7541,30 @@ fn build_method_call<'ctx>(
     }
   }
 
+  // Plan 164's Decision log: `.is_nan` — a real LLVM `fcmp uno` (true
+  // iff either operand is NaN; comparing a value to itself is the
+  // standard idiom), the same "scoped to the receiver's own actually-
+  // produced `ValKind`, checked before the `Expr::Ident`-only guard"
+  // shape `.to_f`/`.to_i` immediately above already establish.
+  if method == "is_nan" {
+    let (recv_val, recv_kind) = build_expr(
+      context,
+      builder,
+      recv,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    if recv_kind == ValKind::Float64 {
+      let f = recv_val.into_float_value();
+      let is_nan = builder
+        .build_float_compare(inkwell::FloatPredicate::UNO, f, f, "isnantmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((is_nan.into(), ValKind::Bool));
+    }
+  }
+
   // Plan 74 (enumerable chaining): resolve a chained-enumerable-call
   // receiver (`nums.select do ... end.map do ... end`) down to a plain
   // Ident first — see `resolve_chained_enumerable_receiver`'s own doc
@@ -8079,6 +8125,55 @@ fn build_method_call<'ctx>(
       }
       other => Err(format!("codegen: unsupported Env static method `{other}`")),
     };
+  }
+
+  // Plan 164's Decision log: `Math.<name>` — the same reserved-
+  // namespace static-call shape `Json`/`Env`/`Base64`/`Hex`/`Regex`
+  // use. Every argument/return is a plain `Float64` (`ValKind::
+  // Float64`) — no marshaling beyond an ordinary call, unlike almost
+  // every other `emerald-rt` intrinsic in this file.
+  if recv_name == "Math" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "sin" => ctx.math_sin,
+      "cos" => ctx.math_cos,
+      "tan" => ctx.math_tan,
+      "asin" => ctx.math_asin,
+      "acos" => ctx.math_acos,
+      "atan" => ctx.math_atan,
+      "atan2" => ctx.math_atan2,
+      "exp" => ctx.math_exp,
+      "exp2" => ctx.math_exp2,
+      "ln" => ctx.math_ln,
+      "log2" => ctx.math_log2,
+      "log10" => ctx.math_log10,
+      "pow" => ctx.math_pow,
+      "sqrt" => ctx.math_sqrt,
+      "cbrt" => ctx.math_cbrt,
+      "hypot" => ctx.math_hypot,
+      "floor" => ctx.math_floor,
+      "ceil" => ctx.math_ceil,
+      "round" => ctx.math_round,
+      "trunc" => ctx.math_trunc,
+      other => return Err(format!("codegen: unsupported Math static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "mathtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Float64));
   }
 
   // Plan 168's Decision log: `Log.configure`/`.<level>`/
@@ -18121,6 +18216,110 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[], false),
     Some(Linkage::External),
   );
+  // Plan 164 (Portable Math Functions): every `Math.<name>` is a plain
+  // `f64 -> f64` (or `(f64, f64) -> f64`) function.
+  let one_f64_to_f64 = f64_ty.fn_type(&[f64_ty.into()], false);
+  let two_f64_to_f64 = f64_ty.fn_type(&[f64_ty.into(), f64_ty.into()], false);
+  let math_sin = module.add_function(
+    "emerald_rt_math_sin",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_cos = module.add_function(
+    "emerald_rt_math_cos",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_tan = module.add_function(
+    "emerald_rt_math_tan",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_asin = module.add_function(
+    "emerald_rt_math_asin",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_acos = module.add_function(
+    "emerald_rt_math_acos",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_atan = module.add_function(
+    "emerald_rt_math_atan",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_atan2 = module.add_function(
+    "emerald_rt_math_atan2",
+    two_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_exp = module.add_function(
+    "emerald_rt_math_exp",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_exp2 = module.add_function(
+    "emerald_rt_math_exp2",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_ln = module.add_function(
+    "emerald_rt_math_ln",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_log2 = module.add_function(
+    "emerald_rt_math_log2",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_log10 = module.add_function(
+    "emerald_rt_math_log10",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_pow = module.add_function(
+    "emerald_rt_math_pow",
+    two_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_sqrt = module.add_function(
+    "emerald_rt_math_sqrt",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_cbrt = module.add_function(
+    "emerald_rt_math_cbrt",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_hypot = module.add_function(
+    "emerald_rt_math_hypot",
+    two_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_floor = module.add_function(
+    "emerald_rt_math_floor",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_ceil = module.add_function(
+    "emerald_rt_math_ceil",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_round = module.add_function(
+    "emerald_rt_math_round",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
+  let math_trunc = module.add_function(
+    "emerald_rt_math_trunc",
+    one_f64_to_f64,
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -18786,6 +18985,26 @@ fn compile_to_object_impl(
     env_remove,
     env_keys,
     env_keys_count,
+    math_sin,
+    math_cos,
+    math_tan,
+    math_asin,
+    math_acos,
+    math_atan,
+    math_atan2,
+    math_exp,
+    math_exp2,
+    math_ln,
+    math_log2,
+    math_log10,
+    math_pow,
+    math_sqrt,
+    math_cbrt,
+    math_hypot,
+    math_floor,
+    math_ceil,
+    math_round,
+    math_trunc,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

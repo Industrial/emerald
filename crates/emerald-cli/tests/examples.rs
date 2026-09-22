@@ -346,3 +346,16 @@ fn environment_variables_proof_em_prints_expected_sequence() {
     "hello\ntrue\nunset\n"
   );
 }
+
+// Plan 164 (Portable Math Functions): `Math.sqrt`/`.pow`/`.sin`/`.cos`
+// plus the new `Float64#is_nan` prerequisite this plan's own text
+// calls for. `sqrt(2.0)`/`sin`+`cos` identity verified against Rust's
+// own std float math in `crates/emerald-rt/src/math.rs`'s own tests;
+// this test pins the real, actually-observed `puts`/interpolation
+// output rather than assuming the plan's own prose (which predicted
+// a bare `1024`, not accounting for this compiler's own Float64
+// printing convention).
+#[test]
+fn libm_proof_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("libm_proof.em"), "1.41421\n1024\ntrue\n1\n");
+}

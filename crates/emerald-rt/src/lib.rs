@@ -131,6 +131,7 @@ mod env;
 mod handle;
 mod json;
 mod log;
+mod math;
 mod regex;
 
 // NativeError's class tag - fixed and reserved, assigned before any
@@ -692,6 +693,133 @@ pub unsafe extern "C" fn emerald_rt_env_keys() -> *mut c_void {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_env_keys_count() -> i64 {
   catch_and_raise(move || env::env_keys_count())
+}
+
+// Plan 164 (Portable Math Functions): `Math.<name>`, a thin f64-in-
+// f64-out wrapping of `libm` — see `math.rs`'s own module doc. Every
+// one of these is TOTAL over f64's full domain (no panic path), but
+// still wrapped in `catch_and_raise` uniformly per plan 92's own
+// "consistency over cleverness" rationale.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_sin(x: f64) -> f64 {
+  catch_and_raise(move || math::sin(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_cos(x: f64) -> f64 {
+  catch_and_raise(move || math::cos(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_tan(x: f64) -> f64 {
+  catch_and_raise(move || math::tan(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_asin(x: f64) -> f64 {
+  catch_and_raise(move || math::asin(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_acos(x: f64) -> f64 {
+  catch_and_raise(move || math::acos(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_atan(x: f64) -> f64 {
+  catch_and_raise(move || math::atan(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_atan2(y: f64, x: f64) -> f64 {
+  catch_and_raise(move || math::atan2(y, x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_exp(x: f64) -> f64 {
+  catch_and_raise(move || math::exp(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_exp2(x: f64) -> f64 {
+  catch_and_raise(move || math::exp2(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_ln(x: f64) -> f64 {
+  catch_and_raise(move || math::ln(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_log2(x: f64) -> f64 {
+  catch_and_raise(move || math::log2(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_log10(x: f64) -> f64 {
+  catch_and_raise(move || math::log10(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_pow(x: f64, y: f64) -> f64 {
+  catch_and_raise(move || math::pow(x, y))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_sqrt(x: f64) -> f64 {
+  catch_and_raise(move || math::sqrt(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_cbrt(x: f64) -> f64 {
+  catch_and_raise(move || math::cbrt(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_hypot(x: f64, y: f64) -> f64 {
+  catch_and_raise(move || math::hypot(x, y))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_floor(x: f64) -> f64 {
+  catch_and_raise(move || math::floor(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_ceil(x: f64) -> f64 {
+  catch_and_raise(move || math::ceil(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_round(x: f64) -> f64 {
+  catch_and_raise(move || math::round(x))
+}
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_math_trunc(x: f64) -> f64 {
+  catch_and_raise(move || math::trunc(x))
 }
 
 // Plan 168 (Structured Logging): `Log.configure`/`.trace`/`.debug`/

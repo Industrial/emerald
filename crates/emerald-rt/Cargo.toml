@@ -67,5 +67,13 @@ hex = "0.4"
 # independent security literature) - the entire reason it lacks
 # backreferences/lookaround. No RustSec advisory found.
 regex = "1.13"
+# Plan 164: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - libm 0.2.16 (Jan 24, 2026), #2 in No-std, 41.8M
+# downloads/month, used in 36,355 crates, owned directly by
+# rust-lang-owner (the fallback core's own float math already uses on
+# targets with no OS-provided math library). No RustSec advisory
+# found. Pure Rust, no_std-compatible - portable to wasm32-wasip1
+# with zero linker flag, unlike calling libc math via extern "C".
+libm = "0.2"
 
 [build-dependencies]
