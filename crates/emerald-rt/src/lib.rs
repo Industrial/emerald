@@ -128,6 +128,7 @@ use std::os::raw::c_char;
 
 mod handle;
 mod json;
+mod log;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -475,6 +476,60 @@ pub unsafe extern "C" fn emerald_rt_json_object_get(
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_json_to_string(obj: *const c_void) -> *const c_char {
   catch_and_raise(move || json::json_to_string(obj))
+}
+
+// Plan 168 (Structured Logging): `Log.configure`/`.trace`/`.debug`/
+// `.info`/`.warn`/`.error`/`.*_fields`, `LogFields.new`/`.set` - see
+// `log.rs`'s own module doc for the full design.
+
+/// # Safety
+/// `level`/`format`, if non-null, must point to valid, NUL-terminated
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_log_configure(
+  level: *const c_char,
+  format: *const c_char,
+) -> i64 {
+  catch_and_raise(move || log::log_configure(level, format))
+}
+
+/// # Safety
+/// `message`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_log_event(level: i64, message: *const c_char) -> i64 {
+  catch_and_raise(move || log::log_event(level, message))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_log_fields_new() -> i64 {
+  catch_and_raise(log::log_fields_new)
+}
+
+/// # Safety
+/// `key`/`value`, if non-null, must point to valid, NUL-terminated C
+/// strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_log_fields_set(
+  handle: i64,
+  key: *const c_char,
+  value: *const c_char,
+) -> i64 {
+  catch_and_raise(move || log::log_fields_set(handle, key, value))
+}
+
+/// # Safety
+/// `message`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_log_event_fields(
+  level: i64,
+  message: *const c_char,
+  handle: i64,
+) -> i64 {
+  catch_and_raise(move || log::log_event_fields(level, message, handle))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

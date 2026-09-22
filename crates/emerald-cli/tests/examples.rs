@@ -38,6 +38,39 @@ fn compile_and_run(example: &str) -> String {
   String::from_utf8_lossy(&run.stdout).into_owned()
 }
 
+// Plan 168's own structured-logging output is deliberately on stderr,
+// structurally separate from `puts`'s own stdout — a sibling of
+// `compile_and_run` asserting against stderr instead, rather than
+// changing that function's own stdout-only contract for everything
+// else in this table.
+fn compile_and_run_stderr(example: &str) -> String {
+  let source = workspace_root().join("examples").join(example);
+  let output = std::env::temp_dir().join(format!(
+    "emerald_example_{}_{}",
+    example.replace(['.', '/'], "_"),
+    std::process::id()
+  ));
+
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg(&source)
+    .arg("-o")
+    .arg(&output)
+    .status()
+    .expect("failed to run emerald-cli");
+  assert!(status.success(), "emerald-cli should succeed on {example}");
+
+  let run = Command::new(&output)
+    .output()
+    .expect("failed to run compiled binary");
+  assert!(
+    run.status.success(),
+    "{example}'s compiled binary should exit 0"
+  );
+
+  std::fs::remove_file(&output).ok();
+  String::from_utf8_lossy(&run.stderr).into_owned()
+}
+
 #[test]
 fn rust_native_runtime_proof_em_prints_expected_sequence() {
   // Plan 91: FNV-1a-32 of "hello"/"hello world"/"" widened to Int64 —
@@ -237,5 +270,17 @@ fn json_demo_em_prints_expected_sequence() {
   assert_eq!(
     compile_and_run("json_demo.em"),
     "Ada\nmissing\n2\n{\"name\":\"Ada\",\"age\":36.0,\"active\":true,\"tags\":[\"math\",\"cs\"]}\nkey must be a string at line 1 column 2\n"
+  );
+}
+
+// Plan 168 (Structured Logging): three JSON lines on stderr — a
+// plain event, an event with two structured fields, a warning — and
+// the fourth, DEBUG-level line never appears at all, the real proof
+// that Log.configure("info", ...)'s level floor is doing its job.
+#[test]
+fn structured_logging_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run_stderr("structured_logging_proof.em"),
+    "{\"level\":\"INFO\",\"message\":\"service starting\"}\n{\"level\":\"INFO\",\"message\":\"user signed in\",\"fields\":{\"user_id\":\"42\",\"plan\":\"pro\"}}\n{\"level\":\"WARN\",\"message\":\"cache miss\"}\n"
   );
 }

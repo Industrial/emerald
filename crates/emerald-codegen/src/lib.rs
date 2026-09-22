@@ -152,6 +152,14 @@ fn set_newtype_underlying(program: &Program) {
     "NativeHandle".to_string(),
     TypeExpr::Named("Int64".to_string()),
   );
+  // Plan 168's Decision log: `LogFields` — the same compiler-
+  // synthesized, zero-cost `Int64` newtype shape as `NativeHandle`
+  // immediately above, reused as a real instance of plan 93's own
+  // handle registry rather than a bespoke mechanism.
+  map.insert(
+    "LogFields".to_string(),
+    TypeExpr::Named("Int64".to_string()),
+  );
   NEWTYPE_UNDERLYING.with(|cell| *cell.borrow_mut() = map);
 }
 
@@ -4900,6 +4908,12 @@ struct Ctx<'a, 'ctx> {
   json_parse: FunctionValue<'ctx>,
   json_object_get: FunctionValue<'ctx>,
   json_to_string: FunctionValue<'ctx>,
+  /// Plan 168 (Structured Logging).
+  log_configure: FunctionValue<'ctx>,
+  log_event: FunctionValue<'ctx>,
+  log_fields_new: FunctionValue<'ctx>,
+  log_fields_set: FunctionValue<'ctx>,
+  log_event_fields: FunctionValue<'ctx>,
   /// Populates `ARGV`/`ARGC` at the top of generated `main` (`leaf-
   /// argv-and-gets`'s own dedicated construction site — never called
   /// anywhere else).
@@ -6480,6 +6494,24 @@ fn build_expr<'ctx>(
     // compiles to EXACTLY the argument's own already-compiled value —
     // no allocation, no wrapper struct, byte-identical to compiling
     // the bare underlying expression alone.
+    // Plan 168's Decision log: `LogFields.new()` — a real, disclosed
+    // exception to the ordinary "compiles to exactly the argument's
+    // own value" newtype-construction arm immediately below (which
+    // indexes `args[0]`, panicking on this constructor's real zero
+    // arguments) — calls `emerald_rt_log_fields_new()` for a fresh
+    // handle instead.
+    Expr::New(class_name, args) if class_name == "LogFields" => {
+      if !args.is_empty() {
+        return Err(format!(
+          "codegen: `LogFields.new` expects 0 arguments, found {}",
+          args.len()
+        ));
+      }
+      let call = builder
+        .build_call(ctx.log_fields_new, &[], "logfieldsnewtmp")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Int64))
+    }
     Expr::New(class_name, args) if !ctx.classes.contains_key(class_name) => build_expr(
       context,
       builder,
@@ -7527,6 +7559,52 @@ fn build_method_call<'ctx>(
     .get(recv_name)
     .is_some_and(|s| ctx.newtypes.contains(s))
   {
+    // Plan 168's Decision log: `LogFields#set` — a real, disclosed
+    // exception to the ordinary newtype `.value`-only rule enforced
+    // immediately below, checked here before that rejection fires.
+    if local_classes.get(recv_name).map(String::as_str) == Some("LogFields") && method == "set" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let key_arg = args
+        .first()
+        .ok_or_else(|| "codegen: `LogFields#set` expects 2 arguments".to_string())?;
+      let value_arg = args
+        .get(1)
+        .ok_or_else(|| "codegen: `LogFields#set` expects 2 arguments".to_string())?;
+      let (key_val, _) = build_expr(
+        context,
+        builder,
+        key_arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (value_val, _) = build_expr(
+        context,
+        builder,
+        value_arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      builder
+        .build_call(
+          ctx.log_fields_set,
+          &[recv_val.into(), key_val.into(), value_val.into()],
+          "logfieldssettmp",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
     }
@@ -7626,6 +7704,76 @@ fn build_method_call<'ctx>(
       .build_call(ctx.json_parse, &[v.into()], "jsonparsetmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 168's Decision log: `Log.configure`/`.<level>`/
+  // `.<level>_fields` — the same reserved-namespace static-call shape
+  // `Json`/`File` use, for the same reason (`Log` is never a real
+  // `ModuleDef`). Every one of these calls returns `Void` and is
+  // built purely for its side effect.
+  if recv_name == "Log" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "configure" => ctx.log_configure,
+      "trace" => {
+        call_args.insert(0, context.i64_type().const_int(0, false).into());
+        ctx.log_event
+      }
+      "debug" => {
+        call_args.insert(0, context.i64_type().const_int(1, false).into());
+        ctx.log_event
+      }
+      "info" => {
+        call_args.insert(0, context.i64_type().const_int(2, false).into());
+        ctx.log_event
+      }
+      "warn" => {
+        call_args.insert(0, context.i64_type().const_int(3, false).into());
+        ctx.log_event
+      }
+      "error" => {
+        call_args.insert(0, context.i64_type().const_int(4, false).into());
+        ctx.log_event
+      }
+      "trace_fields" => {
+        call_args.insert(0, context.i64_type().const_int(0, false).into());
+        ctx.log_event_fields
+      }
+      "debug_fields" => {
+        call_args.insert(0, context.i64_type().const_int(1, false).into());
+        ctx.log_event_fields
+      }
+      "info_fields" => {
+        call_args.insert(0, context.i64_type().const_int(2, false).into());
+        ctx.log_event_fields
+      }
+      "warn_fields" => {
+        call_args.insert(0, context.i64_type().const_int(3, false).into());
+        ctx.log_event_fields
+      }
+      "error_fields" => {
+        call_args.insert(0, context.i64_type().const_int(4, false).into());
+        ctx.log_event_fields
+      }
+      other => return Err(format!("codegen: unsupported Log method `{other}`")),
+    };
+    builder
+      .build_call(fv, &call_args, "logtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
   }
 
   // Plan 45's Decision log: `File` is a separate, hard-coded arm, not
@@ -17430,6 +17578,32 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 168 (Structured Logging).
+  let log_configure = module.add_function(
+    "emerald_rt_log_configure",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let log_event = module.add_function(
+    "emerald_rt_log_event",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let log_fields_new = module.add_function(
+    "emerald_rt_log_fields_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let log_fields_set = module.add_function(
+    "emerald_rt_log_fields_set",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let log_event_fields = module.add_function(
+    "emerald_rt_log_event_fields",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let build_argv = module.add_function(
     "emerald_build_argv",
     ptr_ty.fn_type(&[context.i32_type().into(), ptr_ty.into()], false),
@@ -17995,7 +18169,7 @@ fn compile_to_object_impl(
   // for why `build_method_call`'s `.value` dispatch and `Stmt::Let`'s
   // `local_classes` bookkeeping both need this name set independently
   // of `classes`/`enums` above.
-  let newtypes: HashSet<String> = program
+  let mut newtypes: HashSet<String> = program
     .items
     .iter()
     .filter_map(|item| match item {
@@ -18003,6 +18177,15 @@ fn compile_to_object_impl(
       _ => None,
     })
     .collect();
+  // Plan 93/168's own compiler-synthesized newtypes never appear as a
+  // real `Item::Newtype` in `program.items`, so the scan above can
+  // never find them — added directly here so a `NativeHandle`/
+  // `LogFields`-typed `Let`/parameter still gets the same `local_
+  // classes` bookkeeping (`bind_params`'s own `classes.contains_key
+  // (..) || newtypes.contains(..)` check) a real, source-declared
+  // newtype of the identical shape already gets.
+  newtypes.insert("NativeHandle".to_string());
+  newtypes.insert("LogFields".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -18054,6 +18237,11 @@ fn compile_to_object_impl(
     json_parse,
     json_object_get,
     json_to_string,
+    log_configure,
+    log_event,
+    log_fields_new,
+    log_fields_set,
+    log_event_fields,
     build_argv,
     dibuilder: dibuilder_owner,
     di_file,

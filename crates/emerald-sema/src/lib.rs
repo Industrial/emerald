@@ -3713,6 +3713,27 @@ fn infer_expr_type(
       Ok(sig.return_type.clone())
     }
     Expr::New(class_name, args) => {
+      // Plan 168's Decision log: `LogFields.new()` — a zero-argument
+      // constructor calling `emerald_rt_log_fields_new()` for a fresh
+      // handle, never the ordinary "wrap a given underlying value"
+      // newtype constructor immediately below (which requires exactly
+      // one argument matching the underlying type) — checked first,
+      // since `LogFields` is registered as a `NativeHandle`-style
+      // `Int64` newtype (plan 93's own precedent) purely for its
+      // zero-cost representation, not to be constructed the way
+      // `Meters.new(5.0)` is.
+      if class_name == "LogFields" {
+        if !args.is_empty() {
+          return Err(Diagnostic::new(
+            format!(
+              "`LogFields.new` takes no arguments, found {}",
+              args.len()
+            ),
+            expr.span,
+          ));
+        }
+        return Ok(Type::Newtype("LogFields".to_string(), Box::new(Type::Int64)));
+      }
       let info = classes
         .get(class_name)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
@@ -4024,6 +4045,37 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 168's Decision log: `Log.configure`/`.<level>`/
+    // `.<level>_fields` — the same reserved-namespace static-call
+    // shape `File`/`Json` immediately below use, for the same reason
+    // (`Log` is never a real `ModuleDef`).
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Log") => {
+      let log_fields_ty = Type::Newtype("LogFields".to_string(), Box::new(Type::Int64));
+      let expected_params: Vec<Type> = match method.as_str() {
+        "configure" => vec![Type::String, Type::String],
+        "trace" | "debug" | "info" | "warn" | "error" => vec![Type::String],
+        "trace_fields" | "debug_fields" | "info_fields" | "warn_fields" | "error_fields" => {
+          vec![Type::String, log_fields_ty]
+        }
+        other => {
+          return Err(Diagnostic::new(
+            format!("Log has no method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Void)
+    }
     Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "File") => {
       let (expected_params, ret) = match method.as_str() {
         "read" => (vec![Type::String], Type::String),
@@ -4314,6 +4366,31 @@ fn infer_expr_type(
       // own bits, unchanged), which is exactly what makes this whole
       // construct zero-cost.
       if let Type::Newtype(name, underlying) = &recv_ty {
+        // Plan 168's Decision log: `LogFields#set(key, value)` — a
+        // real, carved-out exception to the ordinary newtype "only
+        // `.value`" rule immediately below, exactly as narrow as
+        // `NativeHandle`'s own actor-boundary carve-out (plan 93) —
+        // `LogFields` needs a real mutating method, not just an
+        // unwrap.
+        if name == "LogFields" && method == "set" {
+          if args.len() != 2 {
+            return Err(Diagnostic::new(
+              format!("`LogFields#set` expects 2 arguments, found {}", args.len()),
+              expr.span,
+            ));
+          }
+          check_args(
+            method,
+            args,
+            &[Type::String, Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(Type::Void);
+        }
         if method != "value" {
           return Err(Diagnostic::new(
             format!("newtype `{name}` has no method `{method}` — only `.value` (unwrap)"),
@@ -11088,6 +11165,30 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // (`leaf-actor-local-handle-enforcement`).
   classes.insert(
     "NativeHandle".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 168's Decision log: `LogFields` — a compiler-synthesized
+  // newtype over `Int64` (the exact same "reserved name, zero-cost
+  // Int64 representation" shape `NativeHandle` immediately above
+  // uses), reused as a real, working resource-handle instance of
+  // plan 93's own registry (`crate::handle` in `emerald-rt`) rather
+  // than inventing a second one, since plan 93 landed earlier this
+  // same session. `.new()` is a special-cased zero-arg constructor
+  // (`Expr::New`'s own arm above); `.set` is carved out of the
+  // ordinary newtype `.value`-only restriction (`infer_expr_type`'s
+  // `Type::Newtype` arm).
+  classes.insert(
+    "LogFields".to_string(),
     ClassInfo {
       fields: HashMap::new(),
       methods: HashMap::new(),

@@ -39,6 +39,8 @@ reasoning — add a new row instead.
 | Crate | Version | Why chosen | Pure-Rust or C-exception (+ justification) | Date added | Plan # |
 |---|---|---|---|---|---|
 | `serde_json` (+ `preserve_order` feature, pulling in `indexmap`) | 1.0.151 | #1 in crates.io's Encoding category, 116M downloads/month, no serious pure-Rust competing choice for JSON; `serde_json::Value` lowers directly to Emerald's own `JsonValue` enum layout | pure-Rust | 2026-09-22 | 118 |
+| `tracing` | 0.1.44 | #1 in crates.io's Debugging category, 67M downloads/month, tokio-rs-owned; industry-standard structured-event macros/dispatch | pure-Rust | 2026-09-22 | 168 |
+| `tracing-subscriber` (+ `registry` feature) | 0.3.23 | Subscriber/Layer composition utilities for `tracing`, same owners; backs `Log`'s custom JSON `Layer`. RUSTSEC-2025-0055 (ANSI-escape injection) checked — patched in >=0.3.20, this pin resolves well above it | pure-Rust | 2026-09-22 | 168 |
 
 ## Pre-existing transitive dependencies (out of scope, triaged)
 

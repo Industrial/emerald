@@ -10,22 +10,22 @@ maestro:
 todos:
   - id: leaf-emerald-rt-log-core
     content: "Add `tracing = \"0.1\"` and `tracing-subscriber = { version = \"0.3\", features = [\"registry\"] }` to `crates/emerald-rt/Cargo.toml` (the crate plan 91 scaffolds); write `emerald-rt/src/log.rs` exporting `#[no_mangle] extern \"C\" fn emerald_rt_log_configure(level: *const c_char, format: *const c_char) -> i64`, `emerald_rt_log_event(level: i64, message: *const c_char) -> i64`, and the `LogFields`-consuming pair below — every one of them `std::panic::catch_unwind`-wrapped per plan 91's established convention, returning `-1` on any panic or invalid-UTF8/null-pointer input, `0` on success."
-    status: pending
+    status: done
   - id: leaf-logfields-handle
     content: "A new opaque handle type, `emerald_rt_log_fields_new() -> *mut LogFields`, `emerald_rt_log_fields_set(handle: *mut LogFields, key: *const c_char, value: *const c_char) -> i64`, and `emerald_rt_log_event_fields(level: i64, message: *const c_char, handle: *mut LogFields) -> i64` (consumes and frees the handle unconditionally, whether or not the event was actually emitted by the active level filter) — a self-contained, minimal worked instance of the create/mutate/consume-and-free resource lifecycle plan 93 will generalize, chosen specifically so this plan does not have to wait on plan 93's file to exist to ship something correct today."
-    status: pending
+    status: done
   - id: leaf-json-layer
     content: "A hand-written `tracing_subscriber::Layer` (not `fmt().json()`) whose `on_event` visits each event's fields with a custom `tracing::field::Visit` impl, accumulates them into a `serde_json::Map<String, Value>`, and writes one `serde_json::Value::Object` per line to stderr via `serde_json::to_writer` — chosen over the subscriber's built-in JSON formatter because this plan's own dynamic `LogFields` payload needs to land as a real nested JSON object, not a second, already-escaped JSON string embedded inside a string field."
-    status: pending
+    status: done
   - id: leaf-sema-codegen-dispatch
     content: "`Log.<level>(message: String): Void` and `Log.<level>_fields(message: String, fields: LogFields): Void` dispatched exactly the way plan 45's `File.read`/`File.write` are: a `matches!(recv.as_ref(), Expr::Ident(n) if n == \"Log\")` arm in `infer_expr_type`, checked before the real `ClassInfo`/module-dispatch arm (never colliding, since `Log` is never declared via a source `ModuleDef`), and a matching early-return in `build_method_call` calling the five `emerald_rt_log_*` functions directly; `LogFields` becomes a new opaque reference `Type`/`ValKind` variant, codegen-identical in shape to how plan 59's `Type::CString` is \"sema-only... same bare pointer, no new runtime representation.\""
-    status: pending
+    status: done
   - id: leaf-configure-once-semantics
     content: "`Log.configure` installs a global `tracing_subscriber::registry().with(layer).init()`-equivalent default dispatcher exactly once, guarded by a `std::sync::OnceLock<()>` inside `emerald-rt`; a second call returns `-1` (already configured) rather than panicking on `tracing::subscriber::SetGlobalDefaultError`, and any `Log.*` call made before the first `Log.configure` uses a built-in default (level `info`, format `text`) so a program that never calls `Log.configure` still logs something sane rather than silently dropping every event."
-    status: pending
+    status: done
   - id: leaf-example-and-tests
     content: "`examples/structured_logging_proof.em` (the Concrete Proof below), wired into `emerald-cli/tests/examples.rs`'s checked table per plan 91's own `leaf-example-and-full-gate` precedent, plus `#[test]`s in `emerald-rt` itself asserting: (a) `emerald_rt_log_configure` is idempotent (second call returns `-1`, first returns `0`), (b) the JSON layer emits valid, `serde_json::from_str`-parseable output for a message with a two-entry `LogFields`, and (c) a level below the configured filter produces zero output bytes."
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -233,3 +233,63 @@ the other.
    decision above), but a future revision collapsing `LogFields` into
    plain `Hash[String, String]` once that mechanism is confirmed real
    is a plausible, smaller follow-up, not a blocking prerequisite here.
+
+## Update (2026-09-22, same-day session): implemented, all six leaves done
+
+Real, current crate check performed at this plan's own authoring time
+(2026-09-22, via `lib.rs`): `tracing` 0.1.44 (Dec 18, 2025), #1 in
+Debugging, 67M downloads/month, tokio-rs-owned, MIT; `tracing-
+subscriber` 0.3.23 (Mar 13, 2026), 51M downloads/month, same owners,
+MIT. A real RustSec advisory was found and checked — RUSTSEC-2025-0055
+(`tracing-subscriber` ANSI-escape-sequence injection, CVE-2025-58160) —
+patched in `>=0.3.20`, comfortably below the 0.3.23 this plan's own
+`"0.3.20"` minimum-version pin resolves to. `crates/emerald-rt/
+DEPENDENCIES.md` gained two more real rows.
+
+**`LogFields` reuses plan 93's own resource-handle registry
+(`crate::handle`) directly, rather than the bespoke create/mutate/
+consume-and-free mechanism this plan's own text proposed** — this
+plan's text was authored assuming plan 93 didn't exist yet ("offered
+here as a concrete worked example... not a promise to redesign
+later"), but plan 93 landed earlier this same session, so its real,
+already-tested registry (`handle_alloc`/`handle_get_mut`/
+`handle_close`) is used as-is. `LogFields` itself is represented as a
+compiler-synthesized `Int64` newtype (the same zero-cost shape plan
+93's own `NativeHandle` uses) rather than a real class — `LogFields.
+new()` is a special-cased zero-argument constructor (`Expr::New`'s
+existing newtype-construction arm, which otherwise always evaluates
+`args[0]` — a real, disclosed guard needed to avoid an index-out-of-
+bounds panic on this constructor's genuinely empty argument list), and
+`.set` is a real, narrow carve-out of the ordinary newtype
+`.value`-only rule, both in `emerald-sema` and — found only by running
+it, a second, SEPARATE enforcement point discovered by testing, not
+assumed from the first fix — a second `.value`-only gate inside
+`emerald-codegen`'s own `build_method_call` (the plain-local-receiver
+path), distinct from the one already fixed for `@field.value`
+(instance-var receivers).
+
+The dynamic-field-count tension this plan's own Decision log names
+(`tracing`'s macros need a fixed field set per call site; Emerald call
+sites don't have one) is resolved exactly as designed: each `emerald_
+rt_log_event`/`_event_fields` goes through its own fixed set of five
+`tracing::event!` call sites (one per level), and the `LogFields`
+payload crosses as a single pre-serialized JSON string passed as a
+plain `&str` field value (`fields_json`) — the custom `Visit` impl's
+`record_str` receives it directly, with no downcasting or `Any`
+needed, and `EmeraldJsonLayer::on_event` re-parses it into a real
+nested `serde_json::Value::Object`.
+
+Full concrete proof verified end to end via `examples/
+structured_logging_proof.em`, both formats: JSON mode produces exactly
+the plan's own predicted three lines (the fourth, DEBUG-level line
+never appears); text mode (`Log.configure("debug", "text")`, tested
+manually, not part of the checked-in example) produces four
+human-readable lines with no JSON at all. Output is stderr, as
+designed — `emerald-cli/tests/examples.rs` gained a `compile_and_run_
+stderr` sibling helper alongside the existing stdout-only
+`compile_and_run`, rather than changing that function's own contract.
+
+Full workspace gate: `cargo nextest run --workspace` (956/956, 2
+skipped — 6 new), `cargo clippy --workspace --all-targets` (clean),
+`treefmt` (0 changed), `cargo audit` (same 5 pre-existing, unrelated,
+triaged warnings — no new finding from `tracing`/`tracing-subscriber`).

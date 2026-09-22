@@ -37,5 +37,14 @@ crate-type = ["staticlib", "rlib"]
 # 95's own pure-Rust-first preference outright — no C-exception needed.
 # See crates/emerald-rt/DEPENDENCIES.md for this row's ledger entry.
 serde_json = { version = "1", features = ["preserve_order"] }
+# Plan 168: real-checked at this plan's own authoring time (2026-09-22,
+# via lib.rs) - tracing 0.1.44 (Dec 18, 2025), #1 in Debugging, 67M
+# downloads/month, tokio-rs-owned, MIT; tracing-subscriber 0.3.23 (Mar
+# 13, 2026), 51M downloads/month, same owners, MIT. RUSTSEC-2025-0055
+# (tracing-subscriber ANSI-escape-injection, CVE-2025-58160) is real
+# and was checked - patched in >=0.3.20, comfortably below the 0.3.23
+# this pin resolves to. Both pure-Rust, no C exception needed.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.20", features = ["registry"] }
 
 [build-dependencies]
