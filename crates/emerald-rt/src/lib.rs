@@ -249,6 +249,10 @@ mod secure_compare;
 // `.commit`/`.rollback`, wrapping `rusqlite` — see `sqlite.rs`'s own
 // module doc.
 mod sqlite;
+// Plan 104 (Server-Sent Events) — `Sse.upgrade`/`.send`/`.comment`/
+// `.close`, layered directly on plan 101's `Http.serve`/`tiny_http` —
+// see `sse.rs`'s own module doc.
+mod sse;
 mod system;
 // Plan 132 (Tar Archives) -- `Tar.create`/`.extract`, `TarReader.open`/
 // `.next_entry`/`.entry_size`/`.read_entry_data`/`.close`, wrapping
@@ -3181,6 +3185,41 @@ pub unsafe extern "C" fn emerald_rt_ws_message_text(ptr: *const i64) -> *const c
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_ws_message_bytes(ptr: *const i64) -> i64 {
   catch_and_raise(move || websocket::ws_message_bytes(ptr))
+}
+
+/// # Safety
+/// `request` must be a live `HttpRequest` handle whose own
+/// `tiny_http::Request` hasn't already been taken.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sse_upgrade(request: i64) -> i64 {
+  catch_and_raise(move || sse::sse_upgrade(request))
+}
+
+/// # Safety
+/// `event`/`data`, if non-null, must point to valid, NUL-terminated C
+/// strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sse_send(
+  stream: i64,
+  event: *const c_char,
+  data: *const c_char,
+) -> i64 {
+  catch_and_raise(move || sse::sse_send(stream, event, data))
+}
+
+/// # Safety
+/// `text`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sse_comment(stream: i64, text: *const c_char) -> i64 {
+  catch_and_raise(move || sse::sse_comment(stream, text))
+}
+
+/// # Safety
+/// Always safe to call for a live `Sse` stream handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sse_close(stream: i64) -> i64 {
+  catch_and_raise(move || sse::sse_close(stream))
 }
 
 /// # Safety

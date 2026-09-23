@@ -1280,3 +1280,80 @@ fn websocket_proof_em_round_trips_a_real_echo_over_a_real_socket() {
   let _ = child.wait();
   std::fs::remove_file(&output).ok();
 }
+
+// Plan 104 (Server-Sent Events): `Http.serve` (plan 101) never
+// returns, so — the identical shape `websocket_proof_em_round_trips_
+// a_real_echo_over_a_real_socket` immediately above already
+// establishes for exactly the same reason — this test spawns the
+// compiled binary in the BACKGROUND, drives a real, plain
+// `std::net::TcpStream` client directly from Rust against it (no
+// external crate needed at all here, unlike the WebSocket proof's own
+// `tungstenite` client — SSE is a plain-text format over an ordinary
+// HTTP response), reads until the server itself closes the
+// connection (`sse_ticker.em`'s own `Sse.close` call drops the
+// writer, per plan 104's own Decision log), and asserts on the exact
+// byte sequence this plan's own Concrete Proof specifies.
+#[test]
+fn sse_ticker_em_streams_three_framed_events_over_a_real_socket() {
+  let source = workspace_root().join("examples").join("sse_ticker.em");
+  let output = std::env::temp_dir().join(format!(
+    "emerald_example_sse_ticker_em_{}",
+    std::process::id()
+  ));
+
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg(&source)
+    .arg("-o")
+    .arg(&output)
+    .status()
+    .expect("failed to run emerald-cli");
+  assert!(
+    status.success(),
+    "emerald-cli should succeed on sse_ticker.em"
+  );
+
+  let mut child = Command::new(&output)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("failed to spawn compiled sse_ticker.em binary");
+  std::thread::sleep(std::time::Duration::from_millis(200));
+
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", 47602))
+    .expect("connect to the compiled Emerald SSE server");
+  // `Connection: close` — a real, disclosed finding made writing this
+  // plan's own `emerald-rt` unit test: `tiny_http`'s internal per-
+  // connection worker (entirely separate from the raw writer
+  // `Sse.close` drops) otherwise keeps the socket's read half open
+  // waiting for a next request that never comes, and `read_to_end`
+  // below would hang rather than observing a real EOF.
+  stream
+    .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    .expect("write request");
+  let mut raw = Vec::new();
+  stream
+    .read_to_end(&mut raw)
+    .expect("read until the server closes the connection");
+  let response = String::from_utf8(raw).expect("response should be valid UTF-8");
+
+  let (head, body) = response
+    .split_once("\r\n\r\n")
+    .expect("response should have a header/body split");
+  assert!(
+    head.starts_with("HTTP/1.1 200 OK"),
+    "unexpected status line; full head:\n{head}"
+  );
+  let head_lower = head.to_ascii_lowercase();
+  assert!(head_lower.contains("content-type: text/event-stream"));
+  assert!(head_lower.contains("cache-control: no-cache"));
+  assert!(head_lower.contains("connection: keep-alive"));
+  assert_eq!(
+    body,
+    "event: tick\ndata: 1\n\nevent: tick\ndata: 2\n\nevent: tick\ndata: 3\n\n"
+  );
+
+  let _ = child.kill();
+  let _ = child.wait();
+  std::fs::remove_file(&output).ok();
+}

@@ -5583,6 +5583,43 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 104's Decision log: `Sse.upgrade`/`.send`/`.comment`/
+    // `.close` — the same reserved-namespace static-call shape `Dns`/
+    // `Kdf`/`Http` already use. No new `Type` at all: `.upgrade`
+    // consumes plan 101's own `HttpRequest` newtype (already `Int64`
+    // underneath) and returns a plain `Int64` stream handle (a
+    // plan-93 opaque resource, not wrapped in `Result` — see this
+    // plan's own Decision log for why); `.send`/`.comment`/`.close`
+    // are all plain `Int64`-in/`Int64`-boolean-out (plan 59/92's
+    // convention), never panicking on a closed/unknown handle.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Sse") =>
+    {
+      let http_request_ty = Type::Newtype("HttpRequest".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match method.as_str() {
+        "upgrade" => (vec![http_request_ty], Type::Int64),
+        "send" => (vec![Type::Int64, Type::String, Type::String], Type::Int64),
+        "comment" => (vec![Type::Int64, Type::String], Type::Int64),
+        "close" => (vec![Type::Int64], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Sse has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 121's Decision log: `Csv.parse`/`.parse_with_headers`/
     // `.write` — the same reserved-namespace static-call shape `Json`/
     // `Toml` already use. Deliberately does NOT reuse `JsonValue` — a

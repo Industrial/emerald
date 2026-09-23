@@ -10,19 +10,19 @@ maestro:
 todos:
   - id: leaf-sse-writer-registry
     content: "A process-wide `static SSE_STREAMS: Mutex<HashMap<u64, Box<dyn Write + Send>>>` inside emerald-rt (or wherever plan 101 places its HTTP runtime module), a monotonic `AtomicU64` handle counter, and poison-recovery on every lock acquisition (`.lock().unwrap_or_else(PoisonError::into_inner)`) since a panic caught by this plan's own catch_unwind boundary must not permanently brick every other open SSE stream"
-    status: pending
+    status: done
   - id: leaf-sse-upgrade-and-headers
     content: "`emerald_rt_sse_upgrade(request_handle: i64) -> i64` — consumes plan 101's request handle, calls `Request::into_writer()`, writes a raw `HTTP/1.1 200 OK\\r\\nContent-Type: text/event-stream\\r\\nCache-Control: no-cache\\r\\nConnection: keep-alive\\r\\n\\r\\n` head, registers the writer under a new handle, exposed to Emerald as `Sse.upgrade(request: Int64): Int64`"
-    status: pending
+    status: done
   - id: leaf-sse-send-and-format
     content: "`emerald_rt_sse_send(stream: i64, event: *const c_char, data: *const c_char) -> i64` and `emerald_rt_sse_comment(stream: i64, text: *const c_char) -> i64` — real SSE wire-format framing (`event: <name>\\n`, one `data: <line>\\n` per line of a multi-line payload, terminating blank line, `: <text>\\n` for comments/keepalives), an explicit `.flush()` after every write, exposed as `Sse.send(stream, event, data): Int64` / `Sse.comment(stream, text): Int64`, both Int64-booleans per plan 59/92's C-side-boolean convention"
-    status: pending
+    status: done
   - id: leaf-sse-close
     content: "`emerald_rt_sse_close(stream: i64) -> i64` — removes and drops the registry entry (shutting the socket down), exposed as `Sse.close(stream: Int64): Int64`; a `.send()`/`.comment()` against an already-closed or unknown handle returns `0` rather than panicking (a real, disclosed use-after-close contract, not UB — see Decision log)"
-    status: pending
+    status: done
   - id: leaf-example-and-gate
     content: "`examples/sse_ticker.em` (the Concrete Proof below) plus a small shell verification step (`curl -N` against the running example) wired into whatever CI mechanism plan 101's own server examples already use for external-client verification; a Rust `#[test]` in emerald-rt spawning a real `std::thread`-backed server and asserting on raw bytes read back over a plain `std::net::TcpStream` client, proving the mechanism with no `curl` dependency in the test itself"
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -237,3 +237,97 @@ responses.
   served over plain HTTP here; running it behind TLS is plan 99's
   concern applied to plan 101's server generally, not something this
   plan changes.
+
+## Update (2026-09-23, EXECUTE)
+
+Implemented `Sse.upgrade`/`.send`/`.comment`/`.close` exactly as this
+plan's own Decision log specifies: a bespoke, poison-recovering
+`static SSE_STREAMS: Mutex<HashMap<u64, Box<dyn Write + Send>>>`
+registry in a new `crates/emerald-rt/src/sse.rs` (deliberately NOT
+`crate::handle`'s plan-93 generic registry, whose plain `.lock()
+.unwrap()` would cascade-poison every other open stream on a panic
+mid-write — the exact reasoning this plan's own Decision log already
+names), `tiny_http::Request::into_writer()` for the raw socket, and a
+hand-written `HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n
+Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n` head
+byte-for-byte as specified. `.upgrade` reuses `http_server.rs`'s own
+`http_request_take` — the identical extraction point plan 102's
+`HttpRequest#upgrade` already established — rather than duplicating
+it. No new crate, confirmed: `tiny_http` was already a direct
+dependency via plan 101.
+
+Two real, disclosed deviations from this plan's own Concrete Proof
+text, found only by actually compiling and running the example end to
+end (mirroring `http_server_proof.em`'s/`websocket_proof.em`'s own
+precedent for the identical reason):
+
+1. **`HttpServer.listen`/`.port`/`.accept` do not exist.** The plan's
+   own Concrete Proof names them "(assumed part of plan 101's own
+   surface)" — plan 101 only ever shipped `Http.serve(port) do |req|
+   ... end`. `examples/sse_ticker.em` upgrades the same accepted
+   request `Http.serve`'s own trampoline hands the handler, on a fixed
+   port (`47602`, matching `http_server_proof.em`'s/
+   `websocket_proof.em`'s own precedent for the identical reason: no
+   `HttpServer.port` readback exists to print an OS-chosen one)
+   instead of the plan's own literal `HttpServer.listen(0)`/
+   `.accept(server)` shape. `Sse.upgrade`/`.send`/`.comment`/`.close`
+   themselves are exactly as specified — only the surrounding
+   accept-a-connection scaffolding differs from the plan's own
+   (mistaken) assumption about plan 101's surface.
+2. **A real, load-bearing codegen bug, the identical class of bug
+   plan 101's own history already disclosed for `HttpResponse`:**
+   `build_inline_lambda`'s free-variable collector is purely syntactic
+   and has no notion of a reserved-namespace/class-static-call
+   receiver — `Sse.upgrade(req)` used inside `Http.serve(...) do |req|
+   ... end`'s own block body was (wrongly) treated as a captured local
+   variable this block must pull from its enclosing scope, hard-erroring
+   with `codegen: captured variable `Sse` is not in scope`. Plan 101's
+   own fix for `HttpResponse` only covers names already registered in
+   `ctx.classes`/`ctx.newtypes` — `Sse` is a genuinely bare reserved
+   namespace (never itself a `Let`-bindable value, unlike
+   `HttpResponse`/`HttpRequest`), exactly the residual gap that fix's
+   own comment already named as real, separate follow-up work. Closed
+   here by registering `"Sse"` in the plain `newtypes: HashSet<String>`
+   registry alongside `HttpResponse`/`HttpRequest`/`WebSocketConnection`
+   — `Sse` is never added to the *separate* `NEWTYPE_UNDERLYING` map
+   (which governs storage-kind resolution for an actual declared TYPE
+   name), since no Emerald source ever writes `x: Sse = ...`; only the
+   free-variable filter needed it.
+
+A third real, load-bearing finding, made only by actually running this
+plan's own mandatory Rust `#[test]` over a real socket (not caught by
+any earlier hand-check): `Sse.close`'s own registry-entry removal
+drops this module's `Box<dyn Write + Send>`, but that alone does NOT
+shut the underlying TCP connection down. `tiny_http` 0.12.0's own
+`RefinedTcpStream` (verified directly against its source this session)
+splits the read/write halves of an accepted connection into two
+independently `try_clone()`'d file descriptors on the SAME socket,
+each closed only via its own `Drop` calling `shutdown(Read)`/
+`shutdown(Write)` respectively — and the READ half is owned by
+`tiny_http`'s own internal per-connection `ClientConnection`, entirely
+separate from the raw writer `into_writer()`/`Sse.close` ever touch.
+For an HTTP/1.1 request with no `Connection: close` header, that
+internal machinery keeps the read half open, blocked waiting for a
+next request that never comes — so a client that reads until EOF
+(`read_to_end`, exactly what `curl -N`/this plan's own Rust test both
+do) would hang forever, never observing a real EOF, even though every
+byte of the three SSE events was already written and flushed
+correctly. Not a bug in `Sse.upgrade`/`.send`/`.close` themselves — a
+client-side request-header requirement, identical to the one
+`http_server.rs`'s own pre-existing `raw_http_get` test helper already
+disclosed and worked around (`Connection: close` in the REQUEST, not
+the response) — applied here to `sse.rs`'s own test and to
+`crates/emerald-cli/tests/examples.rs`'s own `sse_ticker_em_streams_
+three_framed_events_over_a_real_socket` test, both of which now send
+it explicitly and pass.
+
+Verified: `cargo build --workspace`; `cargo test -p emerald-rt --lib`
+(253 passed, including this plan's own two `sse::tests`); `cargo test
+-p emerald-sema -p emerald-codegen` (338 + 203 passed); `cargo test -p
+emerald-cli --test examples` (71 passed, including `sse_ticker_em_
+streams_three_framed_events_over_a_real_socket` and the pre-existing
+`http_server_proof.em`/`websocket_proof.em` proofs, confirming no
+regression); `cargo test -p emerald-cli --test http_server` (1
+passed); `cargo clippy --workspace --all-targets` (0 errors, only
+pre-existing warnings in files this plan did not touch); `cargo fmt --
+check` (clean).

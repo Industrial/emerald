@@ -5589,6 +5589,12 @@ struct Ctx<'a, 'ctx> {
   ws_message_kind: FunctionValue<'ctx>,
   ws_message_text: FunctionValue<'ctx>,
   ws_message_bytes: FunctionValue<'ctx>,
+  /// Plan 104 (Server-Sent Events) — `Sse.upgrade`/`.send`/`.comment`/
+  /// `.close`, layered on plan 101's `Http.serve`/`tiny_http`.
+  sse_upgrade: FunctionValue<'ctx>,
+  sse_send: FunctionValue<'ctx>,
+  sse_comment: FunctionValue<'ctx>,
+  sse_close: FunctionValue<'ctx>,
   /// Plan 115 (Key Derivation Functions) — `Kdf.hkdf`/`.pbkdf2`.
   kdf_hkdf: FunctionValue<'ctx>,
   kdf_pbkdf2: FunctionValue<'ctx>,
@@ -11518,6 +11524,39 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "kdfstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Str));
+  }
+
+  // Plan 104's Decision log: `Sse.upgrade`/`.send`/`.comment`/`.close`
+  // — the same reserved-namespace static-call shape `Dns`/`Kdf`/`Http`
+  // already use. Every method here returns a plain `Int64` (a stream
+  // handle from `.upgrade`, a `0`/`1` boolean from the other three —
+  // plan 59/92's convention), so this is a single uniform passthrough
+  // rather than `Dns`'s own per-arm `ret_kind` split.
+  if recv_name == "Sse" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "upgrade" => ctx.sse_upgrade,
+      "send" => ctx.sse_send,
+      "comment" => ctx.sse_comment,
+      "close" => ctx.sse_close,
+      other => return Err(format!("codegen: unsupported Sse static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "ssestatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
   }
 
   // Plan 101's Decision log: `HttpResponse.build(status, body)` — the
@@ -24975,6 +25014,30 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 104 (Server-Sent Events) — `Sse.upgrade`/`.send`/`.comment`/
+  // `.close`, layered on plan 101's `Http.serve`/`tiny_http`. Every
+  // one of these returns a plain `Int64` (a stream handle from
+  // `.upgrade`, a `0`/`1` boolean from the other three).
+  let sse_upgrade = module.add_function(
+    "emerald_rt_sse_upgrade",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sse_send = module.add_function(
+    "emerald_rt_sse_send",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sse_comment = module.add_function(
+    "emerald_rt_sse_comment",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sse_close = module.add_function(
+    "emerald_rt_sse_close",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 115 (Key Derivation Functions).
   let kdf_hkdf = module.add_function(
     "emerald_rt_kdf_hkdf",
@@ -26187,6 +26250,18 @@ fn compile_to_object_impl(
   newtypes.insert("HttpRequest".to_string());
   // Plan 102's Decision log: `WebSocketConnection`.
   newtypes.insert("WebSocketConnection".to_string());
+  // Plan 104's Decision log: `Sse` — never itself a `Let`-bindable
+  // type (`.upgrade`/`.send`/`.comment`/`.close` are all plain
+  // `Int64`-in/out reserved-namespace statics, no newtype value ever
+  // exists), registered here purely to satisfy `build_inline_lambda`'s
+  // own free-variable-capture filter immediately below (its own
+  // comment there already discloses this exact gap: "a BARE reserved
+  // namespace with no corresponding class/newtype entry at all... used
+  // as a block-body receiver would still hit this same false-
+  // positive" — `Sse.upgrade(req)` inside `Http.serve(...) do |req|
+  // ... end`'s own block body is exactly that case, hit directly by
+  // this plan's own Concrete Proof).
+  newtypes.insert("Sse".to_string());
   // Plan 124's Decision log: `XmlReader`.
   // Plan 191's Decision log: `ProgressBar`.
   newtypes.insert("ProgressBar".to_string());
@@ -26680,6 +26755,10 @@ fn compile_to_object_impl(
     ws_message_kind,
     ws_message_text,
     ws_message_bytes,
+    sse_upgrade,
+    sse_send,
+    sse_comment,
+    sse_close,
     kdf_hkdf,
     kdf_pbkdf2,
     password_hash,
