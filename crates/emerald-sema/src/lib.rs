@@ -5571,6 +5571,90 @@ fn infer_expr_type(
         expr.span,
       ))
     }
+    // Plan 131's Decision log: `Zstd.compress(data: Bytes, level:
+    // Int64): Bytes` / `Zstd.decompress(data: Bytes): Bytes` — the
+    // same reserved-namespace static-call shape `Gzip`/`Deflate`/
+    // `Zlib` immediately above use, except `.compress` takes a real,
+    // exposed `level: Int64` parameter (Zstandard's genuine `1..=22`
+    // range, `0` meaning "library default") rather than a fixed
+    // default — libzstd's own C layer rejects an out-of-range value,
+    // this arm does not pre-validate one. `.decompress` returns a bare
+    // `Bytes`, the identical "raise rather than `Result`" posture
+    // `Gzip.decompress` above already establishes.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Zstd") =>
+    {
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      match method.as_str() {
+        "compress" => {
+          check_args(
+            method,
+            args,
+            &[bytes_ty.clone(), Type::Int64],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(bytes_ty)
+        }
+        "decompress" => {
+          check_args(
+            method,
+            args,
+            std::slice::from_ref(&bytes_ty),
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(bytes_ty)
+        }
+        other => Err(Diagnostic::new(
+          format!("Zstd has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
+    // Plan 131's Decision log: `ZstdWriter.open(path: String, level:
+    // Int64): ZstdWriter` / `ZstdReader.open(path: String): ZstdReader`
+    // — the same reserved-namespace static-call shape `GzipWriter.
+    // open`/`GzipReader.open` above use, except `ZstdWriter.open`
+    // takes a real `level: Int64` parameter (see `Zstd.compress`
+    // above) `GzipWriter.open` never needed.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "ZstdWriter" | "ZstdReader")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let self_ty = Type::Newtype(recv_name.to_string(), Box::new(Type::Int64));
+      if method == "open" {
+        let expected_params: Vec<Type> = if recv_name == "ZstdWriter" {
+          vec![Type::String, Type::Int64]
+        } else {
+          vec![Type::String]
+        };
+        check_args(
+          method,
+          args,
+          &expected_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(self_ty);
+      }
+      Err(Diagnostic::new(
+        format!("{recv_name} has no static method `{method}`"),
+        expr.span,
+      ))
+    }
     // Plan 132's Decision log: `Tar.create(archive_path: String,
     // paths: Array[String]): Void` / `Tar.extract(archive_path:
     // String, dest_dir: String): Void` — the same reserved-namespace
@@ -7674,7 +7758,7 @@ fn infer_expr_type(
         // Plan 130's Decision log: `GzipWriter#write_chunk`/`#close`
         // (+ `DeflateWriter`/`ZlibWriter` siblings) — the identical
         // carved-out shape `TlsStream` immediately above establishes.
-        if matches!(name.as_str(), "GzipWriter" | "DeflateWriter" | "ZlibWriter") {
+        if matches!(name.as_str(), "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter") {
           let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
           let (expected_params, ret) = match method.as_str() {
             "write_chunk" => (vec![bytes_ty], Type::Void),
@@ -7702,7 +7786,7 @@ fn infer_expr_type(
         // (+ `DeflateReader`/`ZlibReader` siblings) — an empty `Bytes`
         // signals EOF, per this plan's own leaf text; the identical
         // carved-out shape `TlsStream` above establishes.
-        if matches!(name.as_str(), "GzipReader" | "DeflateReader" | "ZlibReader") {
+        if matches!(name.as_str(), "GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader") {
           let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
           let (expected_params, ret) = match method.as_str() {
             "read_chunk" => (vec![Type::Int64], bytes_ty),
@@ -15400,6 +15484,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     "DeflateReader",
     "ZlibWriter",
     "ZlibReader",
+    // Plan 131's Decision log: `ZstdWriter`/`ZstdReader` — the
+    // identical shape, plan 93's own handle registry backed by a
+    // boxed `zstd::stream::{Encoder,Decoder}<File>` respectively.
+    "ZstdWriter",
+    "ZstdReader",
     // Plan 132's Decision log: `TarReader` — the identical shape, plan
     // 93's own handle registry backed by a boxed `Vec<(String, Vec<
     // u8>)>` (every entry's name and content, read eagerly by `.open`)

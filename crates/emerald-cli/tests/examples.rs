@@ -901,6 +901,20 @@ fn gzip_roundtrip_em_prints_expected_sequence() {
   );
 }
 
+// Plan 131 (Zstandard Compression): `Zstd.compress`/`.decompress`
+// round-tripping a real, repetitive input at both a low (3, the
+// library default) and a real, higher (19) compression level — see
+// `examples/zstd_roundtrip.em`'s own header comment for the real,
+// disclosed adaptations from the plan's own literal Concrete Proof
+// text, reused verbatim from plan 130's own `gzip_roundtrip.em`.
+#[test]
+fn zstd_roundtrip_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("zstd_roundtrip.em"),
+    "true\ntrue\ntrue\ntrue\n"
+  );
+}
+
 // Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.entries_
 // count`/`.walk`/`.walk_count` (non-recursive `std::fs::read_dir` +
 // recursive, symlink-cycle-safe `walkdir` traversal) and `Path.exists`/

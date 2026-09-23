@@ -346,6 +346,15 @@ mod totp;
 // collision `csvs`/`tomls`/`urls`/`inis` already hit and disclosed.
 #[path = "oauth2.rs"]
 mod oauth2s;
+// Plan 131 (Zstandard Compression) -- `Zstd.compress`/`.decompress`,
+// `ZstdWriter.open`/`#write_chunk`/`#close`, `ZstdReader.open`/
+// `#read_chunk`/`#close`, wrapping `zstd` -- see `zstd.rs`'s own
+// module doc. Named `zstds`, not `zstd` -- this crate's own `mod zstd`
+// would shadow the external `zstd` crate this module wraps, the
+// identical collision `csvs`/`tomls`/`urls`/`inis`/`oauth2s` already
+// hit and disclosed.
+#[path = "zstd.rs"]
+mod zstds;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -3787,6 +3796,68 @@ pub unsafe extern "C" fn emerald_rt_zlib_reader_read_chunk(id: i64, max_len: i64
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_reader_close(id: i64) {
   catch_and_raise(move || gzip::zlib_reader_close(id))
+}
+
+// Plan 131 (Zstandard Compression): `Zstd.compress`/`.decompress`,
+// `ZstdWriter`/`ZstdReader` — see `zstd.rs`'s own module doc. Every
+// `Bytes` value (parameter or return) crosses this boundary as a plain
+// `i64`, identical to plan 130's `Gzip`/`GzipWriter`/`GzipReader`
+// immediately above.
+
+/// `Zstd.compress(data: Bytes, level: Int64): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_compress(data_id: i64, level: i64) -> i64 {
+  catch_and_raise(move || zstds::zstd_compress(data_id, level))
+}
+
+/// `Zstd.decompress(data: Bytes): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_decompress(data_id: i64) -> i64 {
+  catch_and_raise(move || zstds::zstd_decompress(data_id))
+}
+
+/// `ZstdWriter.open(path: String, level: Int64): ZstdWriter`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_writer_open(path: *const c_char, level: i64) -> i64 {
+  catch_and_raise(move || zstds::zstd_writer_open(path, level))
+}
+
+/// `ZstdWriter#write_chunk(self, data: Bytes): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_writer_write_chunk(id: i64, data_id: i64) {
+  catch_and_raise(move || zstds::zstd_writer_write_chunk(id, data_id))
+}
+
+/// `ZstdWriter#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_writer_close(id: i64) {
+  catch_and_raise(move || zstds::zstd_writer_close(id))
+}
+
+/// `ZstdReader.open(path: String): ZstdReader`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_reader_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || zstds::zstd_reader_open(path))
+}
+
+/// `ZstdReader#read_chunk(self, max_len: Int64): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_reader_read_chunk(id: i64, max_len: i64) -> i64 {
+  catch_and_raise(move || zstds::zstd_reader_read_chunk(id, max_len))
+}
+
+/// `ZstdReader#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zstd_reader_close(id: i64) {
+  catch_and_raise(move || zstds::zstd_reader_close(id))
 }
 
 // Plan 132 (Tar Archives): `Tar.create`/`.extract`, `TarReader.open`/

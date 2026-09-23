@@ -239,6 +239,10 @@ fn set_newtype_underlying(program: &Program) {
     "DeflateReader",
     "ZlibWriter",
     "ZlibReader",
+    // Plan 131's Decision log: `ZstdWriter`/`ZstdReader` -- the
+    // identical shape.
+    "ZstdWriter",
+    "ZstdReader",
     // Plan 132's Decision log: `TarReader` -- the identical shape.
     "TarReader",
     // Plan 133's Decision log: `ZipReader` -- the identical shape.
@@ -5531,6 +5535,16 @@ struct Ctx<'a, 'ctx> {
   zlib_reader_open: FunctionValue<'ctx>,
   zlib_reader_read_chunk: FunctionValue<'ctx>,
   zlib_reader_close: FunctionValue<'ctx>,
+  // Plan 131 (Zstandard Compression) -- `Zstd.compress`/`.decompress`,
+  // `ZstdWriter`/`ZstdReader`, wrapping `zstd`.
+  zstd_compress: FunctionValue<'ctx>,
+  zstd_decompress: FunctionValue<'ctx>,
+  zstd_writer_open: FunctionValue<'ctx>,
+  zstd_writer_write_chunk: FunctionValue<'ctx>,
+  zstd_writer_close: FunctionValue<'ctx>,
+  zstd_reader_open: FunctionValue<'ctx>,
+  zstd_reader_read_chunk: FunctionValue<'ctx>,
+  zstd_reader_close: FunctionValue<'ctx>,
   /// Plan 132 (Tar Archives) — `Tar.create`/`.extract`, `TarReader.
   /// open`/`.next_entry`/`.entry_size`/`.read_entry_data`/`.close`,
   /// wrapping `tar`.
@@ -9499,7 +9513,7 @@ fn build_method_call<'ctx>(
     // out shape `TlsStream` above establishes.
     if matches!(
       local_classes.get(recv_name).map(String::as_str),
-      Some("GzipWriter" | "DeflateWriter" | "ZlibWriter")
+      Some("GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter")
     ) {
       let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
       let (recv_val, _) = build_expr(
@@ -9515,6 +9529,7 @@ fn build_method_call<'ctx>(
         "GzipWriter" => (ctx.gzip_writer_close, ctx.gzip_writer_write_chunk),
         "DeflateWriter" => (ctx.deflate_writer_close, ctx.deflate_writer_write_chunk),
         "ZlibWriter" => (ctx.zlib_writer_close, ctx.zlib_writer_write_chunk),
+        "ZstdWriter" => (ctx.zstd_writer_close, ctx.zstd_writer_write_chunk),
         _ => unreachable!(),
       };
       if method == "close" {
@@ -9551,7 +9566,7 @@ fn build_method_call<'ctx>(
     // out shape `TlsStream` above establishes.
     if matches!(
       local_classes.get(recv_name).map(String::as_str),
-      Some("GzipReader" | "DeflateReader" | "ZlibReader")
+      Some("GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader")
     ) {
       let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
       let (recv_val, _) = build_expr(
@@ -9567,6 +9582,7 @@ fn build_method_call<'ctx>(
         "GzipReader" => (ctx.gzip_reader_close, ctx.gzip_reader_read_chunk),
         "DeflateReader" => (ctx.deflate_reader_close, ctx.deflate_reader_read_chunk),
         "ZlibReader" => (ctx.zlib_reader_close, ctx.zlib_reader_read_chunk),
+        "ZstdReader" => (ctx.zstd_reader_close, ctx.zstd_reader_read_chunk),
         _ => unreachable!(),
       };
       if method == "close" {
@@ -11630,13 +11646,50 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ValKind::Int64));
   }
 
+  // Plan 131's Decision log: `Zstd.compress(data: Bytes, level:
+  // Int64): Bytes` / `Zstd.decompress(data: Bytes): Bytes` -- the
+  // same generic args-forwarding shape `Gzip`/`Deflate`/`Zlib`
+  // immediately above use; `.compress`'s real second `level: Int64`
+  // argument is just one more entry in the same per-arg build loop.
+  if recv_name == "Zstd" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "compress" => ctx.zstd_compress,
+      "decompress" => ctx.zstd_decompress,
+      other => return Err(format!("codegen: unsupported Zstd static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "zstdcompresstmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
   // Plan 130's Decision log: `GzipWriter.open`/`DeflateWriter.open`/
   // `ZlibWriter.open`/`GzipReader.open`/`DeflateReader.open`/
   // `ZlibReader.open` -- the same reserved-namespace static-call shape
   // `TcpListener.bind` above uses.
   if matches!(
     recv_name.as_str(),
-    "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "GzipReader" | "DeflateReader" | "ZlibReader"
+    "GzipWriter"
+      | "DeflateWriter"
+      | "ZlibWriter"
+      | "GzipReader"
+      | "DeflateReader"
+      | "ZlibReader"
+      | "ZstdWriter"
+      | "ZstdReader"
   ) {
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
     for a in args {
@@ -11663,6 +11716,8 @@ fn build_method_call<'ctx>(
       "DeflateReader" => ctx.deflate_reader_open,
       "ZlibWriter" => ctx.zlib_writer_open,
       "ZlibReader" => ctx.zlib_reader_open,
+      "ZstdWriter" => ctx.zstd_writer_open,
+      "ZstdReader" => ctx.zstd_reader_open,
       _ => unreachable!(),
     };
     let call = builder
@@ -25649,6 +25704,51 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 131 (Zstandard Compression): `Zstd.compress`'s real second
+  // `level: Int64` argument crosses as a plain `i64_ty`, the same
+  // convention every other `Int64` value already uses; `ZstdWriter.
+  // open` similarly takes a real second `i64_ty` level argument
+  // `GzipWriter.open` never needed.
+  let zstd_compress = module.add_function(
+    "emerald_rt_zstd_compress",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zstd_decompress = module.add_function(
+    "emerald_rt_zstd_decompress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zstd_writer_open = module.add_function(
+    "emerald_rt_zstd_writer_open",
+    i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zstd_writer_write_chunk = module.add_function(
+    "emerald_rt_zstd_writer_write_chunk",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zstd_writer_close = module.add_function(
+    "emerald_rt_zstd_writer_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zstd_reader_open = module.add_function(
+    "emerald_rt_zstd_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zstd_reader_read_chunk = module.add_function(
+    "emerald_rt_zstd_reader_read_chunk",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zstd_reader_close = module.add_function(
+    "emerald_rt_zstd_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 132 (Tar Archives): `Tar.create`'s own `paths: Array[String]`
   // argument crosses as its own already-unpacked `(elements_base:
   // ptr_ty, count: i64_ty)` pair, not the array's header-inclusive
@@ -27702,6 +27802,13 @@ fn compile_to_object_impl(
   newtypes.insert("DeflateReader".to_string());
   newtypes.insert("ZlibWriter".to_string());
   newtypes.insert("ZlibReader".to_string());
+  // Plan 131's Decision log: `ZstdWriter`/`ZstdReader` -- added here
+  // as well as `NEWTYPE_UNDERLYING` above, per the `GzipWriter`/
+  // `GzipReader` gap immediately above (found by plan 132's own
+  // implementing agent): both registries must carry every handle
+  // newtype, not just one.
+  newtypes.insert("ZstdWriter".to_string());
+  newtypes.insert("ZstdReader".to_string());
   // Plan 163's Decision log: `BigInt` (a `crate::handle`-registry
   // opaque `Int64` handle) — `Decimal` is deliberately NOT added here,
   // since it is an ordinary compiler-synthesized `Type::Class`, not a
@@ -28115,6 +28222,14 @@ fn compile_to_object_impl(
     zlib_reader_open,
     zlib_reader_read_chunk,
     zlib_reader_close,
+    zstd_compress,
+    zstd_decompress,
+    zstd_writer_open,
+    zstd_writer_write_chunk,
+    zstd_writer_close,
+    zstd_reader_open,
+    zstd_reader_read_chunk,
+    zstd_reader_close,
     tar_create,
     tar_extract,
     tar_reader_open,

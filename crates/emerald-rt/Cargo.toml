@@ -510,6 +510,38 @@ walkdir = "2.5"
 flate2 = { version = "1.1.10", default-features = false, features = [
   "miniz_oxide",
 ] }
+# Plan 131 (Zstandard Compression): `zstd` 0.14.0 (2026-09-04, real,
+# current pin at this plan's own execution time, verified directly
+# against docs.rs/gyscos-zstd-rs's own `Cargo.toml` — `crates.io`
+# itself blocks bot access), ~4.6M downloads/month, used in 3,018
+# crates (480 directly), owned by `gyscos`, BSD-3-Clause. A genuine,
+# disclosed C-binding exception to plan 95's pure-Rust-first policy —
+# by its own GitHub description, "a rust binding for the zstd
+# compression library": `zstd-sys` vendors and `cc`-compiles Facebook's
+# own reference `libzstd` C source tree at build time (no system
+# `libzstd`/`pkg-config` needed, the same "vendor + `cc`-compile a C
+# tree at Rust build time" shape plan 91's own `build.rs` already uses
+# for `runtime/emerald_runtime.c`). `ruzstd` (0.9.0, real pure-Rust
+# alternative, checked this session) was declined for v1: its own docs
+# state its decompressor is "about 3.5 times slower" than the C
+# original and its compressor "does not yet reach the speed, ratio or
+# configurability of the original zstd library," in the maintainer's
+# own words — disqualifying for a stdlib module whose whole value
+# proposition is compression speed/ratio. `default-features = false`
+# disables all three of this crate's own real default features
+# (`arrays`, `legacy`, `zdict_builder`, verified directly against
+# docs.rs's feature listing this session — a real, disclosed correction
+# against this plan's own text, which named only `legacy`/`zstdmt`):
+# `legacy` (decoding pre-1.0 zstd frames) and `zdict_builder`
+# (dictionary training) are both out of scope for v1 per this plan's
+# own Decision log, and `arrays` (slice-based one-shot `zstd-safe`
+# calls) is unneeded since this module uses `zstd::stream::{encode_all,
+# decode_all}`, not `zstd::bulk`. `zstdmt` (multithreaded compression)
+# was never a default feature to begin with, also left off. No RustSec
+# advisory found (`rustsec.org/packages/{zstd,zstd-sys}.html` both
+# 404 — no advisory ever filed). `Zstd.compress`/`.decompress`,
+# `ZstdWriter`/`ZstdReader`'s direct backing. See DEPENDENCIES.md.
+zstd = { version = "0.14", default-features = false }
 # Plan 132 (Tar Archives): `tar` 0.4.46 (real, current pin at this
 # plan's own authoring time, verified against its own `README.md`/
 # `Cargo.toml` on `alexcrichton/tar-rs`'s `main` branch) - the de facto
