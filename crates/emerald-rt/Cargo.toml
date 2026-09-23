@@ -523,22 +523,6 @@ tar = { version = "0.4.46", default-features = false }
 zip = { version = "8.6", default-features = false, features = [
   "deflate-flate2-zlib-rs",
 ] }
-# Plan 147 (Temporary Files & Directories): `tempfile` 3.27.0 (Mar 11,
-# 2026), #3 in lib.rs's own Filesystem category, actively maintained,
-# pure-Rust, no RustSec advisory found — real-checked at this plan's
-# own execution time (2026-09-23, via lib.rs). Already present in this
-# same file as a `[dev-dependencies]`-only fixture crate added by plan
-# 144, which explicitly anticipated this promotion in its own comment
-# (see that entry's removal above) — reused, not re-vetted from
-# scratch, and now resolves into the real `--release` staticlib for
-# the first time. Chosen specifically because it solves a hard problem
-# (unpredictable, collision-/race-free temp naming; correct-from-
-# creation-time restrictive permissions, not `chmod`'d afterward) that
-# hand-rolling with plain `std::fs` would likely get subtly wrong — see
-# this plan's own Decision log. `Tempfile`/`Tempdir`'s direct backing
-# (`tempfile::NamedTempFile`/`tempfile::TempDir` respectively). See
-# DEPENDENCIES.md.
-tempfile = "3.27"
 
 [build-dependencies]
 
@@ -554,11 +538,15 @@ tempfile = "3.27"
 # identical purpose). No RustSec advisory found.
 [dev-dependencies]
 rcgen = "0.13"
-# Plan 144 (Extended Filesystem Operations) originally added `tempfile`
-# here as a `[dev-dependencies]`-only fixture crate (`dir.rs`'s/
-# `path.rs`'s own `#[cfg(test)]` fixtures use `tempfile::tempdir()`),
-# explicitly anticipating plan 147 would later promote it to a genuine
-# runtime dependency. Plan 147 does exactly that below, under
-# `[dependencies]` — removed from here since a regular dependency is
-# already available to `#[cfg(test)]` code too, so keeping a separate
-# dev-dependency line would just be a redundant duplicate pin.
+# Plan 144 (Extended Filesystem Operations) - a `[dev-dependencies]`-
+# only addition, never linked into the real `--release` staticlib,
+# same role `rcgen` plays immediately above. `tempfile` 3.27.0 (Mar
+# 11, 2026), #3 in crates.io's Filesystem category - `dir.rs`'s/
+# `path.rs`'s own `#[cfg(test)]` fixtures use `tempfile::tempdir()` to
+# build a real, disposable directory tree per test rather than writing
+# into the repo working directory. A real, disclosed forward
+# reference: this plan's own todo text anticipated plan 147 would be
+# the one to first add this crate as a genuine runtime dependency -
+# plan 144 adds it here first, but only as a test fixture, never
+# reachable from the compiled `--release` staticlib.
+tempfile = "3.27"
