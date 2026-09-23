@@ -1432,25 +1432,35 @@ pub enum Item {
     description: String,
     body: Vec<Spanned<Stmt>>,
   },
-  /// `property "description" do ... end` (plan 80's Decision log,
-  /// `history/2026-09-08T174011Z-plan-of-plans.md` row 80) — parses and
-  /// type-checks identically to `Item::Test` (same `description`/`body`
-  /// shape, checked by the exact same `emerald-sema` code path). A
-  /// REAL, DISCLOSED SIMPLIFICATION, not full property-based testing:
-  /// Sable's own design brief (`history/2026-09-19T100000Z-sable-
-  /// design-brief.md` §37) names `property "..." do ... end` alongside
-  /// `test`/`benchmark` but says "the exact test API remains open" —
-  /// it gives no generation/shrinking strategy, and building a real
-  /// QuickCheck/proptest-style input generator is a separate, much
-  /// larger research problem this plan explicitly declines to attempt.
-  /// `emerald_codegen::compile_test_harness` runs a `property` block's
-  /// body exactly ONCE, through the identical `begin ... rescue
-  /// AssertionError => e ... end` pass/fail mechanism a `test` block
-  /// gets — today, `property` is syntactic sugar for a single-input
-  /// test, not generative testing across many random inputs. That gap
-  /// is left open for future work, not silently pretended away.
+  /// `property "description" (a: Int64, b: Int64) do ... end` (plan
+  /// 80's Decision log, `history/2026-09-08T174011Z-plan-of-plans.md`
+  /// row 80, extended by plan 180's
+  /// `history/2026-09-21T212900Z-plan-180-property-testing.md`) — the
+  /// zero-param shape (`params` empty) still parses and type-checks
+  /// identically to `Item::Test`, and `emerald_codegen::
+  /// compile_test_harness` still runs its body exactly ONCE through the
+  /// identical `begin ... rescue AssertionError => e ... end` pass/fail
+  /// mechanism a `test` block gets — a REAL, DISCLOSED SIMPLIFICATION
+  /// plan 80 shipped and plan 180 leaves completely unchanged for this
+  /// shape (`leaf-legacy-zero-param-compat`).
+  ///
+  /// A non-empty `params` is plan 180's real, generator-driven
+  /// property testing: `compile_test_harness` synthesizes a case
+  /// function taking `params` (reusing ordinary `Function`-body
+  /// lowering), then a runtime loop that calls `emerald_rt_proptest_*`
+  /// (a `proptest`-backed native driver, `crates/emerald-rt/src/
+  /// proptest_support.rs`) to generate up to 256 cases per parameter,
+  /// independently per parameter (not one joint/correlated tuple
+  /// strategy — a real, disclosed scope choice, see that module's own
+  /// doc comment), shrinking coordinate-wise via `proptest`'s own real
+  /// `ValueTree::simplify()`/`complicate()` on the first failure.
+  /// `emerald-sema` restricts a parameterized property's own parameter
+  /// types to `Int64`/`Float64`/`String`/`Boolean` (matching plan 59's
+  /// verified `Type` enum finding — no narrower generator target
+  /// exists) with a real diagnostic on any other declared type.
   Property {
     description: String,
+    params: Vec<Param>,
     body: Vec<Spanned<Stmt>>,
   },
   /// `benchmark "description" do ... end` (plan 80's Decision log) —

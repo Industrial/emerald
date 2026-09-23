@@ -184,6 +184,72 @@ fn examples_property_test_em_matches_the_documented_transcript() {
   assert_eq!(output.status.code(), Some(0));
 }
 
+// Plan 180 (property-based testing generators).
+
+#[test]
+fn examples_property_shrink_proof_em_matches_the_documented_transcript() {
+  // Real, executed proof of plan 180's own Concrete Proof
+  // (`history/2026-09-21T212900Z-plan-180-property-testing.md`): a
+  // real `proptest`-backed generate/shrink loop, not a single-shot
+  // run. Can't `assert_eq!` the whole transcript byte-for-byte the
+  // way `examples_property_test_em_matches_the_documented_transcript`
+  // does above — `assert_eq`'s own pre-existing "expected:/but got:"
+  // print-then-raise behavior (real, unchanged by this plan; see
+  // `math_test_worked_example_matches_the_transcript_and_exits_1`
+  // above for the identical single-shot precedent) fires once per
+  // generated/shrunk FAILING case, so the exact line count varies run
+  // to run with the RNG's own random shrink path length. What's
+  // genuinely checkable, and checked here: the first property runs
+  // and passes all 256 generated cases; the second genuinely fails and
+  // shrinks to a real, minimal counterexample (proptest's own
+  // documented shrink target for two independent `i64`s under `a !=
+  // b` is as close to zero as reachable while staying unequal — `(0,
+  // 1)`/`(0, -1)`/`(1, 0)`/`(-1, 0)`, not the exact digits of one
+  // specific run, per this plan's own Decision log); the run-level
+  // pass/fail bookkeeping and exit code are exact.
+  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("property")
+    .arg("examples/property_shrink_proof.em")
+    .current_dir(&root)
+    .output()
+    .unwrap();
+
+  assert_eq!(output.status.code(), Some(1), "{output:?}");
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    stdout.contains("PASS: addition is commutative (256 cases)\n"),
+    "{stdout}"
+  );
+  assert!(
+    stdout.trim_end().ends_with("passed:\n1\nfailed:\n1"),
+    "{stdout}"
+  );
+
+  let fail_line = stdout
+    .lines()
+    .find(|l| l.starts_with("FAIL: subtraction finds a real bug: "))
+    .unwrap_or_else(|| panic!("no FAIL line for the failing property in:\n{stdout}"));
+  let prefix = "FAIL: subtraction finds a real bug: minimal input a=";
+  let rest = fail_line
+    .strip_prefix(prefix)
+    .unwrap_or_else(|| panic!("unexpected FAIL line shape: {fail_line}"));
+  let (a_str, rest) = rest.split_once(", b=").unwrap();
+  let (b_str, rest) = rest.split_once(": ").unwrap();
+  let a: i64 = a_str.parse().unwrap();
+  let b: i64 = b_str.parse().unwrap();
+  assert_ne!(a, b, "a shrunk counterexample must still be a real one");
+  assert!(
+    a.unsigned_abs() <= 1 && b.unsigned_abs() <= 1,
+    "shrinking should converge near zero, got a={a}, b={b}"
+  );
+  // Real shrinking, not a single lucky generated case: `.em:6` is
+  // `property_shrink_proof.em`'s own `assert_eq` line, proving the
+  // reported message came from the guarded case function's own real
+  // exception, not a placeholder.
+  assert!(rest.contains("property_shrink_proof.em:6"), "{fail_line}");
+}
+
 #[test]
 fn benchmark_block_compiles_and_reports_a_real_elapsed_time() {
   // A real, executed proof that `emerald benchmark` actually measures

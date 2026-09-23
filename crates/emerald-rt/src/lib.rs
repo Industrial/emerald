@@ -234,6 +234,11 @@ mod process;
 // reserved-namespace static calls (wrapping `console`) — see
 // `progress.rs`'s own module doc.
 mod progress;
+// Plan 180 (Property-Based Testing Generators) — `property "..."
+// (params...) do ... end`'s real `proptest`-backed generate/shrink
+// session state machine; see this module's own doc comment for the
+// full architecture.
+mod proptest_support;
 mod random;
 mod regex;
 mod secure_compare;
@@ -1699,6 +1704,88 @@ pub unsafe extern "C" fn emerald_rt_xml_reader_from_file(path: *const c_char) ->
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_xml_reader_next_event(id: i64) -> *mut c_void {
   catch_and_raise(move || xml::xml_reader_next_event(id))
+}
+
+// Plan 180 (Property-Based Testing Generators) — `property "..."
+// (a: Int64, ...) do ... end`'s real, generator-driven case loop; see
+// `proptest_support.rs`'s own module doc for the full architecture
+// (the compiled Emerald harness drives the loop, calling into these
+// nine exports once per generated/shrunk case — nothing here calls
+// back into compiled Emerald code).
+
+/// # Safety
+/// `types` must be a valid, NUL-terminated C string, one byte per
+/// property parameter (`i`/`f`/`s`/`b`).
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_begin(types: *const c_char) -> i64 {
+  catch_and_raise(move || proptest_support::proptest_begin(types))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_current_i64(session: i64, idx: i64) -> i64 {
+  catch_and_raise(move || proptest_support::proptest_current_i64(session, idx))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_current_f64(session: i64, idx: i64) -> f64 {
+  catch_and_raise(move || proptest_support::proptest_current_f64(session, idx))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_current_string(
+  session: i64,
+  idx: i64,
+) -> *const c_char {
+  catch_and_raise(move || proptest_support::proptest_current_string(session, idx))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`.
+/// Returns `0`/`1`, not a real Emerald `Boolean` — see `proptest_
+/// support.rs`'s own doc comment for why.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_current_bool(session: i64, idx: i64) -> i64 {
+  catch_and_raise(move || proptest_support::proptest_current_bool(session, idx))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`;
+/// `message`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_report(
+  session: i64,
+  failed: i64,
+  message: *const c_char,
+) -> i64 {
+  catch_and_raise(move || proptest_support::proptest_report(session, failed, message))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_failed(session: i64) -> i64 {
+  catch_and_raise(move || proptest_support::proptest_failed(session))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_case_count(session: i64) -> i64 {
+  catch_and_raise(move || proptest_support::proptest_case_count(session))
+}
+
+/// # Safety
+/// `session` must be a live handle from `emerald_rt_proptest_begin`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_proptest_fail_message(session: i64) -> *const c_char {
+  catch_and_raise(move || proptest_support::proptest_fail_message(session))
 }
 
 // Plan 146 (Environment Variables): `Env.get`/`.set`/`.remove`/

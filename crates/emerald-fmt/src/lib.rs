@@ -465,9 +465,11 @@ fn write_item(out: &mut String, item: &Item) {
       out.push_str(" }\n");
     }
     Item::Test { description, body } => write_named_block(out, "test", description, body, 0),
-    Item::Property { description, body } => {
-      write_named_block(out, "property", description, body, 0)
-    }
+    Item::Property {
+      description,
+      params,
+      body,
+    } => write_named_block_with_params(out, "property", description, params, body, 0),
     Item::Benchmark { description, body } => {
       write_named_block(out, "benchmark", description, body, 0)
     }
@@ -500,10 +502,36 @@ fn write_named_block(
   body: &[Spanned<Stmt>],
   indent: usize,
 ) {
+  write_named_block_with_params(out, keyword, description, &[], body, indent);
+}
+
+/// Plan 180's `leaf-property-params-grammar`: `write_named_block`'s own
+/// sibling, adding an optional `(a: Type, b: Type)` clause right after
+/// the description — reprints as nothing at all (byte-identical to the
+/// original `write_named_block`) when `params` is empty, so every
+/// zero-param `test`/`property`/`benchmark` block still round-trips
+/// unchanged.
+fn write_named_block_with_params(
+  out: &mut String,
+  keyword: &str,
+  description: &str,
+  params: &[Param],
+  body: &[Spanned<Stmt>],
+  indent: usize,
+) {
   push_indent(out, indent);
   out.push_str(keyword);
   out.push(' ');
   out.push_str(&encode_string_lit(description));
+  if !params.is_empty() {
+    out.push_str(" (");
+    let parts: Vec<String> = params
+      .iter()
+      .map(|p| format!("{}: {}", p.name, p.ty))
+      .collect();
+    out.push_str(&parts.join(", "));
+    out.push(')');
+  }
   out.push_str(" do\n");
   write_stmts(out, body, indent + 1);
   push_indent(out, indent);

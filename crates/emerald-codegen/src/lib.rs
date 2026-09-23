@@ -27322,6 +27322,95 @@ pub fn ensure_pre_sema_exception_classes(items: &mut Vec<Item>) {
 /// its own top-level `Item::Function` (`__emerald_test_N`), called
 /// from a synthesized top-level sequence that wraps each call in
 /// `begin ... rescue AssertionError => e ... end`, tracks `passed`/
+/// Plan 180's `leaf-property-params-grammar`/`leaf-proptest-driver`:
+/// one `ExternFn` inside the `Item::Extern` block a parameterized
+/// `property` needs — the same "declare a synthetic native function
+/// via the general, plan-59 extern mechanism, not a new codegen-level
+/// builtin" choice `compile_benchmark_harness`'s own `BENCH_CLOCK_FN`
+/// already makes.
+fn proptest_extern_fn(name: &str, params: &[(&str, &str)], return_type: &str) -> ExternFn {
+  ExternFn {
+    name: name.to_string(),
+    params: params
+      .iter()
+      .map(|(n, ty)| Param {
+        name: n.to_string(),
+        ty: TypeExpr::Named(ty.to_string()),
+        default: None,
+      })
+      .collect(),
+    return_type: TypeExpr::Named(return_type.to_string()),
+  }
+}
+
+/// Plan 180's own v1 generator-type encoding — `emerald-sema`'s
+/// `is_property_generatable_type` already rejects every other declared
+/// property parameter type before codegen ever reaches this function,
+/// so the fallback arms below are real, unreachable defensive code,
+/// not a silently-accepted narrower type.
+fn property_param_kind_char(ty: &TypeExpr) -> char {
+  match ty {
+    TypeExpr::Named(name) => match name.as_str() {
+      "Int64" => 'i',
+      "Float64" => 'f',
+      "String" => 's',
+      "Boolean" => 'b',
+      _ => unreachable!("emerald-sema rejects any other property parameter type"),
+    },
+    _ => unreachable!("emerald-sema rejects any non-Named property parameter type"),
+  }
+}
+
+/// The dummy initial value each per-parameter harness variable holds
+/// before the `while` loop's first iteration overwrites it via
+/// `Stmt::Assign` — never actually read by the property's own case
+/// function (`property_param_fetch_expr` always runs first in the
+/// loop body), needed only so the variable is declared `is_var: true`
+/// once, outside the loop, and can be read again after the loop ends
+/// to build the `FAIL:` message's own `minimal input a=..., b=...`.
+fn property_param_default_expr(ty: &TypeExpr) -> Expr {
+  match property_param_kind_char(ty) {
+    'i' => Expr::Int(0),
+    'f' => Expr::Float(0.0),
+    's' => Expr::StringLit(String::new()),
+    'b' => Expr::Bool(false),
+    _ => unreachable!(),
+  }
+}
+
+/// Plan 180's own "no `Boolean`-typed extern signature" choice (see
+/// `proptest_support.rs`'s own doc comment): every `emerald_rt_
+/// proptest_current_*` call returns the parameter's real declared
+/// type directly EXCEPT `Boolean`, which fetches a plain `Int64` `0`/
+/// `1` and is turned into a real Emerald `Boolean` here via an
+/// ordinary `!= 0` comparison — the same idiom this harness's own
+/// `failed > 0` check already uses.
+fn property_param_fetch_expr(ty: &TypeExpr, session_var: &str, idx: usize) -> Expr {
+  let call_name = match property_param_kind_char(ty) {
+    'i' => "emerald_rt_proptest_current_i64",
+    'f' => "emerald_rt_proptest_current_f64",
+    's' => "emerald_rt_proptest_current_string",
+    'b' => "emerald_rt_proptest_current_bool",
+    _ => unreachable!(),
+  };
+  let call = Expr::Call(
+    call_name.to_string(),
+    vec![
+      syn(Expr::Ident(session_var.to_string())),
+      syn(Expr::Int(idx as i64)),
+    ],
+  );
+  if property_param_kind_char(ty) == 'b' {
+    Expr::Compare(
+      Box::new(syn(call)),
+      CompareOp::Ne,
+      Box::new(syn(Expr::Int(0))),
+    )
+  } else {
+    call
+  }
+}
+
 /// `failed` counts, prints `PASS:`/`FAIL:` lines and the final
 /// `passed:`/`failed:` summary, then — since top-level Emerald code has
 /// no mechanism of its own to set `main`'s exit code (see
@@ -27333,26 +27422,59 @@ pub fn ensure_pre_sema_exception_classes(items: &mut Vec<Item>) {
 /// program is then compiled by the ordinary, unmodified
 /// `compile_to_object` — this function never touches LLVM directly.
 ///
-/// Plan 80's Decision log: `Item::Property` blocks are collected into
-/// the exact same `tests` list, indistinguishable from an `Item::Test`
-/// from this point on — this IS the real, disclosed scope of
-/// `property` today (see `Item::Property`'s own doc comment): a
-/// `property` block runs its body exactly once, through this identical
-/// pass/fail mechanism, not across many generated inputs. Real
-/// property-based testing (input generation, shrinking) is not
-/// implemented here.
+/// Plan 180's Decision log: a zero-param `Item::Property` still
+/// collects into the exact same one-shot pass/fail mechanism an
+/// `Item::Test` gets (`leaf-legacy-zero-param-compat`) — real,
+/// unchanged from plan 80. A non-empty-`params` `Item::Property` gets
+/// plan 180's own real, generator-driven treatment: its body becomes
+/// an ordinary, parameterized `__emerald_property_case_N` function,
+/// wrapped in a synthesized `while` loop that calls `emerald_rt_
+/// proptest_*` (`crates/emerald-rt/src/proptest_support.rs`) once per
+/// generated/shrunk case — see that module's own doc comment for why
+/// the loop lives in the COMPILED harness rather than in native code
+/// calling back into it.
 pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize, String> {
-  let tests: Vec<(String, Vec<Spanned<Stmt>>)> = program
+  enum HarnessCase {
+    Simple {
+      description: String,
+      body: Vec<Spanned<Stmt>>,
+    },
+    Property {
+      description: String,
+      params: Vec<Param>,
+      body: Vec<Spanned<Stmt>>,
+    },
+  }
+
+  let cases: Vec<HarnessCase> = program
     .items
     .iter()
     .filter_map(|it| match it {
-      Item::Test { description, body } | Item::Property { description, body } => {
-        Some((description.clone(), body.clone()))
-      }
+      Item::Test { description, body } => Some(HarnessCase::Simple {
+        description: description.clone(),
+        body: body.clone(),
+      }),
+      Item::Property {
+        description,
+        params,
+        body,
+      } if params.is_empty() => Some(HarnessCase::Simple {
+        description: description.clone(),
+        body: body.clone(),
+      }),
+      Item::Property {
+        description,
+        params,
+        body,
+      } => Some(HarnessCase::Property {
+        description: description.clone(),
+        params: params.clone(),
+        body: body.clone(),
+      }),
       _ => None,
     })
     .collect();
-  let num_tests = tests.len();
+  let num_tests = cases.len();
 
   let mut items: Vec<Item> = program
     .items
@@ -27360,6 +27482,62 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
     .filter(|it| !matches!(it, Item::Test { .. } | Item::Property { .. }))
     .cloned()
     .collect();
+
+  if cases
+    .iter()
+    .any(|c| matches!(c, HarnessCase::Property { .. }))
+  {
+    items.push(Item::Extern(ExternBlock {
+      abi: "C".to_string(),
+      fns: vec![
+        proptest_extern_fn("emerald_rt_proptest_begin", &[("types", "String")], "Int64"),
+        proptest_extern_fn(
+          "emerald_rt_proptest_current_i64",
+          &[("session", "Int64"), ("idx", "Int64")],
+          "Int64",
+        ),
+        proptest_extern_fn(
+          "emerald_rt_proptest_current_f64",
+          &[("session", "Int64"), ("idx", "Int64")],
+          "Float64",
+        ),
+        proptest_extern_fn(
+          "emerald_rt_proptest_current_string",
+          &[("session", "Int64"), ("idx", "Int64")],
+          "String",
+        ),
+        proptest_extern_fn(
+          "emerald_rt_proptest_current_bool",
+          &[("session", "Int64"), ("idx", "Int64")],
+          "Int64",
+        ),
+        proptest_extern_fn(
+          "emerald_rt_proptest_report",
+          &[
+            ("session", "Int64"),
+            ("failed", "Int64"),
+            ("message", "String"),
+          ],
+          "Int64",
+        ),
+        proptest_extern_fn(
+          "emerald_rt_proptest_failed",
+          &[("session", "Int64")],
+          "Int64",
+        ),
+        proptest_extern_fn(
+          "emerald_rt_proptest_case_count",
+          &[("session", "Int64")],
+          "Int64",
+        ),
+        proptest_extern_fn(
+          "emerald_rt_proptest_fail_message",
+          &[("session", "Int64")],
+          "String",
+        ),
+      ],
+    }));
+  }
 
   let mut harness_stmts = vec![
     syn(Stmt::Let {
@@ -27376,67 +27554,271 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
     }),
   ];
 
-  for (i, (description, body)) in tests.into_iter().enumerate() {
-    let fn_name = format!("__emerald_test_{i}");
-    items.push(Item::Function(AstFunction {
-      name: fn_name.clone(),
-      params: Vec::new(),
-      return_type: TypeExpr::Named("Void".to_string()),
-      body,
-      block_param: None,
-      splat_param: None,
-      type_params: Vec::new(),
-      is_comptime: false,
-      requires: Vec::new(),
-      ensures: Vec::new(),
-      is_pure: false,
-      is_static: false,
-      // A synthesized `test`/`property` harness function — no `##`
-      // comment position exists for it (plan 77's Decision log).
-      doc: None,
-    }));
+  for (i, case) in cases.into_iter().enumerate() {
+    match case {
+      HarnessCase::Simple { description, body } => {
+        let fn_name = format!("__emerald_test_{i}");
+        items.push(Item::Function(AstFunction {
+          name: fn_name.clone(),
+          params: Vec::new(),
+          return_type: TypeExpr::Named("Void".to_string()),
+          body,
+          block_param: None,
+          splat_param: None,
+          type_params: Vec::new(),
+          is_comptime: false,
+          requires: Vec::new(),
+          ensures: Vec::new(),
+          is_pure: false,
+          is_static: false,
+          // A synthesized `test`/`property` harness function — no `##`
+          // comment position exists for it (plan 77's Decision log).
+          doc: None,
+        }));
 
-    harness_stmts.push(syn(Stmt::Begin {
-      body: vec![
-        syn(Stmt::Expr(syn(Expr::Call(fn_name, Vec::new())))),
-        syn(Stmt::Expr(syn(Expr::Call(
-          "puts".to_string(),
-          vec![syn(Expr::StringLit(format!("PASS: {description}")))],
-        )))),
-        syn(Stmt::Assign {
-          name: "passed".to_string(),
-          value: syn(Expr::Add(
-            Box::new(syn(Expr::Ident("passed".to_string()))),
-            Box::new(syn(Expr::Int(1))),
+        harness_stmts.push(syn(Stmt::Begin {
+          body: vec![
+            syn(Stmt::Expr(syn(Expr::Call(fn_name, Vec::new())))),
+            syn(Stmt::Expr(syn(Expr::Call(
+              "puts".to_string(),
+              vec![syn(Expr::StringLit(format!("PASS: {description}")))],
+            )))),
+            syn(Stmt::Assign {
+              name: "passed".to_string(),
+              value: syn(Expr::Add(
+                Box::new(syn(Expr::Ident("passed".to_string()))),
+                Box::new(syn(Expr::Int(1))),
+              )),
+            }),
+          ],
+          rescues: vec![RescueClause {
+            class_name: Some("AssertionError".to_string()),
+            var: "e".to_string(),
+            body: vec![
+              syn(Stmt::Expr(syn(Expr::Call(
+                "puts".to_string(),
+                vec![syn(Expr::Add(
+                  Box::new(syn(Expr::StringLit(format!("FAIL: {description}: ")))),
+                  Box::new(syn(Expr::MethodCall(
+                    Box::new(syn(Expr::Ident("e".to_string()))),
+                    "message".to_string(),
+                    Vec::new(),
+                  ))),
+                ))],
+              )))),
+              syn(Stmt::Assign {
+                name: "failed".to_string(),
+                value: syn(Expr::Add(
+                  Box::new(syn(Expr::Ident("failed".to_string()))),
+                  Box::new(syn(Expr::Int(1))),
+                )),
+              }),
+            ],
+          }],
+          ensure: None,
+        }));
+      }
+      HarnessCase::Property {
+        description,
+        params,
+        body,
+      } => {
+        let fn_name = format!("__emerald_property_case_{i}");
+        items.push(Item::Function(AstFunction {
+          name: fn_name.clone(),
+          params: params.clone(),
+          return_type: TypeExpr::Named("Void".to_string()),
+          body,
+          block_param: None,
+          splat_param: None,
+          type_params: Vec::new(),
+          is_comptime: false,
+          requires: Vec::new(),
+          ensures: Vec::new(),
+          is_pure: false,
+          is_static: false,
+          doc: None,
+        }));
+
+        let session_var = format!("__emerald_prop_session_{i}");
+        let cont_var = format!("__emerald_prop_cont_{i}");
+        let arg_vars: Vec<String> = (0..params.len())
+          .map(|j| format!("__emerald_prop_arg_{i}_{j}"))
+          .collect();
+        let type_string: String = params
+          .iter()
+          .map(|p| property_param_kind_char(&p.ty))
+          .collect();
+
+        harness_stmts.push(syn(Stmt::Let {
+          name: session_var.clone(),
+          ty: TypeExpr::Named("Int64".to_string()),
+          value: syn(Expr::Call(
+            "emerald_rt_proptest_begin".to_string(),
+            vec![syn(Expr::StringLit(type_string))],
           )),
-        }),
-      ],
-      rescues: vec![RescueClause {
-        class_name: Some("AssertionError".to_string()),
-        var: "e".to_string(),
-        body: vec![
-          syn(Stmt::Expr(syn(Expr::Call(
-            "puts".to_string(),
-            vec![syn(Expr::Add(
-              Box::new(syn(Expr::StringLit(format!("FAIL: {description}: ")))),
-              Box::new(syn(Expr::MethodCall(
-                Box::new(syn(Expr::Ident("e".to_string()))),
-                "message".to_string(),
-                Vec::new(),
-              ))),
-            ))],
+          is_var: false,
+        }));
+        harness_stmts.push(syn(Stmt::Let {
+          name: cont_var.clone(),
+          ty: TypeExpr::Named("Int64".to_string()),
+          value: syn(Expr::Int(1)),
+          is_var: true,
+        }));
+        for (j, p) in params.iter().enumerate() {
+          harness_stmts.push(syn(Stmt::Let {
+            name: arg_vars[j].clone(),
+            ty: p.ty.clone(),
+            value: syn(property_param_default_expr(&p.ty)),
+            is_var: true,
+          }));
+        }
+
+        let mut loop_body: Vec<Spanned<Stmt>> = params
+          .iter()
+          .enumerate()
+          .map(|(j, p)| {
+            syn(Stmt::Assign {
+              name: arg_vars[j].clone(),
+              value: syn(property_param_fetch_expr(&p.ty, &session_var, j)),
+            })
+          })
+          .collect();
+
+        loop_body.push(syn(Stmt::Begin {
+          body: vec![
+            syn(Stmt::Expr(syn(Expr::Call(
+              fn_name,
+              arg_vars
+                .iter()
+                .map(|v| syn(Expr::Ident(v.clone())))
+                .collect(),
+            )))),
+            syn(Stmt::Assign {
+              name: cont_var.clone(),
+              value: syn(Expr::Call(
+                "emerald_rt_proptest_report".to_string(),
+                vec![
+                  syn(Expr::Ident(session_var.clone())),
+                  syn(Expr::Int(0)),
+                  syn(Expr::StringLit(String::new())),
+                ],
+              )),
+            }),
+          ],
+          rescues: vec![RescueClause {
+            class_name: Some("AssertionError".to_string()),
+            var: "e".to_string(),
+            body: vec![syn(Stmt::Assign {
+              name: cont_var.clone(),
+              value: syn(Expr::Call(
+                "emerald_rt_proptest_report".to_string(),
+                vec![
+                  syn(Expr::Ident(session_var.clone())),
+                  syn(Expr::Int(1)),
+                  syn(Expr::MethodCall(
+                    Box::new(syn(Expr::Ident("e".to_string()))),
+                    "message".to_string(),
+                    Vec::new(),
+                  )),
+                ],
+              )),
+            })],
+          }],
+          ensure: None,
+        }));
+
+        harness_stmts.push(syn(Stmt::While {
+          cond: syn(Expr::Compare(
+            Box::new(syn(Expr::Ident(cont_var.clone()))),
+            CompareOp::Ne,
+            Box::new(syn(Expr::Int(0))),
+          )),
+          body: loop_body,
+        }));
+
+        // `FAIL: {description}: minimal input a=<v>, b=<v>: <message>`
+        // — matches this plan's own Concrete Proof exactly. Built via
+        // `Expr::Interpolate` (plan 36's own string-interpolation
+        // codegen), which stringifies each part by its real, evaluated
+        // `ValKind` (`Int64`/`Float64`/`Boolean`/`String` all directly
+        // supported) — NOT `.to_s`: a real bug found this session by
+        // actually compiling and running this plan's own Concrete
+        // Proof (not assumed) is that `.to_s`'s own codegen dispatch
+        // only ever resolves a receiver's type via `local_classes`'s
+        // CLASS-name lookup (`resolve_local_class_name`/enum/newtype/
+        // `Hash`/`Result`/`Pair`/`Proc` — see `Stmt::Let`'s own codegen
+        // arm), which has no entry at all for a bare `Int64`/`Float64`/
+        // `Boolean`-typed local; `Expr::Interpolate` dispatches on the
+        // receiver's actually-evaluated `ValKind` instead, exactly the
+        // mechanism this harness needs.
+        let mut fail_parts = vec![StringPart::Literal(format!(
+          "FAIL: {description}: minimal input "
+        ))];
+        for (j, p) in params.iter().enumerate() {
+          if j > 0 {
+            fail_parts.push(StringPart::Literal(", ".to_string()));
+          }
+          fail_parts.push(StringPart::Literal(format!("{}=", p.name)));
+          fail_parts.push(StringPart::Expr(Box::new(syn(Expr::Ident(
+            arg_vars[j].clone(),
+          )))));
+        }
+        fail_parts.push(StringPart::Literal(": ".to_string()));
+        fail_parts.push(StringPart::Expr(Box::new(syn(Expr::Call(
+          "emerald_rt_proptest_fail_message".to_string(),
+          vec![syn(Expr::Ident(session_var.clone()))],
+        )))));
+        let fail_msg = Expr::Interpolate(fail_parts);
+
+        // `PASS: {description} (<n> cases)`.
+        let pass_msg = Expr::Interpolate(vec![
+          StringPart::Literal(format!("PASS: {description} (")),
+          StringPart::Expr(Box::new(syn(Expr::Call(
+            "emerald_rt_proptest_case_count".to_string(),
+            vec![syn(Expr::Ident(session_var.clone()))],
           )))),
-          syn(Stmt::Assign {
-            name: "failed".to_string(),
-            value: syn(Expr::Add(
-              Box::new(syn(Expr::Ident("failed".to_string()))),
-              Box::new(syn(Expr::Int(1))),
-            )),
-          }),
-        ],
-      }],
-      ensure: None,
-    }));
+          StringPart::Literal(" cases)".to_string()),
+        ]);
+
+        harness_stmts.push(syn(Stmt::If {
+          cond: syn(Expr::Compare(
+            Box::new(syn(Expr::Call(
+              "emerald_rt_proptest_failed".to_string(),
+              vec![syn(Expr::Ident(session_var.clone()))],
+            ))),
+            CompareOp::Ne,
+            Box::new(syn(Expr::Int(0))),
+          )),
+          then_branch: vec![
+            syn(Stmt::Expr(syn(Expr::Call(
+              "puts".to_string(),
+              vec![syn(fail_msg)],
+            )))),
+            syn(Stmt::Assign {
+              name: "failed".to_string(),
+              value: syn(Expr::Add(
+                Box::new(syn(Expr::Ident("failed".to_string()))),
+                Box::new(syn(Expr::Int(1))),
+              )),
+            }),
+          ],
+          else_branch: Some(vec![
+            syn(Stmt::Expr(syn(Expr::Call(
+              "puts".to_string(),
+              vec![syn(pass_msg)],
+            )))),
+            syn(Stmt::Assign {
+              name: "passed".to_string(),
+              value: syn(Expr::Add(
+                Box::new(syn(Expr::Ident("passed".to_string()))),
+                Box::new(syn(Expr::Int(1))),
+              )),
+            }),
+          ]),
+        }));
+      }
+    }
   }
 
   harness_stmts.push(syn(Stmt::Expr(syn(Expr::Call(

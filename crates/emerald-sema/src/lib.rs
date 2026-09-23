@@ -875,6 +875,20 @@ fn type_references_any(ty: &TypeExpr, names: &HashSet<&str>) -> bool {
 /// `Type` shapes that can't round-trip through a source-level name at
 /// all (`Type::Generic`/`Type::Supervisor`) — never actually reached in
 /// practice, since neither is ever a legal generic-method type argument.
+/// Plan 180's own v1 generator-type allow-list (`Decision log`: "Type
+/// coverage in v1: `Int64`, `Float64`, `String`, `Boolean` only —
+/// matching plan 59's own verified `Type` enum finding"). Checked
+/// against the raw, unresolved `TypeExpr` a `property (...)` parameter
+/// was declared with — a bare `TypeExpr::Named` naming exactly one of
+/// these four, nothing generic/compound/class-shaped.
+fn is_property_generatable_type(ty: &TypeExpr) -> bool {
+  matches!(
+    ty,
+    TypeExpr::Named(name)
+      if matches!(name.as_str(), "Int64" | "Float64" | "String" | "Boolean")
+  )
+}
+
 fn type_to_type_expr(t: &Type) -> TypeExpr {
   match t {
     Type::Int64 => TypeExpr::Named("Int64".to_string()),
@@ -16359,17 +16373,59 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       // `Void`-return, no-`self`-fields scope — the exact same shape
       // `check_function_body` already gives a free function, so this
       // just synthesizes one rather than duplicating that logic.
-      // Plan 80: `property`/`benchmark` bodies get the identical
-      // synthetic-function treatment — same AST shape as `test`, same
-      // check. `property`'s own real, disclosed scope narrowing (it
-      // runs its body once, like an ordinary `test`, not across many
-      // generated inputs) lives in `emerald_codegen::compile_test_
-      // harness`'s doc comment, not here — sema treats all three
-      // identically.
-      Item::Test { body, .. } | Item::Property { body, .. } | Item::Benchmark { body, .. } => {
+      // Plan 80: `benchmark` bodies get the identical synthetic-
+      // function treatment — same AST shape as `test`, same check.
+      Item::Test { body, .. } | Item::Benchmark { body, .. } => {
         let synthetic = Function {
           name: "test".to_string(),
           params: Vec::new(),
+          return_type: TypeExpr::Named("Void".to_string()),
+          body: body.clone(),
+          block_param: None,
+          splat_param: None,
+          type_params: Vec::new(),
+          is_comptime: false,
+          requires: Vec::new(),
+          ensures: Vec::new(),
+          is_pure: false,
+          is_static: false,
+          doc: None,
+        };
+        if let Err(d) = check_function_body(&synthetic, &sigs, &classes, &gctx) {
+          diags.push(d);
+        }
+      }
+      // Plan 180's `leaf-property-params-grammar`: a zero-param
+      // `property` body keeps `Item::Test`'s exact synthetic-function
+      // treatment above (unchanged, `leaf-legacy-zero-param-compat`).
+      // A non-empty `params` first checks every declared parameter
+      // type against plan 180's own v1 generator coverage
+      // (`Int64`/`Float64`/`String`/`Boolean` only, matching plan 59's
+      // verified `Type` enum finding — no composite/class type has a
+      // generator), then synthesizes a real, parameterized function —
+      // `check_function_body` type-checks the body with each param
+      // actually bound in scope, exactly like an ordinary `fn` would.
+      Item::Property {
+        description: _,
+        params,
+        body,
+      } => {
+        for p in params {
+          if !is_property_generatable_type(&p.ty) {
+            diags.push(Diagnostic::new(
+              format!(
+                "property parameter `{}` has type `{}`, which plan 180's property-based \
+                 testing cannot generate — only Int64, Float64, String, and Boolean \
+                 parameters are supported",
+                p.name, p.ty
+              ),
+              (0, 0),
+            ));
+          }
+        }
+        let synthetic = Function {
+          name: "property".to_string(),
+          params: params.clone(),
           return_type: TypeExpr::Named("Void".to_string()),
           body: body.clone(),
           block_param: None,

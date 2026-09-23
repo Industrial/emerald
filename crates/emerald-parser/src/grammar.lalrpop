@@ -98,7 +98,15 @@ Item: Item = {
   // narrow production shape verbatim (a real, new "do" terminal per
   // keyword is unnecessary — `"do"`/`"end"` are already shared
   // terminals) — not a new grammar mechanism.
-  "property" <description:StringLitTok> "do" <body:Stmt*> "end" => Item::Property { description, body },
+  //
+  // Plan 180's Decision log: an optional `"(" Params ")"` slots in
+  // between the description and `"do"` — reuses `Params` verbatim (the
+  // same nonterminal `ExternFnDecl`/`InterfaceMethodDef` already share),
+  // not a new parameter-list grammar. Omitting it entirely (plan 80's
+  // original, still-valid shape) parses to an empty `params`, so every
+  // existing zero-param `property "..." do ... end` block keeps parsing
+  // identically (`leaf-legacy-zero-param-compat`).
+  "property" <description:StringLitTok> <params:("(" <Params> ")")?> "do" <body:Stmt*> "end" => Item::Property { description, params: params.unwrap_or_default(), body },
   "benchmark" <description:StringLitTok> "do" <body:Stmt*> "end" => Item::Benchmark { description, body },
   ! => { errors.push(<>); Item::Error },
 };
