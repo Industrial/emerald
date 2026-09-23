@@ -415,3 +415,67 @@ This document does not itself decompose into Maestro tasks or carry an
 execution overlay — per `inception.md`/`inception-2`'s own precedent,
 that is each individual numbered plan's job (91-191 already have that
 shape; the two `NEW` items in §5.A need it authored before EXECUTE).
+
+## 7. Update (2026-09-22): every real gap named in §4 now has an authored plan
+
+Planning only — nothing in this update reflects executed code beyond
+what plan-of-plans.md's own Foundation-tier row already discloses
+(`derive Serializable` implemented, 4/5 leaves).
+
+- **§4.1 (automatic serialization)** — `to_json_value` shipped
+  (`history/2026-09-22T033000Z-derive-serializable.md`). Its deferred
+  `from_json_value` half now has a real unblocking plan:
+  `history/2026-09-22T224200Z-plan-196-class-level-static-methods.md`
+  (an explicit `static` modifier on `MethodDef`, no grammar change on
+  the call side — verified against `grammar.lalrpop`'s current
+  `MethodDef` production, which has no self-less form today).
+- **§4.2 (iteration protocol)** — plan 192's own two open follow-ups are
+  no longer open: `history/2026-09-22T224000Z-plan-194-iterable-iterator-protocol.md`
+  scopes a concrete ChainCallExpr diagnosis (re-verified directly:
+  the recursive DoBlock alternative is embedded at three separate
+  grammar tiers, not the one plan 192's own text focused on) and a
+  Reader/Writer interface pair, while explicitly declining the full
+  `Array`/`Hash`-onto-`Iterable[T]` dispatch retrofit for the same
+  reason plan 192 itself left it open — `check_enumerable_call`'s
+  existing hardcoded dispatch is not blocking anything today.
+- **§4.3 (Set/priority-queue/deque)** — `history/2026-09-22T223900Z-plan-193-set-deque-priority-queue.md`.
+  Routed through plan 93's `emerald-rt` resource-handle registry
+  (verified: `Array[T]`/`Hash[K,V]` are hand-rolled LLVM memory in
+  `emerald-codegen`, not `emerald-rt`-wrapped, but plan 09's own
+  Decision log already discloses `Hash` doesn't carry `Array`'s
+  unboxed-representation mandate — so the new collection types follow
+  the proven resource-handle mechanism instead of extending
+  codegen's built-in representation). Backed by Rust's own
+  `std::collections` (`HashSet`/`VecDeque`/`BinaryHeap`) — no external
+  crate; `Set`/`PriorityQueue` scoped to `Int64`/`String` (`Float64`
+  excluded on the same grounds Rust's own `std` excludes it from
+  `Eq`/`Hash`/`Ord`).
+- **§4.4 (typed errors)** — `history/2026-09-22T224100Z-plan-195-typed-domain-errors-convention.md`,
+  shaped as a cross-cutting policy document (plan 95's own
+  crate-vetting-policy precedent, not a crate-wrap plan): per-domain
+  `<Domain>Error` enums, never one shared cross-domain enum, with a
+  mandatory `Other(String)` escape hatch; an additive
+  `emerald_rt_result_err_tagged` FFI export alongside plan 92's
+  existing untagged one, so real Rust error classification (e.g.
+  `serde_json::Error::classify()`) survives the native boundary rather
+  than being flattened to a string first. Plans 118 (JSON) and 122
+  (regex) — both already shipped — are named as the real worked-example
+  retrofits; every other not-yet-implemented plan applies the
+  convention from EXECUTE time forward via a checklist.
+
+**What this does not close**: plan 181's miscategorization (§5.D) is
+unchanged — still real, valuable work, still the wrong shelf, still
+not a stdlib plan; no new plan was authored for it, consistent with
+this document's own original recommendation to track it separately
+rather than fold it into this batch.
+
+One disclosed verification gap, not silently smoothed over: plan 196's
+own citation of `emerald-sema/src/lib.rs`'s exact `Expr::New` line
+number was NOT independently re-verified when this update was authored
+(the session's shared code-search tool was rate-limited by concurrent
+authoring work at the time) — it instead cites `derive-serializable.md`'s
+own already-verified finding, which is a legitimate reuse of another
+plan's Decision-log finding per this project's own convention, but
+whichever agent picks up plan 196 for EXECUTE should re-confirm that
+line directly first, per this project's own "verified, not assumed"
+discipline that plan 196 otherwise follows throughout.
