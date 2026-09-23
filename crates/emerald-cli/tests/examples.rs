@@ -722,3 +722,21 @@ fn bignum_decimal_proof_em_prints_expected_sequence() {
     "2432902008176640000\n15511210043330985984000000\ninvalid digit string for BigInt: \"not a number\"\n42\n440\n0.3\n0.1\n0.02\ndivision by zero\n0.3\nInvalid decimal: unknown character\n"
   );
 }
+
+// Plan 160 (Date/Time & Timezones): `DateTime` (a UTC instant, packed
+// two-`Int64`-field class) and `ZonedDateTime` (the same two fields
+// plus a `tz_name: String` IANA identifier), backed by `jiff` — RFC
+// 3339 parsing/formatting, a real unrecognized-timezone `Err`, and a
+// DST-aware `.plus_days` crossing 2026's real US spring-forward
+// transition (2026-03-08, `America/New_York`). Plan 195 (Typed Domain
+// Errors) applied at this plan's own EXECUTE time — `.parse_rfc3339`/
+// `.in_tz` return `Result[T, DateTimeError]`, never a bare `Result[T,
+// String]` — see `examples/datetime_timezones_proof.em`'s own header
+// comment.
+#[test]
+fn datetime_timezones_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("datetime_timezones_proof.em"),
+    "2026-06-15T12:00:00Z\n2026-06-15T12:00:00Z\nfailed to find time zone `Nonexistent/Zone` in time zone database\n-3600\n"
+  );
+}

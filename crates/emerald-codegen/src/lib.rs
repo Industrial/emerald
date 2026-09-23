@@ -5140,6 +5140,16 @@ struct Ctx<'a, 'ctx> {
   decimal_sub: FunctionValue<'ctx>,
   decimal_mul: FunctionValue<'ctx>,
   decimal_div: FunctionValue<'ctx>,
+  /// Plan 160 (Date/Time & Timezones) — `DateTime.now`/`.parse_rfc3339`
+  /// plus its four instance methods, plus `ZonedDateTime`'s own two.
+  datetime_now: FunctionValue<'ctx>,
+  datetime_parse_rfc3339: FunctionValue<'ctx>,
+  datetime_to_rfc3339: FunctionValue<'ctx>,
+  datetime_plus_seconds: FunctionValue<'ctx>,
+  datetime_diff_seconds: FunctionValue<'ctx>,
+  datetime_in_tz: FunctionValue<'ctx>,
+  zoned_to_utc: FunctionValue<'ctx>,
+  zoned_plus_days: FunctionValue<'ctx>,
   /// Plan 193 (`Set[T]`/`Deque[T]`/`PriorityQueue[T]`) — 54 concrete
   /// monomorphized `emerald_rt_<kind>_<elemtype>_<method>` exports
   /// (2 `Set` element types x 7 methods, 4 `Deque` element types x 7
@@ -9438,6 +9448,43 @@ fn build_method_call<'ctx>(
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
   }
+  // Plan 160's Decision log: `DateTime.now`/`.parse_rfc3339` — the
+  // same shape as `Decimal.from_s` immediately above; `.now` takes no
+  // arguments at all, the first zero-arg static method this hardcoded
+  // dispatch shape has needed.
+  if recv_name == "DateTime" {
+    match method {
+      "now" => {
+        let call = builder
+          .build_call(ctx.datetime_now, &[], "datetimenowtmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      "parse_rfc3339" => {
+        let arg = args
+          .first()
+          .ok_or_else(|| "codegen: `DateTime.parse_rfc3339` expects 1 argument".to_string())?;
+        let (v, _) = build_expr(
+          context,
+          builder,
+          arg,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        let call = builder
+          .build_call(ctx.datetime_parse_rfc3339, &[v.into()], "datetimeparsetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      other => {
+        return Err(format!(
+          "codegen: unsupported DateTime static method `{other}`"
+        ));
+      }
+    }
+  }
   // Plan 109's Decision log: `Sha256.hash`/`Sha512.hash`/`Sha3_256.
   // hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — the same
   // reserved-namespace static-call shape `Regex` immediately above
@@ -11163,6 +11210,141 @@ fn build_method_call<'ctx>(
         .build_call(fv, &[recv_val.into(), other_val.into()], "decimalinsttmp")
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Ptr));
+    }
+    // Plan 160's Decision log: `DateTime`'s own four instance methods
+    // — the identical "falls through past the newtypes-gated dispatch
+    // block, checked at this later point" shape `Decimal` immediately
+    // above already uses (`DateTime` is an ordinary `Type::Class`, not
+    // a newtype).
+    if class_name == "DateTime" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "to_rfc3339" {
+        let call = builder
+          .build_call(
+            ctx.datetime_to_rfc3339,
+            &[recv_val.into()],
+            "datetimetorfc3339tmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      if method == "plus_seconds" {
+        let arg = args
+          .first()
+          .ok_or_else(|| "codegen: `DateTime.plus_seconds` expects 1 argument".to_string())?;
+        let (n_val, _) = build_expr(
+          context,
+          builder,
+          arg,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        let call = builder
+          .build_call(
+            ctx.datetime_plus_seconds,
+            &[recv_val.into(), n_val.into()],
+            "datetimeplussecondstmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      if method == "diff_seconds" {
+        let arg = args
+          .first()
+          .ok_or_else(|| "codegen: `DateTime.diff_seconds` expects 1 argument".to_string())?;
+        let (other_val, _) = build_expr(
+          context,
+          builder,
+          arg,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        let call = builder
+          .build_call(
+            ctx.datetime_diff_seconds,
+            &[recv_val.into(), other_val.into()],
+            "datetimediffsecondstmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Int64));
+      }
+      if method == "in_tz" {
+        let arg = args
+          .first()
+          .ok_or_else(|| "codegen: `DateTime.in_tz` expects 1 argument".to_string())?;
+        let (tz_val, _) = build_expr(
+          context,
+          builder,
+          arg,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        let call = builder
+          .build_call(
+            ctx.datetime_in_tz,
+            &[recv_val.into(), tz_val.into()],
+            "datetimeintztmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      return Err(format!("codegen: unsupported DateTime method `{method}`"));
+    }
+    // Plan 160's Decision log: `ZonedDateTime`'s own two instance
+    // methods — same shape as `DateTime` immediately above.
+    if class_name == "ZonedDateTime" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "to_utc" {
+        let call = builder
+          .build_call(ctx.zoned_to_utc, &[recv_val.into()], "zonedtoutctmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      if method == "plus_days" {
+        let arg = args
+          .first()
+          .ok_or_else(|| "codegen: `ZonedDateTime.plus_days` expects 1 argument".to_string())?;
+        let (n_val, _) = build_expr(
+          context,
+          builder,
+          arg,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        let call = builder
+          .build_call(
+            ctx.zoned_plus_days,
+            &[recv_val.into(), n_val.into()],
+            "zonedplusdaystmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      return Err(format!("codegen: unsupported ZonedDateTime method `{method}`"));
     }
     // Plan 32: resolve which ancestor actually *declares* `method` —
     // only the defining class has a compiled `{Class}_{method}` symbol
@@ -21423,6 +21605,53 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 160 (Date/Time & Timezones): `DateTime.now`/`.parse_rfc3339`
+  // plus its four instance methods, plus `ZonedDateTime`'s own two —
+  // every `DateTime`/`ZonedDateTime` value (self AND each `other`/
+  // `tz_name` argument) crosses as a plain heap pointer to its own
+  // packed field block (`ptr_ty`), never a `crate::handle` id — see
+  // `datetime.rs`'s own module doc. `.parse_rfc3339`/`.in_tz` return
+  // plan 53's own `Result` layout.
+  let datetime_now = module.add_function(
+    "emerald_rt_datetime_now",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let datetime_parse_rfc3339 = module.add_function(
+    "emerald_rt_datetime_parse_rfc3339",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let datetime_to_rfc3339 = module.add_function(
+    "emerald_rt_datetime_to_rfc3339",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let datetime_plus_seconds = module.add_function(
+    "emerald_rt_datetime_plus_seconds",
+    ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let datetime_diff_seconds = module.add_function(
+    "emerald_rt_datetime_diff_seconds",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let datetime_in_tz = module.add_function(
+    "emerald_rt_datetime_in_tz",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zoned_to_utc = module.add_function(
+    "emerald_rt_zoned_to_utc",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zoned_plus_days = module.add_function(
+    "emerald_rt_zoned_plus_days",
+    ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 146 (Environment Variables): `.get` returns a bare nullable
   // pointer (this call site itself builds the real `Option[String]`
   // value from it); `.set`/`.remove` return `Void`; `.keys` returns an
@@ -22320,6 +22549,62 @@ fn compile_to_object_impl(
     doc: None,
   };
   class_defs.insert("Decimal".to_string(), &decimal_class_def);
+  // Plan 160 (Date/Time & Timezones): `DateTime`/`ZonedDateTime` — the
+  // same "resolves against the real class registry with no matching
+  // source-level declaration" shape `Decimal` immediately above
+  // already uses, needed here so `ctx.classes.contains_key("DateTime"/
+  // "ZonedDateTime")` is true for `build_match_result`'s own `Ok(z)`
+  // binding path (`utc.in_tz(...)`'s own `Result[ZonedDateTime,
+  // DateTimeError]` return value, bound via `match ... Ok(z) do ...`).
+  let datetime_class_def = ClassDef {
+    name: "DateTime".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![
+      Param {
+        name: "epoch_secs".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "subsec_nanos".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+    ],
+    methods: Vec::new(),
+    type_params: Vec::new(),
+    doc: None,
+  };
+  class_defs.insert("DateTime".to_string(), &datetime_class_def);
+  let zoned_datetime_class_def = ClassDef {
+    name: "ZonedDateTime".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![
+      Param {
+        name: "epoch_secs".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "subsec_nanos".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "tz_name".to_string(),
+        ty: TypeExpr::Named("String".to_string()),
+        default: None,
+      },
+    ],
+    methods: Vec::new(),
+    type_params: Vec::new(),
+    doc: None,
+  };
+  class_defs.insert("ZonedDateTime".to_string(), &zoned_datetime_class_def);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -22382,6 +22667,21 @@ fn compile_to_object_impl(
   // this tag is dead weight for that purpose, kept only so this
   // unconditional bookkeeping loop has an entry to find.
   class_tags.insert("Decimal".to_string(), class_tags.len() as i64);
+  // Plan 160: `DateTime`/`ZonedDateTime`'s own `ClassLayout`s plus
+  // `class_tags` entries — needed unconditionally for the identical
+  // reason `Decimal`'s own comment immediately above discloses (the
+  // `rescue_tag_sets` bookkeeping loop below indexes every `class_defs`
+  // key regardless of whether any real `.em` code ever rescues it).
+  classes.insert(
+    "DateTime".to_string(),
+    build_class_layout("DateTime", &class_defs)?,
+  );
+  class_tags.insert("DateTime".to_string(), class_tags.len() as i64);
+  classes.insert(
+    "ZonedDateTime".to_string(),
+    build_class_layout("ZonedDateTime", &class_defs)?,
+  );
+  class_tags.insert("ZonedDateTime".to_string(), class_tags.len() as i64);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -22659,6 +22959,24 @@ fn compile_to_object_impl(
   enums.insert(
     "DecimalError".to_string(),
     build_enum_layout(&decimal_error_enum_def_cg),
+  );
+  // Plan 160 (Date/Time & Timezones): `DateTimeError` — codegen's own
+  // mirror of `emerald-sema`'s identical synthetic `EnumDef` (see that
+  // crate's own Decision log for the full reasoning: `jiff::Error` is
+  // deliberately opaque, so a single `Other(String)` variant is this
+  // domain's entire, honest v1 scope).
+  let datetime_error_enum_def_cg = EnumDef {
+    name: "DateTimeError".to_string(),
+    variants: vec![EnumVariant {
+      name: "Other".to_string(),
+      fields: vec![TypeExpr::Named("String".to_string())],
+    }],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "DateTimeError".to_string(),
+    build_enum_layout(&datetime_error_enum_def_cg),
   );
   // Plan 124: `XmlNode`/`XmlEvent` — codegen's own mirror of `emerald-
   // sema`'s identical synthetic `EnumDef`s (see that crate's own
@@ -23154,6 +23472,14 @@ fn compile_to_object_impl(
     decimal_sub,
     decimal_mul,
     decimal_div,
+    datetime_now,
+    datetime_parse_rfc3339,
+    datetime_to_rfc3339,
+    datetime_plus_seconds,
+    datetime_diff_seconds,
+    datetime_in_tz,
+    zoned_to_utc,
+    zoned_plus_days,
     set_i64_new,
     set_i64_add,
     set_i64_contains,

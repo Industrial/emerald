@@ -875,6 +875,7 @@ dependencies = [
  "hickory-resolver",
  "hkdf",
  "humantime",
+ "jiff",
  "libc",
  "libm",
  "md-5",

@@ -165,6 +165,9 @@ mod collections;
 // `aead.rs`/`url.rs`/`toml.rs` already hit and disclosed.
 #[path = "csv.rs"]
 mod csvs;
+// Plan 160 (Date/Time & Timezones) — `DateTime`/`ZonedDateTime`,
+// wrapping `jiff` — see `datetime.rs`'s own module doc.
+mod datetime;
 // Plan 163 (Arbitrary-Precision Integers & Decimals), `Decimal` half —
 // see `decimal.rs`'s own module doc for why this half is a packed
 // two-`Int64`-field class, deliberately NOT a `crate::handle` registry
@@ -890,6 +893,77 @@ pub unsafe extern "C" fn emerald_rt_decimal_div(
   other_ptr: *const i64,
 ) -> *mut c_void {
   catch_and_raise(move || decimal::decimal_div(ptr, other_ptr))
+}
+
+// Plan 160 (Date/Time & Timezones): `DateTime`'s two static methods
+// plus its four instance methods, plus `ZonedDateTime`'s own two —
+// dispatched by `emerald-codegen`'s own hardcoded `DateTime`/
+// `ZonedDateTime`-keyed method-call arms, the same shape `Decimal`
+// immediately above uses.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_datetime_now() -> *mut c_void {
+  catch_and_raise(move || datetime::datetime_now())
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_datetime_parse_rfc3339(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || datetime::datetime_parse_rfc3339(s))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 16-byte, `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_datetime_to_rfc3339(ptr: *const i64) -> *const c_char {
+  catch_and_raise(move || datetime::datetime_to_rfc3339(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 16-byte, `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_datetime_plus_seconds(ptr: *const i64, n: i64) -> *mut c_void {
+  catch_and_raise(move || datetime::datetime_plus_seconds(ptr, n))
+}
+
+/// # Safety
+/// `ptr`/`other_ptr` must each point to a live, 16-byte,
+/// `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_datetime_diff_seconds(
+  ptr: *const i64,
+  other_ptr: *const i64,
+) -> i64 {
+  catch_and_raise(move || datetime::datetime_diff_seconds(ptr, other_ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 16-byte, `emerald_alloc`-backed block.
+/// `tz_name`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_datetime_in_tz(
+  ptr: *const i64,
+  tz_name: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || datetime::datetime_in_tz(ptr, tz_name))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 24-byte, `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zoned_to_utc(ptr: *const i64) -> *mut c_void {
+  catch_and_raise(move || datetime::zoned_to_utc(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 24-byte, `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zoned_plus_days(ptr: *const i64, n: i64) -> *mut c_void {
+  catch_and_raise(move || datetime::zoned_plus_days(ptr, n))
 }
 
 // Plan 193 (`Set[T]`, `Deque[T]`, `PriorityQueue[T]`) — 54 concrete

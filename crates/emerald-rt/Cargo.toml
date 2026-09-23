@@ -417,6 +417,27 @@ unicode-segmentation = "1.13.3"
 # installed `cargo audit` database — see this crate's own gate run).
 num-bigint = "0.4"
 rust_decimal = "1"
+# Plan 160 (Date/Time & Timezones): real-checked at this plan's own
+# execution time (2026-09-23, via docs.rs/lib.rs — crates.io itself
+# 403s bot access, the identical finding plan 118's/154's own comments
+# already disclose) - jiff 0.2.37 (Sep 12, 2026), #6 in lib.rs's own
+# "Date and time" category, 27.6M downloads/month, used in 8,592 crates
+# (1,245 directly), owned by Andrew Gallant (BurntSushi - also the
+# author of ripgrep/regex), Unlicense OR MIT. `rustsec.org/packages/
+# jiff.html` 404s - no advisory ever filed (the same absence-of-page
+# signal `x25519-dalek`'s own ledger row above already uses). A real,
+# disclosed correction against this plan's own text: the plan cites
+# `jiff` 0.2.20 - the actual current release is 0.2.37; the plan's
+# underlying reasoning (chosen over `chrono`, soft-deprecated in
+# writing by its own maintainer, GitHub issue `chronotope/chrono#1768`,
+# opened 2026-01-22, still open as of 2026-09-15; chosen over `time`,
+# which has no bundled IANA database of its own) is unaffected - only
+# the version number was stale. Default features (`tz-system`,
+# `tzdb-bundle-platform`, `tzdb-zoneinfo`, verified directly against
+# `docs.rs/crate/jiff/latest/features`) already bundle the IANA Time
+# Zone Database, confirming the plan's own "no second `chrono-tz`-
+# equivalent dependency needed" claim - not assumed. Pure Rust.
+jiff = "0.2.37"
 
 [build-dependencies]
 

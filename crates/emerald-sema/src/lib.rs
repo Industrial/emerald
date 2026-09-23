@@ -13938,6 +13938,229 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&decimal_error_enum_def);
+  // Plan 160 (Date/Time & Timezones): `DateTime` — a compiler-
+  // synthesized, two-`Int64`-field class (`epoch_secs`/`subsec_
+  // nanos`), the identical "packed fields, not a `crate::handle`"
+  // shape `Decimal` immediately above already uses (`jiff::Timestamp`
+  // is `Copy`, internally a signed second count plus a sub-second
+  // nanosecond count — both fit exactly into two `Int64`-typed fields
+  // with zero heap allocation). `fields` stays empty here — Emerald
+  // source never reads `.epoch_secs`/`.subsec_nanos` directly; only
+  // `emerald-rt`'s own native calls ever reconstruct a real `jiff::
+  // Timestamp` from them. `.now`/`.parse_rfc3339` are `is_static: true`
+  // (the identical plan-196 dispatch shape `Decimal.from_s` already
+  // uses); `.to_rfc3339`/`.plus_seconds`/`.diff_seconds`/`.in_tz` are
+  // ordinary instance methods.
+  let datetime_ty = Type::Class("DateTime".to_string());
+  let zoned_datetime_ty = Type::Class("ZonedDateTime".to_string());
+  classes.insert(
+    "DateTime".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::from([
+        (
+          "now".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: datetime_ty.clone(),
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: true,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "parse_rfc3339".to_string(),
+          FunctionSig {
+            params: vec![Type::String],
+            return_type: Type::Result(
+              Box::new(datetime_ty.clone()),
+              Box::new(Type::Enum("DateTimeError".to_string())),
+            ),
+            block_param: None,
+            param_names: vec!["s".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: true,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "to_rfc3339".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::String,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "plus_seconds".to_string(),
+          FunctionSig {
+            params: vec![Type::Int64],
+            return_type: datetime_ty.clone(),
+            block_param: None,
+            param_names: vec!["n".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "diff_seconds".to_string(),
+          FunctionSig {
+            params: vec![datetime_ty.clone()],
+            return_type: Type::Int64,
+            block_param: None,
+            param_names: vec!["other".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "in_tz".to_string(),
+          FunctionSig {
+            params: vec![Type::String],
+            return_type: Type::Result(
+              Box::new(zoned_datetime_ty.clone()),
+              Box::new(Type::Enum("DateTimeError".to_string())),
+            ),
+            block_param: None,
+            param_names: vec!["tz_name".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+      ]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  // Plan 160: `ZonedDateTime` — `DateTime` plus one `String` field,
+  // `tz_name` (the plan's own Decision log: an IANA name is the only
+  // representation stable across a `jiff-tzdb` database update, never
+  // a numeric zone-table index). `.to_utc`/`.plus_days` are ordinary
+  // instance methods; constructed only via `DateTime.in_tz` above, no
+  // static constructor of its own.
+  classes.insert(
+    "ZonedDateTime".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::from([
+        (
+          "to_utc".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: datetime_ty.clone(),
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "plus_days".to_string(),
+          FunctionSig {
+            params: vec![Type::Int64],
+            return_type: zoned_datetime_ty.clone(),
+            block_param: None,
+            param_names: vec!["n".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+      ]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  // Plan 160: `DateTimeError` — the Typed Domain Errors convention
+  // (plan 195), applied to a crate (`jiff`) whose own `Error` type is
+  // deliberately opaque (`pub struct Error(..)`, no public variants,
+  // verified against `docs.rs/jiff` directly) — the identical
+  // situation `BigIntError` documents for `num_bigint`'s bare-`Option`
+  // failure mode, so a single required `Other(String)` escape-hatch
+  // variant is this domain's entire, honest v1 scope, shared by both
+  // `DateTime.parse_rfc3339`'s malformed-input failure and `DateTime.
+  // in_tz`'s unrecognized-IANA-name failure — both surface only
+  // `jiff::Error`'s own opaque `Display` text, with no real
+  // sub-classification to expose either way.
+  let datetime_error_enum_def = EnumDef {
+    name: "DateTimeError".to_string(),
+    variants: vec![EnumVariant {
+      name: "Other".to_string(),
+      fields: vec![TypeExpr::Named("String".to_string())],
+    }],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "DateTimeError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &datetime_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&datetime_error_enum_def);
   // Plan 124's Decision log: `XmlNode` — the XML-shaped sibling of
   // `JsonValue` immediately above, registered the identical compiler-
   // synthesized, NON-generic, self-referential-via-placeholder-seed
