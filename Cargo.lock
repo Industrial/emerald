@@ -892,6 +892,7 @@ dependencies = [
  "csv",
  "ed25519-dalek",
  "encoding_rs",
+ "flate2",
  "getrandom 0.4.3",
  "hex",
  "hickory-resolver",

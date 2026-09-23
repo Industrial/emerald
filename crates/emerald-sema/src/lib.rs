@@ -4864,6 +4864,75 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 130's Decision log: `Gzip.compress`/`.decompress`, `Deflate.
+    // compress`/`.decompress`, `Zlib.compress`/`.decompress` — the same
+    // reserved-namespace static-call shape `Sha256`/`AesGcm256`
+    // immediately above use. `.decompress` returns a bare `Bytes`, not
+    // `Result[Bytes, String]` — a corrupt/mismatched-format stream
+    // raises plan 92's `NativeError` channel directly, the same "one
+    // underlying I/O call, raise rather than `Result`" posture
+    // `TcpStream#read`/`TlsStream#read` already establish (this plan's
+    // own Concrete Proof assigns `Gzip.decompress`'s result straight to
+    // a `Bytes`-typed `let`, never through a `match`/`Result`).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "Gzip" | "Deflate" | "Zlib")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      if matches!(method.as_str(), "compress" | "decompress") {
+        check_args(
+          method,
+          args,
+          std::slice::from_ref(&bytes_ty),
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(bytes_ty);
+      }
+      Err(Diagnostic::new(
+        format!("{recv_name} has no static method `{method}`"),
+        expr.span,
+      ))
+    }
+    // Plan 130's Decision log: `GzipWriter.open`/`DeflateWriter.open`/
+    // `ZlibWriter.open`/`GzipReader.open`/`DeflateReader.open`/
+    // `ZlibReader.open` — the same reserved-namespace static-call shape
+    // `TcpListener.bind` immediately below uses, plan 93's opaque-
+    // handle-plus-explicit-`.close()` model applied to a file-backed
+    // compression stream for the first time in this batch.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(),
+        "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "GzipReader" | "DeflateReader" | "ZlibReader")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let self_ty = Type::Newtype(recv_name.to_string(), Box::new(Type::Int64));
+      if method == "open" {
+        check_args(
+          method,
+          args,
+          &[Type::String],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(self_ty);
+      }
+      Err(Diagnostic::new(
+        format!("{recv_name} has no static method `{method}`"),
+        expr.span,
+      ))
+    }
     // Plan 96's Decision log: `UdpSocket.bind`/`.last_sender_host`/
     // `.last_sender_port` — the last two are the `_Thread_local`-
     // accessor-pair convention this plan's own text mandates in place
@@ -6037,6 +6106,61 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("TlsListener has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 130's Decision log: `GzipWriter#write_chunk`/`#close`
+        // (+ `DeflateWriter`/`ZlibWriter` siblings) — the identical
+        // carved-out shape `TlsStream` immediately above establishes.
+        if matches!(name.as_str(), "GzipWriter" | "DeflateWriter" | "ZlibWriter") {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "write_chunk" => (vec![bytes_ty], Type::Void),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("{name} has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 130's Decision log: `GzipReader#read_chunk`/`#close`
+        // (+ `DeflateReader`/`ZlibReader` siblings) — an empty `Bytes`
+        // signals EOF, per this plan's own leaf text; the identical
+        // carved-out shape `TlsStream` above establishes.
+        if matches!(name.as_str(), "GzipReader" | "DeflateReader" | "ZlibReader") {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "read_chunk" => (vec![Type::Int64], bytes_ty),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("{name} has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -13358,6 +13482,17 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     // identical shape, layered on top of `TcpStream`/`TcpListener`.
     "TlsStream",
     "TlsListener",
+    // Plan 130's Decision log: `GzipWriter`/`GzipReader`/
+    // `DeflateWriter`/`DeflateReader`/`ZlibWriter`/`ZlibReader` — the
+    // identical shape, plan 93's own handle registry backed by a boxed
+    // `flate2::write::{Gz,Deflate,Zlib}Encoder<File>`/`flate2::read::
+    // {Gz,Deflate,Zlib}Decoder<File>` respectively.
+    "GzipWriter",
+    "GzipReader",
+    "DeflateWriter",
+    "DeflateReader",
+    "ZlibWriter",
+    "ZlibReader",
     // Plan 100's Decision log: `HttpResponse` — the identical shape.
     "HttpResponse",
     // Plan 101's Decision log: `HttpRequest` — the identical shape.

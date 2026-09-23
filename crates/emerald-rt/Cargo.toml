@@ -452,6 +452,29 @@ rust_decimal = "1"
 # Zone Database, confirming the plan's own "no second `chrono-tz`-
 # equivalent dependency needed" claim - not assumed. Pure Rust.
 jiff = "0.2.37"
+# Plan 130 (Gzip/Deflate/Zlib Compression): `flate2` 1.1.10 (real,
+# current pin at this plan's own authoring time, verified against its
+# own `Cargo.toml` on `rust-lang/flate2-rs`'s `main` branch) - already
+# resolved into this workspace's own `Cargo.lock` transitively (plan
+# 100's `ureq`, via its own default `gzip` feature), now promoted to a
+# direct dependency here. `default-features = false, features =
+# ["miniz_oxide"]` pins the concrete pure-Rust backend rather than the
+# `rust_backend` alias - flate2's own feature comment states `rust_
+# backend` "at some point may be switched to use `zlib-rs` instead"
+# (still pure Rust, but `zlib-rs` opts into `unsafe` for speed where
+# `miniz_oxide` stays fully safe Rust); pinning the concrete name turns
+# a future alias repoint into a loud missing-feature `cargo build`
+# failure instead of a silent backend swap. `default-features = false`
+# guarantees none of the four C-backed feature families (`zlib`/
+# `zlib-ng`/`zlib-ng-compat`/`cloudflare_zlib`) can be pulled in by a
+# future transitive change elsewhere in the graph's feature
+# unification. `Gzip`/`Deflate`/`Zlib`'s `.compress`/`.decompress` and
+# `GzipWriter`/`GzipReader`'s (+ `Deflate`/`Zlib` siblings) direct
+# backing. No RustSec advisory found against this pin. See
+# DEPENDENCIES.md.
+flate2 = { version = "1.1.10", default-features = false, features = [
+  "miniz_oxide",
+] }
 
 [build-dependencies]
 

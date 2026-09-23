@@ -228,6 +228,15 @@ fn set_newtype_underlying(program: &Program) {
     // identical shape, layered on top of `TcpStream`/`TcpListener`.
     "TlsStream",
     "TlsListener",
+    // Plan 130's Decision log: `GzipWriter`/`GzipReader`/
+    // `DeflateWriter`/`DeflateReader`/`ZlibWriter`/`ZlibReader` -- the
+    // identical shape.
+    "GzipWriter",
+    "GzipReader",
+    "DeflateWriter",
+    "DeflateReader",
+    "ZlibWriter",
+    "ZlibReader",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5358,6 +5367,33 @@ struct Ctx<'a, 'ctx> {
   udp_socket_close: FunctionValue<'ctx>,
   udp_socket_last_sender_host: FunctionValue<'ctx>,
   udp_socket_last_sender_port: FunctionValue<'ctx>,
+  /// Plan 130 (Gzip/Deflate/Zlib Compression) — `Gzip`/`Deflate`/
+  /// `Zlib` `.compress`/`.decompress`, `GzipWriter`/`GzipReader` (+
+  /// `Deflate`/`Zlib` siblings), wrapping `flate2`.
+  gzip_compress: FunctionValue<'ctx>,
+  gzip_decompress: FunctionValue<'ctx>,
+  deflate_compress: FunctionValue<'ctx>,
+  deflate_decompress: FunctionValue<'ctx>,
+  zlib_compress: FunctionValue<'ctx>,
+  zlib_decompress: FunctionValue<'ctx>,
+  gzip_writer_open: FunctionValue<'ctx>,
+  gzip_writer_write_chunk: FunctionValue<'ctx>,
+  gzip_writer_close: FunctionValue<'ctx>,
+  gzip_reader_open: FunctionValue<'ctx>,
+  gzip_reader_read_chunk: FunctionValue<'ctx>,
+  gzip_reader_close: FunctionValue<'ctx>,
+  deflate_writer_open: FunctionValue<'ctx>,
+  deflate_writer_write_chunk: FunctionValue<'ctx>,
+  deflate_writer_close: FunctionValue<'ctx>,
+  deflate_reader_open: FunctionValue<'ctx>,
+  deflate_reader_read_chunk: FunctionValue<'ctx>,
+  deflate_reader_close: FunctionValue<'ctx>,
+  zlib_writer_open: FunctionValue<'ctx>,
+  zlib_writer_write_chunk: FunctionValue<'ctx>,
+  zlib_writer_close: FunctionValue<'ctx>,
+  zlib_reader_open: FunctionValue<'ctx>,
+  zlib_reader_read_chunk: FunctionValue<'ctx>,
+  zlib_reader_close: FunctionValue<'ctx>,
   /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
   /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
   dns_resolve: FunctionValue<'ctx>,
@@ -8731,6 +8767,110 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Int64));
     }
+    // Plan 130's Decision log: `GzipWriter#write_chunk`/`#close` (+
+    // `DeflateWriter`/`ZlibWriter` siblings) -- the identical carved-
+    // out shape `TlsStream` above establishes.
+    if matches!(
+      local_classes.get(recv_name).map(String::as_str),
+      Some("GzipWriter" | "DeflateWriter" | "ZlibWriter")
+    ) {
+      let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (close_fv, write_fv) = match class_name {
+        "GzipWriter" => (ctx.gzip_writer_close, ctx.gzip_writer_write_chunk),
+        "DeflateWriter" => (ctx.deflate_writer_close, ctx.deflate_writer_write_chunk),
+        "ZlibWriter" => (ctx.zlib_writer_close, ctx.zlib_writer_write_chunk),
+        _ => unreachable!(),
+      };
+      if method == "close" {
+        builder
+          .build_call(close_fv, &[recv_val.into()], "compresswriterclosetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      if method != "write_chunk" {
+        return Err(format!(
+          "codegen: unsupported {class_name} method `{method}`"
+        ));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      builder
+        .build_call(write_fv, &call_args, "compresswriterwritetmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
+    // Plan 130's Decision log: `GzipReader#read_chunk`/`#close` (+
+    // `DeflateReader`/`ZlibReader` siblings) -- the identical carved-
+    // out shape `TlsStream` above establishes.
+    if matches!(
+      local_classes.get(recv_name).map(String::as_str),
+      Some("GzipReader" | "DeflateReader" | "ZlibReader")
+    ) {
+      let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (close_fv, read_fv) = match class_name {
+        "GzipReader" => (ctx.gzip_reader_close, ctx.gzip_reader_read_chunk),
+        "DeflateReader" => (ctx.deflate_reader_close, ctx.deflate_reader_read_chunk),
+        "ZlibReader" => (ctx.zlib_reader_close, ctx.zlib_reader_read_chunk),
+        _ => unreachable!(),
+      };
+      if method == "close" {
+        builder
+          .build_call(close_fv, &[recv_val.into()], "compressreaderclosetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      if method != "read_chunk" {
+        return Err(format!(
+          "codegen: unsupported {class_name} method `{method}`"
+        ));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let call = builder
+        .build_call(read_fv, &call_args, "compressreaderreadtmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
     if local_classes.get(recv_name).map(String::as_str) == Some("UdpSocket") {
@@ -9895,6 +10035,85 @@ fn build_method_call<'ctx>(
     };
     let call = builder
       .build_call(fv, &call_args, "tlsstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 130's Decision log: `Gzip.compress`/`.decompress`, `Deflate.
+  // compress`/`.decompress`, `Zlib.compress`/`.decompress` -- every
+  // argument/return is a plain `i64_ty` `Bytes` value (see `gzip.rs`'s
+  // own module doc), so this dispatch just builds the one arg and
+  // forwards it.
+  if matches!(recv_name.as_str(), "Gzip" | "Deflate" | "Zlib") {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match (recv_name.as_str(), method) {
+      ("Gzip", "compress") => ctx.gzip_compress,
+      ("Gzip", "decompress") => ctx.gzip_decompress,
+      ("Deflate", "compress") => ctx.deflate_compress,
+      ("Deflate", "decompress") => ctx.deflate_decompress,
+      ("Zlib", "compress") => ctx.zlib_compress,
+      ("Zlib", "decompress") => ctx.zlib_decompress,
+      (name, other) => {
+        return Err(format!(
+          "codegen: unsupported {name} static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "compresstmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 130's Decision log: `GzipWriter.open`/`DeflateWriter.open`/
+  // `ZlibWriter.open`/`GzipReader.open`/`DeflateReader.open`/
+  // `ZlibReader.open` -- the same reserved-namespace static-call shape
+  // `TcpListener.bind` above uses.
+  if matches!(
+    recv_name.as_str(),
+    "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "GzipReader" | "DeflateReader" | "ZlibReader"
+  ) {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    if method != "open" {
+      return Err(format!(
+        "codegen: unsupported {recv_name} static method `{method}`"
+      ));
+    }
+    let fv = match recv_name.as_str() {
+      "GzipWriter" => ctx.gzip_writer_open,
+      "GzipReader" => ctx.gzip_reader_open,
+      "DeflateWriter" => ctx.deflate_writer_open,
+      "DeflateReader" => ctx.deflate_reader_open,
+      "ZlibWriter" => ctx.zlib_writer_open,
+      "ZlibReader" => ctx.zlib_reader_open,
+      _ => unreachable!(),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "compressopentmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Int64));
   }
@@ -22366,6 +22585,129 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[], false),
     Some(Linkage::External),
   );
+  // Plan 130 (Gzip/Deflate/Zlib Compression): `Bytes` values cross
+  // every call here as a plain `i64_ty`, the same convention `Sha256.
+  // hash`/`AesGcm256.encrypt` already establish.
+  let gzip_compress = module.add_function(
+    "emerald_rt_gzip_compress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gzip_decompress = module.add_function(
+    "emerald_rt_gzip_decompress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_compress = module.add_function(
+    "emerald_rt_deflate_compress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_decompress = module.add_function(
+    "emerald_rt_deflate_decompress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_compress = module.add_function(
+    "emerald_rt_zlib_compress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_decompress = module.add_function(
+    "emerald_rt_zlib_decompress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gzip_writer_open = module.add_function(
+    "emerald_rt_gzip_writer_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gzip_writer_write_chunk = module.add_function(
+    "emerald_rt_gzip_writer_write_chunk",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gzip_writer_close = module.add_function(
+    "emerald_rt_gzip_writer_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gzip_reader_open = module.add_function(
+    "emerald_rt_gzip_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gzip_reader_read_chunk = module.add_function(
+    "emerald_rt_gzip_reader_read_chunk",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let gzip_reader_close = module.add_function(
+    "emerald_rt_gzip_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_writer_open = module.add_function(
+    "emerald_rt_deflate_writer_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_writer_write_chunk = module.add_function(
+    "emerald_rt_deflate_writer_write_chunk",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_writer_close = module.add_function(
+    "emerald_rt_deflate_writer_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_reader_open = module.add_function(
+    "emerald_rt_deflate_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_reader_read_chunk = module.add_function(
+    "emerald_rt_deflate_reader_read_chunk",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deflate_reader_close = module.add_function(
+    "emerald_rt_deflate_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_writer_open = module.add_function(
+    "emerald_rt_zlib_writer_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_writer_write_chunk = module.add_function(
+    "emerald_rt_zlib_writer_write_chunk",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_writer_close = module.add_function(
+    "emerald_rt_zlib_writer_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_reader_open = module.add_function(
+    "emerald_rt_zlib_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_reader_read_chunk = module.add_function(
+    "emerald_rt_zlib_reader_read_chunk",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zlib_reader_close = module.add_function(
+    "emerald_rt_zlib_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 97 (DNS Resolution).
   let dns_resolve = module.add_function(
     "emerald_rt_dns_resolve",
@@ -23719,6 +24061,30 @@ fn compile_to_object_impl(
     udp_socket_close,
     udp_socket_last_sender_host,
     udp_socket_last_sender_port,
+    gzip_compress,
+    gzip_decompress,
+    deflate_compress,
+    deflate_decompress,
+    zlib_compress,
+    zlib_decompress,
+    gzip_writer_open,
+    gzip_writer_write_chunk,
+    gzip_writer_close,
+    gzip_reader_open,
+    gzip_reader_read_chunk,
+    gzip_reader_close,
+    deflate_writer_open,
+    deflate_writer_write_chunk,
+    deflate_writer_close,
+    deflate_reader_open,
+    deflate_reader_read_chunk,
+    deflate_reader_close,
+    zlib_writer_open,
+    zlib_writer_write_chunk,
+    zlib_writer_close,
+    zlib_reader_open,
+    zlib_reader_read_chunk,
+    zlib_reader_close,
     dns_resolve,
     dns_resolve_all,
     dns_resolve_count,

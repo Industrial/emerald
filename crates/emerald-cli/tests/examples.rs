@@ -753,3 +753,20 @@ fn datetime_timezones_proof_em_prints_expected_sequence() {
     "2026-06-15T12:00:00Z\n2026-06-15T12:00:00Z\nfailed to find time zone `Nonexistent/Zone` in time zone database\n-3600\n"
   );
 }
+
+// Plan 130 (Gzip/Deflate/Zlib Compression): `Gzip`/`Deflate`/`Zlib`
+// `.compress`/`.decompress` round-tripping a real, repetitive input
+// through all three of gzip's/zlib's/raw-deflate's actual wire
+// formats — see `examples/gzip_roundtrip.em`'s own header comment for
+// the two real, disclosed adaptations from the plan's own literal
+// Concrete Proof text (no string-literal method receivers, no chained
+// call off a non-block-attached `MethodCall` result, and comparing
+// each `Bytes` value's own `.to_hex()` `String` rather than a
+// `Bytes.length`/`Bytes == Bytes` surface that does not exist).
+#[test]
+fn gzip_roundtrip_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("gzip_roundtrip.em"),
+    "true\ntrue\ntrue\ntrue\n"
+  );
+}

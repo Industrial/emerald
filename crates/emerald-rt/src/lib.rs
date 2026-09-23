@@ -176,6 +176,10 @@ mod decimal;
 mod dns;
 mod encoding;
 mod env;
+// Plan 130 (Gzip/Deflate/Zlib Compression) — `Gzip`/`Deflate`/`Zlib`
+// `.compress`/`.decompress`, `GzipWriter`/`GzipReader` (+ `Deflate`/
+// `Zlib` siblings), wrapping `flate2` — see `gzip.rs`'s own module doc.
+mod gzip;
 mod handle;
 mod hashing;
 mod http_client;
@@ -2687,6 +2691,181 @@ pub unsafe extern "C" fn emerald_rt_string_word_split_count(s: *const c_char) ->
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_string_sentence_split_count(s: *const c_char) -> i64 {
   catch_and_raise(move || unicode::string_sentence_split_count(s))
+}
+
+// Plan 130 (Gzip/Deflate/Zlib Compression): `Gzip`/`Deflate`/`Zlib`
+// `.compress`/`.decompress`, `GzipWriter`/`GzipReader` (+ `Deflate`/
+// `Zlib` siblings) — see `gzip.rs`'s own module doc. Every `Bytes`
+// value (parameter or return) crosses this boundary as a plain `i64`,
+// the identical convention `bytes.rs`'s own `Bytes.to_hex`/`Sha256.
+// hash` already establish.
+
+/// `Gzip.compress(data: Bytes): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_compress(data_id: i64) -> i64 {
+  catch_and_raise(move || gzip::gzip_compress(data_id))
+}
+
+/// `Gzip.decompress(data: Bytes): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_decompress(data_id: i64) -> i64 {
+  catch_and_raise(move || gzip::gzip_decompress(data_id))
+}
+
+/// `Deflate.compress(data: Bytes): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_compress(data_id: i64) -> i64 {
+  catch_and_raise(move || gzip::deflate_compress(data_id))
+}
+
+/// `Deflate.decompress(data: Bytes): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_decompress(data_id: i64) -> i64 {
+  catch_and_raise(move || gzip::deflate_decompress(data_id))
+}
+
+/// `Zlib.compress(data: Bytes): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_compress(data_id: i64) -> i64 {
+  catch_and_raise(move || gzip::zlib_compress(data_id))
+}
+
+/// `Zlib.decompress(data: Bytes): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_decompress(data_id: i64) -> i64 {
+  catch_and_raise(move || gzip::zlib_decompress(data_id))
+}
+
+/// `GzipWriter.open(path: String): GzipWriter`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_writer_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || gzip::gzip_writer_open(path))
+}
+
+/// `GzipWriter#write_chunk(self, data: Bytes): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_writer_write_chunk(id: i64, data_id: i64) {
+  catch_and_raise(move || gzip::gzip_writer_write_chunk(id, data_id))
+}
+
+/// `GzipWriter#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_writer_close(id: i64) {
+  catch_and_raise(move || gzip::gzip_writer_close(id))
+}
+
+/// `GzipReader.open(path: String): GzipReader`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_reader_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || gzip::gzip_reader_open(path))
+}
+
+/// `GzipReader#read_chunk(self, max_len: Int64): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_reader_read_chunk(id: i64, max_len: i64) -> i64 {
+  catch_and_raise(move || gzip::gzip_reader_read_chunk(id, max_len))
+}
+
+/// `GzipReader#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_gzip_reader_close(id: i64) {
+  catch_and_raise(move || gzip::gzip_reader_close(id))
+}
+
+/// `DeflateWriter.open(path: String): DeflateWriter`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_writer_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || gzip::deflate_writer_open(path))
+}
+
+/// `DeflateWriter#write_chunk(self, data: Bytes): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_writer_write_chunk(id: i64, data_id: i64) {
+  catch_and_raise(move || gzip::deflate_writer_write_chunk(id, data_id))
+}
+
+/// `DeflateWriter#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_writer_close(id: i64) {
+  catch_and_raise(move || gzip::deflate_writer_close(id))
+}
+
+/// `DeflateReader.open(path: String): DeflateReader`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_reader_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || gzip::deflate_reader_open(path))
+}
+
+/// `DeflateReader#read_chunk(self, max_len: Int64): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_reader_read_chunk(id: i64, max_len: i64) -> i64 {
+  catch_and_raise(move || gzip::deflate_reader_read_chunk(id, max_len))
+}
+
+/// `DeflateReader#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deflate_reader_close(id: i64) {
+  catch_and_raise(move || gzip::deflate_reader_close(id))
+}
+
+/// `ZlibWriter.open(path: String): ZlibWriter`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_writer_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || gzip::zlib_writer_open(path))
+}
+
+/// `ZlibWriter#write_chunk(self, data: Bytes): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_writer_write_chunk(id: i64, data_id: i64) {
+  catch_and_raise(move || gzip::zlib_writer_write_chunk(id, data_id))
+}
+
+/// `ZlibWriter#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_writer_close(id: i64) {
+  catch_and_raise(move || gzip::zlib_writer_close(id))
+}
+
+/// `ZlibReader.open(path: String): ZlibReader`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_reader_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || gzip::zlib_reader_open(path))
+}
+
+/// `ZlibReader#read_chunk(self, max_len: Int64): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_reader_read_chunk(id: i64, max_len: i64) -> i64 {
+  catch_and_raise(move || gzip::zlib_reader_read_chunk(id, max_len))
+}
+
+/// `ZlibReader#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zlib_reader_close(id: i64) {
+  catch_and_raise(move || gzip::zlib_reader_close(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive
