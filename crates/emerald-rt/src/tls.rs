@@ -488,11 +488,15 @@ mod tests {
   // with no network dependency at all.
   #[test]
   fn local_client_server_round_trip_with_a_self_signed_certificate() {
-    let CertifiedKey { cert, key_pair } =
+    // Real, disclosed correction found by actually compiling this test
+    // under plan 116's own `rcgen` 0.13 -> 0.14 bump (see that plan's
+    // own Cargo.toml comment): `CertifiedKey`'s key-pair field was
+    // renamed `key_pair` -> `signing_key` between those versions.
+    let CertifiedKey { cert, signing_key } =
       generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
         .expect("self-signed test certificate generation should succeed");
     let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
+    let key_pem = signing_key.serialize_pem();
 
     let dir = std::env::temp_dir();
     let pid = std::process::id();

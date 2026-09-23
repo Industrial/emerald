@@ -1381,3 +1381,33 @@ fn jwt_proof_em_prints_expected_sequence() {
      verification failed\n"
   );
 }
+
+// Plan 116 (X.509 Certificate Generation & Parsing): `X509.generate_
+// self_signed`/`.parse`, `X509KeyPair#cert_pem`/`#key_pem`,
+// `X509Certificate#subject`/`#issuer`/`#not_before`/`#not_after`/
+// `#public_key_algorithm` — see `x509_proof.em`'s own header comment
+// for the three real, disclosed deviations from this plan's original
+// Concrete Proof text (an `X509KeyPair` handle in place of an
+// unparseable `Tuple[String, String]`; `rcgen`'s real fixed subject,
+// `CN=rcgen self signed cert`, in place of the plan's assumed
+// `CN=localhost`; `!=` in place of `<`, since this compiler's own
+// codegen supports no `String` ordering operator at all). `not_
+// before`/`not_after` and the certificate's own key material are
+// freshly generated every run — only their real, checked *properties*
+// (they differ; the key PEM is non-empty) are asserted, never their
+// literal values; `.public_key_algorithm()` (`id-ecPublicKey`,
+// `rcgen`'s own default ECDSA signing algorithm at this pin) and the
+// fixed subject line are the two genuinely deterministic values this
+// proof can and does assert exactly.
+#[test]
+fn x509_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("x509_proof.em"),
+    "CN=rcgen self signed cert\n\
+     true\n\
+     true\n\
+     id-ecPublicKey\n\
+     invalid pem\n\
+     invalid certificate\n"
+  );
+}

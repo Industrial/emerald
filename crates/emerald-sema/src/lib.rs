@@ -4335,6 +4335,64 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 116's Decision log: `X509.generate_self_signed`/`.parse` —
+    // the identical reserved-namespace static-call shape `Json`/
+    // `Toml` immediately above use. `.generate_self_signed` takes one
+    // `Array[String]` and returns `X509KeyPair` directly (never a
+    // `Result` — an empty array or an underlying `rcgen` failure
+    // raises a caught `NativeError`, per this plan's own text); a
+    // real, disclosed deviation from this plan's own Concrete Proof,
+    // which specified `Tuple[String, String]` — `Tuple[...]` is not
+    // parseable as a source-level type annotation at all (see
+    // `x509.rs`'s own `x509_generate_self_signed` doc comment for the
+    // full account). `.parse` takes one `String` and returns
+    // `Result[X509Certificate, X509Error]`, plan 195's convention
+    // applied fresh (this plan lands after plan 195).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "X509") =>
+    {
+      match method.as_str() {
+        "generate_self_signed" => {
+          check_args(
+            method,
+            args,
+            &[Type::Array(Box::new(Type::String))],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Newtype(
+            "X509KeyPair".to_string(),
+            Box::new(Type::Int64),
+          ))
+        }
+        "parse" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(
+            Box::new(Type::Newtype(
+              "X509Certificate".to_string(),
+              Box::new(Type::Int64),
+            )),
+            Box::new(Type::Enum("X509Error".to_string())),
+          ))
+        }
+        other => Err(Diagnostic::new(
+          format!("X509 has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
     // Plan 191's Decision log: `ProgressBar.new_spinner()` — the
     // identical reserved-namespace static-call shape `Json`/`Toml`
     // above use, for the same reason (`ProgressBar` is never a real
@@ -6786,6 +6844,63 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("CliParseResult has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 116's Decision log: `X509KeyPair`'s own three instance
+        // methods — the identical carved-out-of-`.value`-only shape
+        // `CliParser`/`CliParseResult` immediately above establish.
+        if name == "X509KeyPair" {
+          let (expected_params, ret) = match method.as_str() {
+            "cert_pem" => (vec![], Type::String),
+            "key_pem" => (vec![], Type::String),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("X509KeyPair has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 116's Decision log: `X509Certificate`'s own six
+        // instance methods — the identical shape `X509KeyPair`
+        // immediately above establishes.
+        if name == "X509Certificate" {
+          let (expected_params, ret) = match method.as_str() {
+            "subject" => (vec![], Type::String),
+            "issuer" => (vec![], Type::String),
+            "not_before" => (vec![], Type::String),
+            "not_after" => (vec![], Type::String),
+            "public_key_algorithm" => (vec![], Type::String),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("X509Certificate has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -14662,6 +14777,49 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       newtype_underlying: Some(Type::Int64),
     },
   );
+  // Plan 116's Decision log: `X509KeyPair`/`X509Certificate` — the
+  // identical "reserved name, zero-cost `Int64` handle" shape
+  // `CliParser`/`CliParseResult` immediately above already use, backed
+  // by plan 93's own `crate::handle` registry (a boxed `(String,
+  // String)` cert/key PEM pair, and a boxed owned DER `Vec<u8>`,
+  // respectively — see `x509.rs`'s own module doc for why the latter
+  // stores only the DER bytes, never a borrowed parsed view). Two
+  // distinct `ClassInfo` entries — `X509KeyPair` is `X509.generate_
+  // self_signed`'s own output (`.cert_pem`/`.key_pem`/`.close`);
+  // `X509Certificate` is `X509.parse`'s own `Ok` payload (`.subject`/
+  // `.issuer`/`.not_before`/`.not_after`/`.public_key_algorithm`/
+  // `.close`). Both carved out of the ordinary newtype `.value`-only
+  // restriction, the same mechanism `Regex`/`CliParser` already
+  // establish — neither has a real `Expr::New` constructor of its own
+  // (both come only from `X509.*`'s own reserved-namespace statics).
+  classes.insert(
+    "X509KeyPair".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  classes.insert(
+    "X509Certificate".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
   // Plan 183's Decision log: `ConfigBuilder`/`ConfigValue` — the
   // identical "reserved name, zero-cost `Int64` handle" shape
   // `CliParser`/`CliParseResult` immediately above already use, backed
@@ -15094,6 +15252,51 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&json_error_enum_def);
+  // Plan 116's Decision log: `X509Error` — the identical registration
+  // shape `JsonError` immediately above establishes. Variant
+  // declaration order matches `crates/emerald-rt/src/x509.rs`'s own
+  // `X509_ERROR_TAG_*` constants byte-for-byte — `InvalidPem`=0,
+  // `InvalidCertificate`=1, `Other`=2. `InvalidPem`/`InvalidCertificate`
+  // are two genuinely separate upstream failure stages (`x509-parser`'s
+  // own `PEMError`/`X509Error`, real-checked against the vendored
+  // source, not invented) — see `x509.rs`'s own doc comment.
+  let x509_error_enum_def = EnumDef {
+    name: "X509Error".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "InvalidPem".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "InvalidCertificate".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "X509Error".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &x509_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&x509_error_enum_def);
   // Plan 195's Decision log: `RegexError` — this plan's second worked
   // example, the same registration shape `JsonError` immediately above
   // uses. The real, pinned `regex` crate's own `Error` enum (verified

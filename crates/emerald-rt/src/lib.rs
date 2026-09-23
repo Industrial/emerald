@@ -280,6 +280,13 @@ mod tls;
 // `WebSocketMessage#kind`/`#text`/`#bytes`, wrapping `tungstenite` --
 // see `websocket.rs`'s own module doc.
 mod websocket;
+// Plan 116 (X.509 Certificate Generation & Parsing) -- `X509.generate_
+// self_signed`/`.parse`, `X509KeyPair#cert_pem`/`#key_pem`,
+// `X509Certificate#subject`/`#issuer`/`#not_before`/`#not_after`/
+// `#public_key_algorithm`, wrapping `rcgen` + `x509-parser` -- see
+// `x509.rs`'s own module doc. No external-crate-name collision to
+// dodge (the wrapped crates are `rcgen`/`x509_parser`, not `x509`).
+mod x509;
 // Named `tomls`, not `toml` — this crate's own `mod toml` would shadow
 // the external `toml` crate this module wraps, the identical collision
 // `aead.rs`/`url.rs` already hit and disclosed.
@@ -4277,6 +4284,90 @@ pub unsafe extern "C" fn emerald_rt_jwt_verify_es256_with_issuer(
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_jwt_peek_header(token: *const c_char) -> *const c_char {
   catch_and_raise(move || jwt::jwt_peek_header(token))
+}
+
+// Plan 116 (X.509 Certificate Generation & Parsing) — `X509.generate_
+// self_signed`/`.parse`, `X509KeyPair#cert_pem`/`#key_pem`/`#close`,
+// `X509Certificate#subject`/`#issuer`/`#not_before`/`#not_after`/
+// `#public_key_algorithm`/`#close` — see `x509.rs`'s own module doc.
+
+/// # Safety
+/// `names_array` must point to a real `Array[String]` buffer.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_generate_self_signed(names_array: *const c_void) -> i64 {
+  catch_and_raise(move || x509::x509_generate_self_signed(names_array))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_generate_self_signed` actually returned.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_keypair_cert_pem(id: i64) -> *const c_char {
+  catch_and_raise(move || x509::x509_keypair_cert_pem(id))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_generate_self_signed` actually returned.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_keypair_key_pem(id: i64) -> *const c_char {
+  catch_and_raise(move || x509::x509_keypair_key_pem(id))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_generate_self_signed` actually returned.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_keypair_close(id: i64) {
+  catch_and_raise(move || x509::x509_keypair_close(id))
+}
+
+/// # Safety
+/// `pem`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_parse(pem: *const c_char) -> *mut c_void {
+  catch_and_raise(move || x509::x509_parse(pem))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_parse` actually returned an `Ok` for.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_certificate_subject(id: i64) -> *const c_char {
+  catch_and_raise(move || x509::x509_certificate_subject(id))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_parse` actually returned an `Ok` for.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_certificate_issuer(id: i64) -> *const c_char {
+  catch_and_raise(move || x509::x509_certificate_issuer(id))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_parse` actually returned an `Ok` for.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_certificate_not_before(id: i64) -> *const c_char {
+  catch_and_raise(move || x509::x509_certificate_not_before(id))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_parse` actually returned an `Ok` for.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_certificate_not_after(id: i64) -> *const c_char {
+  catch_and_raise(move || x509::x509_certificate_not_after(id))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_parse` actually returned an `Ok` for.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_certificate_public_key_algorithm(
+  id: i64,
+) -> *const c_char {
+  catch_and_raise(move || x509::x509_certificate_public_key_algorithm(id))
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_x509_parse` actually returned an `Ok` for.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_x509_certificate_close(id: i64) {
+  catch_and_raise(move || x509::x509_certificate_close(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

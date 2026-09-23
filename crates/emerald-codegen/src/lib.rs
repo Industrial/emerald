@@ -261,6 +261,10 @@ fn set_newtype_underlying(program: &Program) {
     // shape, plan 93's own handle registry backed by a boxed
     // `tungstenite::WebSocket<WsStream>`.
     "WebSocketConnection",
+    // Plan 116's Decision log: `X509KeyPair`/`X509Certificate` -- the
+    // identical shape.
+    "X509KeyPair",
+    "X509Certificate",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5405,6 +5409,21 @@ struct Ctx<'a, 'ctx> {
   jwt_verify_es256: FunctionValue<'ctx>,
   jwt_verify_es256_with_issuer: FunctionValue<'ctx>,
   jwt_peek_header: FunctionValue<'ctx>,
+  /// Plan 116 (X.509 Certificate Generation & Parsing) — `X509.
+  /// generate_self_signed`/`.parse`, `X509KeyPair#cert_pem`/`#key_pem`/
+  /// `#close`, `X509Certificate#subject`/`#issuer`/`#not_before`/
+  /// `#not_after`/`#public_key_algorithm`/`#close`.
+  x509_generate_self_signed: FunctionValue<'ctx>,
+  x509_keypair_cert_pem: FunctionValue<'ctx>,
+  x509_keypair_key_pem: FunctionValue<'ctx>,
+  x509_keypair_close: FunctionValue<'ctx>,
+  x509_parse: FunctionValue<'ctx>,
+  x509_certificate_subject: FunctionValue<'ctx>,
+  x509_certificate_issuer: FunctionValue<'ctx>,
+  x509_certificate_not_before: FunctionValue<'ctx>,
+  x509_certificate_not_after: FunctionValue<'ctx>,
+  x509_certificate_public_key_algorithm: FunctionValue<'ctx>,
+  x509_certificate_close: FunctionValue<'ctx>,
   /// Plan 113 (Cryptographically Secure Random Number Generation) —
   /// `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`.
   random_secure_hex: FunctionValue<'ctx>,
@@ -8606,6 +8625,83 @@ fn build_method_call<'ctx>(
       return Ok((call_result(call)?, ValKind::Int64));
     }
 
+    // Plan 116's Decision log: `X509KeyPair`'s own three instance
+    // methods — the identical carved-out-of-newtype shape `Regex`/
+    // `BigInt` immediately above establish. `.close` is a void call
+    // (the same shape `ProgressBar`'s own methods immediately below
+    // establish), never routed through `call_result`.
+    if local_classes.get(recv_name).map(String::as_str) == Some("X509KeyPair") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.x509_keypair_close,
+            &[recv_val.into()],
+            "x509keypairclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let fv = match method {
+        "cert_pem" => ctx.x509_keypair_cert_pem,
+        "key_pem" => ctx.x509_keypair_key_pem,
+        other => return Err(format!("codegen: unsupported X509KeyPair method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "x509keypairtmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Str));
+    }
+
+    // Plan 116's Decision log: `X509Certificate`'s own six instance
+    // methods — the identical shape `X509KeyPair` immediately above
+    // establishes.
+    if local_classes.get(recv_name).map(String::as_str) == Some("X509Certificate") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.x509_certificate_close,
+            &[recv_val.into()],
+            "x509certclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let fv = match method {
+        "subject" => ctx.x509_certificate_subject,
+        "issuer" => ctx.x509_certificate_issuer,
+        "not_before" => ctx.x509_certificate_not_before,
+        "not_after" => ctx.x509_certificate_not_after,
+        "public_key_algorithm" => ctx.x509_certificate_public_key_algorithm,
+        other => {
+          return Err(format!(
+            "codegen: unsupported X509Certificate method `{other}`"
+          ))
+        }
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "x509certtmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Str));
+    }
+
     // Plan 191's Decision log: `ProgressBar`'s own three instance
     // methods (`.increment`/`.set_message`/`.finish`) — the identical
     // carved-out-of-newtype shape `Regex`/`BigInt` immediately above
@@ -10143,6 +10239,39 @@ fn build_method_call<'ctx>(
       .build_call(ctx.toml_parse, &[v.into()], "tomlparsetmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 116's Decision log: `X509.generate_self_signed`/`.parse` —
+  // the same reserved-namespace static-call shape `Json`/`Toml`
+  // above use. `.generate_self_signed` returns a bare NEW `i64`
+  // handle directly (never wrapped in `Result` — an empty array or
+  // an underlying `rcgen` failure raises a caught `NativeError` at
+  // the Rust side's own `catch_and_raise` boundary, never a `Result`
+  // value); `.parse` returns plan 53's own `Result` layout directly,
+  // `emerald_rt_x509_parse` already building it, zero additional
+  // marshaling needed here — the identical `Json.parse` shape.
+  if recv_name == "X509" {
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `X509.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (fv, ret_kind) = match method {
+      "generate_self_signed" => (ctx.x509_generate_self_signed, ValKind::Int64),
+      "parse" => (ctx.x509_parse, ValKind::Ptr),
+      other => return Err(format!("codegen: unsupported X509 static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &[v.into()], "x509tmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
   }
 
   // Plan 125's Decision log: `Bincode.encode`/`.decode`, `MessagePack.
@@ -24529,6 +24658,68 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 116 (X.509 Certificate Generation & Parsing): `.generate_
+  // self_signed` takes an `Array[String]` (`ptr`) and returns a bare
+  // NEW `i64` handle (never wrapped in `Result`); `.parse` takes a
+  // `String` (`ptr`) and returns plan 53's own `Result` layout (`ptr`).
+  // Every `X509KeyPair`/`X509Certificate` instance accessor takes the
+  // receiver's own `i64` handle and returns either a `String` (`ptr`)
+  // or nothing (`.close`).
+  let x509_generate_self_signed = module.add_function(
+    "emerald_rt_x509_generate_self_signed",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_keypair_cert_pem = module.add_function(
+    "emerald_rt_x509_keypair_cert_pem",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_keypair_key_pem = module.add_function(
+    "emerald_rt_x509_keypair_key_pem",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_keypair_close = module.add_function(
+    "emerald_rt_x509_keypair_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_parse = module.add_function(
+    "emerald_rt_x509_parse",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_certificate_subject = module.add_function(
+    "emerald_rt_x509_certificate_subject",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_certificate_issuer = module.add_function(
+    "emerald_rt_x509_certificate_issuer",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_certificate_not_before = module.add_function(
+    "emerald_rt_x509_certificate_not_before",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_certificate_not_after = module.add_function(
+    "emerald_rt_x509_certificate_not_after",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_certificate_public_key_algorithm = module.add_function(
+    "emerald_rt_x509_certificate_public_key_algorithm",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let x509_certificate_close = module.add_function(
+    "emerald_rt_x509_certificate_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 113 (Cryptographically Secure Random Number Generation):
   // `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`. `.shuffle`
   // takes the array's own bare heap pointer directly.
@@ -26067,6 +26258,33 @@ fn compile_to_object_impl(
     "JsonError".to_string(),
     build_enum_layout(&json_error_enum_def_cg),
   );
+  // Plan 116: `X509Error` -- codegen's own mirror of `emerald-sema`'s
+  // identical synthetic `EnumDef` (see that crate's own Decision log).
+  // Variant declaration order matches `crates/emerald-rt/src/x509.rs`'s
+  // own `X509_ERROR_TAG_*` constants byte-for-byte.
+  let x509_error_enum_def_cg = EnumDef {
+    name: "X509Error".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "InvalidPem".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "InvalidCertificate".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "X509Error".to_string(),
+    build_enum_layout(&x509_error_enum_def_cg),
+  );
   let regex_error_enum_def_cg = EnumDef {
     name: "RegexError".to_string(),
     variants: vec![
@@ -26721,6 +26939,14 @@ fn compile_to_object_impl(
   // ConfigBuilder.new()` and `cfg: ConfigValue = builder.build()`.
   newtypes.insert("ConfigBuilder".to_string());
   newtypes.insert("ConfigValue".to_string());
+  // Plan 116's Decision log: `X509KeyPair`/`X509Certificate` -- added
+  // here as well as `NEWTYPE_UNDERLYING` above, the identical
+  // `CliParser`/`CliParseResult` gap-avoidance immediately above: this
+  // plan's own Concrete Proof `Let`-binds `pair: X509KeyPair = X509.
+  // generate_self_signed(...)` and `cert: X509Certificate = X509.
+  // parse(...)`.
+  newtypes.insert("X509KeyPair".to_string());
+  newtypes.insert("X509Certificate".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -27183,6 +27409,17 @@ fn compile_to_object_impl(
     jwt_verify_es256,
     jwt_verify_es256_with_issuer,
     jwt_peek_header,
+    x509_generate_self_signed,
+    x509_keypair_cert_pem,
+    x509_keypair_key_pem,
+    x509_keypair_close,
+    x509_parse,
+    x509_certificate_subject,
+    x509_certificate_issuer,
+    x509_certificate_not_before,
+    x509_certificate_not_after,
+    x509_certificate_public_key_algorithm,
+    x509_certificate_close,
     encoding_decode,
     encoding_decode_strict,
     encoding_encode,

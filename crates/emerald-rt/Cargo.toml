@@ -831,21 +831,63 @@ hyper-util = { version = "0.1", features = [
   "tokio",
 ] }
 http-body-util = "0.1"
+# Plan 116 (X.509 Certificate Generation & Parsing): real-checked at
+# this plan's own execution time (2026-09-23, via `cargo info` against
+# the live crates.io index) — `rcgen` 0.14.10 (latest as of this
+# check), `rustls`-org-owned (Dirkjan Ochtman/est31, the same
+# maintainers as `rustls` itself), MIT/Apache-2.0. Promoted from a
+# `[dev-dependencies]`-only fixture (plan 99, 0.13) to a real
+# dependency here — see that entry's own comment. Default features
+# (`crypto`, `pem`, `ring`) plus this plan's own `x509-parser` feature,
+# enabled so `rcgen`'s own optional self-verification round-trip and
+# this plan's separate `X509.parse` path share one `x509-parser`
+# version rather than two potentially-diverging ones (per this plan's
+# own Decision log). `ring` (not `aws_lc_rs`) is `rcgen`'s own default
+# crypto backend at this pin, real-checked via `cargo info`'s own
+# feature listing — a real, disclosed correction against this crate's
+# EARLIER `DEPENDENCIES.md` row (plan 99, 0.13.2), which stated the
+# opposite; not edited there per this ledger's own append-only
+# convention, corrected here instead. No RustSec advisory found.
+# `x509-parser` 0.18.1 (also real-checked via `cargo info`), the
+# `rusticata` project's (Pierre Chifflier) pure-Rust, panic-free RFC
+# 5280 parser, MIT/Apache-2.0. Default features only — this plan does
+# NOT enable `verify`/`verify-aws` (cryptographic signature
+# verification, which would pull `ring`/`aws-lc-rs` in a second time
+# for a question — "was this certificate properly signed by a trusted
+# root" — plan 99's TLS/`rustls` design is the correct place to answer,
+# per this plan's own Decision log). No RustSec advisory found.
+# `oid-registry` 0.8.1 — already resolved transitively via
+# `x509-parser`'s own dependency graph before this plan; promoted to a
+# direct dependency (the identical `bytes`/`futures-core` "already
+# resolved, promoted to direct" shape plan 105's own row discloses) so
+# `x509.rs`'s own `.public_key_algorithm()` accessor can name
+# `oid_registry::OidRegistry`/`oid2sn` directly — Rust's extern prelude
+# only admits a crate's own *direct* dependencies. No RustSec advisory
+# found. `X509.generate_self_signed`/`X509.parse`, `X509KeyPair#cert_
+# pem`/`#key_pem`, `X509Certificate#subject`/`#issuer`/`#not_before`/
+# `#not_after`/`#public_key_algorithm`'s direct backing. See
+# DEPENDENCIES.md.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+x509-parser = "0.18"
+oid-registry = "0.8"
 
 [build-dependencies]
 
-# Plan 99's own `leaf-tests-and-example`: a `[dev-dependencies]`-only
-# addition, never linked into the real `--release` staticlib
-# `emerald-driver` embeds — `rcgen` 0.13 generates a fresh, real
-# self-signed X.509 certificate/key pair entirely in-process for
-# `tls.rs`'s own local, network-independent client/server round-trip
-# test, replacing what would otherwise need an `openssl`/`certtool`
-# CLI invocation this sandboxed test environment has no access to.
-# Widely used in exactly this role across the Rust ecosystem (`rustls`'s
-# own test suite, `quinn`, `tokio-rustls` all depend on it for the
-# identical purpose). No RustSec advisory found.
+# Plan 99 originally added `rcgen` here as a `[dev-dependencies]`-only
+# fixture crate (0.13, `tls.rs`'s own local self-signed-certificate
+# round-trip test). Plan 116 (X.509 Certificate Generation & Parsing)
+# promotes it to a genuine `[dependencies]` entry below — the identical
+# "already present as a dev fixture, later promoted" shape `tempfile`'s
+# own comment two entries down already discloses — bumping it to 0.14
+# (this plan's own real, checked pin) in the same move, since keeping
+# two separate version reqs for one crate across `[dependencies]`/
+# `[dev-dependencies]` would be a redundant, potentially-diverging
+# duplicate pin. `tls.rs`'s own test DID need a one-line fix, found
+# only by actually compiling `emerald-rt`'s test target under the
+# bumped version, not assumed: `CertifiedKey`'s key-pair field was
+# renamed `key_pair` -> `signing_key` between 0.13 and 0.14 — fixed in
+# `tls.rs` itself, disclosed there.
 [dev-dependencies]
-rcgen = "0.13"
 # Plan 114 (JSON Web Tokens): `p256` 0.13.2 — a `[dev-dependencies]`-
 # only addition, `jwt.rs`'s own ES256 round-trip `#[test]` needs a
 # real P-256 keypair to generate PEM key material for, and this exact
