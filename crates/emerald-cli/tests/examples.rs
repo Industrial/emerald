@@ -806,3 +806,19 @@ fn extended_filesystem_proof_em_prints_expected_sequence() {
 
   std::fs::remove_dir_all(&fixture_root).ok();
 }
+
+// Plan 132 (Tar Archives): `Tar.create`/`.extract`, `TarReader.open`/
+// `.next_entry`/`.entry_size`/`.read_entry_data`/`.close`, wrapping
+// the pure-Rust `tar` crate — a real create-then-list-then-extract
+// round trip against two real files, `.next_entry()` genuinely
+// terminating past the last entry, and `Tar.extract` recreating the
+// exact original bytes — see `examples/tar_roundtrip.em`'s own header
+// comment for the four real, disclosed adaptations from the plan's
+// own literal Concrete Proof text.
+#[test]
+fn tar_roundtrip_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("tar_roundtrip.em"),
+    "tar_demo_a.txt\n68656c6c6f\ntar_demo_b.txt\n776f726c642c2061206c6f6e676572207365636f6e642066696c65\nend\ntrue\n"
+  );
+}

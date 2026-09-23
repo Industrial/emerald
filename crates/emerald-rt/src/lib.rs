@@ -204,6 +204,10 @@ mod random;
 mod regex;
 mod secure_compare;
 mod system;
+// Plan 132 (Tar Archives) -- `Tar.create`/`.extract`, `TarReader.open`/
+// `.next_entry`/`.entry_size`/`.read_entry_data`/`.close`, wrapping
+// `tar` -- see `tar.rs`'s own module doc.
+mod tar;
 // Plan 99 (TLS) -- `Tls.connect`/`.connect_with_roots`/`.listen`,
 // `TlsStream#read`/`#write`/`#close`, `TlsListener#accept`/`#close`,
 // wrapping `rustls` -- see `tls.rs`'s own module doc.
@@ -3022,6 +3026,72 @@ pub unsafe extern "C" fn emerald_rt_zlib_reader_read_chunk(id: i64, max_len: i64
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_reader_close(id: i64) {
   catch_and_raise(move || gzip::zlib_reader_close(id))
+}
+
+// Plan 132 (Tar Archives): `Tar.create`/`.extract`, `TarReader.open`/
+// `.next_entry`/`.entry_size`/`.read_entry_data`/`.close` -- see
+// `tar.rs`'s own module doc.
+
+/// `Tar.create(archive_path: String, paths: Array[String]): Void`.
+///
+/// # Safety
+/// `archive_path`, if non-null, must point to a valid, NUL-terminated
+/// C string. `path_ptrs` must point to `count` valid `*const c_char`
+/// entries, each itself a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tar_create(
+  archive_path: *const c_char,
+  path_ptrs: *const *const c_char,
+  count: i64,
+) {
+  catch_and_raise(move || tar::tar_create(archive_path, path_ptrs, count))
+}
+
+/// `Tar.extract(archive_path: String, dest_dir: String): Void`.
+///
+/// # Safety
+/// `archive_path`/`dest_dir`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tar_extract(
+  archive_path: *const c_char,
+  dest_dir: *const c_char,
+) {
+  catch_and_raise(move || tar::tar_extract(archive_path, dest_dir))
+}
+
+/// `TarReader.open(archive_path: String): TarReader`.
+///
+/// # Safety
+/// `archive_path`, if non-null, must point to a valid, NUL-terminated
+/// C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tar_reader_open(archive_path: *const c_char) -> i64 {
+  catch_and_raise(move || tar::tar_reader_open(archive_path))
+}
+
+/// `TarReader#next_entry(self): Option[String]`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tar_reader_next_entry(id: i64) -> *mut c_void {
+  catch_and_raise(move || tar::tar_reader_next_entry(id))
+}
+
+/// `TarReader#entry_size(self): Int64`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tar_reader_entry_size(id: i64) -> i64 {
+  catch_and_raise(move || tar::tar_reader_entry_size(id))
+}
+
+/// `TarReader#read_entry_data(self): Bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tar_reader_read_entry_data(id: i64) -> i64 {
+  catch_and_raise(move || tar::tar_reader_read_entry_data(id))
+}
+
+/// `TarReader#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tar_reader_close(id: i64) {
+  catch_and_raise(move || tar::tar_reader_close(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

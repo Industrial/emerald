@@ -487,6 +487,22 @@ walkdir = "2.5"
 flate2 = { version = "1.1.10", default-features = false, features = [
   "miniz_oxide",
 ] }
+# Plan 132 (Tar Archives): `tar` 0.4.46 (real, current pin at this
+# plan's own authoring time, verified against its own `README.md`/
+# `Cargo.toml` on `alexcrichton/tar-rs`'s `main` branch) - the de facto
+# standard pure-Rust tar reader/writer (`cargo`'s own `.crate` package
+# format is itself a `.tar.gz`, and `cargo` depends on this exact
+# crate to read/write it). `default-features = false` disables the
+# crate's one non-essential default feature (`xattr`, POSIX extended-
+# attribute preservation) - a real, disclosed v1 capability loss (see
+# this plan's own Decision log), not an oversight - leaving a
+# dependency graph with no C code at all: `tar`'s own real
+# dependencies are `filetime` (pure Rust, reaching platform mtime
+# syscalls through safe wrappers) and, only under the now-disabled
+# `xattr` feature, the `xattr` crate. `Tar.create`/`.extract`,
+# `TarReader`'s direct backing. No RustSec advisory found. See
+# DEPENDENCIES.md.
+tar = { version = "0.4.46", default-features = false }
 
 [build-dependencies]
 

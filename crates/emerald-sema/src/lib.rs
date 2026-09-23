@@ -4933,6 +4933,63 @@ fn infer_expr_type(
         expr.span,
       ))
     }
+    // Plan 132's Decision log: `Tar.create(archive_path: String,
+    // paths: Array[String]): Void` / `Tar.extract(archive_path:
+    // String, dest_dir: String): Void` — the same reserved-namespace
+    // static-call shape `Gzip`/`Deflate`/`Zlib` above use. Archive
+    // member order is `paths`' own caller order, matching `tar::
+    // Builder::append_path`'s real behavior — this plan never sorts on
+    // the caller's behalf.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Tar") =>
+    {
+      let expected_params = match method.as_str() {
+        "create" => vec![Type::String, Type::Array(Box::new(Type::String))],
+        "extract" => vec![Type::String, Type::String],
+        other => {
+          return Err(Diagnostic::new(
+            format!("Tar has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      return Ok(Type::Void);
+    }
+    // Plan 132's Decision log: `TarReader.open(archive_path: String):
+    // TarReader` — the same reserved-namespace static-call shape
+    // `GzipReader.open` above uses.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "TarReader") =>
+    {
+      let self_ty = Type::Newtype("TarReader".to_string(), Box::new(Type::Int64));
+      if method == "open" {
+        check_args(
+          method,
+          args,
+          &[Type::String],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(self_ty);
+      }
+      Err(Diagnostic::new(
+        format!("TarReader has no static method `{method}`"),
+        expr.span,
+      ))
+    }
     // Plan 96's Decision log: `UdpSocket.bind`/`.last_sender_host`/
     // `.last_sender_port` — the last two are the `_Thread_local`-
     // accessor-pair convention this plan's own text mandates in place
@@ -6240,6 +6297,42 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("{name} has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 132's Decision log: `TarReader#next_entry`/`#entry_
+        // size`/`#read_entry_data`/`#close` — the identical carved-
+        // out-of-`.value`-only shape `Regex`'s own methods establish,
+        // just with a real return-type table instead of nine.
+        // `.next_entry` returns `Option[String]` (`None` past the last
+        // real entry); `.read_entry_data` returns a bare `Bytes`, not
+        // `Result[Bytes, String]`, the same "one call, raise rather
+        // than `Result`" posture `GzipReader#read_chunk` immediately
+        // above establishes.
+        if name == "TarReader" {
+          let option_string = Type::Enum("Option$String".to_string());
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "next_entry" => (vec![], option_string),
+            "entry_size" => (vec![], Type::Int64),
+            "read_entry_data" => (vec![], bytes_ty),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("TarReader has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -13572,6 +13665,13 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     "DeflateReader",
     "ZlibWriter",
     "ZlibReader",
+    // Plan 132's Decision log: `TarReader` — the identical shape, plan
+    // 93's own handle registry backed by a boxed `Vec<(String, Vec<
+    // u8>)>` (every entry's name and content, read eagerly by `.open`)
+    // plus a cursor — see `tar.rs`'s own module doc for why this is a
+    // real, disclosed simplification from a true self-referential
+    // `tar::Entries` iterator.
+    "TarReader",
     // Plan 100's Decision log: `HttpResponse` — the identical shape.
     "HttpResponse",
     // Plan 101's Decision log: `HttpRequest` — the identical shape.

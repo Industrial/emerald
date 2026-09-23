@@ -237,6 +237,8 @@ fn set_newtype_underlying(program: &Program) {
     "DeflateReader",
     "ZlibWriter",
     "ZlibReader",
+    // Plan 132's Decision log: `TarReader` -- the identical shape.
+    "TarReader",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5418,6 +5420,16 @@ struct Ctx<'a, 'ctx> {
   zlib_reader_open: FunctionValue<'ctx>,
   zlib_reader_read_chunk: FunctionValue<'ctx>,
   zlib_reader_close: FunctionValue<'ctx>,
+  /// Plan 132 (Tar Archives) — `Tar.create`/`.extract`, `TarReader.
+  /// open`/`.next_entry`/`.entry_size`/`.read_entry_data`/`.close`,
+  /// wrapping `tar`.
+  tar_create: FunctionValue<'ctx>,
+  tar_extract: FunctionValue<'ctx>,
+  tar_reader_open: FunctionValue<'ctx>,
+  tar_reader_next_entry: FunctionValue<'ctx>,
+  tar_reader_entry_size: FunctionValue<'ctx>,
+  tar_reader_read_entry_data: FunctionValue<'ctx>,
+  tar_reader_close: FunctionValue<'ctx>,
   /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
   /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
   dns_resolve: FunctionValue<'ctx>,
@@ -8895,6 +8907,44 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Int64));
     }
+    // Plan 132's Decision log: `TarReader#next_entry`/`#entry_size`/
+    // `#read_entry_data`/`#close` -- the identical carved-out-of-
+    // newtype shape `Regex`'s own methods establish. `.next_entry`
+    // returns `Option[String]`/`ValKind::Ptr` (`Regex#find`'s own
+    // convention); `.read_entry_data` returns a bare `Bytes`/
+    // `ValKind::Int64` (`Gzip.compress`'s own convention -- a `Bytes`
+    // value's ABI is a plain `i64`, unlike a genuine `ValKind::Ptr`).
+    if local_classes.get(recv_name).map(String::as_str) == Some("TarReader") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.tar_reader_close,
+            &[recv_val.into()],
+            "tarreaderclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let (fv, ret_kind) = match method {
+        "next_entry" => (ctx.tar_reader_next_entry, ValKind::Ptr),
+        "entry_size" => (ctx.tar_reader_entry_size, ValKind::Int64),
+        "read_entry_data" => (ctx.tar_reader_read_entry_data, ValKind::Int64),
+        other => return Err(format!("codegen: unsupported TarReader method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "tarreadertmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
     if local_classes.get(recv_name).map(String::as_str) == Some("UdpSocket") {
@@ -10138,6 +10188,103 @@ fn build_method_call<'ctx>(
     };
     let call = builder
       .build_call(fv, &call_args, "compressopentmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 132's Decision log: `Tar.create(archive_path: String, paths:
+  // Array[String]): Void` -- unlike every other reserved-namespace
+  // static call above, `paths`'s own `Array[String]` argument is
+  // unpacked into its raw `elements_base`/`count` pair here (mirroring
+  // `build_array_each`'s own read of the identical `[length: Int64]
+  // [elements...]` layout `build_array_lit` writes), since `emerald_
+  // rt_tar_create`'s own FFI signature needs the element-pointer array
+  // and count as two separate parameters, not the array's own header-
+  // inclusive base pointer -- the "real, new marshaling shape" this
+  // plan's own Decision log names. `Tar.extract(archive_path: String,
+  // dest_dir: String): Void` forwards both `String` arguments
+  // directly, the same uniform shape `Gzip`/`Deflate`/`Zlib` above use.
+  if recv_name == "Tar" {
+    if method == "create" {
+      let (archive_val, _) = build_expr(
+        context,
+        builder,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (paths_val, _) = build_expr(
+        context,
+        builder,
+        &args[1],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let arr_ptr = paths_val.into_pointer_value();
+      let count_val = builder
+        .build_load(context.i64_type(), arr_ptr, "tarcreatecount")
+        .map_err(|e| e.to_string())?
+        .into_int_value();
+      let elems_base = field_ptr(context, builder, arr_ptr, 8)?;
+      builder
+        .build_call(
+          ctx.tar_create,
+          &[archive_val.into(), elems_base.into(), count_val.into()],
+          "tarcreatetmp",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
+    if method != "extract" {
+      return Err(format!("codegen: unsupported Tar static method `{method}`"));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    builder
+      .build_call(ctx.tar_extract, &call_args, "tarextracttmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+  }
+
+  // Plan 132's Decision log: `TarReader.open(archive_path: String):
+  // TarReader` -- the same reserved-namespace static-call shape
+  // `GzipReader.open` above uses.
+  if recv_name == "TarReader" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    if method != "open" {
+      return Err(format!(
+        "codegen: unsupported TarReader static method `{method}`"
+      ));
+    }
+    let call = builder
+      .build_call(ctx.tar_reader_open, &call_args, "tarreaderopentmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Int64));
   }
@@ -23006,6 +23153,47 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 132 (Tar Archives): `Tar.create`'s own `paths: Array[String]`
+  // argument crosses as its own already-unpacked `(elements_base:
+  // ptr_ty, count: i64_ty)` pair, not the array's header-inclusive
+  // base pointer -- see this call site's own build_method_call/static
+  // dispatch below. Every other `Bytes`/`Option[String]`-shaped value
+  // crosses as `ptr_ty`, the same `Regex`/`GzipReader` convention.
+  let tar_create = module.add_function(
+    "emerald_rt_tar_create",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tar_extract = module.add_function(
+    "emerald_rt_tar_extract",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tar_reader_open = module.add_function(
+    "emerald_rt_tar_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tar_reader_next_entry = module.add_function(
+    "emerald_rt_tar_reader_next_entry",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tar_reader_entry_size = module.add_function(
+    "emerald_rt_tar_reader_entry_size",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tar_reader_read_entry_data = module.add_function(
+    "emerald_rt_tar_reader_read_entry_data",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tar_reader_close = module.add_function(
+    "emerald_rt_tar_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 97 (DNS Resolution).
   let dns_resolve = module.add_function(
     "emerald_rt_dns_resolve",
@@ -24143,6 +24331,13 @@ fn compile_to_object_impl(
   // newtype (see `emerald-sema`'s own Decision log for the full
   // reasoning).
   newtypes.insert("BigInt".to_string());
+  // Plan 132's Decision log: `TarReader` — added here as well as
+  // `NEWTYPE_UNDERLYING` above, per `XmlReader`'s own disclosed
+  // finding immediately above (`newtypes.insert(...)` alone was not
+  // enough there either): this plan's own Concrete Proof `Let`-binds
+  // `reader: TarReader = TarReader.open(...)`, so both registries are
+  // load-bearing here, not just one.
+  newtypes.insert("TarReader".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -24476,6 +24671,13 @@ fn compile_to_object_impl(
     zlib_reader_open,
     zlib_reader_read_chunk,
     zlib_reader_close,
+    tar_create,
+    tar_extract,
+    tar_reader_open,
+    tar_reader_next_entry,
+    tar_reader_entry_size,
+    tar_reader_read_entry_data,
+    tar_reader_close,
     dns_resolve,
     dns_resolve_all,
     dns_resolve_count,
