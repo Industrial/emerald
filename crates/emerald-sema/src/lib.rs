@@ -3923,26 +3923,35 @@ fn infer_expr_type(
         )?;
         return Ok(Type::Newtype("CliParser".to_string(), Box::new(Type::Int64)));
       }
-      // Plan 183's Decision log: `ConfigBuilder.new()` — the identical
-      // zero-argument carve-out `LogFields.new()` above already
-      // establishes, for the identical reason (`ConfigBuilder` is
-      // registered as a `NativeHandle`-style `Int64` newtype purely
-      // for its zero-cost representation, never constructed by
-      // wrapping a given underlying value).
-      if class_name == "ConfigBuilder" {
-        if !args.is_empty() {
+      // Plan 191's Decision log: `ProgressBar.new(total)` — the
+      // identical real-argument carve-out `CliParser.new(name,
+      // version)` above establishes, just with one `Int64` argument
+      // instead of two `String`s. `.new_spinner()` (no arguments) is
+      // a separate, reserved-namespace static call on the same
+      // `ProgressBar` name (this `Expr::MethodCall` arm's own sibling
+      // below) — never routed through `Expr::New` at all, since
+      // `new_spinner` is not the literal reserved `new` token.
+      if class_name == "ProgressBar" {
+        if args.len() != 1 {
           return Err(Diagnostic::new(
             format!(
-              "`ConfigBuilder.new` takes no arguments, found {}",
+              "`ProgressBar.new` expects exactly 1 argument (total), found {}",
               args.len()
             ),
             expr.span,
           ));
         }
-        return Ok(Type::Newtype(
-          "ConfigBuilder".to_string(),
-          Box::new(Type::Int64),
-        ));
+        check_args(
+          "ProgressBar.new",
+          args,
+          &[Type::Int64],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(Type::Newtype("ProgressBar".to_string(), Box::new(Type::Int64)));
       }
       let info = classes
         .get(class_name)
@@ -4290,6 +4299,56 @@ fn infer_expr_type(
         Box::new(Type::Enum("JsonValue".to_string())),
         Box::new(Type::String),
       ))
+    }
+    // Plan 191's Decision log: `ProgressBar.new_spinner()` — the
+    // identical reserved-namespace static-call shape `Json`/`Toml`
+    // above use, for the same reason (`ProgressBar` is never a real
+    // `ModuleDef`). `.new(total)` is a real-argument `Expr::New`
+    // constructor instead (see that arm above) — this arm covers only
+    // the zero-argument `new_spinner` static call.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "ProgressBar") =>
+    {
+      if method != "new_spinner" {
+        return Err(Diagnostic::new(
+          format!("ProgressBar has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+      Ok(Type::Newtype("ProgressBar".to_string(), Box::new(Type::Int64)))
+    }
+    // Plan 191's Decision log: `Console.styled(text, color)`/
+    // `.is_terminal` — the identical reserved-namespace static-call
+    // shape `Json`/`Toml` above use; `Console` never becomes a value
+    // itself (no constructor, no handle) — both methods return an
+    // ordinary `String`/`Boolean` directly.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Console") =>
+    {
+      match method.as_str() {
+        "styled" => {
+          check_args(
+            method,
+            args,
+            &[Type::String, Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::String)
+        }
+        "is_terminal" => {
+          check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+          Ok(Type::Boolean)
+        }
+        other => Err(Diagnostic::new(
+          format!("Console has no static method `{other}`"),
+          expr.span,
+        )),
+      }
     }
     // Plan 125's Decision log: `Bincode.encode`/`.decode`,
     // `MessagePack.encode`/`.decode` — the same reserved-namespace
@@ -6308,6 +6367,34 @@ fn infer_expr_type(
           )?;
           return Ok(ret);
         }
+        // Plan 191's Decision log: `ProgressBar`'s own three
+        // instance methods (`.increment`/`.set_message`/`.finish`) —
+        // the identical carved-out-of-`.value`-only shape `Regex`'s
+        // own methods immediately above establish.
+        if name == "ProgressBar" {
+          let (expected_params, ret) = match method.as_str() {
+            "increment" => (vec![Type::Int64], Type::Void),
+            "set_message" => (vec![Type::String], Type::Void),
+            "finish" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("ProgressBar has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
         if name == "XmlReader" {
           if method != "next_event" {
             return Err(Diagnostic::new(
@@ -6408,83 +6495,6 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("CliParseResult has no method `{other}`"),
-                expr.span,
-              ));
-            }
-          };
-          check_args(
-            method,
-            args,
-            &expected_params,
-            env,
-            sigs,
-            classes,
-            self_fields,
-            gctx,
-          )?;
-          return Ok(ret);
-        }
-        // Plan 183's Decision log: `ConfigBuilder`'s own six instance
-        // methods — the identical carved-out-of-`.value`-only shape
-        // `CliParser` above establishes. `.add_cli_overrides` takes a
-        // real `CliParseResult` newtype value (plan 182's own output,
-        // never a second `ARGV` parse), an `Array[String]` of keys to
-        // read from it, and the array's own companion `Int64` count
-        // (`Array[T]`'s own no-length-prefix representation, the
-        // identical reason `CliParser#parse`'s own `argv`/`argc` pair
-        // is two parameters, not one).
-        if name == "ConfigBuilder" {
-          let cli_parse_result_ty =
-            Type::Newtype("CliParseResult".to_string(), Box::new(Type::Int64));
-          let (expected_params, ret) = match method.as_str() {
-            "add_defaults_file" => (vec![Type::String], Type::Void),
-            "add_config_file" => (vec![Type::String], Type::Void),
-            "add_env_prefix" => (vec![Type::String], Type::Void),
-            "add_cli_overrides" => (
-              vec![
-                cli_parse_result_ty,
-                Type::Array(Box::new(Type::String)),
-                Type::Int64,
-              ],
-              Type::Void,
-            ),
-            "build" => (
-              vec![],
-              Type::Newtype("ConfigValue".to_string(), Box::new(Type::Int64)),
-            ),
-            other => {
-              return Err(Diagnostic::new(
-                format!("ConfigBuilder has no method `{other}`"),
-                expr.span,
-              ));
-            }
-          };
-          check_args(
-            method,
-            args,
-            &expected_params,
-            env,
-            sigs,
-            classes,
-            self_fields,
-            gctx,
-          )?;
-          return Ok(ret);
-        }
-        // Plan 183's Decision log: `ConfigValue`'s own three typed
-        // getters — the identical carved-out-of-`.value`-only shape
-        // `CliParser`/`ConfigBuilder` above establish. A missing key
-        // and a present-but-wrong-shape key both collapse to `None`
-        // (this plan's own Decision log) — never a second `Result[T,
-        // String]`-shaped error channel.
-        if name == "ConfigValue" {
-          let (expected_params, ret) = match method.as_str() {
-            "get_string" => (vec![Type::String], Type::Enum("Option$String".to_string())),
-            "get_int" => (vec![Type::String], Type::Enum("Option$Int64".to_string())),
-            "get_bool" => (vec![Type::String], Type::Enum("Option$Boolean".to_string())),
-            other => {
-              return Err(Diagnostic::new(
-                format!("ConfigValue has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -14093,6 +14103,29 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // carved out of the ordinary newtype `.value`-only restriction, the
   // same mechanism `Regex`'s own nine methods already establish, just
   // with one zero-arg method instead of nine.
+  // Plan 191's Decision log: `ProgressBar` — the identical "reserved
+  // name, zero-cost `Int64` handle" shape `Regex` immediately above
+  // already uses, backed by plan 93's own `crate::handle` registry (a
+  // boxed `indicatif::ProgressBar`, never a raw pointer smuggled
+  // through as an `Int64`). `.new_spinner()` is a reserved-namespace
+  // static intrinsic (this `Expr::MethodCall` arm's own sibling
+  // above); `.increment`/`.set_message`/`.finish` are carved out of
+  // the ordinary newtype `.value`-only restriction, the same
+  // mechanism `Regex`'s own nine methods already establish.
+  classes.insert(
+    "ProgressBar".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
   classes.insert(
     "XmlReader".to_string(),
     ClassInfo {
@@ -14182,48 +14215,6 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   );
   classes.insert(
     "CliParseResult".to_string(),
-    ClassInfo {
-      fields: HashMap::new(),
-      methods: HashMap::new(),
-      is_module: false,
-      superclass: None,
-      implements: None,
-      enum_variants: None,
-      is_actor: false,
-      generic_methods: HashMap::new(),
-      newtype_underlying: Some(Type::Int64),
-    },
-  );
-  // Plan 183's Decision log: `ConfigBuilder`/`ConfigValue` — the
-  // identical "reserved name, zero-cost `Int64` handle" shape
-  // `CliParser`/`CliParseResult` immediately above already use, backed
-  // by plan 93's own `crate::handle` registry (a boxed `config::
-  // ConfigBuilder<DefaultState>` / this crate's own already-merged
-  // `config::Config` respectively). Two distinct `ClassInfo` entries —
-  // `ConfigBuilder` is built up by a sequence of `.add_defaults_file`/
-  // `.add_config_file`/`.add_env_prefix`/`.add_cli_overrides` calls
-  // and consumed by `.build`; `ConfigValue` is `.build`'s own output,
-  // never itself mutated. `ConfigBuilder.new()` is carved out of the
-  // ordinary single-argument newtype constructor in the `Expr::New`
-  // arm above (zero arguments, the identical `LogFields.new()` shape);
-  // every other method on either class is carved out of the ordinary
-  // newtype `.value`-only restriction.
-  classes.insert(
-    "ConfigBuilder".to_string(),
-    ClassInfo {
-      fields: HashMap::new(),
-      methods: HashMap::new(),
-      is_module: false,
-      superclass: None,
-      implements: None,
-      enum_variants: None,
-      is_actor: false,
-      generic_methods: HashMap::new(),
-      newtype_underlying: Some(Type::Int64),
-    },
-  );
-  classes.insert(
-    "ConfigValue".to_string(),
     ClassInfo {
       fields: HashMap::new(),
       methods: HashMap::new(),

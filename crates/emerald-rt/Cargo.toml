@@ -641,6 +641,30 @@ bincode = { version = "=2.0.1", features = ["serde"] }
 # `serde_json::Value` directly), so the advisory is moot twice over.
 # `MessagePack.encode`/`.decode`'s direct backing. See DEPENDENCIES.md.
 rmp-serde = "1.3"
+# Plan 191 (Progress Bars & Terminal Formatting): real-checked at this
+# plan's own execution time (2026-09-23, via `cargo info` against the
+# live crates.io registry) - indicatif 0.18.6 (MIT, MSRV 1.85,
+# released 2026-07-01) and console 0.16.6 (MIT, MSRV 1.71, released
+# 2026-09-10), both confirming the plan's own cited figures, both
+# owned by the `console-rs` GitHub organization (indicatif's own
+# default feature set depends on `console` directly, verified against
+# its own `Cargo.toml`/feature list - not an arbitrary pairing).
+# `rustsec.org/packages/indicatif.html` and `.../console.html` both
+# 404 - no advisory ever filed against either crate. Default features
+# only (`unicode-width`, `wasmbind` for indicatif; `unicode-width`,
+# `ansi-parsing`, `std` for console) - no bespoke feature selection
+# needed, since `ProgressBar`/`Console.styled`/`.is_terminal`'s own v1
+# scope (see `progress.rs`'s own module doc) never touches `rayon`/
+# `tokio`/`in_memory`/`improved_unicode`. Pure Rust: `console`'s own
+# real dependency list (`libc`/`windows-sys`, both thin raw-syscall
+# bindings with no bundled C library, the same category plan 96's
+# `std::net` already relies on transitively) clears plan 95's
+# pure-Rust-first bar outright - no C-exception needed.
+# `ProgressBar.new`/`.new_spinner`/`.increment`/`.set_message`/
+# `.finish`, `Console.styled`/`.is_terminal`'s direct backing. See
+# DEPENDENCIES.md.
+indicatif = "0.18.6"
+console = "0.16.6"
 # Plan 182 (Structured CLI Flag Parsing): real-checked at this plan's
 # own execution time (2026-09-23, via docs.rs) - clap 4.6.7 (published
 # 14 Sep 2026), actively maintained by the clap-rs/rust-cli teams, #1
@@ -659,24 +683,6 @@ rmp-serde = "1.3"
 # `Command::new`/`.version` call in `cli.rs` fails to compile at all.
 # `CliParser`/`CliParseResult`'s direct backing. See DEPENDENCIES.md.
 clap = { version = "4.6", features = ["string"] }
-# Plan 183 (Layered Configuration Loading): real-checked at this
-# plan's own execution time (2026-09-23, via `cargo search`/`cargo
-# info` against the live crates.io registry) - config 0.15.26,
-# rust-cli-org-owned (`github:rust-cli/config-rs`), MSRV 1.88.
-# `rustsec.org/packages/config.html` 404s - no advisory ever filed.
-# `default-features = false`, `features = ["toml", "yaml"]` only -
-# `ConfigBuilder.add_config_file`/`.add_defaults_file` delegate file
-# parsing entirely to this crate's own `toml`/`yaml-rust2` backends
-# (plans 119/120's already-vetted formats), never a third,
-# independently vetted parser; the crate's own `default` feature list
-# additionally pulls `json`/`ini`/`ron`/`json5`/`convert-case`/`async`
-# (the last requiring `async-trait`), none of which this plan's own
-# file/env/CLI-flag scope needs. `ConfigBuilder`/`ConfigValue`'s
-# direct backing. See DEPENDENCIES.md.
-config = { version = "0.15", default-features = false, features = [
-  "toml",
-  "yaml",
-] }
 
 [build-dependencies]
 

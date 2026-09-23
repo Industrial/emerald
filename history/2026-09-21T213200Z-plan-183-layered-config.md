@@ -10,16 +10,16 @@ maestro:
 todos:
   - id: leaf-scaffold-config-module-and-builder-resource
     content: "Create `crates/emerald-rt/src/config.rs`. Register a compiler-provided, non-user-declarable `ConfigBuilder` class (one hidden `u64` handle field, per plan 93, into a `HashMap<u64, config::ConfigBuilder<config::builder::DefaultState>>`) and a `ConfigValue` result class (one hidden handle into a `HashMap<u64, config::Config>`, the crate's own already-merged, already-frozen output type). Every exported `emerald_rt_config_*` function goes through plan 92's `emerald_rt_fn!` catch-unwind macro; a malformed source (invalid TOML/YAML syntax, an environment variable that can't coerce to a requested type) becomes a `NativeError` at `.build()` time, not a panic or a silent empty config."
-    status: done
+    status: pending
   - id: leaf-source-registration-methods
     content: "`ConfigBuilder.new(): ConfigBuilder`, `.add_defaults_file(path: String): Void` (lowest precedence — `config::File::with_name(path).required(false)`, tolerating a missing defaults file rather than failing), `.add_config_file(path: String): Void` (the program's real config file — TOML via plan 119's parser or YAML via plan 120's, both already real `config::Source` implementations the `config` crate itself supports natively through its own `toml`/`yaml` feature flags, not reimplemented by this plan), `.add_env_prefix(prefix: String): Void` (`config::Environment::with_prefix(prefix).separator(\"__\")` — the crate's own documented convention for mapping `APPNAME__SECTION__KEY` env vars onto nested config keys, reused verbatim rather than inventing a different separator), and `.add_cli_overrides(result: CliParseResult, keys: Array[String], count: Int64): Void` (walks plan 182's `CliParseResult.value(key)` for each of the given `keys` and layers any `Some(v)` as the highest-precedence source via `config::Config::builder().set_override(key, v)` — see Decision log for why this is a manual bridge rather than `config` parsing `ArgMatches` itself, which it has no built-in support for). Each registration call appends one more layered source to the builder held behind the handle, in the exact order called — `config`'s own merge semantics are last-registered-wins per key, which this plan's fixed call order (`add_defaults_file` → `add_config_file` → `add_env_prefix` → `add_cli_overrides`) turns into the stated precedence order."
-    status: done
+    status: pending
   - id: leaf-build-and-typed-getters
     content: "`ConfigBuilder.build(self): ConfigValue` (`.build()`, wrapped in `catch_unwind`, converting a `config::ConfigError` into a `NativeError` with the crate's own formatted message — e.g. which file failed to parse and why). `ConfigValue` accessors: `.get_string(key: String): Option[String]`, `.get_int(key: String): Option[Int64]`, `.get_bool(key: String): Option[Boolean]` — each a thin wrapper over `config::Config::get::<T>(key)`, converting `Err` (key absent, or present with the wrong shape) uniformly to `None` rather than distinguishing 'missing' from 'wrong type' — a real, disclosed simplification (see Decision log) chosen because `Option[T]`, not a second `Result[T,E]`-shaped error channel, is this plan's whole external contract. Dotted keys (`\"server.port\"`) work exactly as `config`'s own nested-key addressing already supports, with zero special-casing on Emerald's side."
-    status: done
+    status: pending
   - id: leaf-example-and-gate
     content: "Add `examples/layered_config.em` (the Concrete Proof below) to `examples/`, wired into `emerald-cli/tests/examples.rs`'s CI-checked table per plan 95's mandatory checklist, run from a fixed temporary directory with a real TOML fixture file, a real set environment variable, and a real fixed `argv`, so the precedence order is demonstrated by genuine layered inputs, not asserted in prose alone. Add `#[test]`s in `emerald-rt` covering: file-only resolution, env-overriding-file, CLI-overriding-both, and a missing key producing `None` rather than a panic. Run the full `AGENTS.md` gate (`cargo nextest run --workspace`, `cargo clippy --workspace --all-targets`, `treefmt`) plus a clean-checkout end-to-end build."
-    status: done
+    status: pending
 isProject: false
 ---
 
@@ -200,128 +200,3 @@ toy case that could pass by accident.
   materialized into a whole struct at once. Secrets/keyring-backed
   config sources (`figment-keyring`-style) — a real, separate crate
   and trust boundary, not folded into this plan's file/env/CLI scope.
-
-## Update (2026-09-23, same-day session): implemented, all four leaves done
-
-`config` 0.15.26 confirmed as the real, current crates.io release at
-this plan's own implementation time (`cargo search`/`cargo info`
-against the live registry — direct crates.io web access was
-unavailable in this session, the same fallback plan 163/164's own
-Decision logs already used). `default-features = false`, `features =
-["toml", "yaml"]` — matches this plan's own scope exactly. No RustSec
-advisory found against `config` itself (`rustsec.org/packages/
-config.html` 404s).
-
-`crates/emerald-rt/src/config.rs` (`#[path = "config.rs"] mod
-configs;` in `lib.rs`, the identical `csvs`/`tomls`/`urls` external-
-crate-name-collision dodge) implements `ConfigBuilder`/`ConfigValue`
-exactly as scoped — both registered as compiler-synthesized `Int64`
-newtypes over plan 93's `crate::handle` registry, the same shape
-`CliParser`/`CliParseResult` (plan 182) already establish, in both
-`emerald-sema` (constructor + instance-method type checking +
-`classes.insert`) and `emerald-codegen` (`NEWTYPE_UNDERLYING` +
-`newtypes.insert` + constructor/method-call codegen + `extern "C"`
-declarations).
-
-`ConfigBuilder.new`/`.add_defaults_file`/`.add_config_file`/
-`.add_env_prefix`/`.add_cli_overrides`/`.build`, `ConfigValue#get_
-string`/`#get_int`/`#get_bool` all implemented per the leaf list.
-`.build()` reads every registered source and converts a real
-`config::ConfigError` (malformed TOML/YAML, a required config file
-genuinely missing) into a `NativeError` carrying the crate's own
-formatted message — never a panic, never a silently empty
-`ConfigValue`. `add_defaults_file` uses `.required(false)`;
-`add_config_file` uses `config::File::with_name`'s own default
-`required(true)`.
-
-**One real, disclosed correction to this plan's own literal Concrete
-Proof, found only by actually running it — `add_cli_overrides`'s own
-per-key lookup cannot use the given key string verbatim against `cli::
-cliparseresult_value`.** The proof registers a CLI flag named `"port"`
-(`parser.option("port", "p", ...)`) but supplies `override_keys =
-["server.port"]` — two different strings. Calling `cliparseresult_
-value` with the full dotted key (`"server.port"`) asks `clap`'s own
-`ArgMatches::get_one` for an arg id it was never given, which `clap`
-treats as a programmer error and panics on (not a graceful `None`) —
-verified directly by running the proof as literally written. The
-fix, entirely local to `configbuilder_add_cli_overrides` (no change to
-plan 182's own `cli.rs`): only the key's own LAST dot-separated
-segment (`"port"` from `"server.port"`) is looked up against the
-`CliParseResult`; the FULL key is still what `set_override` layers
-into `ConfigValue`. Documented in `config.rs`'s own doc comment on
-`configbuilder_add_cli_overrides`. With this fix, the proof's own
-expected output (`7070` then `0.0.0.0`) holds exactly, both as a Rust
-`#[test]` (`configs::tests::a_cli_override_wins_over_both_the_
-environment_variable_and_the_config_file`) and as the real compiled-
-and-run `examples/layered_config.em` (see below).
-
-**A second real, disclosed correction, this time reverted after
-actually breaking a pre-existing test: `Option[Int64]`/`Option
-[Boolean]` are deliberately NOT unconditionally pre-instantiated the
-way `Option[String]` is for `String.from_cstring`/`CliParseResult`.**
-An initial implementation added unconditional `instantiate_generic_
-enum`/`instantiate_generic_enum_defs` calls for both in `emerald-sema`/
-`emerald-codegen`, mirroring `Option[String]`'s own precedent — this
-broke a real, pre-existing sema test (`rejects_safe_call_on_a_method_
-returning_a_value_type_with_no_prior_option_instantiation`), whose own
-assertion requires `Option[Int64]` to NOT already be instantiated
-anywhere. Investigated and reverted: unlike `String.from_cstring`
-(whose `Option[String]` return is compiler-internal-derived, never
-spelled out as literal source text a program could otherwise trigger),
-`ConfigValue.get_int`/`.get_bool`'s own `Option[Int64]`/`Option
-[Boolean]` return types need no special-casing at all — `Stmt::Let`
-has no untyped/inferred form in this grammar (`ty: TypeExpr`, not
-`Option<TypeExpr>`, in `emerald-parser/src/ast.rs`), and `match`'s own
-scrutinee must already be a plain `Let`-bound local (this compiler's
-own pre-existing restriction), so every real, meaningful use of either
-getter already requires writing `Option[Int64]`/`Option[Boolean]` as a
-literal type annotation somewhere — which the ordinary generic-
-instantiation discovery scan (`collect_generic_instantiation_
-typenames`) picks up on its own, the identical mechanism any user-
-written `Stack[Int64]` already relies on. Verified directly: a real
-compiled-and-run probe program (`x: Option[Int64] = cfg.get_int(...)`)
-type-checks and runs correctly with no special-casing present.
-
-`examples/layered_config.em` added and wired into `crates/emerald-cli/
-tests/examples.rs` (`layered_config_em_prints_expected_sequence`), run
-from a fixed temporary directory with a real `app.toml` fixture file
-(`[server]\nport = 8080\nhost = "0.0.0.0"\n`), a real `APP__SERVER__
-PORT=9090` environment variable, and a real `--port 7070` argv —
-stdout is exactly `7070\n0.0.0.0\n`, the genuine three-layer
-precedence proof this plan's own Decision log names. Two further real,
-disclosed deviations from the plan's own literal Concrete Proof
-syntax, the identical class plan 182's own `examples/cli_flag_
-parsing.em` already disclosed: `case`/`when` is not this grammar's
-real `Option[T]` pattern-matching syntax (the actual construct is
-`match X do Some(v) do ... end None do ... end end`), and a `match`
-scrutinee must be a plain `Let`-bound local, never a direct method-call
-expression.
-
-Four `#[test]`s added in `crates/emerald-rt/src/config.rs` per the
-leaf list: `file_only_resolution_reads_every_key_straight_from_the_
-config_file`, `an_environment_variable_overrides_a_config_file_value_
-at_the_same_key`, `a_cli_override_wins_over_both_the_environment_
-variable_and_the_config_file`, `a_missing_key_produces_none_rather_
-than_a_panic` — plus a fifth covering `add_defaults_file`'s own
-tolerate-a-missing-file behavior
-(`a_missing_optional_defaults_file_is_tolerated_not_a_build_failure`).
-All fixture files use unique absolute temp paths (never a process-wide
-`chdir`) and unique env-var prefixes, safe under real parallel test
-execution.
-
-Gate: `cargo build --workspace` clean; `cargo nextest run --workspace`
-green except three pre-existing, environment-specific conditions
-disclosed in this session's own operating instructions and verified
-independently in isolation — `emerald-driver::cache::tests::
-corrupting_the_cached_object_file_forces_a_real_recompile_not_an_
-error` (pre-existing flake), `emerald-cli::examples::http_client_
-proof_em_prints_expected_sequence` (network-dependent, passes in
-isolation), and `emerald-cli::examples::progress_and_formatting_
-proof_em_prints_expected_sequence` (a concurrent, uncommitted plan-191
-example in this same shared working tree at the time of this run, not
-this plan's own code). `cargo clippy --workspace --all-targets` clean
-(pre-existing warning baseline in `emerald-rt`, none in this plan's own
-`config.rs`). `treefmt` reports zero changes needed.
-
-`crates/emerald-rt/DEPENDENCIES.md` gained one more real row (`config`
-0.15.26, plan 183).

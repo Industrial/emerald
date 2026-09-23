@@ -223,6 +223,8 @@ fn set_newtype_underlying(program: &Program) {
     // signature") the moment `reader.next_event` tried to pass that
     // `ptr`-typed load where `emerald_rt_xml_reader_next_event`'s
     // real `i64` parameter expected an `Int64`.
+    // Plan 191's Decision log: `ProgressBar` -- the identical shape.
+    "ProgressBar",
     "XmlReader",
     // Plan 99's Decision log: `TlsStream`/`TlsListener` -- the
     // identical shape, layered on top of `TcpStream`/`TcpListener`.
@@ -251,10 +253,6 @@ fn set_newtype_underlying(program: &Program) {
     // identical shape.
     "CliParser",
     "CliParseResult",
-    // Plan 183's Decision log: `ConfigBuilder`/`ConfigValue` -- the
-    // identical shape.
-    "ConfigBuilder",
-    "ConfigValue",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5501,19 +5499,16 @@ struct Ctx<'a, 'ctx> {
   cliparseresult_help_text: FunctionValue<'ctx>,
   cliparseresult_error_message: FunctionValue<'ctx>,
   cliparseresult_close: FunctionValue<'ctx>,
-  /// Plan 183 (Layered Configuration Loading) — `ConfigBuilder.new`/
-  /// `.add_defaults_file`/`.add_config_file`/`.add_env_prefix`/
-  /// `.add_cli_overrides`/`.build`, `ConfigValue#get_string`/
-  /// `#get_int`/`#get_bool`, wrapping `config`.
-  configbuilder_new: FunctionValue<'ctx>,
-  configbuilder_add_defaults_file: FunctionValue<'ctx>,
-  configbuilder_add_config_file: FunctionValue<'ctx>,
-  configbuilder_add_env_prefix: FunctionValue<'ctx>,
-  configbuilder_add_cli_overrides: FunctionValue<'ctx>,
-  configbuilder_build: FunctionValue<'ctx>,
-  configvalue_get_string: FunctionValue<'ctx>,
-  configvalue_get_int: FunctionValue<'ctx>,
-  configvalue_get_bool: FunctionValue<'ctx>,
+  /// Plan 191 (Progress Bars & Terminal Formatting) — `ProgressBar.new`/
+  /// `.new_spinner`/`.increment`/`.set_message`/`.finish`,
+  /// `Console.styled`/`.is_terminal`, wrapping `indicatif`/`console`.
+  progressbar_new: FunctionValue<'ctx>,
+  progressbar_new_spinner: FunctionValue<'ctx>,
+  progressbar_increment: FunctionValue<'ctx>,
+  progressbar_set_message: FunctionValue<'ctx>,
+  progressbar_finish: FunctionValue<'ctx>,
+  console_styled: FunctionValue<'ctx>,
+  console_is_terminal: FunctionValue<'ctx>,
   /// Plan 137 (SQLite) — `Sqlite.open`/`.open_memory`/`.close`/
   /// `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
   /// `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
@@ -7214,19 +7209,33 @@ fn build_expr<'ctx>(
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Int64))
     }
-    // Plan 183's Decision log: `ConfigBuilder.new()` — the identical
-    // zero-argument carve-out `LogFields.new()` above already
-    // establishes, calling `emerald_rt_configbuilder_new()` for a
-    // fresh handle instead of indexing a non-existent `args[0]`.
-    Expr::New(class_name, args) if class_name == "ConfigBuilder" => {
-      if !args.is_empty() {
+    // Plan 191's Decision log: `ProgressBar.new(total)` — the
+    // identical real-argument carve-out `CliParser.new(name, version)`
+    // above establishes, just with one `Int64` argument passed
+    // straight through to `emerald_rt_progressbar_new` instead of two
+    // `String`s.
+    Expr::New(class_name, args) if class_name == "ProgressBar" => {
+      if args.len() != 1 {
         return Err(format!(
-          "codegen: `ConfigBuilder.new` expects 0 arguments, found {}",
+          "codegen: `ProgressBar.new` expects 1 argument, found {}",
           args.len()
         ));
       }
+      let (total_val, _) = build_expr(
+        context,
+        builder,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
       let call = builder
-        .build_call(ctx.configbuilder_new, &[], "configbuildernewtmp")
+        .build_call(
+          ctx.progressbar_new,
+          &[total_val.into()],
+          "progressbarnewtmp",
+        )
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Int64))
     }
@@ -8514,6 +8523,47 @@ fn build_method_call<'ctx>(
       return Ok((call_result(call)?, ValKind::Int64));
     }
 
+    // Plan 191's Decision log: `ProgressBar`'s own three instance
+    // methods (`.increment`/`.set_message`/`.finish`) — the identical
+    // carved-out-of-newtype shape `Regex`/`BigInt` immediately above
+    // establish. `.finish` folds `crate::handle::handle_close` into
+    // itself on the Rust side (`progress.rs`'s own module doc) — no
+    // separate `.close` call exists at this codegen layer either.
+    if local_classes.get(recv_name).map(String::as_str) == Some("ProgressBar") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let fv = match method {
+        "increment" => ctx.progressbar_increment,
+        "set_message" => ctx.progressbar_set_message,
+        "finish" => ctx.progressbar_finish,
+        other => return Err(format!("codegen: unsupported ProgressBar method `{other}`")),
+      };
+      builder
+        .build_call(fv, &call_args, "progressbartmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
+
     if local_classes.get(recv_name).map(String::as_str) == Some("XmlReader") {
       let (recv_val, _) = build_expr(
         context,
@@ -9403,128 +9453,6 @@ fn build_method_call<'ctx>(
         return Ok((is_true.into(), ValKind::Bool));
       }
       return Ok((result, ret_kind));
-    }
-    // Plan 183's Decision log: `ConfigBuilder.add_defaults_file`/
-    // `.add_config_file`/`.add_env_prefix`/`.add_cli_overrides`/
-    // `.build` — the identical carved-out-of-newtype shape `CliParser`
-    // above establishes. `.add_cli_overrides`'s own `keys` argument
-    // (its second real, non-receiver argument, after `result`) needs
-    // the identical `[len: i64]`-header-skipping `CliParser#parse`'s
-    // own `argv` argument already establishes.
-    if local_classes.get(recv_name).map(String::as_str) == Some("ConfigBuilder") {
-      let (recv_val, _) = build_expr(
-        context,
-        builder,
-        recv,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
-      if method == "build" {
-        let call = builder
-          .build_call(
-            ctx.configbuilder_build,
-            &[recv_val.into()],
-            "configbuilderbuildtmp",
-          )
-          .map_err(|e| e.to_string())?;
-        return Ok((call_result(call)?, ValKind::Int64));
-      }
-      if method == "add_cli_overrides" {
-        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
-        for (i, a) in args.iter().enumerate() {
-          let (v, _) = build_expr(
-            context,
-            builder,
-            a,
-            vars,
-            local_classes,
-            local_array_elem_types,
-            ctx,
-          )?;
-          if i == 1 {
-            let keys_ptr = field_ptr(context, builder, v.into_pointer_value(), 8)?;
-            call_args.push(keys_ptr.into());
-          } else {
-            call_args.push(v.into());
-          }
-        }
-        builder
-          .build_call(
-            ctx.configbuilder_add_cli_overrides,
-            &call_args,
-            "configbuilderaddclitmp",
-          )
-          .map_err(|e| e.to_string())?;
-        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
-      }
-      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
-      for a in args {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          a,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        call_args.push(v.into());
-      }
-      let fv = match method {
-        "add_defaults_file" => ctx.configbuilder_add_defaults_file,
-        "add_config_file" => ctx.configbuilder_add_config_file,
-        "add_env_prefix" => ctx.configbuilder_add_env_prefix,
-        other => {
-          return Err(format!(
-            "codegen: unsupported ConfigBuilder method `{other}`"
-          ))
-        }
-      };
-      builder
-        .build_call(fv, &call_args, "configbuildertmp")
-        .map_err(|e| e.to_string())?;
-      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
-    }
-    // Plan 183's Decision log: `ConfigValue#get_string`/`#get_int`/
-    // `#get_bool` — the identical carved-out-of-newtype shape
-    // `ConfigBuilder` immediately above establishes; every getter
-    // returns an already-built `Option[T]` block pointer (`ValKind::
-    // Ptr`), the identical `CliParseResult#value` shape.
-    if local_classes.get(recv_name).map(String::as_str) == Some("ConfigValue") {
-      let (recv_val, _) = build_expr(
-        context,
-        builder,
-        recv,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
-      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
-      for a in args {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          a,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        call_args.push(v.into());
-      }
-      let fv = match method {
-        "get_string" => ctx.configvalue_get_string,
-        "get_int" => ctx.configvalue_get_int,
-        "get_bool" => ctx.configvalue_get_bool,
-        other => return Err(format!("codegen: unsupported ConfigValue method `{other}`")),
-      };
-      let call = builder
-        .build_call(fv, &call_args, "configvaluetmp")
-        .map_err(|e| e.to_string())?;
-      return Ok((call_result(call)?, ValKind::Ptr));
     }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
@@ -11423,6 +11351,71 @@ fn build_method_call<'ctx>(
   // Rust side (`ValKind::Ptr`); `.reader_from_string` returns a bare
   // `i64` handle id (`ValKind::Int64`), never wrapped in `Result` (see
   // `emerald-sema`'s own Decision log for why).
+  // Plan 191's Decision log: `ProgressBar.new_spinner()` — a
+  // zero-argument reserved-namespace static call producing a fresh
+  // handle, the identical shape `Xml.reader_from_string` below
+  // already establishes (never wrapped in `Result` — constructing a
+  // spinner does no I/O and cannot fail).
+  if recv_name == "ProgressBar" {
+    if method != "new_spinner" {
+      return Err(format!(
+        "codegen: unsupported ProgressBar static method `{method}`"
+      ));
+    }
+    let call = builder
+      .build_call(
+        ctx.progressbar_new_spinner,
+        &[],
+        "progressbarnewspinnertmp",
+      )
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 191's Decision log: `Console.styled`/`.is_terminal` — the
+  // same reserved-namespace static-call shape `Csv`/`Xml` below use;
+  // `Console` never becomes a handle, so there is no sibling
+  // `local_classes.get(recv_name) == Some("Console")` instance-method
+  // arm anywhere else in this file.
+  if recv_name == "Console" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "styled" => (ctx.console_styled, ValKind::Str),
+      "is_terminal" => (ctx.console_is_terminal, ValKind::Int64),
+      other => return Err(format!("codegen: unsupported Console static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "consolestatictmp")
+      .map_err(|e| e.to_string())?;
+    let result = call_result(call)?;
+    if method == "is_terminal" {
+      // `Regex#is_match`'s own "widen the other direction" trick —
+      // narrows the `i64` (0/1) ABI value back into a real `i1`.
+      let is_true = builder
+        .build_int_compare(
+          IntPredicate::NE,
+          result.into_int_value(),
+          context.i64_type().const_int(0, false),
+          "consoleisterminalbool",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((is_true.into(), ValKind::Bool));
+    }
+    return Ok((result, ret_kind));
+  }
+
   if recv_name == "Xml" {
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
     for a in args {
@@ -24382,58 +24375,44 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
-  // Plan 183 (Layered Configuration Loading): `ConfigBuilder.new`/
-  // `.add_defaults_file`/`.add_config_file`/`.add_env_prefix`/
-  // `.add_cli_overrides`/`.build`, `ConfigValue#get_string`/
-  // `#get_int`/`#get_bool`, wrapping `config` -- the same zero/one/
-  // multi-`i64`-argument-plus-`ptr_ty`-string shapes `CliParser`/
-  // `CliParseResult` above already use.
-  let configbuilder_new = module.add_function(
-    "emerald_rt_configbuilder_new",
-    i64_ty.fn_type(&[], false),
-    Some(Linkage::External),
-  );
-  let configbuilder_add_defaults_file = module.add_function(
-    "emerald_rt_configbuilder_add_defaults_file",
-    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let configbuilder_add_config_file = module.add_function(
-    "emerald_rt_configbuilder_add_config_file",
-    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let configbuilder_add_env_prefix = module.add_function(
-    "emerald_rt_configbuilder_add_env_prefix",
-    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let configbuilder_add_cli_overrides = module.add_function(
-    "emerald_rt_configbuilder_add_cli_overrides",
-    void_ty.fn_type(
-      &[i64_ty.into(), i64_ty.into(), ptr_ty.into(), i64_ty.into()],
-      false,
-    ),
-    Some(Linkage::External),
-  );
-  let configbuilder_build = module.add_function(
-    "emerald_rt_configbuilder_build",
+  // Plan 191 (Progress Bars & Terminal Formatting): `ProgressBar.new`/
+  // `.new_spinner`/`.increment`/`.set_message`/`.finish`, `Console.
+  // styled`/`.is_terminal`, wrapping `indicatif`/`console` -- the same
+  // zero/one-`i64`-argument-plus-`ptr_ty`-string shapes `Regex`/
+  // `CliParser` above already use.
+  let progressbar_new = module.add_function(
+    "emerald_rt_progressbar_new",
     i64_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
-  let configvalue_get_string = module.add_function(
-    "emerald_rt_configvalue_get_string",
-    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+  let progressbar_new_spinner = module.add_function(
+    "emerald_rt_progressbar_new_spinner",
+    i64_ty.fn_type(&[], false),
     Some(Linkage::External),
   );
-  let configvalue_get_int = module.add_function(
-    "emerald_rt_configvalue_get_int",
-    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+  let progressbar_increment = module.add_function(
+    "emerald_rt_progressbar_increment",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
     Some(Linkage::External),
   );
-  let configvalue_get_bool = module.add_function(
-    "emerald_rt_configvalue_get_bool",
-    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+  let progressbar_set_message = module.add_function(
+    "emerald_rt_progressbar_set_message",
+    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let progressbar_finish = module.add_function(
+    "emerald_rt_progressbar_finish",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let console_styled = module.add_function(
+    "emerald_rt_console_styled",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let console_is_terminal = module.add_function(
+    "emerald_rt_console_is_terminal",
+    i64_ty.fn_type(&[], false),
     Some(Linkage::External),
   );
   // Plan 137 (SQLite): `Sqlite.open`/`.open_memory`/`.close`/
@@ -25758,6 +25737,8 @@ fn compile_to_object_impl(
   // Plan 101's Decision log: `HttpRequest`.
   newtypes.insert("HttpRequest".to_string());
   // Plan 124's Decision log: `XmlReader`.
+  // Plan 191's Decision log: `ProgressBar`.
+  newtypes.insert("ProgressBar".to_string());
   newtypes.insert("XmlReader".to_string());
   // Plan 130's Decision log: `GzipWriter`/`GzipReader`/`DeflateWriter`/
   // `DeflateReader`/`ZlibWriter`/`ZlibReader` -- the identical
@@ -25806,13 +25787,6 @@ fn compile_to_object_impl(
   // new(...)` and `result: CliParseResult = parser.parse(...)`.
   newtypes.insert("CliParser".to_string());
   newtypes.insert("CliParseResult".to_string());
-  // Plan 183's Decision log: `ConfigBuilder`/`ConfigValue` -- added
-  // here as well as `NEWTYPE_UNDERLYING` above, the identical
-  // `CliParser`/`CliParseResult` gap-avoidance immediately above: this
-  // plan's own Concrete Proof `Let`-binds `builder: ConfigBuilder =
-  // ConfigBuilder.new()` and `cfg: ConfigValue = builder.build()`.
-  newtypes.insert("ConfigBuilder".to_string());
-  newtypes.insert("ConfigValue".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -26192,15 +26166,13 @@ fn compile_to_object_impl(
     cliparseresult_help_text,
     cliparseresult_error_message,
     cliparseresult_close,
-    configbuilder_new,
-    configbuilder_add_defaults_file,
-    configbuilder_add_config_file,
-    configbuilder_add_env_prefix,
-    configbuilder_add_cli_overrides,
-    configbuilder_build,
-    configvalue_get_string,
-    configvalue_get_int,
-    configvalue_get_bool,
+    progressbar_new,
+    progressbar_new_spinner,
+    progressbar_increment,
+    progressbar_set_message,
+    progressbar_finish,
+    console_styled,
+    console_is_terminal,
     sqlite_open,
     sqlite_open_memory,
     sqlite_close,
