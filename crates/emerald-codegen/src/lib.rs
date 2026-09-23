@@ -24325,6 +24325,21 @@ fn compile_to_object_impl(
   newtypes.insert("HttpRequest".to_string());
   // Plan 124's Decision log: `XmlReader`.
   newtypes.insert("XmlReader".to_string());
+  // Plan 130's Decision log: `GzipWriter`/`GzipReader`/`DeflateWriter`/
+  // `DeflateReader`/`ZlibWriter`/`ZlibReader` -- the identical
+  // `XmlReader` gap, found and fixed by plan 132's own implementing
+  // agent while auditing this registry for `TarReader`: all six were
+  // already present in `NEWTYPE_UNDERLYING` above but missing here,
+  // meaning a `Let`-bound local of any of these six types would have
+  // hit the same LLVM verifier failure `XmlReader` hit before its own
+  // fix -- never exercised by `gzip_roundtrip.em`, which never binds
+  // one to a local, so it shipped silently.
+  newtypes.insert("GzipWriter".to_string());
+  newtypes.insert("GzipReader".to_string());
+  newtypes.insert("DeflateWriter".to_string());
+  newtypes.insert("DeflateReader".to_string());
+  newtypes.insert("ZlibWriter".to_string());
+  newtypes.insert("ZlibReader".to_string());
   // Plan 163's Decision log: `BigInt` (a `crate::handle`-registry
   // opaque `Int64` handle) — `Decimal` is deliberately NOT added here,
   // since it is an ordinary compiler-synthesized `Type::Class`, not a
