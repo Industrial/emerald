@@ -822,3 +822,20 @@ fn tar_roundtrip_em_prints_expected_sequence() {
     "tar_demo_a.txt\n68656c6c6f\ntar_demo_b.txt\n776f726c642c2061206c6f6e676572207365636f6e642066696c65\nend\ntrue\n"
   );
 }
+
+// Plan 145 (Process Spawning & Control): `Process.run(cmd, args, argc,
+// stdin_data): ProcessResult`, wrapping plain `std::process::Command`
+// (no third-party crate) — a zero/nonzero exit code travels back as a
+// plain field, never an error; only a genuine spawn failure (`ENOENT`)
+// raises a catchable `NativeError`. See `examples/process_spawning_
+// proof.em`'s own header comment for two real, disclosed deviations
+// from this plan's own literal Concrete Proof text (`puts`'s real
+// `Boolean`-rejecting signature; `rescue`'s real class-naming
+// requirement).
+#[test]
+fn process_spawning_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("process_spawning_proof.em"),
+    "hello from emerald\n\n0\ntrue\n1\nfalse\nspawn failed\n"
+  );
+}

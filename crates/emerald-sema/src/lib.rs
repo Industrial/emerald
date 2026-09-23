@@ -5561,6 +5561,48 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 145 (Process Spawning & Control): `Process.run(cmd: String,
+    // args: Array[String], argc: Int64, stdin_data: String):
+    // ProcessResult` — the identical reserved-namespace hardcoded-arm
+    // shape `File`/`Dir`/`Path` immediately above use (`Process` is
+    // never a real `ModuleDef`). Spawn failure raises a catchable
+    // `NativeError` exception (`crates/emerald-rt/src/process.rs`'s
+    // own module doc); a nonzero exit code is a plain field on the
+    // returned `ProcessResult`, never wrapped in any error/`Result`
+    // type — so this method's own return type is a plain `Type::
+    // Class`, not `Result[ProcessResult, _]`.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Process") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "run" => (
+          vec![
+            Type::String,
+            Type::Array(Box::new(Type::String)),
+            Type::Int64,
+            Type::String,
+          ],
+          Type::Class("ProcessResult".to_string()),
+        ),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Process has no method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 59's Decision log: `String.from_cstring(ptr)` — the same
     // reserved-namespace static-call shape as `File` immediately above,
     // for the same reason (`String` is never a real `ModuleDef`).
@@ -14653,6 +14695,95 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
         ),
         (
           "readonly".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Boolean,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+      ]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  // Plan 145 (Process Spawning & Control): `ProcessResult` — a
+  // compiler-synthesized, three-field class (`stdout: String`,
+  // `stderr: String`, `exit_code: Int64`), the identical "ordinary
+  // `Type::Class`, real `ClassInfo.methods` entries, no `Type::
+  // Newtype` carve-out" shape `FileMetadata` immediately above uses.
+  // `fields` stays empty (Emerald source never reads the packed
+  // fields directly, only through the four zero-argument instance
+  // methods below) — `.success()` has no backing field at all; it's
+  // computed by `emerald-rt`'s own `processresult_success` from the
+  // stored `exit_code` instead.
+  classes.insert(
+    "ProcessResult".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::from([
+        (
+          "stdout".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::String,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "stderr".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::String,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "exit_code".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Int64,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "success".to_string(),
           FunctionSig {
             params: vec![],
             return_type: Type::Boolean,

@@ -200,6 +200,10 @@ mod password;
 // Plan 144 (Extended Filesystem Operations), `Path`/`FileMetadata`
 // half — see `path.rs`'s own module doc.
 mod path;
+// Plan 145 (Process Spawning & Control) — `Process.run`/
+// `ProcessResult`, wrapping plain `std::process::Command` — see
+// `process.rs`'s own module doc.
+mod process;
 mod random;
 mod regex;
 mod secure_compare;
@@ -1597,6 +1601,58 @@ pub unsafe extern "C" fn emerald_rt_path_symlink(target: *const c_char, link_pat
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_path_read_link(path: *const c_char) -> *mut c_void {
   catch_and_raise(move || path::path_read_link(path))
+}
+
+// Plan 145 (Process Spawning & Control): `Process.run` plus
+// `ProcessResult`'s own four zero-argument accessors — see
+// `process.rs`'s own module doc.
+
+/// # Safety
+/// `cmd`/`stdin_data`, if non-null, must point to valid, NUL-
+/// terminated C strings. `argv` must point to a buffer of at least
+/// `argc` valid, NUL-terminated C string pointers — `emerald-codegen`'s
+/// own call-site codegen guarantees this; see `process.rs`'s own
+/// module doc for the header-skipping convention that produces it.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_process_run(
+  cmd: *const c_char,
+  argv: *const *const c_char,
+  argc: i64,
+  stdin_data: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || process::process_run(cmd, argv, argc, stdin_data))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 24-byte, `emerald_alloc`-backed
+/// `ProcessResult` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_processresult_stdout(ptr: *const i64) -> *const c_char {
+  catch_and_raise(move || process::processresult_stdout(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 24-byte, `emerald_alloc`-backed
+/// `ProcessResult` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_processresult_stderr(ptr: *const i64) -> *const c_char {
+  catch_and_raise(move || process::processresult_stderr(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 24-byte, `emerald_alloc`-backed
+/// `ProcessResult` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_processresult_exit_code(ptr: *const i64) -> i64 {
+  catch_and_raise(move || process::processresult_exit_code(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 24-byte, `emerald_alloc`-backed
+/// `ProcessResult` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_processresult_success(ptr: *const i64) -> i64 {
+  catch_and_raise(move || process::processresult_success(ptr))
 }
 
 // Plan 164 (Portable Math Functions): `Math.<name>`, a thin f64-in-

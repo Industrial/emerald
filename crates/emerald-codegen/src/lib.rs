@@ -5252,6 +5252,13 @@ struct Ctx<'a, 'ctx> {
   filemetadata_is_dir: FunctionValue<'ctx>,
   filemetadata_is_file: FunctionValue<'ctx>,
   filemetadata_readonly: FunctionValue<'ctx>,
+  /// Plan 145 (Process Spawning & Control) — `Process.run` plus
+  /// `ProcessResult`'s own four zero-argument accessors.
+  process_run: FunctionValue<'ctx>,
+  processresult_stdout: FunctionValue<'ctx>,
+  processresult_stderr: FunctionValue<'ctx>,
+  processresult_exit_code: FunctionValue<'ctx>,
+  processresult_success: FunctionValue<'ctx>,
   /// Plan 164 (Portable Math Functions) — `Math.<name>`, a thin
   /// `Float64`-in-`Float64`-out wrapping of `libm`.
   math_sin: FunctionValue<'ctx>,
@@ -11303,6 +11310,48 @@ fn build_method_call<'ctx>(
     };
   }
 
+  // Plan 145 (Process Spawning & Control): `Process.run(cmd, args,
+  // argc, stdin_data): ProcessResult` — the identical reserved-
+  // namespace hardcoded-arm shape `File`/`Dir`/`Path` immediately
+  // above use. `args` (the second positional argument, an `Array
+  // [String]`) is NOT passed through as its own header-inclusive
+  // pointer the way every other argument here is — `build_array_lit`'s
+  // own `[len: i64][elem...]` layout means the real `argv: *const
+  // *const c_char` `emerald-rt`'s own `process_run` expects starts 8
+  // bytes past that pointer, skipping the length header the caller-
+  // supplied `argc` (the third positional argument) already makes
+  // redundant to re-derive on the Rust side.
+  if recv_name == "Process" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if i == 1 {
+        let argv_ptr = field_ptr(context, builder, v.into_pointer_value(), 8)?;
+        call_args.push(argv_ptr.into());
+      } else {
+        call_args.push(v.into());
+      }
+    }
+    return match method {
+      "run" => {
+        let call = builder
+          .build_call(ctx.process_run, &call_args, "processruntmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Ptr))
+      }
+      other => Err(format!("codegen: unsupported Process method `{other}`")),
+    };
+  }
+
   // Plan 59's Decision log (superseded by plan 73's own Decision log
   // below): `String.from_cstring(ptr)` — the same reserved-namespace
   // static-call shape as `File` immediately above, for the same reason
@@ -11959,6 +12008,51 @@ fn build_method_call<'ctx>(
         return Ok((is_true.into(), ValKind::Bool));
       }
       return Ok((result, ValKind::Int64));
+    }
+    // Plan 145 (Process Spawning & Control): `ProcessResult`'s own
+    // four zero-argument instance methods — the identical carved-out-
+    // of-the-`method_owners`-lookup shape `FileMetadata` immediately
+    // above establishes. `.stdout`/`.stderr` are a real `ptr` (a
+    // `String`); `.exit_code` a plain `i64`; `.success` crosses as
+    // `i64` (0/1), narrowed to a real `i1` here, the same direction
+    // `FileMetadata`'s own Boolean accessors already narrow.
+    if class_name == "ProcessResult" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (fv, ret_kind) = match method {
+        "stdout" => (ctx.processresult_stdout, ValKind::Str),
+        "stderr" => (ctx.processresult_stderr, ValKind::Str),
+        "exit_code" => (ctx.processresult_exit_code, ValKind::Int64),
+        "success" => (ctx.processresult_success, ValKind::Bool),
+        other => {
+          return Err(format!(
+            "codegen: unsupported ProcessResult method `{other}`"
+          ));
+        }
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "processresulttmp")
+        .map_err(|e| e.to_string())?;
+      let result = call_result(call)?;
+      if ret_kind == ValKind::Bool {
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "processresultboolresult",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      return Ok((result, ret_kind));
     }
     // Plan 32: resolve which ancestor actually *declares* `method` —
     // only the defining class has a compiled `{Class}_{method}` symbol
@@ -22400,6 +22494,43 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 145 (Process Spawning & Control): `Process.run(cmd: *const
+  // c_char, argv: *const *const c_char, argc: i64, stdin_data: *const
+  // c_char) -> *mut c_void` — `argv` is the call site's own header-
+  // skipped `Array[String]` element buffer (see `build_method_call`'s
+  // own `Process` arm). `ProcessResult`'s own four zero-argument
+  // accessors mirror `FileMetadata`'s shape immediately above;
+  // `.stdout`/`.stderr` return a `ptr` (a `String`), `.exit_code` a
+  // plain `i64`, `.success` an `i64` (0/1) narrowed the same way
+  // `Path.exists` above is.
+  let process_run = module.add_function(
+    "emerald_rt_process_run",
+    ptr_ty.fn_type(
+      &[ptr_ty.into(), ptr_ty.into(), i64_ty.into(), ptr_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let processresult_stdout = module.add_function(
+    "emerald_rt_processresult_stdout",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let processresult_stderr = module.add_function(
+    "emerald_rt_processresult_stderr",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let processresult_exit_code = module.add_function(
+    "emerald_rt_processresult_exit_code",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let processresult_success = module.add_function(
+    "emerald_rt_processresult_success",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 164 (Portable Math Functions): every `Math.<name>` is a plain
   // `f64 -> f64` (or `(f64, f64) -> f64`) function.
   let one_f64_to_f64 = f64_ty.fn_type(&[f64_ty.into()], false);
@@ -23543,6 +23674,38 @@ fn compile_to_object_impl(
     doc: None,
   };
   class_defs.insert("FileMetadata".to_string(), &filemetadata_class_def);
+  // Plan 145 (Process Spawning & Control): `ProcessResult` — a
+  // compiler-synthesized, three-field class (`stdout`/`stderr: String`,
+  // `exit_code: Int64`), the identical "resolves against the real
+  // class registry with no matching source-level declaration" shape
+  // `FileMetadata` immediately above uses.
+  let process_result_class_def = ClassDef {
+    name: "ProcessResult".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![
+      Param {
+        name: "stdout".to_string(),
+        ty: TypeExpr::Named("String".to_string()),
+        default: None,
+      },
+      Param {
+        name: "stderr".to_string(),
+        ty: TypeExpr::Named("String".to_string()),
+        default: None,
+      },
+      Param {
+        name: "exit_code".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+    ],
+    methods: Vec::new(),
+    type_params: Vec::new(),
+    doc: None,
+  };
+  class_defs.insert("ProcessResult".to_string(), &process_result_class_def);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -23628,6 +23791,14 @@ fn compile_to_object_impl(
     build_class_layout("FileMetadata", &class_defs)?,
   );
   class_tags.insert("FileMetadata".to_string(), class_tags.len() as i64);
+  // Plan 145 (Process Spawning & Control): `ProcessResult`'s own
+  // `ClassLayout` plus `class_tags` entry — needed unconditionally,
+  // the identical reason `Decimal`'s own comment above discloses.
+  classes.insert(
+    "ProcessResult".to_string(),
+    build_class_layout("ProcessResult", &class_defs)?,
+  );
+  class_tags.insert("ProcessResult".to_string(), class_tags.len() as i64);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -24550,6 +24721,11 @@ fn compile_to_object_impl(
     filemetadata_is_dir,
     filemetadata_is_file,
     filemetadata_readonly,
+    process_run,
+    processresult_stdout,
+    processresult_stderr,
+    processresult_exit_code,
+    processresult_success,
     math_sin,
     math_cos,
     math_tan,
