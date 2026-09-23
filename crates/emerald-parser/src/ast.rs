@@ -459,6 +459,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       };
 
@@ -480,6 +481,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
           requires: Vec::new(),
           ensures: Vec::new(),
           is_pure: false,
+          is_static: false,
           doc: None,
         });
       }
@@ -571,6 +573,7 @@ pub fn expand_derives(program: &mut Program) -> Result<(), String> {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       };
       let Item::Class(c) = &mut program.items[i] else {
@@ -1073,6 +1076,22 @@ pub struct Function {
   /// sema narrows" discipline `type_params`/`is_comptime`/`requires`/
   /// `ensures` already established).
   pub is_pure: bool,
+  /// `static fn ...` inside a class/actor body (plan 196's Decision
+  /// log) — `false` for every pre-existing declaration, additive and
+  /// source-compatible. Grammatically reachable ONLY on a `MethodDef`
+  /// (a class/actor method) — `false` unconditionally for a top-level
+  /// `FuncDef` and a module method, mirroring `requires`/`ensures`'s
+  /// own stricter-than-`is_pure` top-level-only grammar fence rather
+  /// than `type_params`'s "reachable everywhere, sema narrows" one
+  /// (there is no legal reading of `static` on a function that already
+  /// has no receiver to begin with). A `static` method's body is
+  /// checked with `self_fields: None` — the exact same no-receiver
+  /// mechanism a top-level function's own body already uses (`emerald-
+  /// sema`'s `check_method_body`) — and is callable only as `ClassName.
+  /// method(args)`, never `instance.method(args)`; `emerald-codegen`
+  /// lowers a call to it as a direct function call with no leading
+  /// `self` pointer argument.
+  pub is_static: bool,
   /// Plan 77's Decision log (`##` doc comments, design brief §36) —
   /// `Some(text)` only when a contiguous run of `##` lines immediately
   /// precedes this declaration in source, with no blank line and no

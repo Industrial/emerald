@@ -210,6 +210,10 @@ ClassField: (Param, Vec<Function>) = {
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: false,
+      // A synthesized `read` accessor is an ordinary instance method,
+      // never static — it exists precisely to read `@<name>` off a
+      // real receiver.
+      is_static: false,
       // A synthesized `read` accessor has no `##` comment of its own in
       // source (the comment, if any, precedes the field's own `Param`
       // line, a position this production never captures) — `None`,
@@ -300,6 +304,12 @@ FuncDef: Function = {
       requires,
       ensures,
       is_pure: is_pure.is_some(),
+      // Plan 196's Decision log: `static` is grammatically reachable
+      // only from `MethodDef` below, a stricter-than-`pure` cut
+      // mirroring `requires`/`ensures`'s own top-level-only fence —
+      // always `false` here, never read from a `FuncDef`'s own source
+      // text (there is no `"static"?` slot in this production at all).
+      is_static: false,
       // `l` is captured before `pure`/`comptime`'s own optional
       // modifiers, matching exactly where `collect_doc_comments`
       // records a preceding `##` run's target position — a doc comment
@@ -521,7 +531,7 @@ MethodDef: Function = {
   // never a silent accept.
   // Plan 71: `"fn"`/`":"`/mandatory `"do"` replace `"def"`/`"->"` here
   // exactly the same way `FuncDef` above changes.
-  <l:@L> <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> "do" <body:Stmt*> "end" => Function {
+  <l:@L> <is_static:"static"?> <is_pure:"pure"?> <comptime:"comptime"?> "fn" <name:MethodName> <type_params:TypeParamClause?> <parts:ParenParams> ":" <return_type:TypeExpr> "do" <body:Stmt*> "end" => Function {
     name,
     params: parts.0,
     return_type,
@@ -545,6 +555,13 @@ MethodDef: Function = {
     // is what rejects it specifically on an actor method, the same
     // "grammar stays general, sema narrows" cut `type_params` uses.
     is_pure: is_pure.is_some(),
+    // Plan 196's Decision log: `static` slots in before `pure`/
+    // `comptime`, the identical `<tok>?` mechanism those two already
+    // establish — reachable ONLY here (`MethodDef`, a `ClassDef`'s own
+    // method list), never on `FuncDef`/a module method, the same
+    // class-only-reachability precedent `MethodName`'s own operator-
+    // method forms already set (this production's own comment above).
+    is_static: is_static.is_some(),
   }
 };
 

@@ -206,6 +206,19 @@ struct FunctionSig {
   /// into the raw `Program` — the same "carry it alongside the
   /// signature" precedent `requires` above already set for plan 62.
   is_pure: bool,
+  /// Plan 196's Decision log: mirrors `Function.is_static` exactly —
+  /// carried alongside the signature the same "carry it, don't look
+  /// back into the raw `Program`" precedent `is_pure`/`requires`
+  /// already set. A `static`-marked method is checked with
+  /// `self_fields: None` (`check_method_body`'s own gate) and is
+  /// dispatched only via `ClassName.method(args)` — the new bare-
+  /// class-name `Expr::MethodCall` arm below reads this field directly
+  /// off `ClassInfo.methods[name]` rather than re-deriving staticness
+  /// from anywhere else. `false` for every pre-plan-196 signature
+  /// (a top-level function, an extern fn, a module method, and every
+  /// compiler-synthesized method — `NativeError#message`, `derive`'s
+  /// own synthesized methods — none of which is ever static).
+  is_static: bool,
   /// Plan 83's Decision log (`spec/OWNERSHIP.md` §2/§10): `params[i]`'s
   /// own `own`/`borrow`/`borrow var` annotation, parallel to `params`/
   /// `param_names` — `None` for a plain (unannotated) parameter, always
@@ -1052,6 +1065,7 @@ fn build_generic_class_info(
         splat_elem,
         requires: m.requires.clone(),
         is_pure: m.is_pure,
+        is_static: m.is_static,
         param_ownership,
       },
     );
@@ -2061,6 +2075,7 @@ fn function_signature(
     splat_elem,
     requires: f.requires.clone(),
     is_pure: f.is_pure,
+    is_static: f.is_static,
     param_ownership,
   })
 }
@@ -2119,6 +2134,7 @@ fn function_signature_with_subst(
     splat_elem,
     requires: f.requires.clone(),
     is_pure: f.is_pure,
+    is_static: f.is_static,
     param_ownership,
   })
 }
@@ -5215,6 +5231,52 @@ fn infer_expr_type(
       )?;
       Ok(sig.return_type.clone())
     }
+    // Plan 196's Decision log: `ClassName.method(args)` — a class-level
+    // `static fn` — dispatches straight to its own signature, the
+    // identical "checked *before* `infer_expr_type(recv)` runs at all"
+    // shape the module-dispatch arm immediately above already
+    // establishes (evaluating a bare class name as an ordinary value
+    // would fail with "undefined variable" — a class name is never in
+    // `env`, the same reason a module name isn't). This is a genuinely
+    // NEW dispatch path, additive only: verified directly against
+    // `Expr::New`/`Expr::Spawn`/`Expr::Remote`/`Expr::Locate` above
+    // (the sole reserved bare-class-name call forms before this plan)
+    // that nothing here changes their handling, and no prior program
+    // could already reach this arm (there was no way to mark a class
+    // method `is_static: true` before this plan existed).
+    //
+    // `!env.contains_key(n)` is checked FIRST so a local variable that
+    // happens to share a class's exact name always wins — this plan's
+    // own disclosed "Not yet decided" finding, now verified directly:
+    // this compiler places NO restriction anywhere on a local binding
+    // shadowing a class name (`declare_local`/`check_stmt`'s `Stmt::
+    // Let` arm never consults `classes` at all before inserting into
+    // `env`), so `point: Int64 = 5` in a scope that also has a class
+    // `Point`-i.e.-`point` (this grammar enforces no capitalization
+    // rule on class names) genuinely shadows it — `point.origin()`
+    // then resolves `point` as the local `Int64` first, correctly
+    // falling through to the ordinary non-class `MethodCall` handling
+    // (a real, if confusing, diagnostic — "method call `.origin` on
+    // non-class type Int64" — rather than a silent wrong dispatch).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if !env.contains_key(n) && classes.get(n).is_some_and(|c| c.methods.get(method).is_some_and(|s| s.is_static))) =>
+    {
+      let Expr::Ident(class_name) = &recv.node else {
+        unreachable!()
+      };
+      let sig = &classes[class_name].methods[method];
+      check_args(
+        method,
+        args,
+        &sig.params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(sig.return_type.clone())
+    }
     // Plan 41's Decision log: a method call on a `Type::Generic`-typed
     // receiver — a call inside the body of the generic function that
     // declares it, before this specific call site's own concrete type
@@ -6120,6 +6182,24 @@ fn infer_expr_type(
           expr.span,
         )
       })?;
+      // Plan 196's Decision log: a `static` method has no `self`
+      // parameter at all — `emerald-codegen` lowers a call to it
+      // WITHOUT a leading `self` pointer argument, so dispatching one
+      // here (an ordinary instance-receiver call, which DOES pass
+      // `self`) would silently miscompile rather than fail loudly.
+      // Rejected here, before `check_args`, with a real diagnostic
+      // naming the fix — `ClassName.method(args)`, this plan's own
+      // actual dispatch path (the new bare-class-name `MethodCall` arm
+      // above) — rather than an arity mismatch surfacing later in
+      // codegen or a silent wrong call.
+      if sig.is_static {
+        return Err(Diagnostic::new(
+          format!(
+            "static method `{class_name}.{method}` cannot be called on an instance — call `{class_name}.{method}(...)` instead"
+          ),
+          expr.span,
+        ));
+      }
       check_args(
         method,
         args,
@@ -11907,13 +11987,22 @@ fn check_method_body(
     env.insert(p.name.clone(), param_plain_type(&p.ty, classes)?);
   }
   let declared_return = resolve_type(&m.return_type, classes)?;
+  // Plan 196's Decision log: a `static` method's body is checked with
+  // `self_fields: None` — the exact same no-receiver mechanism `check_
+  // function_body`'s own top-level-function body already uses (a
+  // top-level function has no `self` either), reused directly rather
+  // than a new "static context" concept. `Expr::InstanceVar`'s own
+  // existing `self_fields.is_none()`-gated rejection (`` `@name` used
+  // outside of a method body ``) then rejects `@field` access inside a
+  // `static` method body for free, with no second diagnostic path.
+  let self_fields = if m.is_static { None } else { Some(fields) };
   check_block(
     &m.body,
     &mut env,
     &mut mutable_locals,
     sigs,
     classes,
-    Some(fields),
+    self_fields,
     &declared_return,
     false,
     false,
@@ -11925,7 +12014,7 @@ fn check_method_body(
     &env,
     sigs,
     classes,
-    Some(fields),
+    self_fields,
     &declared_return,
     &format!("{class_name}#{}", m.name),
     gctx,
@@ -12615,6 +12704,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           splat_elem: None,
           requires: vec![],
           is_pure: true,
+          is_static: false,
           param_ownership: vec![],
           return_ownership: None,
         },
@@ -13515,6 +13605,12 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           // is even grammatically reachable on an `ExternFn`, so this
           // is always `false`, never read from user source.
           is_pure: false,
+          // Plan 196's Decision log: an `extern "C"` fn is never a
+          // class method at all (no `ClassDef` involved), so this is
+          // always `false`, never read from user source — mirrors
+          // `is_pure`'s identical always-`false`-here precedent
+          // immediately above.
+          is_static: false,
           // Plan 83/85: `own`/`borrow`-typed FFI parameters are plan
           // 85's own scope (`spec/OWNERSHIP.md` §7), not this plan's —
           // `resolve_extern_type` already rejects the wrapper outright
@@ -13723,6 +13819,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           requires: Vec::new(),
           ensures: Vec::new(),
           is_pure: false,
+          is_static: false,
           doc: None,
         };
         if let Err(d) = check_function_body(&synthetic, &sigs, &classes, &gctx) {
@@ -17154,6 +17251,7 @@ mod tests {
       }],
       ensures: Vec::new(),
       is_pure: false,
+      is_static: false,
       doc: None,
     });
     let errs = check_program(&program).expect_err("contracts on a method must be rejected");
@@ -17791,5 +17889,91 @@ mod tests {
     let program = emerald_parser::parse(src).expect("should parse");
     check_program(&program)
       .expect("an ordinary Int64-holding class must still cross an actor boundary freely");
+  }
+
+  // Plan 196 (Class-Level Static Methods).
+
+  #[test]
+  fn static_method_body_accessing_a_field_is_rejected() {
+    // `check_method_body` passes `self_fields: None` for a `static`
+    // method — the exact same no-receiver mechanism a top-level
+    // function's own body already uses — so `@x` hits `Expr::
+    // InstanceVar`'s own pre-existing `self_fields.is_none()`-gated
+    // diagnostic, reused verbatim (this plan's own Decision log:
+    // "reusing it directly... no new diagnostic surface to get subtly
+    // wrong").
+    let src = "class Point\n  x: Int64\n\n  fn initialize(x: Int64): Void do\n    @x = x\n  end\n\n  static fn bad(): Int64 do\n    @x\n  end\nend\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("a static method body referencing @x directly must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("@x") && d.message.contains("used outside of a method body")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn static_method_dispatches_via_class_name_and_type_checks() {
+    // `Point.origin()` — a bare class name receiver, absent from `env`,
+    // present in `classes` with a registered `is_static: true` method —
+    // resolves via the new dispatch arm and type-checks its declared
+    // return type.
+    let src = "class Point\n  x: Int64\n  y: Int64\n\n  fn initialize(x: Int64, y: Int64): Void do\n    @x = x\n    @y = y\n  end\n\n  static fn origin(): Point do\n    Point.new(0, 0)\n  end\nend\n\no: Point = Point.origin()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    check_program(&program).expect("Point.origin() must type-check as a static class method call");
+  }
+
+  #[test]
+  fn static_method_called_on_an_instance_is_rejected() {
+    // A `static` method has no `self` parameter — codegen lowers it
+    // without a leading `self` pointer argument — so dispatching it via
+    // an ordinary instance receiver must be a real diagnostic, not a
+    // silent miscompile.
+    let src = "class Point\n  x: Int64\n\n  fn initialize(x: Int64): Void do\n    @x = x\n  end\n\n  static fn origin(): Point do\n    Point.new(0)\n  end\nend\n\np: Point = Point.new(1)\nq: Point = p.origin()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program)
+      .expect_err("calling a static method on an instance receiver must be rejected");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("cannot be called on an instance")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn ordinary_new_and_instance_methods_are_unaffected_by_a_sibling_static_method() {
+    // Regression: `.new` and an ordinary instance method on a class
+    // that ALSO declares a `static` method must keep working exactly as
+    // before this plan — the new dispatch arm is additive only.
+    let src = "class Point\n  x: Int64\n\n  fn initialize(x: Int64): Void do\n    @x = x\n  end\n\n  fn get_x(): Int64 do\n    @x\n  end\n\n  static fn origin(): Point do\n    Point.new(0)\n  end\nend\n\np: Point = Point.new(5)\nputs p.get_x()\no: Point = Point.origin()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    check_program(&program)
+      .expect(".new and an ordinary instance method must be unaffected by a sibling static method");
+  }
+
+  #[test]
+  fn a_local_variable_shadows_a_same_named_class_for_static_dispatch() {
+    // This plan's own disclosed "Not yet decided" finding, verified
+    // directly: `declare_local` never consults `classes` before
+    // inserting into `env`, so a local binding legally shadows a class
+    // name of the identical spelling — `point.origin()` then resolves
+    // `point` as the local `Int64` FIRST (the new static-dispatch arm's
+    // own `!env.contains_key(n)` guard), falling through to the
+    // ordinary non-class `MethodCall` path rather than silently
+    // dispatching the static method.
+    let src = "class Point\n  static fn origin(): Int64 do\n    5\n  end\nend\n\npoint: Int64 = 3\nputs point.origin()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err(
+      "a local named `point` must shadow the class `Point`'s own static dispatch, so `point.origin()` is an ordinary (and here, invalid) Int64 method call",
+    );
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Int64 has no method")),
+      "{errs:?}"
+    );
   }
 }

@@ -1585,6 +1585,7 @@ mod tests {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       }
     );
@@ -4636,5 +4637,64 @@ mod tests {
     // extended by one more, final, non-block `.length` call.
     let src = "nums: Array[Int64] = [1, 2, 3]\nwhile (nums.select do |x: Int64| x > 100 end).length > 0 do\n  puts 1\nend\n";
     parse(src).expect("a parenthesized block-attached call must be legal as a while condition");
+  }
+
+  // Plan 196 (Class-Level Static Methods): `static fn` on a `MethodDef`,
+  // mirroring `pure`/`comptime_prefixed_def_parses_with_is_comptime_true`'s
+  // own exact shape immediately above.
+
+  #[test]
+  fn static_prefixed_method_parses_with_is_static_true() {
+    let src =
+      "class Point\n  x: Int64\n\n  static fn origin(): Point do\n    Point.new(0)\n  end\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class, got {:?}", program.items[0]);
+    };
+    assert!(c.methods[0].is_static);
+  }
+
+  #[test]
+  fn an_ordinary_method_has_is_static_false() {
+    let src = "class Point\n  x: Int64\n\n  fn get_x(): Int64 do\n    return @x\n  end\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class, got {:?}", program.items[0]);
+    };
+    assert!(!c.methods[0].is_static);
+  }
+
+  #[test]
+  fn static_and_pure_compose_on_the_same_method() {
+    let src = "class Point\n  x: Int64\n\n  static pure fn origin(): Point do\n    Point.new(0)\n  end\nend\n";
+    let program = parse(src).expect("should parse");
+    let Item::Class(c) = &program.items[0] else {
+      panic!("expected a class");
+    };
+    assert!(c.methods[0].is_static);
+    assert!(c.methods[0].is_pure);
+  }
+
+  #[test]
+  fn static_is_not_grammatically_reachable_on_a_top_level_fn() {
+    // `static` is reachable ONLY from `MethodDef` (a class/actor
+    // method's own production) — `FuncDef` has no `"static"?` slot at
+    // all, mirroring `type_params`'s own class-only reachability
+    // precedent this plan's Decision log cites. A genuine parse error,
+    // not a silent no-op.
+    let src = "static fn origin(): Int64 do\n  0\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "`static` must not be grammatically reachable on a top-level `fn`"
+    );
+  }
+
+  #[test]
+  fn static_is_not_grammatically_reachable_on_a_module_method() {
+    let src = "module Utils\n  static fn helper(): Int64 do\n    0\n  end\nend\n";
+    assert!(
+      parse(src).is_err(),
+      "`static` must not be grammatically reachable on a module method"
+    );
   }
 }

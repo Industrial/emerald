@@ -527,6 +527,14 @@ fn write_type_params(out: &mut String, tps: &[TypeParam]) {
 fn write_function(out: &mut String, f: &Function, indent: usize) {
   write_doc(out, &f.doc, indent);
   push_indent(out, indent);
+  // Plan 196's Decision log: `static` slots in before `pure`/`comptime`,
+  // the exact same prefix order `grammar.lalrpop`'s `MethodDef` itself
+  // parses (`<is_static:"static"?> <is_pure:"pure"?> <comptime:
+  // "comptime"?>`) — always `false` for a `FuncDef`-parsed `Function`
+  // (`write_function` is shared by both), so this is a real no-op there.
+  if f.is_static {
+    out.push_str("static ");
+  }
   if f.is_pure {
     out.push_str("pure ");
   }

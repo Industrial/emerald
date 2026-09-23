@@ -1141,6 +1141,7 @@ fn instantiate_generic_class_defs(
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: m.is_pure,
+      is_static: m.is_static,
       // A monomorphized copy of a real, user-written method — the same
       // declaration, just with substituted types, so its doc comment
       // (if any) carries forward unchanged.
@@ -1528,6 +1529,29 @@ fn build_method_owners(
     result.insert(name.clone(), owners);
   }
   Ok(result)
+}
+
+/// Plan 196's Decision log: `{declaring class}_{mangled method symbol}`
+/// (the exact same key `user_func_ids` itself uses) for every `static
+/// fn` directly declared anywhere in `class_defs` — mirrors `build_
+/// generic_class_methods`'s own identical "keyed by the DECLARING class
+/// only, no inheritance-chain flattening" shape immediately below (an
+/// inherited static method's own key already lives under its real
+/// declaring ancestor, which is exactly the class `method_owners`
+/// resolves a call's `defining_class` to). `build_method_call`'s new
+/// bare-class-name dispatch arm checks this set — after resolving
+/// `defining_class` via `method_owners` — to decide whether to build a
+/// direct call WITHOUT a leading `self` pointer argument.
+fn build_static_methods(class_defs: &HashMap<String, &ClassDef>) -> HashSet<String> {
+  let mut result = HashSet::new();
+  for (name, c) in class_defs {
+    for m in &c.methods {
+      if m.is_static {
+        result.insert(format!("{name}_{}", mangled_operator_symbol(&m.name)));
+      }
+    }
+  }
+  result
 }
 
 /// Real, disclosed regression fix (this session): plan 88 taught
@@ -2713,6 +2737,7 @@ fn substitute_generic_function(
     requires: f.requires.clone(),
     ensures: f.ensures.clone(),
     is_pure: f.is_pure,
+    is_static: f.is_static,
     doc: f.doc.clone(),
   }
 }
@@ -2761,6 +2786,7 @@ fn substitute_function_type_params(
     requires: f.requires.clone(),
     ensures: f.ensures.clone(),
     is_pure: f.is_pure,
+    is_static: f.is_static,
     doc: f.doc.clone(),
   }
 }
@@ -4923,6 +4949,14 @@ struct Ctx<'a, 'ctx> {
   /// module's `{Name}_{method}` function directly, with no receiver
   /// value at all (modules have no fields/self, unlike classes/Procs).
   module_names: &'a HashSet<String>,
+  /// Plan 196's Decision log: `{declaring class}_{mangled method}` for
+  /// every `static fn` — `build_static_methods`'s own doc comment.
+  /// `build_method_call`'s new bare-class-name dispatch arm checks this
+  /// (after resolving `method_owners`' own `defining_class`) to build a
+  /// direct call with NO leading `self` pointer argument, the identical
+  /// "no receiver value at all" shape `module_names` above already
+  /// establishes for a module method.
+  static_methods: &'a HashSet<String>,
   /// Plan 25's `Array.new(size)` (`calloc`-backed, unlike `alloc`'s
   /// bare `malloc`) and `Hash[K, V]` key-not-found abort helper.
   alloc_zeroed: FunctionValue<'ctx>,
@@ -10324,6 +10358,65 @@ fn build_method_call<'ctx>(
       return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
     }
     return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 196's Decision log: `ClassName.method(args)` — a class-level
+  // `static fn` — dispatches to a direct call, mirroring the module-
+  // dispatch arm immediately above (no receiver value built at all),
+  // but scoped to exactly the shape `emerald-sema`'s own new dispatch
+  // arm accepts: `recv_name` absent from `vars` (no local shadows it —
+  // codegen's own equivalent of sema's `!env.contains_key(name)`
+  // guard) AND its resolved `defining_class` (via `method_owners`,
+  // which already walks the inheritance chain the identical way an
+  // ordinary instance method call below does) is registered in
+  // `static_methods`. Unlike `module_names`, a class ALSO has ordinary
+  // instance methods sharing the very same `method_owners` table — this
+  // is why `static_methods` (not just "is `recv_name` a class name") is
+  // the actual gate: an ordinary instance method of the same class,
+  // reached via a real local receiver, still falls through to the
+  // `local_classes`-driven dispatch further below, completely
+  // unaffected. No `self` pointer is prepended to `call_args` — a
+  // `static` method's own compiled LLVM signature has no leading
+  // `self` parameter at all (`declare_user_functions`'s matching
+  // `m.is_static` gate).
+  if !vars.contains_key(recv_name) {
+    if let Some(defining_class) = ctx
+      .method_owners
+      .get(recv_name)
+      .and_then(|owners| owners.get(method))
+    {
+      let key = format!("{defining_class}_{}", mangled_operator_symbol(method));
+      if ctx.static_methods.contains(&key) {
+        let (fv, ret_kind) = ctx
+          .user_func_ids
+          .get(&key)
+          .map(|(fv, k)| (*fv, k.clone()))
+          .ok_or_else(|| {
+            format!("codegen: internal error — static method `{key}` was never declared")
+          })?;
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+          Vec::with_capacity(args.len());
+        for a in args {
+          let (v, _) = build_expr(
+            context,
+            builder,
+            a,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          call_args.push(v.into());
+        }
+        let call = builder
+          .build_call(fv, &call_args, "staticcalltmp")
+          .map_err(|e| e.to_string())?;
+        if ret_kind == ValKind::Void {
+          return Ok((context.i64_type().const_int(0, false).into(), ret_kind));
+        }
+        return Ok((call_result(call)?, ret_kind));
+      }
+    }
   }
 
   // Plan 89's Decision log: a literal, statically-named top-level
@@ -19042,7 +19135,14 @@ fn declare_user_functions<'ctx>(
             continue;
           }
           let ret_kind = value_kind_for_type(&m.return_type);
-          let mut kinds = vec![ValKind::Ptr]; // self
+          // Plan 196's Decision log: a `static` method has no `self`
+          // parameter at all in its compiled LLVM signature — the
+          // leading `ValKind::Ptr` every ordinary instance method
+          // declares is omitted entirely, not merely ignored.
+          let mut kinds = Vec::new();
+          if !m.is_static {
+            kinds.push(ValKind::Ptr); // self
+          }
           kinds.extend(param_kinds(&m.params));
           let fn_ty = make_fn_type(context, &kinds, &ret_kind);
           let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
@@ -19072,7 +19172,14 @@ fn declare_user_functions<'ctx>(
             continue;
           }
           let ret_kind = value_kind_for_type(&m.return_type);
-          let mut kinds = vec![ValKind::Ptr]; // self
+          // Plan 196's Decision log: same `is_static` gate as
+          // `Item::Class` immediately above — an actor method may also
+          // be `static` (grammatically reachable: `MethodDef` is shared
+          // between `ClassDef`/`ActorDef`).
+          let mut kinds = Vec::new();
+          if !m.is_static {
+            kinds.push(ValKind::Ptr); // self
+          }
           kinds.extend(param_kinds(&m.params));
           let fn_ty = make_fn_type(context, &kinds, &ret_kind);
           let mangled = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
@@ -19140,7 +19247,13 @@ fn declare_user_functions<'ctx>(
         continue;
       }
       let ret_kind = value_kind_for_type(&m.return_type);
-      let mut kinds = vec![ValKind::Ptr]; // self
+      // Plan 196's Decision log: same `is_static` gate as `Item::Class`
+      // above, extended to a monomorphized generic-class instantiation's
+      // own methods.
+      let mut kinds = Vec::new();
+      if !m.is_static {
+        kinds.push(ValKind::Ptr); // self
+      }
       kinds.extend(param_kinds(&m.params));
       let fn_ty = make_fn_type(context, &kinds, &ret_kind);
       let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
@@ -21164,6 +21277,7 @@ fn compile_to_object_impl(
     class_tags.insert(name.clone(), class_tags.len() as i64);
   }
   let method_owners = build_method_owners(&class_defs)?;
+  let static_methods = build_static_methods(&class_defs);
   let generic_class_methods = build_generic_class_methods(&class_defs);
 
   // Plan 52: independently re-derived from the raw `Program`/`Item::
@@ -21457,6 +21571,7 @@ fn compile_to_object_impl(
           requires: Vec::new(),
           ensures: Vec::new(),
           is_pure: false,
+          is_static: false,
           // `ExternFn` has no `doc` field of its own (plan 77's scope
           // stops at `fn`/`class`/`method`/`interface`/`module`/`enum`/
           // `actor` declarations — `unsafe extern "C" { ... }` blocks
@@ -21705,6 +21820,7 @@ fn compile_to_object_impl(
     generic_class_methods: &generic_class_methods,
     exc_funcs,
     module_names: &module_names,
+    static_methods: &static_methods,
     alloc_zeroed,
     hash_key_not_found,
     block_funcs: &block_funcs,
@@ -21994,15 +22110,24 @@ fn compile_to_object_impl(
           }
           let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
           let (fv, _) = user_func_ids[&mangled];
-          define_method(
-            &context,
-            &builder,
-            m,
-            fv,
-            &layout.fields,
-            &layout.field_classes,
-            &gen_ctx,
-          )?;
+          // Plan 196's Decision log: a `static` method has no `self`/
+          // `@field` access at all — it compiles via the exact same
+          // no-receiver path `Item::Module`'s own methods immediately
+          // below already reuse, not `define_method` (which
+          // unconditionally reads LLVM param 0 as `self`).
+          if m.is_static {
+            define_user_function(&context, &builder, m, fv, &gen_ctx)?;
+          } else {
+            define_method(
+              &context,
+              &builder,
+              m,
+              fv,
+              &layout.fields,
+              &layout.field_classes,
+              &gen_ctx,
+            )?;
+          }
         }
       }
       Item::Module(m) => {
@@ -22027,15 +22152,21 @@ fn compile_to_object_impl(
           }
           let mangled = format!("{}_{}", a.name, mangled_operator_symbol(&m.name));
           let (fv, _) = user_func_ids[&mangled];
-          define_method(
-            &context,
-            &builder,
-            m,
-            fv,
-            &layout.fields,
-            &layout.field_classes,
-            &gen_ctx,
-          )?;
+          // Plan 196's Decision log: same `is_static` gate as
+          // `Item::Class` above.
+          if m.is_static {
+            define_user_function(&context, &builder, m, fv, &gen_ctx)?;
+          } else {
+            define_method(
+              &context,
+              &builder,
+              m,
+              fv,
+              &layout.fields,
+              &layout.field_classes,
+              &gen_ctx,
+            )?;
+          }
         }
       }
       Item::Stmt(Spanned {
@@ -22127,15 +22258,21 @@ fn compile_to_object_impl(
       }
       let mangled = format!("{}_{}", c.name, mangled_operator_symbol(&m.name));
       let (fv, _) = user_func_ids[&mangled];
-      define_method(
-        &context,
-        &builder,
-        m,
-        fv,
-        &layout.fields,
-        &layout.field_classes,
-        &gen_ctx,
-      )?;
+      // Plan 196's Decision log: same `is_static` gate as `Item::Class`
+      // above, extended to a monomorphized generic-class instantiation.
+      if m.is_static {
+        define_user_function(&context, &builder, m, fv, &gen_ctx)?;
+      } else {
+        define_method(
+          &context,
+          &builder,
+          m,
+          fv,
+          &layout.fields,
+          &layout.field_classes,
+          &gen_ctx,
+        )?;
+      }
     }
   }
 
@@ -22483,6 +22620,7 @@ fn assertion_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       },
       AstFunction {
@@ -22499,6 +22637,7 @@ fn assertion_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       },
     ],
@@ -22554,6 +22693,7 @@ fn remote_actor_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       },
       AstFunction {
@@ -22570,6 +22710,7 @@ fn remote_actor_error_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       },
     ],
@@ -22632,6 +22773,7 @@ fn contract_violation_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       },
       AstFunction {
@@ -22648,6 +22790,7 @@ fn contract_violation_class_item() -> Item {
         requires: Vec::new(),
         ensures: Vec::new(),
         is_pure: false,
+        is_static: false,
         doc: None,
       },
     ],
@@ -22835,6 +22978,7 @@ pub fn compile_test_harness(program: &Program, out_path: &Path) -> Result<usize,
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: false,
+      is_static: false,
       // A synthesized `test`/`property` harness function — no `##`
       // comment position exists for it (plan 77's Decision log).
       doc: None,
@@ -22999,6 +23143,7 @@ pub fn compile_benchmark_harness(program: &Program, out_path: &Path) -> Result<u
       requires: Vec::new(),
       ensures: Vec::new(),
       is_pure: false,
+      is_static: false,
       // A synthesized `benchmark` harness function — same reasoning as
       // the `test`/`property` harness function above.
       doc: None,
@@ -23938,6 +24083,7 @@ mod tests {
           requires: Vec::new(),
           ensures: Vec::new(),
           is_pure: false,
+          is_static: false,
           doc: None,
         }),
         Item::Stmt(syn(Stmt::Expr(syn(Expr::Call(

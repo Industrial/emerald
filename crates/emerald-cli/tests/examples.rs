@@ -645,3 +645,15 @@ fn unicode_normalization_segmentation_proof_em_prints_expected_sequence() {
     "5\n6\n4\n5\n4\n4\n5\n"
   );
 }
+
+// Plan 196 (Class-Level Static Methods): `Point.origin()` and `Point.
+// midpoint(a, b)` are both real `static fn` methods, dispatched with no
+// implicit `self` receiver — `Point.origin` constructs a `Point`
+// internally via the already-existing `.new` dispatch; `Point.midpoint`
+// reads its two `Point` arguments' fields via ordinary (non-static)
+// `read x: Int64`/`read y: Int64` accessor calls (plan 33's sugar).
+// Neither static method touches `@x`/`@y`/`self` directly.
+#[test]
+fn static_methods_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("static_methods.em"), "0\n0\n5\n7\n");
+}
