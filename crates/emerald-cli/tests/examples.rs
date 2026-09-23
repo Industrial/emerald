@@ -743,6 +743,24 @@ fn binary_serialization_em_prints_expected_sequence() {
   );
 }
 
+// Plan 189 (CBOR Binary Format): `Cbor.encode`/`.decode` (`ciborium`),
+// reusing plan 118's own `JsonValue` as the shared dynamic-value
+// representation — a value built via `Json.parse`, encoded to CBOR,
+// decoded back, and compared equal to the original via `.to_s` (see
+// `examples/cbor_roundtrip.em`'s own header comment for the full
+// account of the disclosed adaptations this required). Expected
+// sequence: `true` (a non-empty CBOR byte buffer was produced), the
+// decoded value's own `.to_s` text (JSON numbers always widen to
+// `Float64` — `1`/`2`/`3` print back as `1.0`/`2.0`/`3.0`), then
+// `true` (the round trip matches the original exactly).
+#[test]
+fn cbor_roundtrip_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("cbor_roundtrip.em"),
+    "true\n{\"name\":\"Ada\",\"scores\":[1.0,2.0,3.0],\"active\":true}\ntrue\n"
+  );
+}
+
 // Plan 124 (XML): `Xml.parse`/`.reader_from_string` proving tree mode
 // and streaming mode agree on the same document's root element —
 // `library` printed twice (tree mode's own root tag, then the
@@ -1476,5 +1494,159 @@ fn ini_demo_em_prints_expected_sequence() {
   assert_eq!(
     compile_and_run("ini_demo.em"),
     "localhost\n8080\n2\n3:1 expecting \"[Some(']')]\" but found EOF.\ndemo\n"
+  );
+}
+
+// Plan 185 (OAuth2 Client Flow — Authorization Code Grant with
+// Mandatory PKCE): unlike every other example in this table, this
+// test does NOT use `compile_and_run` alone — `oauth2_client_flow.em`
+// is a real network CLIENT (`OAuth2Client#exchange_code`'s one real
+// round trip), so this test itself plays the SERVER role, starting a
+// fixed, local, single-purpose mock OAuth2 token endpoint (a real
+// `tiny_http::Server`, not a live third-party provider — the same
+// "no live network dependency in CI" posture plan 96's own worked
+// proof already established) on the exact fixed port (9931) this
+// file's own literal `auth_url`/`token_url` text hardcodes, BEFORE
+// running the compiled example, mirroring `websocket_proof_em_
+// round_trips_a_real_echo_over_a_real_socket`'s own "the Emerald side
+// and the Rust side play opposite roles" shape — the reverse role
+// from most of this table, since the *Emerald* side here is the
+// CLIENT, matching plan 185's own Concrete Proof's own framing.
+//
+// The mock server itself performs the real, meaningful PKCE check
+// plan 185's own Decision log describes: it captures the real
+// `code_challenge` query parameter from the GET `/authorize` request
+// this example's own `Http.get(url)` call sends (the file's own real,
+// disclosed addition simulating the browser step — see its own header
+// comment), then on the POST `/token` request, recomputes SHA256/
+// base64url of the received `code_verifier` and rejects the exchange
+// (a 400 `invalid_grant`) unless it matches — a genuine, working proof
+// that a PKCE-paired authorization URL was built and the matching
+// verifier was later presented correctly at token-exchange time, not
+// a mocked-away shortcut.
+#[test]
+fn oauth2_client_flow_em_exchanges_a_real_authorization_code_for_a_token() {
+  use sha2::{Digest, Sha256};
+  use std::sync::{Arc, Mutex};
+
+  fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+      if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+          out.push(byte);
+          i += 3;
+          continue;
+        }
+      }
+      out.push(bytes[i]);
+      i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+  }
+
+  fn query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split('?').nth(1)?;
+    for pair in query.split('&') {
+      let (k, v) = pair.split_once('=')?;
+      if k == key {
+        return Some(percent_decode(v));
+      }
+    }
+    None
+  }
+
+  let server = tiny_http::Server::http("127.0.0.1:9931")
+    .expect("bind the fixed mock OAuth2 token endpoint on 127.0.0.1:9931");
+  let captured_challenge: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+  let captured = captured_challenge.clone();
+
+  let server_thread = std::thread::spawn(move || {
+    // Request 1: GET /authorize?... — the simulated browser step;
+    // capture `code_challenge`, respond with an arbitrary 200 (its
+    // body is never inspected by the client).
+    if let Ok(req1) = server.recv() {
+      let url = req1.url().to_string();
+      *captured.lock().unwrap() = query_param(&url, "code_challenge");
+      let _ = req1.respond(tiny_http::Response::from_string("ok"));
+    }
+
+    // Request 2: POST /token — the real token-exchange round trip.
+    if let Ok(mut req2) = server.recv() {
+      let mut body = String::new();
+      let _ = req2.as_reader().read_to_string(&mut body);
+      let mut code = None;
+      let mut verifier = None;
+      for pair in body.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+          match k {
+            "code" => code = Some(percent_decode(v)),
+            "code_verifier" => verifier = Some(percent_decode(v)),
+            _ => {}
+          }
+        }
+      }
+      let expected_challenge = captured.lock().unwrap().clone().unwrap_or_default();
+      let ok = match (code.as_deref(), verifier.as_deref()) {
+        (Some("fixed-test-code"), Some(verifier)) => {
+          use base64::Engine;
+          let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+          computed == expected_challenge
+        }
+        _ => false,
+      };
+      let response = if ok {
+        tiny_http::Response::from_string(
+          r#"{"access_token":"mock-access-token-12345","token_type":"bearer","expires_in":3600}"#,
+        )
+        .with_header(
+          "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+        )
+      } else {
+        tiny_http::Response::from_string(r#"{"error":"invalid_grant"}"#).with_status_code(400)
+      };
+      let _ = req2.respond(response);
+    }
+  });
+
+  let stdout = compile_and_run("oauth2_client_flow.em");
+  server_thread
+    .join()
+    .expect("mock OAuth2 token endpoint thread should not panic");
+
+  let lines: Vec<&str> = stdout.lines().collect();
+  assert_eq!(lines.len(), 3, "expected 3 printed lines, got: {stdout:?}");
+  assert!(
+    lines[0].starts_with("http://127.0.0.1:9931/authorize?"),
+    "line 1 should be the real authorization URL, got: {}",
+    lines[0]
+  );
+  assert!(
+    lines[0].contains("code_challenge="),
+    "authorization URL should carry a real PKCE code_challenge, got: {}",
+    lines[0]
+  );
+  assert!(
+    lines[0].contains("code_challenge_method=S256"),
+    "authorization URL should be S256, got: {}",
+    lines[0]
+  );
+  assert!(
+    lines[0].contains("state="),
+    "authorization URL should carry a real CSRF state, got: {}",
+    lines[0]
+  );
+  assert_eq!(
+    lines[1], "true",
+    "the generated state string should be non-empty"
+  );
+  assert_eq!(
+    lines[2], "mock-access-token-12345",
+    "the real token exchange should recover the mock server's own fixed access token"
   );
 }

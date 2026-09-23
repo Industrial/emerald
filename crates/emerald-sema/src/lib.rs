@@ -4038,6 +4038,29 @@ fn infer_expr_type(
           Box::new(Type::Enum("TotpError".to_string())),
         ));
       }
+      // Plan 185's Decision log: `OAuth2Client.new(client_id,
+      // client_secret, auth_url, token_url, redirect_url)` — the
+      // identical real-argument carve-out `Totp.new` immediately above
+      // establishes, five real `String` arguments and a plain
+      // `OAuth2Client` return (not `Result`-wrapped — a malformed URL
+      // is a `NativeError` at construction time, this plan's own
+      // text and `oauth2.rs`'s own module doc).
+      if class_name == "OAuth2Client" {
+        check_args(
+          "OAuth2Client.new",
+          args,
+          &[Type::String, Type::String, Type::String, Type::String, Type::String],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(Type::Newtype(
+          "OAuth2Client".to_string(),
+          Box::new(Type::Int64),
+        ));
+      }
       let info = classes
         .get(class_name)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
@@ -4536,6 +4559,52 @@ fn infer_expr_type(
     // error (plan 195's convention, applied fresh here since this
     // plan lands after plan 195 rather than shipping `Toml.parse`'s
     // still-pre-195 `Result[JsonValue, String]` shape).
+    // Plan 189's Decision log: `Cbor.encode`/`.decode` — the same
+    // reserved-namespace static-call shape `Bincode`/`MessagePack`
+    // immediately below use, sharing this arm's own `.encode(v:
+    // JsonValue): Bytes` / `.decode(data: Bytes): Result[JsonValue,
+    // CborError]` signature shape exactly (this plan reuses plan 118's
+    // `JsonValue` directly rather than inventing a second dynamic-
+    // value type — see that plan's own Decision log).
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Cbor") =>
+    {
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      match method.as_str() {
+        "encode" => {
+          check_args(
+            method,
+            args,
+            &[Type::Enum("JsonValue".to_string())],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(bytes_ty)
+        }
+        "decode" => {
+          check_args(
+            method,
+            args,
+            std::slice::from_ref(&bytes_ty),
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(
+            Box::new(Type::Enum("JsonValue".to_string())),
+            Box::new(Type::Enum("CborError".to_string())),
+          ))
+        }
+        other => Err(Diagnostic::new(
+          format!("Cbor has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
     Expr::MethodCall(recv, method, args)
       if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "Bincode" | "MessagePack")) =>
     {
@@ -7253,6 +7322,110 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("Totp has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 185's Decision log: `OAuth2Client#begin_auth`/
+        // `#exchange_code` — the identical carved-out-of-newtype shape
+        // `Totp`'s own methods immediately above establish.
+        // `#begin_auth` takes `Array[String]` (scopes) plus an
+        // explicit `Int64` scope count (this plan's own text) and
+        // returns a plain `OAuth2AuthRequest` (no network call, per
+        // this plan's own Decision log). `#exchange_code` is the one
+        // real network round trip this module makes and returns
+        // `Result[OAuth2Token, OAuth2Error]` (plan 195's Typed Domain
+        // Errors convention, applied fresh here — see `oauth2.rs`'s
+        // own module doc for the full "lands after 195, retrofit
+        // directly" account).
+        if name == "OAuth2Client" {
+          let (expected_params, ret) = match method.as_str() {
+            "begin_auth" => (
+              vec![Type::Array(Box::new(Type::String)), Type::Int64],
+              Type::Newtype("OAuth2AuthRequest".to_string(), Box::new(Type::Int64)),
+            ),
+            "exchange_code" => (
+              vec![
+                Type::Newtype("OAuth2AuthRequest".to_string(), Box::new(Type::Int64)),
+                Type::String,
+              ],
+              Type::Result(
+                Box::new(Type::Newtype("OAuth2Token".to_string(), Box::new(Type::Int64))),
+                Box::new(Type::Enum("OAuth2Error".to_string())),
+              ),
+            ),
+            other => {
+              return Err(Diagnostic::new(
+                format!("OAuth2Client has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 185's Decision log: `OAuth2AuthRequest#authorization_
+        // url`/`#state` — the identical carved-out-of-newtype shape
+        // `Totp`'s own methods above establish.
+        if name == "OAuth2AuthRequest" {
+          let (expected_params, ret) = match method.as_str() {
+            "authorization_url" => (vec![], Type::String),
+            "state" => (vec![], Type::String),
+            other => {
+              return Err(Diagnostic::new(
+                format!("OAuth2AuthRequest has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 185's Decision log: `OAuth2Token#access_token`/
+        // `#refresh_token`/`#expires_in_seconds` — the identical
+        // carved-out-of-newtype shape `Totp`'s own methods above
+        // establish. `#refresh_token`/`#expires_in_seconds` return the
+        // generic, already-instantiated `Option$String`/`Option$Int64`
+        // enums (`ConfigValue#get_string`/`#get_int`'s own precedent),
+        // not a new type this module introduces.
+        if name == "OAuth2Token" {
+          let (expected_params, ret) = match method.as_str() {
+            "access_token" => (vec![], Type::String),
+            "refresh_token" => (vec![], Type::Enum("Option$String".to_string())),
+            "expires_in_seconds" => (vec![], Type::Enum("Option$Int64".to_string())),
+            other => {
+              return Err(Diagnostic::new(
+                format!("OAuth2Token has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -15254,6 +15427,14 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     // zero-cost `Int64` handle" shape, plan 93's own handle registry
     // backed by a boxed `totp_rs::Totp`.
     "Totp",
+    // Plan 185's Decision log: `OAuth2Client`/`OAuth2AuthRequest`/
+    // `OAuth2Token` — the identical "reserved name, zero-cost `Int64`
+    // handle" shape, plan 93's own handle registry backed by a boxed
+    // `oauth2::basic::BasicClient`/a small verifier+state+URL struct/
+    // a small access-token+refresh-token+expiry struct respectively.
+    "OAuth2Client",
+    "OAuth2AuthRequest",
+    "OAuth2Token",
   ] {
     classes.insert(
       name.to_string(),
@@ -15752,6 +15933,51 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&messagepack_error_enum_def);
+  // Plan 189's Decision log: `CborError` — this plan lands after
+  // plan 195, so it registers a real typed domain error directly per
+  // that plan's own convention, the identical two-variant minimum
+  // `BincodeError`/`MessagePackError` immediately above already
+  // establish: `UnexpectedEnd` (a truncated buffer, the routine,
+  // always-possible outcome of decoding corrupted or attacker-
+  // controlled bytes) and `Other(String)` (every other classification
+  // this domain's own decode path produces — a real CBOR syntax/
+  // semantic error, or this plan's own disclosed `Bytes`/`Tag`/
+  // out-of-`i64`-range-integer rejections) — see `crates/emerald-rt/
+  // src/cbor.rs`'s own `CBOR_ERROR_TAG_*` constants for the byte-for-
+  // byte matching tag order this mirrors.
+  let cbor_error_enum_def = EnumDef {
+    name: "CborError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "CborError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &cbor_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&cbor_error_enum_def);
   // Plan 163's Decision log: `BigInt` — a compiler-synthesized,
   // zero-cost `Int64` newtype (the identical "reserved name, zero-cost
   // Int64 representation" shape `Regex`/`XmlReader` above already use),
@@ -16835,6 +17061,51 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&totp_error_enum_def);
+  // Plan 185's Decision log: `OAuth2Error` — plan 195's Typed Domain
+  // Errors convention, applied fresh here (plan 185 was authored
+  // before plan 195 landed but is executed after it — see
+  // `oauth2.rs`'s own module doc for the full "lands after 195,
+  // retrofit directly" account). Declaration order matches
+  // `crates/emerald-rt/src/oauth2.rs`'s own `OAUTH2_ERROR_TAG_*`
+  // constants byte-for-byte — `TokenEndpoint`=0, `Request`=1,
+  // `Other`=2.
+  let oauth2_error_enum_def = EnumDef {
+    name: "OAuth2Error".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "TokenEndpoint".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Request".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "OAuth2Error".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &oauth2_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&oauth2_error_enum_def);
   for item in &program.items {
     if let Item::Enum(e) = item {
       if !e.type_params.is_empty() {

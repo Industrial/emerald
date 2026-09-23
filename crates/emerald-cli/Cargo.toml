@@ -36,3 +36,24 @@ serde = { version = "1", features = ["derive"] }
 # test-only dependency (this workspace's shared `Cargo.lock` already
 # resolves it) rather than hand-rolling a second RFC6455 client.
 tungstenite = "0.30"
+# Plan 185 (OAuth2 Client Flow): `examples.rs`'s own
+# `oauth2_client_flow_em_exchanges_a_real_authorization_code_for_a_
+# token` test needs a real, local, fixed-response mock OAuth2 token
+# endpoint, driven directly from Rust, against the compiled Emerald
+# program acting as the CLIENT (the plan's own Concrete Proof's own
+# framing) — the identical `tiny_http` `emerald-rt` already depends on
+# and vets for plan 101 (see `crates/emerald-rt/DEPENDENCIES.md`),
+# reused here as a test-only dependency (this workspace's shared
+# `Cargo.lock` already resolves it) rather than hand-rolling a second
+# minimal HTTP server, the same "reuse an already-vetted crate as a
+# test-only dependency" precedent `tungstenite` immediately above
+# already establishes.
+tiny_http = "0.12"
+# Plan 185: `sha2`/`base64`, both already `[dependencies]` of
+# `emerald-rt` (plans 109/123) and thus already resolved into this
+# workspace's shared `Cargo.lock` — reused here, test-only, so the mock
+# token endpoint above can perform the real SHA256/base64url PKCE
+# `code_verifier` -> `code_challenge` check plan 185's own Decision log
+# describes, rather than skipping it.
+sha2 = "0.11"
+base64 = "0.23"

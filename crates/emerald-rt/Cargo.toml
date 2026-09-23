@@ -926,6 +926,49 @@ totp-rs = { version = "6.0", features = ["gen_secret", "otpauth"] }
 # `#get`, `IniDocument.new`/`#set`/`#write`/`#to_string`. See
 # crates/emerald-rt/DEPENDENCIES.md for this row's ledger entry.
 ini = { package = "rust-ini", version = "0.21" }
+# Plan 189 (CBOR Binary Format): real-checked at this plan's own
+# authoring time (2026-09-21, via lib.rs since crates.io itself blocks
+# bot access) - `ciborium` 0.2.2 (published 29 August 2026), Apache-2.0,
+# maintained under the `enarx` organization, `serde`-based (depending
+# on the companion `ciborium-io`/`ciborium-ll` crates for the actual
+# RFC 8949 wire encoding). No RustSec advisory found. Pure Rust,
+# clearing plan 95's own pure-Rust-first preference outright - no C
+# exception needed. `ciborium::Value` (its own dynamic CBOR tree type)
+# is the intermediate `cbor.rs` walks plan 118's `JsonValue` through on
+# either side of `into_writer`/`from_reader` - never a second,
+# parallel dynamic-value type of Emerald's own. `Cbor.encode`/
+# `.decode`'s direct backing. See DEPENDENCIES.md.
+ciborium = "0.2"
+# Plan 185 (OAuth2 Client Flow): real-checked at this plan's own
+# implementation time (2026-09-23, via docs.rs, since crates.io itself
+# blocks bot access) - `oauth2` 5.0.0 (07 August 2026), owned by
+# `ramosbugs` (github:ramosbugs/oauth2-rs), MIT/Apache. No RustSec
+# advisory found. `default-features = false` (skips the crate's
+# default `reqwest`/`reqwest-blocking` dependency, which this module
+# does not use) with the `ureq` feature enabled instead, so
+# `OAuth2Client#exchange_code`'s one real network round trip rides on
+# `oauth2`'s own synchronous, `ureq`-backed client - the strongest fit
+# for plan 94's "prefer a crate's sync API" rule, the same reasoning
+# plan 100's own `ureq`-backed `Http.get`/`.post` already applies. Real,
+# disclosed finding: `oauth2` 5.0.0's own `ureq` feature pins `ureq ^2`
+# (verified directly against its docs.rs dependency listing), NOT the
+# `ureq 3.4` plan 100 already depends on directly above - a second,
+# distinct semver-major `ureq` (2.x, reached only via `oauth2::ureq`'s
+# own re-export, never imported directly here) therefore also enters
+# this archive, alongside the existing 3.x; Cargo resolves both
+# simultaneously as genuinely separate crates with no symbol collision
+# - real but harmless, disclosed in `oauth2.rs`'s own module doc too,
+# not silently left to contradict this plan's own "no second HTTP
+# client crate" text. `oauth2`'s own `getrandom ^0.2` (its CSRF-token/
+# PKCE-verifier generation's own RNG source) is a third, similarly
+# harmless additional `getrandom` major alongside this crate's existing
+# `getrandom 0.4` (plan 110) - the identical "different majors coexist
+# fine" shape `totp-rs`'s own `rand 0.10` addition immediately above
+# already discloses. `OAuth2Client.new`/`#begin_auth`/`#exchange_code`,
+# `OAuth2AuthRequest#authorization_url`/`#state`,
+# `OAuth2Token#access_token`/`#refresh_token`/`#expires_in_seconds`'s
+# direct backing. See DEPENDENCIES.md.
+oauth2 = { version = "5.0", default-features = false, features = ["ureq"] }
 
 [build-dependencies]
 

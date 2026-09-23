@@ -269,6 +269,11 @@ fn set_newtype_underlying(program: &Program) {
     "X509Certificate",
     // Plan 184's Decision log: `Totp` -- the identical shape.
     "Totp",
+    // Plan 185's Decision log: `OAuth2Client`/`OAuth2AuthRequest`/
+    // `OAuth2Token` -- the identical shape.
+    "OAuth2Client",
+    "OAuth2AuthRequest",
+    "OAuth2Token",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5132,6 +5137,9 @@ struct Ctx<'a, 'ctx> {
   bincode_decode: FunctionValue<'ctx>,
   msgpack_encode: FunctionValue<'ctx>,
   msgpack_decode: FunctionValue<'ctx>,
+  /// Plan 189 (CBOR Binary Format) — `Cbor.encode`/`.decode`.
+  cbor_encode: FunctionValue<'ctx>,
+  cbor_decode: FunctionValue<'ctx>,
   /// Plan 121 (CSV) — `Csv.parse`/`.parse_with_headers`/`.write`.
   csv_parse: FunctionValue<'ctx>,
   csv_parse_with_headers: FunctionValue<'ctx>,
@@ -5439,6 +5447,17 @@ struct Ctx<'a, 'ctx> {
   totp_generate_current: FunctionValue<'ctx>,
   totp_check_current: FunctionValue<'ctx>,
   totp_provisioning_uri: FunctionValue<'ctx>,
+  /// Plan 185 (OAuth2 Client Flow) — `OAuth2Client.new`/`#begin_auth`/
+  /// `#exchange_code`, `OAuth2AuthRequest#authorization_url`/`#state`,
+  /// `OAuth2Token#access_token`/`#refresh_token`/`#expires_in_seconds`.
+  oauth2_client_new: FunctionValue<'ctx>,
+  oauth2_client_begin_auth: FunctionValue<'ctx>,
+  oauth2_auth_request_authorization_url: FunctionValue<'ctx>,
+  oauth2_auth_request_state: FunctionValue<'ctx>,
+  oauth2_client_exchange_code: FunctionValue<'ctx>,
+  oauth2_token_access_token: FunctionValue<'ctx>,
+  oauth2_token_refresh_token: FunctionValue<'ctx>,
+  oauth2_token_expires_in_seconds: FunctionValue<'ctx>,
   /// Plan 113 (Cryptographically Secure Random Number Generation) —
   /// `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`.
   random_secure_hex: FunctionValue<'ctx>,
@@ -7418,6 +7437,38 @@ fn build_expr<'ctx>(
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Ptr))
     }
+    // Plan 185's Decision log: `OAuth2Client.new(client_id,
+    // client_secret, auth_url, token_url, redirect_url)` — the
+    // identical real-argument carve-out `Totp.new` immediately above
+    // establishes, five real `String` arguments and a plain
+    // `ValKind::Int64` result (a bare handle id, never `Result`-
+    // wrapped — a malformed URL is a `NativeError` at construction
+    // time, per `oauth2.rs`'s own module doc).
+    Expr::New(class_name, args) if class_name == "OAuth2Client" => {
+      if args.len() != 5 {
+        return Err(format!(
+          "codegen: `OAuth2Client.new` expects 5 arguments, found {}",
+          args.len()
+        ));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let call = builder
+        .build_call(ctx.oauth2_client_new, &call_args, "oauth2clientnewtmp")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Int64))
+    }
     // Plan 193's Decision log: `Set.new()`/`Deque.new()`/
     // `PriorityQueue.new()` are ALWAYS handled by `build_stmt`'s own
     // dedicated `Stmt::Let` arm (the enclosing `Let`'s own declared
@@ -8702,6 +8753,111 @@ fn build_method_call<'ctx>(
         return Ok((is_true.into(), ValKind::Bool));
       }
       return Ok((result, ret_kind));
+    }
+    // Plan 185's Decision log: `OAuth2Client#begin_auth`/
+    // `#exchange_code` — the identical carved-out-of-newtype shape
+    // `Totp`'s own methods immediately above establish. Every argument
+    // (including `begin_auth`'s own `Array[String]`/`Int64` pair)
+    // builds and pushes generically via `build_expr`, the same
+    // uniform loop every other reserved-namespace call in this match
+    // already uses — no special marshaling needed for the array
+    // argument (`emerald_rt_oauth2_client_begin_auth`'s own Rust side
+    // reads it the same self-describing `[len][elem...]` way
+    // `x509_generate_self_signed` already does).
+    if local_classes.get(recv_name).map(String::as_str) == Some("OAuth2Client") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "begin_auth" => (ctx.oauth2_client_begin_auth, ValKind::Int64),
+        "exchange_code" => (ctx.oauth2_client_exchange_code, ValKind::Ptr),
+        other => {
+          return Err(format!(
+            "codegen: unsupported OAuth2Client method `{other}`"
+          ))
+        }
+      };
+      let call = builder
+        .build_call(fv, &call_args, "oauth2clienttmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
+    // Plan 185's Decision log: `OAuth2AuthRequest#authorization_url`/
+    // `#state` — the identical carved-out-of-newtype shape `Totp`'s
+    // own methods above establish.
+    if local_classes.get(recv_name).map(String::as_str) == Some("OAuth2AuthRequest") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      let (fv, ret_kind) = match method {
+        "authorization_url" => (ctx.oauth2_auth_request_authorization_url, ValKind::Str),
+        "state" => (ctx.oauth2_auth_request_state, ValKind::Str),
+        other => {
+          return Err(format!(
+            "codegen: unsupported OAuth2AuthRequest method `{other}`"
+          ))
+        }
+      };
+      let call = builder
+        .build_call(fv, &call_args, "oauth2authrequesttmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
+    // Plan 185's Decision log: `OAuth2Token#access_token`/
+    // `#refresh_token`/`#expires_in_seconds` — the identical carved-
+    // out-of-newtype shape `Totp`'s own methods above establish.
+    // `#refresh_token`/`#expires_in_seconds` return a `ValKind::Ptr`
+    // (the already-tagged `Option$String`/`Option$Int64` heap block
+    // `emerald-rt`'s own `alloc_option_string`/`alloc_option_i64`
+    // build directly — `ConfigValue#get_string`/`#get_int`'s own
+    // precedent, no extra wrapping needed at this call site).
+    if local_classes.get(recv_name).map(String::as_str) == Some("OAuth2Token") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      let (fv, ret_kind) = match method {
+        "access_token" => (ctx.oauth2_token_access_token, ValKind::Str),
+        "refresh_token" => (ctx.oauth2_token_refresh_token, ValKind::Ptr),
+        "expires_in_seconds" => (ctx.oauth2_token_expires_in_seconds, ValKind::Ptr),
+        other => return Err(format!("codegen: unsupported OAuth2Token method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "oauth2tokentmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
     }
     // Plan 124's Decision log: `XmlReader#next_event` — the identical
     // carved-out-of-`.value`-only shape `Regex`'s own methods
@@ -10536,6 +10692,36 @@ fn build_method_call<'ctx>(
   // directly (`ValKind::Ptr`), zero additional marshaling needed here
   // — both Rust-side functions already build/consume exactly these
   // shapes.
+  // Plan 189's Decision log: `Cbor.encode`/`.decode` — the identical
+  // reserved-namespace static-call dispatch shape `Bincode`/
+  // `MessagePack` immediately below use, sharing this block's own
+  // `.encode`/`.decode` marshaling exactly (a `JsonValue`/`ValKind::
+  // Ptr` argument in, a `Bytes`/`ValKind::Int64` or `Result`/
+  // `ValKind::Ptr` value out).
+  if recv_name == "Cbor" {
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `Cbor.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (fv, result_kind) = match method {
+      "encode" => (ctx.cbor_encode, ValKind::Int64),
+      "decode" => (ctx.cbor_decode, ValKind::Ptr),
+      other => return Err(format!("codegen: unsupported Cbor static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &[v.into()], "cbortmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, result_kind));
+  }
+
   if matches!(recv_name.as_str(), "Bincode" | "MessagePack") {
     let arg = args
       .first()
@@ -23709,6 +23895,21 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 189 (CBOR Binary Format): identical `.encode`/`.decode`
+  // signature shape to `Bincode`/`MessagePack` immediately above —
+  // `.encode` takes a `JsonValue` (`ptr_ty`) and returns a `Bytes`
+  // value (`i64_ty`); `.decode` takes a `Bytes` value (`i64_ty`) and
+  // returns plan 53's own `Result` layout directly (`ptr_ty`).
+  let cbor_encode = module.add_function(
+    "emerald_rt_cbor_encode",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cbor_decode = module.add_function(
+    "emerald_rt_cbor_decode",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 121 (CSV).
   let csv_parse = module.add_function(
     "emerald_rt_csv_parse",
@@ -25069,6 +25270,63 @@ fn compile_to_object_impl(
   );
   let totp_provisioning_uri = module.add_function(
     "emerald_rt_totp_provisioning_uri",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  // Plan 185 (OAuth2 Client Flow): `.new` returns a bare `i64` handle
+  // (never `Result`-wrapped — a malformed URL is a `NativeError` at
+  // construction time); `#begin_auth` returns a bare `i64` handle too
+  // (no network call); `#authorization_url`/`#state`/`#access_token`
+  // return `String` (a heap pointer); `#exchange_code` returns plan
+  // 53's own `Result` layout (a heap pointer); `#refresh_token`/
+  // `#expires_in_seconds` return the already-tagged `Option$String`/
+  // `Option$Int64` heap block (also a heap pointer).
+  let oauth2_client_new = module.add_function(
+    "emerald_rt_oauth2_client_new",
+    i64_ty.fn_type(
+      &[
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+      ],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let oauth2_client_begin_auth = module.add_function(
+    "emerald_rt_oauth2_client_begin_auth",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let oauth2_auth_request_authorization_url = module.add_function(
+    "emerald_rt_oauth2_auth_request_authorization_url",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let oauth2_auth_request_state = module.add_function(
+    "emerald_rt_oauth2_auth_request_state",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let oauth2_client_exchange_code = module.add_function(
+    "emerald_rt_oauth2_client_exchange_code",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let oauth2_token_access_token = module.add_function(
+    "emerald_rt_oauth2_token_access_token",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let oauth2_token_refresh_token = module.add_function(
+    "emerald_rt_oauth2_token_refresh_token",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let oauth2_token_expires_in_seconds = module.add_function(
+    "emerald_rt_oauth2_token_expires_in_seconds",
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
@@ -26797,6 +27055,33 @@ fn compile_to_object_impl(
     "TotpError".to_string(),
     build_enum_layout(&totp_error_enum_def_cg),
   );
+  // Plan 185: `OAuth2Error` -- codegen's own mirror of `emerald-sema`'s
+  // identical synthetic `EnumDef` (see that crate's own Decision log).
+  // Variant declaration order matches `crates/emerald-rt/src/
+  // oauth2.rs`'s own `OAUTH2_ERROR_TAG_*` constants byte-for-byte.
+  let oauth2_error_enum_def_cg = EnumDef {
+    name: "OAuth2Error".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "TokenEndpoint".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Request".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "OAuth2Error".to_string(),
+    build_enum_layout(&oauth2_error_enum_def_cg),
+  );
   // Plan 163: `BigIntError`/`DecimalError` — codegen's own mirror of
   // `emerald-sema`'s identical synthetic `EnumDef`s (see that crate's
   // own Decision log for the full reasoning). Variant declaration
@@ -26907,6 +27192,30 @@ fn compile_to_object_impl(
   enums.insert(
     "MessagePackError".to_string(),
     build_enum_layout(&messagepack_error_enum_def_cg),
+  );
+  // Plan 189 (CBOR Binary Format): `CborError` — codegen's own mirror
+  // of `emerald-sema`'s identical synthetic `EnumDef` (see that
+  // crate's own Decision log). Variant declaration order matches
+  // `crates/emerald-rt/src/cbor.rs`'s own `CBOR_ERROR_TAG_*` constants
+  // byte-for-byte.
+  let cbor_error_enum_def_cg = EnumDef {
+    name: "CborError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "CborError".to_string(),
+    build_enum_layout(&cbor_error_enum_def_cg),
   );
   // Plan 160 (Date/Time & Timezones): `DateTimeError` — codegen's own
   // mirror of `emerald-sema`'s identical synthetic `EnumDef` (see that
@@ -27449,6 +27758,12 @@ fn compile_to_object_impl(
   // Plan 184's Decision log: `Totp` -- the identical "both registries
   // need the entry" gap-avoidance immediately above.
   newtypes.insert("Totp".to_string());
+  // Plan 185's Decision log: `OAuth2Client`/`OAuth2AuthRequest`/
+  // `OAuth2Token` -- the identical "both registries need the entry"
+  // gap-avoidance immediately above.
+  newtypes.insert("OAuth2Client".to_string());
+  newtypes.insert("OAuth2AuthRequest".to_string());
+  newtypes.insert("OAuth2Token".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -27521,6 +27836,8 @@ fn compile_to_object_impl(
     bincode_decode,
     msgpack_encode,
     msgpack_decode,
+    cbor_encode,
+    cbor_decode,
     csv_parse,
     csv_parse_with_headers,
     csv_write,
@@ -27940,6 +28257,14 @@ fn compile_to_object_impl(
     totp_generate_current,
     totp_check_current,
     totp_provisioning_uri,
+    oauth2_client_new,
+    oauth2_client_begin_auth,
+    oauth2_auth_request_authorization_url,
+    oauth2_auth_request_state,
+    oauth2_client_exchange_code,
+    oauth2_token_access_token,
+    oauth2_token_refresh_token,
+    oauth2_token_expires_in_seconds,
     encoding_decode,
     encoding_decode_strict,
     encoding_encode,

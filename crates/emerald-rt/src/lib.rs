@@ -156,6 +156,7 @@ mod bignum;
 #[path = "bincode.rs"]
 mod bincodes;
 mod bytes;
+mod cbor;
 // Plan 153 (Character Set / Encoding Conversion) — named `charset`,
 // not `encoding`: `mod encoding` below is already plan 123's Base64/
 // Hex module (its own file predates this plan and wraps a different
@@ -336,6 +337,15 @@ mod multipart;
 // `#provisioning_uri`, wrapping `totp-rs` -- see `totp.rs`'s own
 // module doc.
 mod totp;
+// Plan 185 (OAuth2 Client Flow) -- `OAuth2Client.new`/`#begin_auth`/
+// `#exchange_code`, `OAuth2AuthRequest#authorization_url`/`#state`,
+// `OAuth2Token#access_token`/`#refresh_token`/`#expires_in_seconds`,
+// wrapping `oauth2` -- see `oauth2.rs`'s own module doc. Named
+// `oauth2s`, not `oauth2` -- this crate's own `mod oauth2` would
+// shadow the external `oauth2` crate this module wraps, the identical
+// collision `csvs`/`tomls`/`urls`/`inis` already hit and disclosed.
+#[path = "oauth2.rs"]
+mod oauth2s;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -4203,6 +4213,28 @@ pub unsafe extern "C" fn emerald_rt_msgpack_decode(id: i64) -> *mut c_void {
   catch_and_raise(move || msgpack::msgpack_decode(id))
 }
 
+// Plan 189 (CBOR Binary Format): `Cbor.encode`/`.decode`, dispatched
+// by exact free-function/receiver-gated name in `emerald-codegen`'s
+// own `build_method_call` — the identical shape plan 125's `Bincode`/
+// `MessagePack` immediately above already establish. See `cbor.rs`'s
+// own module doc for the full design.
+
+/// # Safety
+/// `obj` must point to a real `JsonValue` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cbor_encode(obj: *const c_void) -> i64 {
+  catch_and_raise(move || cbor::cbor_encode(obj))
+}
+
+/// # Safety
+/// `id` must be a pointer `emerald_rt_bytes_from_slice` (or an
+/// equally-shaped native producer, e.g. `String.to_bytes`) actually
+/// returned.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cbor_decode(id: i64) -> *mut c_void {
+  catch_and_raise(move || cbor::cbor_decode(id))
+}
+
 // Plan 114 (JSON Web Tokens): `Jwt.encode_hs256`/`.verify_hs256`/
 // `.verify_hs256_with_issuer`/`.encode_rs256`/`.verify_rs256`/
 // `.verify_rs256_with_issuer`/`.encode_es256`/`.verify_es256`/
@@ -4447,6 +4479,88 @@ pub unsafe extern "C" fn emerald_rt_totp_check_current(id: i64, code: *const c_c
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_totp_provisioning_uri(id: i64) -> *const c_char {
   catch_and_raise(move || totp::totp_provisioning_uri(id))
+}
+
+// Plan 185 (OAuth2 Client Flow) -- `OAuth2Client.new`/`#begin_auth`/
+// `#exchange_code`, `OAuth2AuthRequest#authorization_url`/`#state`,
+// `OAuth2Token#access_token`/`#refresh_token`/`#expires_in_seconds` --
+// see `oauth2.rs`'s own module doc.
+
+/// # Safety
+/// Every parameter, if non-null, must point to a valid, NUL-terminated
+/// C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_client_new(
+  client_id: *const c_char,
+  client_secret: *const c_char,
+  auth_url: *const c_char,
+  token_url: *const c_char,
+  redirect_url: *const c_char,
+) -> i64 {
+  catch_and_raise(move || {
+    oauth2s::oauth2_client_new(client_id, client_secret, auth_url, token_url, redirect_url)
+  })
+}
+
+/// # Safety
+/// `scopes_array`, if non-null, must point to a real `Array[String]`
+/// buffer at least `scope_count` elements long.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_client_begin_auth(
+  id: i64,
+  scopes_array: *const c_void,
+  scope_count: i64,
+) -> i64 {
+  catch_and_raise(move || oauth2s::oauth2_client_begin_auth(id, scopes_array, scope_count))
+}
+
+/// # Safety
+/// `id` must be a live `OAuth2AuthRequest` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_auth_request_authorization_url(
+  id: i64,
+) -> *const c_char {
+  catch_and_raise(move || oauth2s::oauth2_auth_request_authorization_url(id))
+}
+
+/// # Safety
+/// `id` must be a live `OAuth2AuthRequest` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_auth_request_state(id: i64) -> *const c_char {
+  catch_and_raise(move || oauth2s::oauth2_auth_request_state(id))
+}
+
+/// # Safety
+/// `code`, if non-null, must point to a valid, NUL-terminated C
+/// string. `request_id` must be a live `OAuth2AuthRequest` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_client_exchange_code(
+  id: i64,
+  request_id: i64,
+  code: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || oauth2s::oauth2_client_exchange_code(id, request_id, code))
+}
+
+/// # Safety
+/// `id` must be a live `OAuth2Token` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_token_access_token(id: i64) -> *const c_char {
+  catch_and_raise(move || oauth2s::oauth2_token_access_token(id))
+}
+
+/// # Safety
+/// `id` must be a live `OAuth2Token` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_token_refresh_token(id: i64) -> *mut c_void {
+  catch_and_raise(move || oauth2s::oauth2_token_refresh_token(id))
+}
+
+/// # Safety
+/// `id` must be a live `OAuth2Token` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_oauth2_token_expires_in_seconds(id: i64) -> *mut c_void {
+  catch_and_raise(move || oauth2s::oauth2_token_expires_in_seconds(id))
 }
 
 // Plan 127 (INI Configuration Files): `Ini.parse`/`.load`,
