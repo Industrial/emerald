@@ -5622,7 +5622,7 @@ fn infer_expr_type(
     }
     // Plan 105's Decision log: `Multipart.start`/`.next_field` — the
     // same reserved-namespace static-call shape `Dns`/`Kdf`/`Sse`
-    // already use. `.begin` consumes plan 101's own `HttpRequest`
+    // already use. `.start` consumes plan 101's own `HttpRequest`
     // newtype plus the `String` boundary (from `HttpRequest#content_
     // type_boundary`, added onto the existing `HttpRequest` instance-
     // method arm below — `HttpServer` is not a real namespace, the
