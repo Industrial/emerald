@@ -80,6 +80,19 @@ pub unsafe fn bytes_to_hex(id: i64) -> *const c_char {
   crate::alloc_and_copy_str(&s)
 }
 
+/// `Bytes.length(self): Int64` — plan 125's own Concrete Proof needs
+/// a real, positive byte count to print (`puts wire.length`) and no
+/// existing `Bytes` method exposed one; reads the same `[len: i64]
+/// [data]` heap block's own length word every other function in this
+/// module already reads, at zero extra cost.
+///
+/// # Safety
+/// `id` must be a pointer `bytes_from_slice` (or an equally-shaped
+/// native producer) actually returned.
+pub unsafe fn bytes_length(id: i64) -> i64 {
+  *(id as *const i64)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -100,6 +113,14 @@ mod tests {
     unsafe {
       let id = bytes_from_slice(&[0x00, 0xff, 0x10]);
       assert_eq!(bytes_as_slice(id), &[0x00, 0xff, 0x10]);
+    }
+  }
+
+  #[test]
+  fn length_reports_the_real_byte_count() {
+    unsafe {
+      let id = bytes_from_slice(&[0x00, 0xff, 0x10, 0x22]);
+      assert_eq!(bytes_length(id), 4);
     }
   }
 }

@@ -30,7 +30,13 @@ use std::os::raw::c_char;
 
 // `pub(crate)`, not private: plan 119's `toml.rs` reuses these tags and
 // `alloc_enum_block`/`lift_json_value` directly rather than duplicating
-// the `JsonValue` byte layout a second time.
+// the `JsonValue` byte layout a second time. Plan 125's `bincode.rs`/
+// `msgpack.rs` additionally reuse `lower_json_value` itself (widened
+// from private to `pub(crate)` for exactly that reuse) — both codecs
+// decode into an owned `serde_json::Value` via `serde`'s own derive on
+// that type, then re-lower it into a real `JsonValue` block the same
+// way `Json.parse` already does, rather than re-deriving a third
+// "how do dynamic values map to Rust" answer.
 pub(crate) const TAG_NULL: i64 = 0;
 pub(crate) const TAG_BOOL: i64 = 1;
 pub(crate) const TAG_NUMBER: i64 = 2;
@@ -62,7 +68,7 @@ pub(crate) unsafe fn alloc_enum_block(tag: i64) -> *mut i64 {
 /// the same allocator `emerald-codegen`'s own generated code already
 /// uses for every other value this program allocates, not a second
 /// one.
-unsafe fn lower_json_value(v: &serde_json::Value) -> *mut c_void {
+pub(crate) unsafe fn lower_json_value(v: &serde_json::Value) -> *mut c_void {
   match v {
     serde_json::Value::Null => alloc_enum_block(TAG_NULL) as *mut c_void,
     serde_json::Value::Bool(b) => {

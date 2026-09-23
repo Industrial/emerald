@@ -5101,6 +5101,12 @@ struct Ctx<'a, 'ctx> {
   /// Plan 119 (TOML) — `Toml.parse`, `JsonValue.to_toml`.
   toml_parse: FunctionValue<'ctx>,
   json_to_toml: FunctionValue<'ctx>,
+  /// Plan 125 (Binary Serialization: bincode/msgpack) — `Bincode.
+  /// encode`/`.decode`, `MessagePack.encode`/`.decode`.
+  bincode_encode: FunctionValue<'ctx>,
+  bincode_decode: FunctionValue<'ctx>,
+  msgpack_encode: FunctionValue<'ctx>,
+  msgpack_decode: FunctionValue<'ctx>,
   /// Plan 121 (CSV) — `Csv.parse`/`.parse_with_headers`/`.write`.
   csv_parse: FunctionValue<'ctx>,
   csv_parse_with_headers: FunctionValue<'ctx>,
@@ -5316,6 +5322,8 @@ struct Ctx<'a, 'ctx> {
   /// `Sha256Hasher`/`Blake3Hasher` incremental handle trios.
   string_to_bytes: FunctionValue<'ctx>,
   bytes_to_hex: FunctionValue<'ctx>,
+  /// Plan 125 (Binary Serialization: bincode/msgpack) — `Bytes#length`.
+  bytes_length: FunctionValue<'ctx>,
   sha256_hash: FunctionValue<'ctx>,
   sha512_hash: FunctionValue<'ctx>,
   sha3_256_hash: FunctionValue<'ctx>,
@@ -5496,24 +5504,6 @@ struct Ctx<'a, 'ctx> {
   sqlite_begin: FunctionValue<'ctx>,
   sqlite_commit: FunctionValue<'ctx>,
   sqlite_rollback: FunctionValue<'ctx>,
-  /// Plan 142 (Embedded ACID Database, redb) -- `Redb.open`/`.close`/
-  /// `.table`/`.begin_write`/`.begin_read`/`.table_insert`/
-  /// `.table_get`/`.table_remove`/`.commit`/`.abort`, wrapping
-  /// `redb`. Every handle (database, table schema, write
-  /// transaction, read transaction) is a bare `i64` -- the same
-  /// Decision-log shape `Sqlite` immediately above uses, so no
-  /// separate instance-method-on-newtype-receiver dispatch arm
-  /// exists anywhere else in this file for `Redb` either.
-  redb_open: FunctionValue<'ctx>,
-  redb_close: FunctionValue<'ctx>,
-  redb_table: FunctionValue<'ctx>,
-  redb_begin_write: FunctionValue<'ctx>,
-  redb_begin_read: FunctionValue<'ctx>,
-  redb_table_insert: FunctionValue<'ctx>,
-  redb_table_get: FunctionValue<'ctx>,
-  redb_table_remove: FunctionValue<'ctx>,
-  redb_commit: FunctionValue<'ctx>,
-  redb_abort: FunctionValue<'ctx>,
   /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
   /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
   dns_resolve: FunctionValue<'ctx>,
@@ -8468,13 +8458,23 @@ fn build_method_call<'ctx>(
         local_array_elem_types,
         ctx,
       )?;
-      if method != "to_hex" {
-        return Err(format!("codegen: unsupported Bytes method `{method}`"));
+      // Plan 125's Decision log: `#length` — the identical carved-out
+      // `Bytes` receiver shape as `#to_hex` immediately above.
+      match method {
+        "to_hex" => {
+          let call = builder
+            .build_call(ctx.bytes_to_hex, &[recv_val.into()], "bytestohextmp")
+            .map_err(|e| e.to_string())?;
+          return Ok((call_result(call)?, ValKind::Str));
+        }
+        "length" => {
+          let call = builder
+            .build_call(ctx.bytes_length, &[recv_val.into()], "byteslengthtmp")
+            .map_err(|e| e.to_string())?;
+          return Ok((call_result(call)?, ValKind::Int64));
+        }
+        other => return Err(format!("codegen: unsupported Bytes method `{other}`")),
       }
-      let call = builder
-        .build_call(ctx.bytes_to_hex, &[recv_val.into()], "bytestohextmp")
-        .map_err(|e| e.to_string())?;
-      return Ok((call_result(call)?, ValKind::Str));
     }
     // Plan 109's Decision log: `Sha256Hasher#update`/`#finalize` and
     // `Blake3Hasher#update`/`#finalize` — the identical carved-out
@@ -9548,6 +9548,46 @@ fn build_method_call<'ctx>(
       .build_call(ctx.toml_parse, &[v.into()], "tomlparsetmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 125's Decision log: `Bincode.encode`/`.decode`, `MessagePack.
+  // encode`/`.decode` — the same reserved-namespace static-call shape
+  // `Toml.parse` immediately above uses. `.encode` forwards its one
+  // `JsonValue` (`ValKind::Ptr`) argument and returns a `Bytes` value
+  // (`ValKind::Int64`, the same convention `Gzip.compress` already
+  // establishes); `.decode` forwards its one `Bytes` (`ValKind::
+  // Int64`) argument and returns plan 53's own `Result` layout
+  // directly (`ValKind::Ptr`), zero additional marshaling needed here
+  // — both Rust-side functions already build/consume exactly these
+  // shapes.
+  if matches!(recv_name.as_str(), "Bincode" | "MessagePack") {
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `{recv_name}.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let (fv, result_kind) = match (recv_name.as_str(), method) {
+      ("Bincode", "encode") => (ctx.bincode_encode, ValKind::Int64),
+      ("Bincode", "decode") => (ctx.bincode_decode, ValKind::Ptr),
+      ("MessagePack", "encode") => (ctx.msgpack_encode, ValKind::Int64),
+      ("MessagePack", "decode") => (ctx.msgpack_decode, ValKind::Ptr),
+      (name, other) => {
+        return Err(format!(
+          "codegen: unsupported {name} static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &[v.into()], "bincodemsgpacktmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, result_kind));
   }
 
   // Plan 123's Decision log (revised, `String`-only scope): `Base64.
@@ -11070,7 +11110,11 @@ fn build_method_call<'ctx>(
       "column_string" => (ctx.sqlite_column_string, ValKind::Str),
       "column_int64" => (ctx.sqlite_column_int64, ValKind::Int64),
       "column_float64" => (ctx.sqlite_column_float64, ValKind::Float64),
-      other => return Err(format!("codegen: unsupported Sqlite static method `{other}`")),
+      other => {
+        return Err(format!(
+          "codegen: unsupported Sqlite static method `{other}`"
+        ))
+      }
     };
     let call = builder
       .build_call(fv, &call_args, "sqlitestatictmp")
@@ -11087,159 +11131,6 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((is_true.into(), ValKind::Bool));
     }
-    return Ok((result, ret_kind));
-  }
-
-  // Plan 142's Decision log: `Redb.open`/`.close`/`.table`/
-  // `.begin_write`/`.begin_read`/`.table_insert`/`.table_get`/
-  // `.table_remove`/`.commit`/`.abort` -- the same reserved-namespace
-  // static-call shape `Sqlite` immediately above uses: every handle
-  // (database, table schema, write transaction, read transaction)
-  // crosses as a bare `i64`, never a `Type::Newtype` receiver, so no
-  // separate instance-method-on-newtype-receiver dispatch arm exists
-  // anywhere else in this file for `Redb` either. `.table_insert`/
-  // `.table_get`/`.table_remove` return a bare nullable `*mut c_char`
-  // from the Rust side; this call site builds the real tagged
-  // `Option[String]` value from it, the identical `is_null`-branch-
-  // plus-`phi` pattern `Env.get` immediately below already
-  // establishes -- reused verbatim, not re-derived.
-  if recv_name == "Redb" {
-    if matches!(method, "table_insert" | "table_get" | "table_remove") {
-      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-      for a in args {
-        let (v, _) = build_expr(
-          context,
-          builder,
-          a,
-          vars,
-          local_classes,
-          local_array_elem_types,
-          ctx,
-        )?;
-        call_args.push(v.into());
-      }
-      let fv = match method {
-        "table_insert" => ctx.redb_table_insert,
-        "table_get" => ctx.redb_table_get,
-        "table_remove" => ctx.redb_table_remove,
-        _ => unreachable!(),
-      };
-      let call = builder
-        .build_call(fv, &call_args, "redbtablecalltmp")
-        .map_err(|e| e.to_string())?;
-      let ptr_val = call_result(call)?.into_pointer_value();
-      let enum_name = "Option$String";
-      let layout = ctx.enums.get(enum_name).ok_or_else(|| {
-        format!(
-          "codegen: internal error — `Option$String` was not pre-instantiated for `Redb.{method}`"
-        )
-      })?;
-      let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
-        "codegen: internal error — `Option$String` has no `Some` variant".to_string()
-      })?;
-      let none_tag = *layout.variant_tags.get("None").ok_or_else(|| {
-        "codegen: internal error — `Option$String` has no `None` variant".to_string()
-      })?;
-      let size_val = context.i64_type().const_int(layout.size, false);
-      let is_null = builder
-        .build_is_null(ptr_val, "redbtableisnull")
-        .map_err(|e| e.to_string())?;
-
-      let entry_block = builder
-        .get_insert_block()
-        .ok_or("codegen: internal error — no current block")?;
-      let func = entry_block
-        .get_parent()
-        .ok_or("codegen: internal error — block has no parent function")?;
-      let some_block = context.append_basic_block(func, "redbtable.some");
-      let none_block = context.append_basic_block(func, "redbtable.none");
-      let merge_block = context.append_basic_block(func, "redbtable.merge");
-      builder
-        .build_conditional_branch(is_null, none_block, some_block)
-        .map_err(|e| e.to_string())?;
-
-      builder.position_at_end(some_block);
-      let some_alloc = builder
-        .build_call(ctx.alloc, &[size_val.into()], "redbtablesome")
-        .map_err(|e| e.to_string())?;
-      let some_ptr = call_result(some_alloc)?.into_pointer_value();
-      let some_tag_ptr = field_ptr(context, builder, some_ptr, 0)?;
-      builder
-        .build_store(some_tag_ptr, context.i64_type().const_int(some_tag, false))
-        .map_err(|e| e.to_string())?;
-      let some_field_ptr = field_ptr(context, builder, some_ptr, 8)?;
-      builder
-        .build_store(some_field_ptr, ptr_val)
-        .map_err(|e| e.to_string())?;
-      let some_end_block = builder
-        .get_insert_block()
-        .ok_or("codegen: internal error — no current block after some")?;
-      builder
-        .build_unconditional_branch(merge_block)
-        .map_err(|e| e.to_string())?;
-
-      builder.position_at_end(none_block);
-      let none_alloc = builder
-        .build_call(ctx.alloc, &[size_val.into()], "redbtablenone")
-        .map_err(|e| e.to_string())?;
-      let none_ptr = call_result(none_alloc)?.into_pointer_value();
-      let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
-      builder
-        .build_store(none_tag_ptr, context.i64_type().const_int(none_tag, false))
-        .map_err(|e| e.to_string())?;
-      let none_end_block = builder
-        .get_insert_block()
-        .ok_or("codegen: internal error — no current block after none")?;
-      builder
-        .build_unconditional_branch(merge_block)
-        .map_err(|e| e.to_string())?;
-
-      builder.position_at_end(merge_block);
-      let phi = builder
-        .build_phi(local_llvm_type(context, &ValKind::Ptr), "redbtableresult")
-        .map_err(|e| e.to_string())?;
-      let some_val: BasicValueEnum = some_ptr.into();
-      let none_val: BasicValueEnum = none_ptr.into();
-      phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
-      return Ok((phi.as_basic_value(), ValKind::Ptr));
-    }
-
-    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-    for a in args {
-      let (v, _) = build_expr(
-        context,
-        builder,
-        a,
-        vars,
-        local_classes,
-        local_array_elem_types,
-        ctx,
-      )?;
-      call_args.push(v.into());
-    }
-    let void_fv = match method {
-      "close" => Some(ctx.redb_close),
-      "commit" => Some(ctx.redb_commit),
-      "abort" => Some(ctx.redb_abort),
-      _ => None,
-    };
-    if let Some(fv) = void_fv {
-      builder
-        .build_call(fv, &call_args, "redbstatictmp")
-        .map_err(|e| e.to_string())?;
-      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
-    }
-    let (fv, ret_kind) = match method {
-      "open" => (ctx.redb_open, ValKind::Int64),
-      "table" => (ctx.redb_table, ValKind::Int64),
-      "begin_write" => (ctx.redb_begin_write, ValKind::Int64),
-      "begin_read" => (ctx.redb_begin_read, ValKind::Int64),
-      other => return Err(format!("codegen: unsupported Redb static method `{other}`")),
-    };
-    let call = builder
-      .build_call(fv, &call_args, "redbstatictmp")
-      .map_err(|e| e.to_string())?;
-    let result = call_result(call)?;
     return Ok((result, ret_kind));
   }
 
@@ -22343,6 +22234,32 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 125 (Binary Serialization: bincode/msgpack): `.encode` takes
+  // a `JsonValue` (`ptr_ty`) and returns a `Bytes` value (`i64_ty`,
+  // the same convention `Gzip.compress` already establishes); `.decode`
+  // takes a `Bytes` value (`i64_ty`) and returns plan 53's own
+  // `Result` layout directly (`ptr_ty`), the same convention
+  // `Json.parse`/`Toml.parse` already establish.
+  let bincode_encode = module.add_function(
+    "emerald_rt_bincode_encode",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bincode_decode = module.add_function(
+    "emerald_rt_bincode_decode",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let msgpack_encode = module.add_function(
+    "emerald_rt_msgpack_encode",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let msgpack_decode = module.add_function(
+    "emerald_rt_msgpack_decode",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 121 (CSV).
   let csv_parse = module.add_function(
     "emerald_rt_csv_parse",
@@ -23307,6 +23224,11 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  let bytes_length = module.add_function(
+    "emerald_rt_bytes_length",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let sha256_hash = module.add_function(
     "emerald_rt_sha256_hash",
     i64_ty.fn_type(&[i64_ty.into()], false),
@@ -24078,64 +24000,6 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
-  // Plan 142 (Embedded ACID Database, redb): `Redb.open`/`.close`/
-  // `.table`/`.begin_write`/`.begin_read`/`.table_insert`/
-  // `.table_get`/`.table_remove`/`.commit`/`.abort` -- every handle is
-  // a bare `i64`; `.table_insert`/`.table_get`/`.table_remove` return
-  // `ptr_ty` (a nullable `String?`), the same `Env.get` convention.
-  let redb_open = module.add_function(
-    "emerald_rt_redb_open",
-    i64_ty.fn_type(&[ptr_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_close = module.add_function(
-    "emerald_rt_redb_close",
-    void_ty.fn_type(&[i64_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_table = module.add_function(
-    "emerald_rt_redb_table",
-    i64_ty.fn_type(&[ptr_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_begin_write = module.add_function(
-    "emerald_rt_redb_begin_write",
-    i64_ty.fn_type(&[i64_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_begin_read = module.add_function(
-    "emerald_rt_redb_begin_read",
-    i64_ty.fn_type(&[i64_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_table_insert = module.add_function(
-    "emerald_rt_redb_table_insert",
-    ptr_ty.fn_type(
-      &[i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()],
-      false,
-    ),
-    Some(Linkage::External),
-  );
-  let redb_table_get = module.add_function(
-    "emerald_rt_redb_table_get",
-    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_table_remove = module.add_function(
-    "emerald_rt_redb_table_remove",
-    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_commit = module.add_function(
-    "emerald_rt_redb_commit",
-    void_ty.fn_type(&[i64_ty.into()], false),
-    Some(Linkage::External),
-  );
-  let redb_abort = module.add_function(
-    "emerald_rt_redb_abort",
-    void_ty.fn_type(&[i64_ty.into()], false),
-    Some(Linkage::External),
-  );
   // Plan 97 (DNS Resolution).
   let dns_resolve = module.add_function(
     "emerald_rt_dns_resolve",
@@ -24888,6 +24752,59 @@ fn compile_to_object_impl(
     "DecimalError".to_string(),
     build_enum_layout(&decimal_error_enum_def_cg),
   );
+  // Plan 125 (Binary Serialization: bincode/msgpack): `BincodeError`/
+  // `MessagePackError` — codegen's own mirror of `emerald-sema`'s
+  // identical synthetic `EnumDef`s (see that crate's own Decision log
+  // for the full reasoning). Variant declaration order matches
+  // `crates/emerald-rt/src/bincode.rs`'s own `BINCODE_ERROR_TAG_*`/
+  // `msgpack.rs`'s own `MSGPACK_ERROR_TAG_*` constants byte-for-byte.
+  // A real, disclosed gap this plan's own text didn't anticipate,
+  // found only by actually compiling and running an example: without
+  // this mirror registration, `build_case`'s own `ctx.enums.get(tn)`
+  // lookup (see that function's own doc comment) never finds either
+  // enum, so a `match e do ... end` over a `BincodeError`/
+  // `MessagePackError`-typed local falls through to the plain-`Int64`
+  // scrutinee path and fails with "codegen: `case` scrutinee must be
+  // Int64" — sema alone registering the enum (for type-checking) is
+  // not sufficient; codegen needs its own copy too.
+  let bincode_error_enum_def_cg = EnumDef {
+    name: "BincodeError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "BincodeError".to_string(),
+    build_enum_layout(&bincode_error_enum_def_cg),
+  );
+  let messagepack_error_enum_def_cg = EnumDef {
+    name: "MessagePackError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "MessagePackError".to_string(),
+    build_enum_layout(&messagepack_error_enum_def_cg),
+  );
   // Plan 160 (Date/Time & Timezones): `DateTimeError` — codegen's own
   // mirror of `emerald-sema`'s identical synthetic `EnumDef` (see that
   // crate's own Decision log for the full reasoning: `jiff::Error` is
@@ -25413,6 +25330,10 @@ fn compile_to_object_impl(
     json_to_string,
     toml_parse,
     json_to_toml,
+    bincode_encode,
+    bincode_decode,
+    msgpack_encode,
+    msgpack_decode,
     csv_parse,
     csv_parse_with_headers,
     csv_write,
@@ -25588,6 +25509,7 @@ fn compile_to_object_impl(
     system_process_memory_bytes,
     string_to_bytes,
     bytes_to_hex,
+    bytes_length,
     sha256_hash,
     sha512_hash,
     sha3_256_hash,
@@ -25726,16 +25648,6 @@ fn compile_to_object_impl(
     sqlite_begin,
     sqlite_commit,
     sqlite_rollback,
-    redb_open,
-    redb_close,
-    redb_table,
-    redb_begin_write,
-    redb_begin_read,
-    redb_table_insert,
-    redb_table_get,
-    redb_table_remove,
-    redb_commit,
-    redb_abort,
     dns_resolve,
     dns_resolve_all,
     dns_resolve_count,

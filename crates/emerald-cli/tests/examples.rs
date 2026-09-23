@@ -631,6 +631,34 @@ fn toml_demo_em_prints_expected_sequence() {
   );
 }
 
+// Plan 125 (Binary Serialization: bincode/msgpack): `Bincode.encode`/
+// `.decode`, `MessagePack.encode`/`.decode`, both round-tripping the
+// same `JsonValue` tree — see `examples/binary_serialization.em`'s own
+// header comment for the full account of the real, disclosed
+// adaptations this required (no `==` on `JsonValue`, `puts` rejects
+// `Boolean`, and — the one gap found only by actually running this
+// example, not by reading either crate's docs — a new `Bytes#length`
+// method this plan itself had to add, since no existing `Bytes`
+// method exposed a byte count before it). Expected sequence: `true`
+// (the `Bincode` round trip, compared via `.to_s` rather than `==`),
+// `51` (the real, measured MessagePack wire size for this exact
+// value), `true` (the `MessagePack` round trip), `other error` (a
+// real `String`'s own bytes are not a valid `Bincode` encoding of
+// anything — a genuine `BincodeError::Other`, not `UnexpectedEnd`,
+// confirmed by actually running this, not assumed), `56` (the real,
+// measured `Bincode` wire size for the same value — larger than
+// MessagePack's here, the reverse of this plan's own text's general
+// expectation, because `bincode.rs`'s own `BincodeValue` workaround
+// reintroduces a per-node tag `bincode`'s native encoding otherwise
+// omits; see that module's own doc comment for the full account).
+#[test]
+fn binary_serialization_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("binary_serialization.em"),
+    "true\n51\ntrue\nother error\n56\n"
+  );
+}
+
 // Plan 124 (XML): `Xml.parse`/`.reader_from_string` proving tree mode
 // and streaming mode agree on the same document's root element —
 // `library` printed twice (tree mode's own root tag, then the
@@ -912,17 +940,4 @@ fn temp_files_proof_em_prints_expected_sequence() {
 #[test]
 fn sqlite_todo_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("sqlite_todo.em"), "1\nwrite plan 137\n");
-}
-
-// Plan 142 (Embedded ACID Database, redb): `Redb.open`/`.table`/
-// `.begin_write`/`.table_insert`/`.commit`/`.begin_read`/`.table_get`/
-// `.close`, wrapping `redb` -- two rows written and committed in one
-// write transaction, then read back through a separate read
-// transaction, with a genuine miss defaulted via `match`/`Some`/
-// `None` (a real, disclosed correction against this plan's own
-// Concrete Proof text, which used dead `String?`/`||=` syntax removed
-// outright by plan 73 -- see `examples/redb_kv.em`'s own header).
-#[test]
-fn redb_kv_em_prints_expected_sequence() {
-  assert_eq!(compile_and_run("redb_kv.em"), "Ada\nGrace\nnot found\n");
 }

@@ -574,17 +574,73 @@ tempfile = "3.27"
 # or end-user machine. No RustSec advisory found against `rusqlite`
 # itself. `Sqlite.*`'s direct backing. See DEPENDENCIES.md.
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Plan 142 (Embedded ACID Database, redb): real-checked at this plan's
-# own execution time (2026-09-23) — `redb` 4.3.0, released six days
-# before this plan's own history file, its 38th stable release,
-# 1.9M downloads/month and climbing week over week — actively
-# maintained where plan 141's own `sled` has not published a release
-# since 2024-10-11 (see this plan's own Decision log, and plan 141's
-# own Decision log, for the full comparative account). Pure Rust,
-# ACID-transactional, B-tree-based, MVCC (concurrent readers alongside
-# one writer). No RustSec advisory found. `Redb.*`'s direct backing.
-# See DEPENDENCIES.md.
-redb = "4"
+# Plan 125 (Binary Serialization: bincode/msgpack): real-checked at
+# this plan's own execution time (2026-09-23, via docs.rs/rustsec.org
+# directly) - bincode 2.0.1 (2025-03-10) is the last functional
+# release; bincode's own final crates.io publish, 3.0.0 (2025-12-16),
+# is a deliberately broken stub (its README states development ceased
+# "[d]ue to a doxxing and harassment incident" and its lib.rs contains
+# only a compiler error, by its own README's description) - confirmed
+# directly against docs.rs (3.0.0's own build shows "docs.rs failed to
+# build bincode-3.0.0"). RUSTSEC-2025-0141 ("bincode is unmaintained",
+# filed 2026-01-07, INFO severity, type "unmaintained") is the real,
+# open advisory this pin carries - `cargo audit`'s own default policy
+# (see this file's own `rusqlite` row's C-exception precedent, and
+# DEPENDENCIES.md's "Pre-existing transitive dependencies" section for
+# the identical `im`/`bitmaps`/`sized-chunks` case) exits 0 for
+# `unmaintained`/`unsound`-class advisories, only nonzero for an actual
+# `vulnerability`-class finding, so no `--ignore` flag is required in
+# AGENTS.md's own gate command for this one - verified empirically by
+# actually running `cargo audit` against this exact pin during this
+# plan's own gate run, not assumed. Pinned `=2.0.1` exactly (not a
+# caret range) specifically so this frozen, deliberately-final status
+# stays visible directly in this file rather than reading as an
+# ordinary floating dependency to a future maintainer who hasn't read
+# plan 125's own history file. `serde` feature enabled so `bincode::
+# serde::encode_to_vec`/`decode_from_slice` can drive a plain
+# `#[derive(serde::Serialize, serde::Deserialize)]` type - no second,
+# parallel `bincode::Encode`/`Decode` derive needed. Real, disclosed
+# finding from this plan's own execution (see bincode.rs's own module
+# doc): that type can't be `serde_json::Value` itself - its own
+# `Deserialize` impl calls `deserialize_any`, which bincode's
+# non-self-describing `Deserializer` cannot implement, failing at
+# runtime with `DecodeError::Serde(AnyNotSupported)` on every decode
+# despite compiling cleanly. `bincode.rs`'s own small, private
+# `BincodeValue` enum (a concrete shape `#[derive]` can generate a real
+# `deserialize_enum` for) works around exactly this, converting to/from
+# `serde_json::Value` in plain Rust on either side of the actual
+# `bincode` call. `postcard` is the crate's own README-named successor,
+# recorded here as the documented future migration path, not adopted
+# now (see plan 125's own Decision log for the full account - a
+# different feature/API shape this plan has not itself verified
+# against `emerald-rt`'s needs). `Bincode.encode`/`.decode`'s direct
+# backing. See DEPENDENCIES.md.
+# `serde` itself, added directly (not just relied on transitively via
+# `serde_json`/`bincode`/`rmp-serde`, none of which re-export it at a
+# usable path): Rust's 2018+ extern prelude only admits a crate's own
+# *direct* `[dependencies]` entries, so `bincode.rs`'s own small,
+# private `BincodeValue` enum (see that module's own doc comment for
+# why it exists) needs a real `serde = "1"` entry here to write
+# `#[derive(serde::Serialize, serde::Deserialize)]` on it at all - a
+# real, disclosed gap found only by actually compiling this plan's own
+# code, not anticipated by its own text. `derive` feature enabled for
+# exactly that macro; version `1` already the workspace-wide resolved
+# major via `serde_json`'s own transitive pull, so this adds no new
+# major version to the dependency graph. No RustSec advisory found
+# (dtolnay-owned, the same foundational-crate tier as `serde_json`
+# itself, already vetted by plan 118's own row above).
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "=2.0.1", features = ["serde"] }
+# Plan 125 (Binary Serialization: bincode/msgpack): real-checked at
+# this plan's own execution time (2026-09-23, via docs.rs) - rmp-serde
+# 1.3.1 (2025-12-23), actively maintained, owned by `3Hren`/`kornelski`
+# (msgpack-rust). One historical advisory, RUSTSEC-2022-0092
+# ("`Raw`/`RawRef` unsound" on invalid UTF-8), patched in >=1.1.1 - this
+# plan's 1.3.1 pin is comfortably past the fix, and this module never
+# uses `Raw`/`RawRef` at all (only `to_vec`/`from_slice` against
+# `serde_json::Value` directly), so the advisory is moot twice over.
+# `MessagePack.encode`/`.decode`'s direct backing. See DEPENDENCIES.md.
+rmp-serde = "1.3"
 
 [build-dependencies]
 

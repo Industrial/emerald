@@ -4240,6 +4240,67 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 125's Decision log: `Bincode.encode`/`.decode`,
+    // `MessagePack.encode`/`.decode` — the same reserved-namespace
+    // static-call shape `Toml`/`Gzip`/`Deflate`/`Zlib` above use.
+    // `.encode(v: JsonValue): Bytes` never fails (a genuinely
+    // caller-unrecoverable encode failure raises `NativeError`
+    // directly, the same posture `Gzip.compress` already takes, not
+    // folded into this signature's own non-`Result` return type);
+    // `.decode(data: Bytes): Result[JsonValue, BincodeError]` /
+    // `Result[JsonValue, MessagePackError]` — each domain's own typed
+    // error (plan 195's convention, applied fresh here since this
+    // plan lands after plan 195 rather than shipping `Toml.parse`'s
+    // still-pre-195 `Result[JsonValue, String]` shape).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "Bincode" | "MessagePack")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      let error_enum = if recv_name == "Bincode" {
+        "BincodeError"
+      } else {
+        "MessagePackError"
+      };
+      match method.as_str() {
+        "encode" => {
+          check_args(
+            method,
+            args,
+            &[Type::Enum("JsonValue".to_string())],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(bytes_ty)
+        }
+        "decode" => {
+          check_args(
+            method,
+            args,
+            std::slice::from_ref(&bytes_ty),
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(
+            Box::new(Type::Enum("JsonValue".to_string())),
+            Box::new(Type::Enum(error_enum.to_string())),
+          ))
+        }
+        other => Err(Diagnostic::new(
+          format!("{recv_name} has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
     // Plan 123's Decision log (revised, `String`-only scope — see
     // `crates/emerald-rt/src/encoding.rs`'s own module doc): `Base64.
     // encode`/`.decode` and its four-variant-pair siblings, the same
@@ -4548,66 +4609,6 @@ fn infer_expr_type(
         other => {
           return Err(Diagnostic::new(
             format!("Sqlite has no static method `{other}`"),
-            expr.span,
-          ));
-        }
-      };
-      check_args(
-        method,
-        args,
-        &expected_params,
-        env,
-        sigs,
-        classes,
-        self_fields,
-        gctx,
-      )?;
-      Ok(ret)
-    }
-    // Plan 142's Decision log: `Redb.open`/`.close`/`.table`/
-    // `.begin_write`/`.begin_read`/`.table_insert`/`.table_get`/
-    // `.table_remove`/`.commit`/`.abort` — the same reserved-namespace
-    // static-call shape `Sqlite` immediately above uses: every handle
-    // in this surface (database, table schema, write transaction,
-    // read transaction) is a bare `Int64`, never a `Type::Newtype` —
-    // the identical shape `Sqlite`'s own Decision log already chose.
-    // `.table_insert`/`.table_get`/`.table_remove` all return
-    // `Option[String]`, mirroring `redb`'s own real `Option<
-    // AccessGuard<V>>` return shape for `insert`/`get`/`remove` alike
-    // — the previous value for `insert`/`remove`, the current value
-    // for `get` — the same nullable-`String`-to-`Option[String]`
-    // marshaling `Env.get` already establishes. No function in this
-    // surface is `Result`-wrapped — a real `redb` error (a write
-    // attempted through a read transaction, a closed/unknown handle,
-    // a genuine storage error) raises a plain, catchable
-    // `NativeError` instead, `Sqlite`'s own convention.
-    Expr::MethodCall(recv, method, args)
-      if matches!(&recv.node, Expr::Ident(n) if n == "Redb") =>
-    {
-      let option_string = Type::Enum("Option$String".to_string());
-      let (expected_params, ret) = match method.as_str() {
-        "open" => (vec![Type::String], Type::Int64),
-        "close" => (vec![Type::Int64], Type::Void),
-        "table" => (vec![Type::String], Type::Int64),
-        "begin_write" => (vec![Type::Int64], Type::Int64),
-        "begin_read" => (vec![Type::Int64], Type::Int64),
-        "table_insert" => (
-          vec![Type::Int64, Type::Int64, Type::String, Type::String],
-          option_string.clone(),
-        ),
-        "table_get" => (
-          vec![Type::Int64, Type::Int64, Type::String],
-          option_string.clone(),
-        ),
-        "table_remove" => (
-          vec![Type::Int64, Type::Int64, Type::String],
-          option_string.clone(),
-        ),
-        "commit" => (vec![Type::Int64], Type::Void),
-        "abort" => (vec![Type::Int64], Type::Void),
-        other => {
-          return Err(Diagnostic::new(
-            format!("Redb has no static method `{other}`"),
             expr.span,
           ));
         }
@@ -6298,14 +6299,24 @@ fn infer_expr_type(
         // out-of-`.value`-only shape `Regex`'s own methods immediately
         // above establish, just with a single method.
         if name == "Bytes" {
-          if method != "to_hex" {
-            return Err(Diagnostic::new(
-              format!("Bytes has no method `{method}`"),
-              expr.span,
-            ));
-          }
+          // Plan 125's Decision log: `#length` — the plan's own
+          // Concrete Proof needs a real, positive byte count to print
+          // (`puts wire.length`) and no existing `Bytes` method
+          // exposed one; added here alongside `#to_hex` rather than
+          // as a separate dispatch arm, since both share the same
+          // "carved out of `.value`-only" `Bytes` receiver shape.
+          let ret = match method.as_str() {
+            "to_hex" => Type::String,
+            "length" => Type::Int64,
+            other => {
+              return Err(Diagnostic::new(
+                format!("Bytes has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
           check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
-          return Ok(Type::String);
+          return Ok(ret);
         }
         // Plan 109's Decision log: `Sha256Hasher#update`/`#finalize`
         // and `Blake3Hasher#update`/`#finalize` — the identical
@@ -14363,6 +14374,85 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&regex_error_enum_def);
+  // Plan 125's Decision log: `BincodeError`/`MessagePackError` — this
+  // plan lands after plan 195, so it registers a real typed domain
+  // error directly rather than shipping `Toml.parse`'s own pre-195
+  // `Result[JsonValue, String]` shape (a real, disclosed deviation
+  // from this plan's own literal text, which still shows the older
+  // shape). Both enums share the identical two-variant minimum
+  // `RegexError` immediately above already establishes: `UnexpectedEnd`
+  // (a truncated buffer, the routine, always-possible outcome of
+  // decoding corrupted or attacker-controlled bytes) and `Other
+  // (String)` (every other classification either codec's own Rust
+  // error type produces) — see `crates/emerald-rt/src/bincode.rs`'s/
+  // `msgpack.rs`'s own `BINCODE_ERROR_TAG_*`/`MSGPACK_ERROR_TAG_*`
+  // constants for the byte-for-byte matching tag order this mirrors.
+  let bincode_error_enum_def = EnumDef {
+    name: "BincodeError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "BincodeError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &bincode_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&bincode_error_enum_def);
+  let messagepack_error_enum_def = EnumDef {
+    name: "MessagePackError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "MessagePackError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &messagepack_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&messagepack_error_enum_def);
   // Plan 163's Decision log: `BigInt` — a compiler-synthesized,
   // zero-cost `Int64` newtype (the identical "reserved name, zero-cost
   // Int64 representation" shape `Regex`/`XmlReader` above already use),
