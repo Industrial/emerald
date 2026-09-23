@@ -257,6 +257,8 @@ fn set_newtype_underlying(program: &Program) {
     // identical shape.
     "ConfigBuilder",
     "ConfigValue",
+    // Plan 127's Decision log: `IniDocument` -- the identical shape.
+    "IniDocument",
     // Plan 102's Decision log: `WebSocketConnection` -- the identical
     // shape, plan 93's own handle registry backed by a boxed
     // `tungstenite::WebSocket<WsStream>`.
@@ -5570,6 +5572,20 @@ struct Ctx<'a, 'ctx> {
   configvalue_get_string: FunctionValue<'ctx>,
   configvalue_get_int: FunctionValue<'ctx>,
   configvalue_get_bool: FunctionValue<'ctx>,
+  /// Plan 127 (INI Configuration Files) -- `Ini.parse`/`.load`,
+  /// `IniDocument.new`/`#section_count`/`#section_name`/`#key_count`/
+  /// `#key_at`/`#get`/`#set`/`#write`/`#to_string`, wrapping `rust-ini`.
+  ini_parse: FunctionValue<'ctx>,
+  ini_load: FunctionValue<'ctx>,
+  ini_new: FunctionValue<'ctx>,
+  ini_section_count: FunctionValue<'ctx>,
+  ini_section_name: FunctionValue<'ctx>,
+  ini_key_count: FunctionValue<'ctx>,
+  ini_key_at: FunctionValue<'ctx>,
+  ini_get: FunctionValue<'ctx>,
+  ini_set: FunctionValue<'ctx>,
+  ini_write: FunctionValue<'ctx>,
+  ini_to_string: FunctionValue<'ctx>,
   /// Plan 191 (Progress Bars & Terminal Formatting) — `ProgressBar.new`/
   /// `.new_spinner`/`.increment`/`.set_message`/`.finish`,
   /// `Console.styled`/`.is_terminal`, wrapping `indicatif`/`console`.
@@ -7321,6 +7337,22 @@ fn build_expr<'ctx>(
       }
       let call = builder
         .build_call(ctx.configbuilder_new, &[], "configbuildernewtmp")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Int64))
+    }
+    // Plan 127's Decision log: `IniDocument.new()` — the identical
+    // zero-argument carve-out `ConfigBuilder.new()` immediately above
+    // establishes, calling `emerald_rt_ini_new()` for a fresh handle
+    // instead of indexing a non-existent `args[0]`.
+    Expr::New(class_name, args) if class_name == "IniDocument" => {
+      if !args.is_empty() {
+        return Err(format!(
+          "codegen: `IniDocument.new` expects 0 arguments, found {}",
+          args.len()
+        ));
+      }
+      let call = builder
+        .build_call(ctx.ini_new, &[], "ininewtmp")
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Int64))
     }
@@ -9851,6 +9883,102 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Ptr));
     }
+    // Plan 127's Decision log: `IniDocument`'s own eight instance
+    // methods — the identical carved-out-of-newtype shape
+    // `ConfigBuilder`/`ConfigValue` immediately above establish; each
+    // method's own return kind is exactly what `emerald-sema`'s own
+    // `IniDocument` dispatch arm already type-checked it as.
+    if local_classes.get(recv_name).map(String::as_str) == Some("IniDocument") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        arg_vals.push(v.into());
+      }
+      if method == "section_count" {
+        let call = builder
+          .build_call(
+            ctx.ini_section_count,
+            &[recv_val.into()],
+            "inisectioncounttmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Int64));
+      }
+      if method == "section_name" {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+        call_args.extend(arg_vals);
+        let call = builder
+          .build_call(ctx.ini_section_name, &call_args, "inisectionnametmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      if method == "key_count" {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+        call_args.extend(arg_vals);
+        let call = builder
+          .build_call(ctx.ini_key_count, &call_args, "inikeycounttmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Int64));
+      }
+      if method == "key_at" {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+        call_args.extend(arg_vals);
+        let call = builder
+          .build_call(ctx.ini_key_at, &call_args, "inikeyattmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      if method == "get" {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+        call_args.extend(arg_vals);
+        let call = builder
+          .build_call(ctx.ini_get, &call_args, "inigettmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      if method == "set" {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+        call_args.extend(arg_vals);
+        builder
+          .build_call(ctx.ini_set, &call_args, "inisettmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      if method == "write" {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+        call_args.extend(arg_vals);
+        let call = builder
+          .build_call(ctx.ini_write, &call_args, "iniwritetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      if method == "to_string" {
+        let call = builder
+          .build_call(ctx.ini_to_string, &[recv_val.into()], "initostringtmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      return Err(format!(
+        "codegen: unsupported IniDocument method `{method}`"
+      ));
+    }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
     if local_classes.get(recv_name).map(String::as_str) == Some("UdpSocket") {
@@ -10668,6 +10796,35 @@ fn build_method_call<'ctx>(
     )?;
     let call = builder
       .build_call(ctx.regex_compile, &[v.into()], "regexcompiletmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 127's Decision log: `Ini.parse(s)`/`Ini.load(path)` — the
+  // same reserved-namespace static-call shape `Regex.compile`
+  // immediately above uses. `emerald_rt_ini_parse`/`_load` already
+  // return plan 53's own `Result` layout directly (a heap pointer),
+  // zero additional marshaling.
+  if recv_name == "Ini" {
+    let fv = match method {
+      "parse" => ctx.ini_parse,
+      "load" => ctx.ini_load,
+      other => return Err(format!("codegen: unsupported Ini static method `{other}`")),
+    };
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `Ini.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(fv, &[v.into()], "initmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
   }
@@ -25496,6 +25653,70 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 127 (INI Configuration Files): `.parse`/`.load` return plan
+  // 53's own `Result` layout (a heap pointer); `.new`/`.section_count`/
+  // `.key_count`/`.set` return a plain `i64`; every other method
+  // returns a heap pointer (`String`/`Option[String]`/`Result`, all
+  // pointer-sized) -- the same shapes `Regex`/`ConfigBuilder` above
+  // already establish.
+  let ini_parse = module.add_function(
+    "emerald_rt_ini_parse",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_load = module.add_function(
+    "emerald_rt_ini_load",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_new = module.add_function(
+    "emerald_rt_ini_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let ini_section_count = module.add_function(
+    "emerald_rt_ini_section_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_section_name = module.add_function(
+    "emerald_rt_ini_section_name",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_key_count = module.add_function(
+    "emerald_rt_ini_key_count",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_key_at = module.add_function(
+    "emerald_rt_ini_key_at",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_get = module.add_function(
+    "emerald_rt_ini_get",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_set = module.add_function(
+    "emerald_rt_ini_set",
+    i64_ty.fn_type(
+      &[i64_ty.into(), ptr_ty.into(), ptr_ty.into(), ptr_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let ini_write = module.add_function(
+    "emerald_rt_ini_write",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ini_to_string = module.add_function(
+    "emerald_rt_ini_to_string",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 191 (Progress Bars & Terminal Formatting): `ProgressBar.new`/
   // `.new_spinner`/`.increment`/`.set_message`/`.finish`, `Console.
   // styled`/`.is_terminal`, wrapping `indicatif`/`console` -- the same
@@ -26526,6 +26747,33 @@ fn compile_to_object_impl(
     "RegexError".to_string(),
     build_enum_layout(&regex_error_enum_def_cg),
   );
+  // Plan 127: `IniError` -- codegen's own mirror of `emerald-sema`'s
+  // identical synthetic `EnumDef` (see that crate's own Decision log).
+  // Variant declaration order matches `crates/emerald-rt/src/ini.rs`'s
+  // own `INI_ERROR_TAG_*` constants byte-for-byte.
+  let ini_error_enum_def_cg = EnumDef {
+    name: "IniError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Io".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "IniError".to_string(),
+    build_enum_layout(&ini_error_enum_def_cg),
+  );
   // Plan 184: `TotpError` -- codegen's own mirror of `emerald-sema`'s
   // identical synthetic `EnumDef` (see that crate's own Decision log).
   // Variant declaration order matches `crates/emerald-rt/src/totp.rs`'s
@@ -27184,6 +27432,12 @@ fn compile_to_object_impl(
   // ConfigBuilder.new()` and `cfg: ConfigValue = builder.build()`.
   newtypes.insert("ConfigBuilder".to_string());
   newtypes.insert("ConfigValue".to_string());
+  // Plan 127's Decision log: `IniDocument` -- added here as well as
+  // `NEWTYPE_UNDERLYING` above, the identical `ConfigBuilder`/
+  // `ConfigValue` gap-avoidance immediately above: this plan's own
+  // Concrete Proof `Let`-binds `builder: IniDocument = IniDocument.
+  // new()`.
+  newtypes.insert("IniDocument".to_string());
   // Plan 116's Decision log: `X509KeyPair`/`X509Certificate` -- added
   // here as well as `NEWTYPE_UNDERLYING` above, the identical
   // `CliParser`/`CliParseResult` gap-avoidance immediately above: this
@@ -27587,6 +27841,17 @@ fn compile_to_object_impl(
     configvalue_get_string,
     configvalue_get_int,
     configvalue_get_bool,
+    ini_parse,
+    ini_load,
+    ini_new,
+    ini_section_count,
+    ini_section_name,
+    ini_key_count,
+    ini_key_at,
+    ini_get,
+    ini_set,
+    ini_write,
+    ini_to_string,
     progressbar_new,
     progressbar_new_spinner,
     progressbar_increment,

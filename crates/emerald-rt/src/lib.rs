@@ -210,6 +210,15 @@ mod http2_client;
 mod http_client;
 mod http_server;
 mod humantime;
+// Plan 127 (INI Configuration Files) — `Ini.parse`/`.load`,
+// `IniDocument.new`/`#section_count`/`#section_name`/`#key_count`/
+// `#key_at`/`#get`/`#set`/`#write`/`#to_string`, wrapping `rust-ini` —
+// see `ini.rs`'s own module doc. Named `inis`, not `ini` — this
+// crate's own `mod ini` would shadow the external `ini` crate this
+// module wraps, the identical collision `csvs`/`tomls`/`urls`/
+// `charset` already hit and disclosed.
+#[path = "ini.rs"]
+mod inis;
 mod json;
 // Plan 114 (JSON Web Tokens) — `Jwt.encode_hs256`/`.verify_hs256`/
 // `.encode_rs256`/`.verify_rs256`/`.encode_es256`/`.verify_es256`/
@@ -4438,6 +4447,107 @@ pub unsafe extern "C" fn emerald_rt_totp_check_current(id: i64, code: *const c_c
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_totp_provisioning_uri(id: i64) -> *const c_char {
   catch_and_raise(move || totp::totp_provisioning_uri(id))
+}
+
+// Plan 127 (INI Configuration Files): `Ini.parse`/`.load`,
+// `IniDocument.new`/`#section_count`/`#section_name`/`#key_count`/
+// `#key_at`/`#get`/`#set`/`#write`/`#to_string` -- see `ini.rs`'s own
+// module doc.
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_parse(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || inis::ini_parse(s))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_load(path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || inis::ini_load(path))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_new() -> i64 {
+  catch_and_raise(inis::ini_new)
+}
+
+/// # Safety
+/// `id` must be a handle `emerald_rt_ini_parse`/`_load`/`_new` actually returned.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_section_count(id: i64) -> i64 {
+  catch_and_raise(move || inis::ini_section_count(id))
+}
+
+/// # Safety
+/// `id` must be a live `IniDocument` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_section_name(id: i64, i: i64) -> *const c_char {
+  catch_and_raise(move || inis::ini_section_name(id, i))
+}
+
+/// # Safety
+/// `id` must be a live `IniDocument` handle. `section`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_key_count(id: i64, section: *const c_char) -> i64 {
+  catch_and_raise(move || inis::ini_key_count(id, section))
+}
+
+/// # Safety
+/// `id` must be a live `IniDocument` handle. `section`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_key_at(
+  id: i64,
+  section: *const c_char,
+  i: i64,
+) -> *const c_char {
+  catch_and_raise(move || inis::ini_key_at(id, section, i))
+}
+
+/// # Safety
+/// `id` must be a live `IniDocument` handle. `section`/`key`, if
+/// non-null, must each point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_get(
+  id: i64,
+  section: *const c_char,
+  key: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || inis::ini_get(id, section, key))
+}
+
+/// # Safety
+/// `id` must be a live `IniDocument` handle. `section`/`key`/`value`,
+/// if non-null, must each point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_set(
+  id: i64,
+  section: *const c_char,
+  key: *const c_char,
+  value: *const c_char,
+) -> i64 {
+  catch_and_raise(move || inis::ini_set(id, section, key, value))
+}
+
+/// # Safety
+/// `id` must be a live `IniDocument` handle. `path`, if non-null, must
+/// point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_write(id: i64, path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || inis::ini_write(id, path))
+}
+
+/// # Safety
+/// `id` must be a live `IniDocument` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ini_to_string(id: i64) -> *const c_char {
+  catch_and_raise(move || inis::ini_to_string(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

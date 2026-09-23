@@ -914,6 +914,18 @@ oid-registry = "0.8"
 # `#check_current`/`#provisioning_uri`'s direct backing. See
 # DEPENDENCIES.md.
 totp-rs = { version = "6.0", features = ["gen_secret", "otpauth"] }
+# Plan 127: real-checked at this plan's own authoring time (2026-09-21)
+# via lib.rs since crates.io itself blocks bot access — `rust-ini`
+# (crates.io package name `rust-ini`, import/library name `ini`) is
+# the actively maintained, dominant INI-parsing crate (0.21.3,
+# published 2025-08-30, 8.06M downloads/month, 856 dependent crates,
+# 45 contributors, owned by zonyitoo). No RustSec advisory. Pure Rust
+# (depends on `ordered-multimap`/`cfg-if` internally), clearing plan
+# 95's own pure-Rust-first preference outright. `Ini.parse`/`.load`,
+# `IniDocument#section_count`/`#section_name`/`#key_count`/`#key_at`/
+# `#get`, `IniDocument.new`/`#set`/`#write`/`#to_string`. See
+# crates/emerald-rt/DEPENDENCIES.md for this row's ledger entry.
+ini = { package = "rust-ini", version = "0.21" }
 
 [build-dependencies]
 

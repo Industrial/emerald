@@ -1460,3 +1460,21 @@ fn x509_proof_em_prints_expected_sequence() {
      invalid certificate\n"
   );
 }
+
+// Plan 127 (INI Configuration Files): `Ini.parse` against a real
+// multi-section document, `IniDocument#get`/`#key_count` reading two
+// keys back by name (the Ok path); a genuinely malformed document (an
+// unterminated `[section` header) landing on a real, typed `IniError::
+// Syntax`, `rust-ini`'s own real parser output, not a simulated
+// failure; and the write API round trip (`IniDocument.new`/`#set`/
+// `#write` through a real `Tempfile`, then `Ini.load`/`#get` reading
+// it back). `Ini.parse`/`.load` return `Result[IniDocument, IniError]`
+// from this plan's own first EXECUTE (plan 195's Typed Domain Errors
+// convention applied fresh, unlike `Toml.parse`, which predates it).
+#[test]
+fn ini_demo_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("ini_demo.em"),
+    "localhost\n8080\n2\n3:1 expecting \"[Some(']')]\" but found EOF.\ndemo\n"
+  );
+}

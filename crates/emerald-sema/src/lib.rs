@@ -3958,6 +3958,27 @@ fn infer_expr_type(
           Box::new(Type::Int64),
         ));
       }
+      // Plan 127's Decision log: `IniDocument.new()` — the identical
+      // zero-argument carve-out `ConfigBuilder.new()` immediately
+      // above establishes, for the identical reason (`IniDocument` is
+      // registered as a `NativeHandle`-style `Int64` newtype purely
+      // for its zero-cost representation, never constructed by
+      // wrapping a given underlying value).
+      if class_name == "IniDocument" {
+        if !args.is_empty() {
+          return Err(Diagnostic::new(
+            format!(
+              "`IniDocument.new` takes no arguments, found {}",
+              args.len()
+            ),
+            expr.span,
+          ));
+        }
+        return Ok(Type::Newtype(
+          "IniDocument".to_string(),
+          Box::new(Type::Int64),
+        ));
+      }
       // Plan 191's Decision log: `ProgressBar.new(total)` — the
       // identical real-argument carve-out `CliParser.new(name,
       // version)` above establishes, just with one `Int64` argument
@@ -4726,6 +4747,42 @@ fn infer_expr_type(
         Box::new(Type::Newtype("Regex".to_string(), Box::new(Type::Int64))),
         Box::new(Type::Enum("RegexError".to_string())),
       ))
+    }
+    // Plan 127's Decision log: `Ini.parse(s)`/`Ini.load(path)` — the
+    // same reserved-namespace static-call shape `Regex.compile`
+    // immediately above uses. Every OTHER `IniDocument` method is an
+    // instance method on an already-parsed/constructed `IniDocument`-
+    // newtype-typed receiver, dispatched by the `Type::Newtype` arm
+    // further below, never reached from here. This plan lands after
+    // plan 195, so it registers `Result[IniDocument, IniError]`
+    // directly, never a `Result[IniDocument, String]` shape.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Ini") =>
+    {
+      match method.as_str() {
+        "parse" | "load" => {
+          check_args(
+            method,
+            args,
+            &[Type::String],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(Type::Result(
+            Box::new(Type::Newtype(
+              "IniDocument".to_string(),
+              Box::new(Type::Int64),
+            )),
+            Box::new(Type::Enum("IniError".to_string())),
+          ))
+        }
+        other => Err(Diagnostic::new(
+          format!("Ini has no static method `{other}`"),
+          expr.span,
+        )),
+      }
     }
     // Plan 184's Decision log: `Totp.generate_secret()` — the same
     // reserved-namespace static-call shape `Regex.compile` immediately
@@ -7059,6 +7116,48 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("ConfigValue has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 127's Decision log: `IniDocument`'s own eight instance
+        // methods — the identical carved-out-of-`.value`-only shape
+        // `Regex`/`ConfigBuilder`/`ConfigValue` above establish.
+        if name == "IniDocument" {
+          let option_string = Type::Enum("Option$String".to_string());
+          let (expected_params, ret) = match method.as_str() {
+            "section_count" => (vec![], Type::Int64),
+            "section_name" => (vec![Type::Int64], Type::String),
+            "key_count" => (vec![Type::String], Type::Int64),
+            "key_at" => (vec![Type::String, Type::Int64], Type::String),
+            "get" => (vec![Type::String, Type::String], option_string),
+            "set" => (
+              vec![Type::String, Type::String, Type::String],
+              Type::Void,
+            ),
+            "write" => (
+              vec![Type::String],
+              Type::Result(
+                Box::new(Type::Void),
+                Box::new(Type::Enum("IniError".to_string())),
+              ),
+            ),
+            "to_string" => (vec![], Type::String),
+            other => {
+              return Err(Diagnostic::new(
+                format!("IniDocument has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -14976,6 +15075,28 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
       newtype_underlying: Some(Type::Int64),
     },
   );
+  // Plan 127's Decision log: `IniDocument` — the identical "reserved
+  // name, zero-cost `Int64` handle" shape `ConfigBuilder`/`ConfigValue`
+  // immediately above already use, backed by plan 93's own
+  // `crate::handle` registry (a boxed `ini::Ini`). `IniDocument.new()`
+  // is carved out of the ordinary single-argument newtype constructor
+  // in the `Expr::New` arm above (zero arguments, the identical
+  // `ConfigBuilder.new()` shape); every other method is carved out of
+  // the ordinary newtype `.value`-only restriction.
+  classes.insert(
+    "IniDocument".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
   // Plan 109's Decision log: `Bytes` — a compiler-synthesized `Int64`
   // newtype the identical "reserved name, zero-cost handle" shape
   // `Regex`/`NativeHandle`/`LogFields` above already use, but backed
@@ -15505,6 +15626,53 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&regex_error_enum_def);
+  // Plan 127's Decision log: `IniError` — this plan lands after plan
+  // 195, so it registers a real typed domain error directly, the same
+  // registration shape `JsonError` above uses, rather than shipping
+  // plan 127's own original `Result[IniDocument, String]` text.
+  // Variant declaration order matches `crates/emerald-rt/src/ini.rs`'s
+  // own `INI_ERROR_TAG_*` constants byte-for-byte — `Syntax`=0,
+  // `Io`=1, `Other`=2. `Syntax`/`Io` are two genuinely separate,
+  // real-checked upstream failure stages (`rust-ini` 0.21.3's own
+  // `ini::ParseError`/`ini::Error::Io`, verified against the actually-
+  // vendored source, not invented) — see `ini.rs`'s own doc comment.
+  let ini_error_enum_def = EnumDef {
+    name: "IniError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Io".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "IniError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &ini_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&ini_error_enum_def);
   // Plan 125's Decision log: `BincodeError`/`MessagePackError` — this
   // plan lands after plan 195, so it registers a real typed domain
   // error directly rather than shipping `Toml.parse`'s own pre-195
