@@ -873,3 +873,19 @@ fn temp_files_proof_em_prints_expected_sequence() {
     "temporary contents\ntrue\nfalse\ntrue\nfalse\n"
   );
 }
+
+// Plan 137 (SQLite): `Sqlite.open_memory`/`.execute_direct`/`.prepare`/
+// `.bind_string`/`.bind_int64`/`.execute`/`.query`/`.step`/
+// `.column_int64`/`.column_string`/`.close`, wrapping `rusqlite`
+// (`features = ["bundled"]`, this batch's one deliberate C-binding
+// exception) — an in-memory database created, a row inserted through
+// a bound parameter, and read back through a prepared, bound
+// `SELECT`, matching this plan's own Concrete Proof verbatim (see
+// `examples/sqlite_todo.em`).
+#[test]
+fn sqlite_todo_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("sqlite_todo.em"),
+    "1\nwrite plan 137\n"
+  );
+}

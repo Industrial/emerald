@@ -5465,6 +5465,34 @@ struct Ctx<'a, 'ctx> {
   tempdir_create: FunctionValue<'ctx>,
   tempdir_path: FunctionValue<'ctx>,
   tempdir_close: FunctionValue<'ctx>,
+  /// Plan 137 (SQLite) — `Sqlite.open`/`.open_memory`/`.close`/
+  /// `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
+  /// `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
+  /// `.column_string`/`.column_int64`/`.column_float64`/`.begin`/
+  /// `.commit`/`.rollback`, wrapping `rusqlite`. Every handle
+  /// (connection, prepared statement, result cursor) is a bare
+  /// `i64` — this plan's own Decision log deliberately never
+  /// introduces a `Type::Newtype` for any of them, so no separate
+  /// instance-method-on-newtype-receiver dispatch arm exists
+  /// anywhere else in this file, unlike `Regex`/`XmlReader`.
+  sqlite_open: FunctionValue<'ctx>,
+  sqlite_open_memory: FunctionValue<'ctx>,
+  sqlite_close: FunctionValue<'ctx>,
+  sqlite_execute_direct: FunctionValue<'ctx>,
+  sqlite_prepare: FunctionValue<'ctx>,
+  sqlite_bind_string: FunctionValue<'ctx>,
+  sqlite_bind_int64: FunctionValue<'ctx>,
+  sqlite_bind_float64: FunctionValue<'ctx>,
+  sqlite_bind_null: FunctionValue<'ctx>,
+  sqlite_execute: FunctionValue<'ctx>,
+  sqlite_query: FunctionValue<'ctx>,
+  sqlite_step: FunctionValue<'ctx>,
+  sqlite_column_string: FunctionValue<'ctx>,
+  sqlite_column_int64: FunctionValue<'ctx>,
+  sqlite_column_float64: FunctionValue<'ctx>,
+  sqlite_begin: FunctionValue<'ctx>,
+  sqlite_commit: FunctionValue<'ctx>,
+  sqlite_rollback: FunctionValue<'ctx>,
   /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
   /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
   dns_resolve: FunctionValue<'ctx>,
@@ -10964,6 +10992,81 @@ fn build_method_call<'ctx>(
       .build_call(fv, &call_args, "xmlstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 137's Decision log: `Sqlite.open`/`.open_memory`/`.close`/
+  // `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
+  // `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
+  // `.column_string`/`.column_int64`/`.column_float64`/`.begin`/
+  // `.commit`/`.rollback` — every handle (connection, prepared
+  // statement, result cursor) crosses as a bare `i64`, never a
+  // `Type::Newtype` receiver, so this whole surface is one reserved-
+  // namespace static-call block, the same shape `Csv`/`Xml` above use,
+  // with no separate `local_classes.get(recv_name) == Some("Sqlite")`
+  // instance-method arm needed anywhere else in this file. `.step`
+  // narrows its `i64` (0/1) ABI value back into a real `i1`, the same
+  // "widen the other direction" trick `Regex#is_match` above already
+  // establishes.
+  if recv_name == "Sqlite" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let void_fv = match method {
+      "close" => Some(ctx.sqlite_close),
+      "execute_direct" => Some(ctx.sqlite_execute_direct),
+      "bind_string" => Some(ctx.sqlite_bind_string),
+      "bind_int64" => Some(ctx.sqlite_bind_int64),
+      "bind_float64" => Some(ctx.sqlite_bind_float64),
+      "bind_null" => Some(ctx.sqlite_bind_null),
+      "begin" => Some(ctx.sqlite_begin),
+      "commit" => Some(ctx.sqlite_commit),
+      "rollback" => Some(ctx.sqlite_rollback),
+      _ => None,
+    };
+    if let Some(fv) = void_fv {
+      builder
+        .build_call(fv, &call_args, "sqlitestatictmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
+    let (fv, ret_kind) = match method {
+      "open" => (ctx.sqlite_open, ValKind::Int64),
+      "open_memory" => (ctx.sqlite_open_memory, ValKind::Int64),
+      "prepare" => (ctx.sqlite_prepare, ValKind::Int64),
+      "execute" => (ctx.sqlite_execute, ValKind::Int64),
+      "query" => (ctx.sqlite_query, ValKind::Int64),
+      "step" => (ctx.sqlite_step, ValKind::Int64),
+      "column_string" => (ctx.sqlite_column_string, ValKind::Str),
+      "column_int64" => (ctx.sqlite_column_int64, ValKind::Int64),
+      "column_float64" => (ctx.sqlite_column_float64, ValKind::Float64),
+      other => return Err(format!("codegen: unsupported Sqlite static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "sqlitestatictmp")
+      .map_err(|e| e.to_string())?;
+    let result = call_result(call)?;
+    if method == "step" {
+      let is_true = builder
+        .build_int_compare(
+          IntPredicate::NE,
+          result.into_int_value(),
+          context.i64_type().const_int(0, false),
+          "sqlitestepbool",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((is_true.into(), ValKind::Bool));
+    }
+    return Ok((result, ret_kind));
   }
 
   // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
@@ -23651,6 +23754,105 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 137 (SQLite): `Sqlite.open`/`.open_memory`/`.close`/
+  // `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
+  // `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
+  // `.column_string`/`.column_int64`/`.column_float64`/`.begin`/
+  // `.commit`/`.rollback` -- every handle is a bare `i64`; `.column_
+  // string` returns `ptr_ty` (a `String`), `.column_float64` returns
+  // `f64_ty`, `.step` returns a plain `i64_ty` (0/1), narrowed to a
+  // real `i1` at its own call site, the same `Regex#is_match`
+  // convention.
+  let sqlite_open = module.add_function(
+    "emerald_rt_sqlite_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_open_memory = module.add_function(
+    "emerald_rt_sqlite_open_memory",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let sqlite_close = module.add_function(
+    "emerald_rt_sqlite_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_execute_direct = module.add_function(
+    "emerald_rt_sqlite_execute_direct",
+    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_prepare = module.add_function(
+    "emerald_rt_sqlite_prepare",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_bind_string = module.add_function(
+    "emerald_rt_sqlite_bind_string",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_bind_int64 = module.add_function(
+    "emerald_rt_sqlite_bind_int64",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_bind_float64 = module.add_function(
+    "emerald_rt_sqlite_bind_float64",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into(), f64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_bind_null = module.add_function(
+    "emerald_rt_sqlite_bind_null",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_execute = module.add_function(
+    "emerald_rt_sqlite_execute",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_query = module.add_function(
+    "emerald_rt_sqlite_query",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_step = module.add_function(
+    "emerald_rt_sqlite_step",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_column_string = module.add_function(
+    "emerald_rt_sqlite_column_string",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_column_int64 = module.add_function(
+    "emerald_rt_sqlite_column_int64",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_column_float64 = module.add_function(
+    "emerald_rt_sqlite_column_float64",
+    f64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_begin = module.add_function(
+    "emerald_rt_sqlite_begin",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_commit = module.add_function(
+    "emerald_rt_sqlite_commit",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let sqlite_rollback = module.add_function(
+    "emerald_rt_sqlite_rollback",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 97 (DNS Resolution).
   let dns_resolve = module.add_function(
     "emerald_rt_dns_resolve",
@@ -25221,6 +25423,24 @@ fn compile_to_object_impl(
     tempdir_create,
     tempdir_path,
     tempdir_close,
+    sqlite_open,
+    sqlite_open_memory,
+    sqlite_close,
+    sqlite_execute_direct,
+    sqlite_prepare,
+    sqlite_bind_string,
+    sqlite_bind_int64,
+    sqlite_bind_float64,
+    sqlite_bind_null,
+    sqlite_execute,
+    sqlite_query,
+    sqlite_step,
+    sqlite_column_string,
+    sqlite_column_int64,
+    sqlite_column_float64,
+    sqlite_begin,
+    sqlite_commit,
+    sqlite_rollback,
     dns_resolve,
     dns_resolve_all,
     dns_resolve_count,

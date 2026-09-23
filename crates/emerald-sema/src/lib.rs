@@ -4498,6 +4498,72 @@ fn infer_expr_type(
         )),
       }
     }
+    // Plan 137's Decision log: `Sqlite.open`/`.open_memory`/`.close`/
+    // `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
+    // `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
+    // `.column_string`/`.column_int64`/`.column_float64`/`.begin`/
+    // `.commit`/`.rollback` — the same reserved-namespace static-call
+    // shape `Xml`/`Env`/`Regex.compile` above use, but EVERY handle in
+    // this surface (connection, prepared statement, result cursor) is
+    // a bare `Int64`, never a `Type::Newtype` — this plan's own
+    // Decision log chose that shape deliberately, so no instance-
+    // method-on-newtype-receiver dispatch (the `Type::Newtype` arm
+    // further below `Regex`/`XmlReader`/`Tempfile`/`Tempdir` use) is
+    // needed anywhere in this surface at all; every operation here is
+    // a `Sqlite.<method>(handle, ...)` static call taking the handle
+    // as an ordinary leading `Int64` argument. No function in this
+    // surface is `Result`-wrapped — a real `rusqlite::Error`
+    // (constraint violation, malformed SQL, a closed/unknown handle)
+    // raises a plain, catchable `NativeError` instead, the same
+    // convention `Tempfile.create`/`File`'s own functions/plan 145's
+    // `Process.run` already use.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Sqlite") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "open" => (vec![Type::String], Type::Int64),
+        "open_memory" => (vec![], Type::Int64),
+        "close" => (vec![Type::Int64], Type::Void),
+        "execute_direct" => (vec![Type::Int64, Type::String], Type::Void),
+        "prepare" => (vec![Type::Int64, Type::String], Type::Int64),
+        "bind_string" => (
+          vec![Type::Int64, Type::Int64, Type::String],
+          Type::Void,
+        ),
+        "bind_int64" => (vec![Type::Int64, Type::Int64, Type::Int64], Type::Void),
+        "bind_float64" => (
+          vec![Type::Int64, Type::Int64, Type::Float64],
+          Type::Void,
+        ),
+        "bind_null" => (vec![Type::Int64, Type::Int64], Type::Void),
+        "execute" => (vec![Type::Int64], Type::Int64),
+        "query" => (vec![Type::Int64], Type::Int64),
+        "step" => (vec![Type::Int64], Type::Boolean),
+        "column_string" => (vec![Type::Int64, Type::Int64], Type::String),
+        "column_int64" => (vec![Type::Int64, Type::Int64], Type::Int64),
+        "column_float64" => (vec![Type::Int64, Type::Int64], Type::Float64),
+        "begin" => (vec![Type::Int64], Type::Void),
+        "commit" => (vec![Type::Int64], Type::Void),
+        "rollback" => (vec![Type::Int64], Type::Void),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Sqlite has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 109's Decision log: `Sha256.hash`/`Sha512.hash`/`Sha3_256.
     // hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — six reserved-
     // namespace static intrinsics, identically shaped to `Regex.

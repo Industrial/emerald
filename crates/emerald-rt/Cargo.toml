@@ -539,6 +539,30 @@ zip = { version = "8.6", default-features = false, features = [
 # (`tempfile::NamedTempFile`/`tempfile::TempDir` respectively). See
 # DEPENDENCIES.md.
 tempfile = "3.27"
+# Plan 137 (SQLite): real-checked at this plan's own execution time
+# (2026-09-23, via lib.rs) — rusqlite 0.40.2 (Aug 2026), #1 in
+# crates.io's Database interfaces category, 13M downloads/month, an
+# explicit `maintenance = { status = "actively-developed" }` badge in
+# its own `Cargo.toml`, 74 releases. Checked directly against `turso`
+# (formerly `limbo`) as the pure-Rust alternative that would avoid a C
+# dependency entirely: still `0.8.0-pre.11` on crates.io as of
+# 2026-09-11, no `1.0.0` ever cut, seven breaking changes across 127
+# published releases, and its own README's installation instructions
+# still pin `turso = "0.4.3"` — inconsistent with its own latest
+# published version, a live sign of a project mid-churn rather than
+# settled. `rusqlite` is therefore this batch's one deliberate,
+# plan-95-sanctioned C-binding exception (see this plan's own history
+# file's Decision log for the full account) — this repo's SQL-database
+# plans otherwise stay pure-Rust (plans 138/139 wrap public wire
+# protocols with mature pure-Rust clients; SQLite has no wire protocol
+# to wrap, only its own C file-format implementation). `features =
+# ["bundled"]`: `libsqlite3-sys` compiles its own vendored SQLite
+# amalgamation via `cc` at this crate's own build time (the identical
+# mechanism plan 91's `build.rs` already uses for `runtime/emerald_
+# runtime.c`) — no system `libsqlite3` package required on the build
+# or end-user machine. No RustSec advisory found against `rusqlite`
+# itself. `Sqlite.*`'s direct backing. See DEPENDENCIES.md.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [build-dependencies]
 

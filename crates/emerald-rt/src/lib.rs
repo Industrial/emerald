@@ -207,6 +207,13 @@ mod process;
 mod random;
 mod regex;
 mod secure_compare;
+// Plan 137 (SQLite) — `Sqlite.open`/`.open_memory`/`.close`/
+// `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
+// `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
+// `.column_string`/`.column_int64`/`.column_float64`/`.begin`/
+// `.commit`/`.rollback`, wrapping `rusqlite` — see `sqlite.rs`'s own
+// module doc.
+mod sqlite;
 mod system;
 // Plan 132 (Tar Archives) -- `Tar.create`/`.extract`, `TarReader.open`/
 // `.next_entry`/`.entry_size`/`.read_entry_data`/`.close`, wrapping
@@ -3302,6 +3309,185 @@ pub unsafe extern "C" fn emerald_rt_tempdir_path(id: i64) -> *const c_char {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_tempdir_close(id: i64) {
   catch_and_raise(move || tempfiles::tempdir_close(id))
+}
+
+// Plan 137 (SQLite): `Sqlite.open`/`.open_memory`/`.close`/
+// `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
+// `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
+// `.column_string`/`.column_int64`/`.column_float64`/`.begin`/
+// `.commit`/`.rollback` -- see `sqlite.rs`'s own module doc.
+
+/// `Sqlite.open(path: String): Int64`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || sqlite::sqlite_open(path))
+}
+
+/// `Sqlite.open_memory(): Int64`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_open_memory() -> i64 {
+  catch_and_raise(sqlite::sqlite_open_memory)
+}
+
+/// `Sqlite.close(conn: Int64): Void`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_close(conn: i64) {
+  catch_and_raise(move || sqlite::sqlite_close(conn))
+}
+
+/// `Sqlite.execute_direct(conn: Int64, sql: String): Void`.
+///
+/// # Safety
+/// `conn` must be a live `Sqlite` connection handle; `sql`, if
+/// non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_execute_direct(conn: i64, sql: *const c_char) {
+  catch_and_raise(move || sqlite::sqlite_execute_direct(conn, sql))
+}
+
+/// `Sqlite.prepare(conn: Int64, sql: String): Int64`.
+///
+/// # Safety
+/// `conn` must be a live `Sqlite` connection handle; `sql`, if
+/// non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_prepare(conn: i64, sql: *const c_char) -> i64 {
+  catch_and_raise(move || sqlite::sqlite_prepare(conn, sql))
+}
+
+/// `Sqlite.bind_string(stmt: Int64, index: Int64, value: String): Void`.
+///
+/// # Safety
+/// `stmt` must be a live `Sqlite` statement handle; `value`, if
+/// non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_bind_string(
+  stmt: i64,
+  index: i64,
+  value: *const c_char,
+) {
+  catch_and_raise(move || sqlite::sqlite_bind_string(stmt, index, value))
+}
+
+/// `Sqlite.bind_int64(stmt: Int64, index: Int64, value: Int64): Void`.
+///
+/// # Safety
+/// `stmt` must be a live `Sqlite` statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_bind_int64(stmt: i64, index: i64, value: i64) {
+  catch_and_raise(move || sqlite::sqlite_bind_int64(stmt, index, value))
+}
+
+/// `Sqlite.bind_float64(stmt: Int64, index: Int64, value: Float64): Void`.
+///
+/// # Safety
+/// `stmt` must be a live `Sqlite` statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_bind_float64(stmt: i64, index: i64, value: f64) {
+  catch_and_raise(move || sqlite::sqlite_bind_float64(stmt, index, value))
+}
+
+/// `Sqlite.bind_null(stmt: Int64, index: Int64): Void`.
+///
+/// # Safety
+/// `stmt` must be a live `Sqlite` statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_bind_null(stmt: i64, index: i64) {
+  catch_and_raise(move || sqlite::sqlite_bind_null(stmt, index))
+}
+
+/// `Sqlite.execute(stmt: Int64): Int64`.
+///
+/// # Safety
+/// `stmt` must be a live `Sqlite` statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_execute(stmt: i64) -> i64 {
+  catch_and_raise(move || sqlite::sqlite_execute(stmt))
+}
+
+/// `Sqlite.query(stmt: Int64): Int64`.
+///
+/// # Safety
+/// `stmt` must be a live `Sqlite` statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_query(stmt: i64) -> i64 {
+  catch_and_raise(move || sqlite::sqlite_query(stmt))
+}
+
+/// `Sqlite.step(cursor: Int64): Boolean`.
+///
+/// # Safety
+/// `cursor` must be a live `Sqlite` cursor handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_step(cursor: i64) -> i64 {
+  catch_and_raise(move || sqlite::sqlite_step(cursor))
+}
+
+/// `Sqlite.column_string(cursor: Int64, col: Int64): String`.
+///
+/// # Safety
+/// `cursor` must be a live `Sqlite` cursor handle, currently
+/// positioned on a real row.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_column_string(cursor: i64, col: i64) -> *const c_char {
+  catch_and_raise(move || sqlite::sqlite_column_string(cursor, col))
+}
+
+/// `Sqlite.column_int64(cursor: Int64, col: Int64): Int64`.
+///
+/// # Safety
+/// `cursor` must be a live `Sqlite` cursor handle, currently
+/// positioned on a real row.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_column_int64(cursor: i64, col: i64) -> i64 {
+  catch_and_raise(move || sqlite::sqlite_column_int64(cursor, col))
+}
+
+/// `Sqlite.column_float64(cursor: Int64, col: Int64): Float64`.
+///
+/// # Safety
+/// `cursor` must be a live `Sqlite` cursor handle, currently
+/// positioned on a real row.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_column_float64(cursor: i64, col: i64) -> f64 {
+  catch_and_raise(move || sqlite::sqlite_column_float64(cursor, col))
+}
+
+/// `Sqlite.begin(conn: Int64): Void`.
+///
+/// # Safety
+/// `conn` must be a live `Sqlite` connection handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_begin(conn: i64) {
+  catch_and_raise(move || sqlite::sqlite_begin(conn))
+}
+
+/// `Sqlite.commit(conn: Int64): Void`.
+///
+/// # Safety
+/// `conn` must be a live `Sqlite` connection handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_commit(conn: i64) {
+  catch_and_raise(move || sqlite::sqlite_commit(conn))
+}
+
+/// `Sqlite.rollback(conn: Int64): Void`.
+///
+/// # Safety
+/// `conn` must be a live `Sqlite` connection handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_sqlite_rollback(conn: i64) {
+  catch_and_raise(move || sqlite::sqlite_rollback(conn))
 }
 
 // Real, expected consequence of introducing genuine cross-archive
