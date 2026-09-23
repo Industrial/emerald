@@ -11344,7 +11344,9 @@ fn build_method_call<'ctx>(
           .map_err(|e| e.to_string())?;
         return Ok((call_result(call)?, ValKind::Ptr));
       }
-      return Err(format!("codegen: unsupported ZonedDateTime method `{method}`"));
+      return Err(format!(
+        "codegen: unsupported ZonedDateTime method `{method}`"
+      ));
     }
     // Plan 32: resolve which ancestor actually *declares* `method` —
     // only the defining class has a compiled `{Class}_{method}` symbol
