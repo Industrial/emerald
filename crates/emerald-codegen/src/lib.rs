@@ -5309,6 +5309,9 @@ struct Ctx<'a, 'ctx> {
   rsa_verify: FunctionValue<'ctx>,
   /// Plan 117 (Constant-Time Comparison) — `SecureCompare.eq`.
   secure_compare: FunctionValue<'ctx>,
+  /// Plan 112 (Password Hashing) — `Password.hash`/`.verify`.
+  password_hash: FunctionValue<'ctx>,
+  password_verify: FunctionValue<'ctx>,
   /// Plan 113 (Cryptographically Secure Random Number Generation) —
   /// `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`.
   random_secure_hex: FunctionValue<'ctx>,
@@ -9698,6 +9701,56 @@ fn build_method_call<'ctx>(
       )
       .map_err(|e| e.to_string())?;
     return Ok((is_true.into(), ValKind::Bool));
+  }
+
+  // Plan 112's Decision log: `Password.hash`/`.verify` — the same
+  // reserved-namespace static-call shape `SecureCompare` immediately
+  // above uses. `.hash` returns a plain `String`; `.verify` returns
+  // `i64` 0/1 from the Rust side, turned into a real `Boolean` here
+  // via the identical `build_int_compare` pattern `SecureCompare.eq`
+  // immediately above already establishes.
+  if recv_name == "Password" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    match method {
+      "hash" => {
+        let call = builder
+          .build_call(ctx.password_hash, &call_args, "passwordhashtmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      "verify" => {
+        let call = builder
+          .build_call(ctx.password_verify, &call_args, "passwordverifytmp")
+          .map_err(|e| e.to_string())?;
+        let result = call_result(call)?;
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "passwordverifybool",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      other => {
+        return Err(format!(
+          "codegen: unsupported Password static method `{other}`"
+        ))
+      }
+    }
   }
 
   // Plan 113's Decision log: `Random.secure_hex`/`.secure_token`/
@@ -22104,6 +22157,19 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 112 (Password Hashing): `Password.hash`/`.verify`. `.hash`
+  // takes one plain `String` and returns one; `.verify` takes two
+  // `String`s and returns `i64` 0/1.
+  let password_hash = module.add_function(
+    "emerald_rt_password_hash",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let password_verify = module.add_function(
+    "emerald_rt_password_verify",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 113 (Cryptographically Secure Random Number Generation):
   // `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`. `.shuffle`
   // takes the array's own bare heap pointer directly.
@@ -23668,6 +23734,8 @@ fn compile_to_object_impl(
     http_request_body,
     kdf_hkdf,
     kdf_pbkdf2,
+    password_hash,
+    password_verify,
     encoding_decode,
     encoding_decode_strict,
     encoding_encode,

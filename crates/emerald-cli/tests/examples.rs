@@ -488,6 +488,19 @@ fn secure_compare_proof_em_prints_expected_sequence() {
   );
 }
 
+// Plan 112 (Password Hashing): `Password.hash`'s own PHC-string
+// output is salted and non-deterministic by design — hashing the same
+// plaintext twice produces two different strings — so only round-trip
+// correctness is checkable here, the same honest constraint plan
+// 111's/113's own randomized-output proofs above already establish.
+#[test]
+fn password_hashing_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("password_hashing_proof.em"),
+    "true\nfalse\ntrue\n"
+  );
+}
+
 // Plan 113 (Cryptographically Secure Random Number Generation):
 // `token`'s own value is randomized by design — only its length
 // (`32` for 16 hex-encoded bytes) is checked.

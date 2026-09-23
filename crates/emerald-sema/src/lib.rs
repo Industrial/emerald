@@ -4677,6 +4677,41 @@ fn infer_expr_type(
       )?;
       Ok(Type::Boolean)
     }
+    // Plan 112's Decision log: `Password.hash`/`.verify` — the same
+    // reserved-namespace static-call shape `SecureCompare` immediately
+    // above uses, deliberately in its own namespace (never `Hash`,
+    // plan 109's general-purpose hashing module) so no plausible
+    // autocomplete path leads a caller from `Hash.sha256(pw)` to a
+    // stored password column. `.hash` takes/returns plain `String`
+    // (no salt parameter — salt generation is automatic and internal,
+    // never Emerald-visible). `.verify` collapses every failure mode
+    // (wrong password, corrupt/unparseable stored hash) to a single
+    // `Boolean`, never a distinguishable error.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Password") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "hash" => (vec![Type::String], Type::String),
+        "verify" => (vec![Type::String, Type::String], Type::Boolean),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Password has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 113's Decision log: `Random.secure_hex`/`.secure_token`/
     // `.int`/`.shuffle` — the same reserved-namespace static-call
     // shape immediately above. `.secure_hex`/`.secure_token` are

@@ -186,6 +186,9 @@ mod kdf;
 mod log;
 mod math;
 mod net;
+// Plan 112 (Password Hashing) — `Password.hash`/`.verify`, wrapping
+// `argon2` — see `password.rs`'s own module doc.
+mod password;
 mod random;
 mod regex;
 mod secure_compare;
@@ -2082,6 +2085,28 @@ pub unsafe extern "C" fn emerald_rt_rsa_verify(
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_secure_compare(a: *const c_char, b: *const c_char) -> i64 {
   catch_and_raise(move || secure_compare::secure_compare(a, b))
+}
+
+// Plan 112 (Password Hashing): `Password.hash`/`.verify` — see
+// `password.rs`'s own module doc.
+
+/// # Safety
+/// `plaintext`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_password_hash(plaintext: *const c_char) -> *const c_char {
+  catch_and_raise(move || password::password_hash(plaintext))
+}
+
+/// # Safety
+/// `plaintext`/`stored_hash`, if non-null, must point to valid,
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_password_verify(
+  plaintext: *const c_char,
+  stored_hash: *const c_char,
+) -> i64 {
+  catch_and_raise(move || password::password_verify(plaintext, stored_hash))
 }
 
 // Plan 113 (Cryptographically Secure Random Number Generation):

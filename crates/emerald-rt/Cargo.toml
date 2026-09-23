@@ -163,6 +163,20 @@ rand = "0.8"
 # runtime dependencies (only a dev-only `rand` 0.8) - the smallest
 # possible addition to this ledger of any crate in the 91-191 batch.
 subtle = "2.6"
+# Plan 112: real-checked at this plan's own authoring time (2026-09-23,
+# via lib.rs) - argon2 0.6.0 (Aug 27, 2026), RustCrypto-owned
+# (`password-hashes` project), MIT/Apache. Implements Argon2d/Argon2i/
+# Argon2id, defaulting to Argon2id per the crate's own docs ("(default)
+# hybrid version combining both Argon2i and Argon2d"), the Password
+# Hashing Competition's own 2015 winner and OWASP's own first-named
+# recommendation. `password-hash` feature pulls in `password-hash` 0.6
+# (the `PasswordHasher`/`PasswordVerifier`/`PasswordHash`/`SaltString`
+# API this plan's own `Password.hash`/`.verify` are built on directly),
+# transitively `base64ct`, `blake2` 0.11, `cpufeatures` - verified
+# against the crate's own docs.rs dependency listing. No RustSec
+# advisory found. `Password.hash`/`.verify`'s direct backing. See
+# DEPENDENCIES.md.
+argon2 = { version = "0.6", features = ["password-hash"] }
 # Plan 98: real-checked at this plan's own authoring time (2026-09-22,
 # via lib.rs) - url 2.5.8 (Jan 5, 2026), servo-owned (the reference-
 # grade WHATWG URL Standard implementation the rest of the Rust web
