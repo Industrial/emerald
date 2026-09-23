@@ -292,6 +292,11 @@ mod x509;
 // `aead.rs`/`url.rs` already hit and disclosed.
 #[path = "toml.rs"]
 mod tomls;
+// Plan 120 (YAML) — `Yaml.parse`/`JsonValue.to_yaml`, wrapping
+// `saphyr` — see `yaml.rs`'s own module doc. No external-crate-name
+// collision to dodge (the wrapped crate is `saphyr`, not `yaml`),
+// unlike `tomls` immediately above.
+mod yaml;
 // Plan 154 (Unicode Normalization & Segmentation) — `String.nfc`/
 // `.nfd`/`.nfkc`/`.nfkd`/`.codepoint_count`/`.grapheme_count`/
 // `.graphemes`/`.words`/`.sentences`/`.grapheme_split_count`/
@@ -3455,6 +3460,23 @@ pub unsafe extern "C" fn emerald_rt_toml_parse(s: *const c_char) -> *mut c_void 
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_json_to_toml(obj: *const c_void) -> *mut c_void {
   catch_and_raise(move || tomls::json_to_toml(obj))
+}
+
+// Plan 120 (YAML): `Yaml.parse`/`JsonValue.to_yaml` — see `yaml.rs`'s
+// own module doc for the full design.
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_yaml_parse(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || yaml::yaml_parse(s))
+}
+
+/// # Safety
+/// `obj` must point to a real `JsonValue` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_json_to_yaml(obj: *const c_void) -> *const c_char {
+  catch_and_raise(move || yaml::json_to_yaml(obj))
 }
 
 /// # Safety

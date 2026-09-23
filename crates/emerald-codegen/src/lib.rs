@@ -5119,6 +5119,9 @@ struct Ctx<'a, 'ctx> {
   /// Plan 119 (TOML) — `Toml.parse`, `JsonValue.to_toml`.
   toml_parse: FunctionValue<'ctx>,
   json_to_toml: FunctionValue<'ctx>,
+  /// Plan 120 (YAML) — `Yaml.parse`, `JsonValue.to_yaml`.
+  yaml_parse: FunctionValue<'ctx>,
+  json_to_yaml: FunctionValue<'ctx>,
   /// Plan 125 (Binary Serialization: bincode/msgpack) — `Bincode.
   /// encode`/`.decode`, `MessagePack.encode`/`.decode`.
   bincode_encode: FunctionValue<'ctx>,
@@ -10241,6 +10244,34 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ValKind::Ptr));
   }
 
+  // Plan 120's Decision log: `Yaml.parse(s)` — the identical shape
+  // `Json.parse`/`Toml.parse` immediately above use;
+  // `emerald_rt_yaml_parse` already returns plan 53's own `Result`
+  // layout directly.
+  if recv_name == "Yaml" {
+    if method != "parse" {
+      return Err(format!(
+        "codegen: unsupported Yaml static method `{method}`"
+      ));
+    }
+    let arg = args
+      .first()
+      .ok_or_else(|| "codegen: `Yaml.parse` expects 1 argument".to_string())?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(ctx.yaml_parse, &[v.into()], "yamlparsetmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
   // Plan 116's Decision log: `X509.generate_self_signed`/`.parse` —
   // the same reserved-namespace static-call shape `Json`/`Toml`
   // above use. `.generate_self_signed` returns a bare NEW `i64`
@@ -13270,7 +13301,9 @@ fn build_method_call<'ctx>(
     // `json_value_enum_def_cg` above), so neither ever appears in
     // `method_owners`. Checked here, before that lookup, the same way
     // `NativeError.message` immediately above is.
-    if class_name == "JsonValue" && (method == "get" || method == "to_s" || method == "to_toml") {
+    if class_name == "JsonValue"
+      && (method == "get" || method == "to_s" || method == "to_toml" || method == "to_yaml")
+    {
       let (recv_val, _) = build_expr(
         context,
         builder,
@@ -13294,6 +13327,15 @@ fn build_method_call<'ctx>(
           .build_call(ctx.json_to_toml, &[recv_val.into()], "jsontotomltmp")
           .map_err(|e| e.to_string())?;
         return Ok((call_result(call)?, ValKind::Ptr));
+      }
+      // Plan 120's Decision log: `.to_yaml` — `emerald_rt_json_to_yaml`
+      // returns a plain `String` directly (`ValKind::Str`, the same
+      // total shape `.to_s` immediately above uses), never a `Result`.
+      if method == "to_yaml" {
+        let call = builder
+          .build_call(ctx.json_to_yaml, &[recv_val.into()], "jsontoyamltmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
       }
       let key_arg = args
         .first()
@@ -23362,6 +23404,17 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 120 (YAML).
+  let yaml_parse = module.add_function(
+    "emerald_rt_yaml_parse",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let json_to_yaml = module.add_function(
+    "emerald_rt_json_to_yaml",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 125 (Binary Serialization: bincode/msgpack): `.encode` takes
   // a `JsonValue` (`ptr_ty`) and returns a `Bytes` value (`i64_ty`,
   // the same convention `Gzip.compress` already establishes); `.decode`
@@ -26258,6 +26311,33 @@ fn compile_to_object_impl(
     "JsonError".to_string(),
     build_enum_layout(&json_error_enum_def_cg),
   );
+  // Plan 120: `YamlError` -- codegen's own mirror of `emerald-sema`'s
+  // identical synthetic `EnumDef` (see that crate's own Decision log).
+  // Variant declaration order matches `crates/emerald-rt/src/yaml.rs`'s
+  // own `YAML_ERROR_TAG_*` constants byte-for-byte.
+  let yaml_error_enum_def_cg = EnumDef {
+    name: "YamlError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "EmptyDocument".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "YamlError".to_string(),
+    build_enum_layout(&yaml_error_enum_def_cg),
+  );
   // Plan 116: `X509Error` -- codegen's own mirror of `emerald-sema`'s
   // identical synthetic `EnumDef` (see that crate's own Decision log).
   // Variant declaration order matches `crates/emerald-rt/src/x509.rs`'s
@@ -27013,6 +27093,8 @@ fn compile_to_object_impl(
     json_to_string,
     toml_parse,
     json_to_toml,
+    yaml_parse,
+    json_to_yaml,
     bincode_encode,
     bincode_decode,
     msgpack_encode,

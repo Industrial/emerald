@@ -347,6 +347,29 @@ pbkdf2 = { version = "0.13", features = ["sha2"] }
 # scope follow-up work, not folded in here. `Toml.parse`/`JsonValue.
 # to_toml`'s direct backing.
 toml = "1"
+# Plan 120: real-checked at this plan's own execution time (2026-09-23,
+# via `cargo info` against the live crates.io registry) — `serde_yaml`
+# (the historically obvious choice) is dead: its own `lib.rs`/README
+# state outright "This project is no longer maintained," final release
+# `0.9.34+deprecated` (2024-03-25). `saphyr` 0.1.0 (published this same
+# month, 2026-09-19) is the real, actively-developed, YAML-1.2-
+# compliant successor — `saphyr-rs`-org owned, 52 contributors, no
+# RustSec advisory found; see this plan's own history file for the
+# full download-trend/maintenance-cadence evidence. Its own API is
+# `Yaml`/`Scalar` (a `serde`-free tagged union, walked directly — the
+# same non-`serde`-derive shape `serde_json::Value`/`toml::Value`
+# already use above), not a `serde`-derive path. `Yaml.parse`/
+# `JsonValue.to_yaml`'s direct backing. See DEPENDENCIES.md.
+saphyr = "0.1"
+# `ordered-float` 5.x — already resolved transitively via `saphyr`'s
+# own dependency graph (`Scalar::FloatingPoint` is an `OrderedFloat<
+# f64>`, not a bare `f64`, verified against the vendored `saphyr` 0.1.0
+# source); promoted to a direct dependency (the identical `bytes`/
+# `futures-core`/`oid-registry` "already resolved, promoted to direct"
+# shape those rows above disclose) so `yaml.rs` can construct a
+# `Scalar::FloatingPoint` directly for `JsonValue.to_yaml`'s own
+# JSON-number-to-YAML-scalar lowering. No RustSec advisory found.
+ordered-float = { version = "5", default-features = false }
 # Plan 121: real-checked at this plan's own authoring time (2026-09-22,
 # via docs.rs) - csv 1.4.0, BurntSushi-owned (the author of ripgrep),
 # the canonical, official Rust CSV reader/writer, #6 in Encoding,

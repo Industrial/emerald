@@ -4335,6 +4335,37 @@ fn infer_expr_type(
         Box::new(Type::String),
       ))
     }
+    // Plan 120's Decision log: `Yaml.parse(s)` — the identical
+    // reserved-namespace static-call shape `Json`/`Toml` immediately
+    // above use, reusing the same `JsonValue` enum as the parsed
+    // dynamic-value representation (no second `YamlValue` enum). This
+    // plan lands after plan 195, so — unlike `Toml.parse` immediately
+    // above — it registers a real typed domain error directly rather
+    // than shipping the older `Result[JsonValue, String]` shape.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Yaml") =>
+    {
+      if method != "parse" {
+        return Err(Diagnostic::new(
+          format!("Yaml has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(
+        method,
+        args,
+        &[Type::String],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(Type::Result(
+        Box::new(Type::Enum("JsonValue".to_string())),
+        Box::new(Type::Enum("YamlError".to_string())),
+      ))
+    }
     // Plan 116's Decision log: `X509.generate_self_signed`/`.parse` —
     // the identical reserved-namespace static-call shape `Json`/
     // `Toml` immediately above use. `.generate_self_signed` takes one
@@ -7770,6 +7801,11 @@ fn infer_expr_type(
           // since not every `JsonValue` a JSON document can produce is
           // representable in TOML (no null literal).
           "to_toml" => (vec![], Type::Result(Box::new(Type::String), Box::new(Type::String))),
+          // Plan 120's Decision log: `.to_yaml` — a total `String`
+          // (unlike `.to_toml` immediately above), since every
+          // `JsonValue` variant, including `JsonNull()`, has a direct
+          // YAML equivalent (YAML's own `null` literal).
+          "to_yaml" => (vec![], Type::String),
           other => {
             return Err(Diagnostic::new(
               format!("JsonValue has no method `{other}`"),
@@ -15252,6 +15288,52 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&json_error_enum_def);
+  // Plan 120's Decision log: `YamlError` — the identical compiler-
+  // synthesized, NON-generic, placeholder-first registration shape
+  // `JsonError` immediately above uses, applied fresh here per this
+  // plan's own instruction (it lands after plan 195, so it registers
+  // a real typed domain error directly rather than shipping `Toml.
+  // parse`'s own pre-195 `Result[JsonValue, String]` shape). Variant
+  // declaration order matches `crates/emerald-rt/src/yaml.rs`'s own
+  // `YAML_ERROR_TAG_*` constants byte-for-byte — `Syntax`=0,
+  // `EmptyDocument`=1, `Other`=2.
+  let yaml_error_enum_def = EnumDef {
+    name: "YamlError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "EmptyDocument".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "YamlError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &yaml_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&yaml_error_enum_def);
   // Plan 116's Decision log: `X509Error` — the identical registration
   // shape `JsonError` immediately above establishes. Variant
   // declaration order matches `crates/emerald-rt/src/x509.rs`'s own

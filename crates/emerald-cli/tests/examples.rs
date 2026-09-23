@@ -666,6 +666,23 @@ fn toml_demo_em_prints_expected_sequence() {
   );
 }
 
+// Plan 120 (YAML): `Yaml.parse`/`JsonValue.to_yaml` against a real
+// block-style document — the Ok path (a found string key, a found
+// array's own .count, and a full .to_yaml round-trip beginning with
+// `saphyr::YamlEmitter`'s own `---` document-start marker) and two
+// negative `Err` proofs (a real YAML indentation error landing on
+// `YamlError::Syntax`, and an empty document stream landing on
+// `YamlError::EmptyDocument`), both typed per plan 195's convention
+// from this plan's own first EXECUTE (unlike `Toml.parse` above,
+// which predates it).
+#[test]
+fn yaml_demo_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("yaml_demo.em"),
+    "Ada\n2\n---\nname: Ada\nlanguages:\n  - math\n  - cs\nactive: true\nsimple key expected at byte 14 line 4 column 1\nempty document\n"
+  );
+}
+
 // Plan 125 (Binary Serialization: bincode/msgpack): `Bincode.encode`/
 // `.decode`, `MessagePack.encode`/`.decode`, both round-tripping the
 // same `JsonValue` tree — see `examples/binary_serialization.em`'s own
