@@ -538,6 +538,17 @@ zip = { version = "8.6", default-features = false, features = [
 # this plan's own Decision log. `Tempfile`/`Tempdir`'s direct backing
 # (`tempfile::NamedTempFile`/`tempfile::TempDir` respectively). See
 # DEPENDENCIES.md.
+# Plan 150 (Path Globbing): real-checked at this plan's own execution
+# time (2026-09-23, via lib.rs — crates.io itself blocks bot access) -
+# glob 0.3.4 (Jul 21, 2026), #16 in lib.rs's own Filesystem category,
+# 46.8M downloads/month, used in 34,614 crates (4,056 directly), owned
+# by `rust-lang-owner` (Alex Crichton/The Rust Project Developers),
+# MIT/Apache, "No runtime deps". `rustsec.org/packages/glob.html`
+# 404s — no advisory ever filed. Implements shell-style `*`/`?`/
+# `[...]`/`**` pattern matching directly against the real filesystem,
+# entirely in Rust (no libc `glob`/`fnmatch` binding). `Glob.glob`/
+# `.glob_count`'s direct backing. Pure Rust. See DEPENDENCIES.md.
+glob = "0.3"
 tempfile = "3.27"
 # Plan 137 (SQLite): real-checked at this plan's own execution time
 # (2026-09-23, via lib.rs) — rusqlite 0.40.2 (Aug 2026), #1 in

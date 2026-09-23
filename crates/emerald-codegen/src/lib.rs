@@ -5242,6 +5242,9 @@ struct Ctx<'a, 'ctx> {
   dir_entries_count: FunctionValue<'ctx>,
   dir_walk: FunctionValue<'ctx>,
   dir_walk_count: FunctionValue<'ctx>,
+  /// Plan 150 (Path Globbing) — `Glob.match`/`.match_count`.
+  glob_match: FunctionValue<'ctx>,
+  glob_match_count: FunctionValue<'ctx>,
   /// Plan 144 (Extended Filesystem Operations) — `Path.exists`/`.is_
   /// file`/`.is_dir`/`.is_symlink`/`.metadata`/`.unix_mode`/`.set_
   /// unix_mode`/`.symlink`/`.read_link`, plus `FileMetadata`'s own
@@ -11570,6 +11573,43 @@ fn build_method_call<'ctx>(
     };
     let call = builder
       .build_call(fv, &call_args, "dirtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 150 (Path Globbing): `Glob.glob`/`.glob_count` — the
+  // identical reserved-namespace hardcoded-arm shape `File`/`Dir`
+  // immediately above use. Real, disclosed finding: the plan's own
+  // literal method name, `Glob.match`/`.match_count`, is unparseable
+  // (`match` is a grammar-reserved keyword) — renamed to `Glob.glob`/
+  // `.glob_count` instead, see `emerald-sema`'s own mirrored arm for
+  // the full account. `.glob` returns an `Array[String]` pointer
+  // built directly by `emerald-rt`'s own `glob.rs` (already carrying
+  // its own `[len: i64][elem...]` header — no extra codegen-side
+  // wrapping needed here, the same `ValKind::Ptr` shape `Dir.entries`/
+  // `.walk` already establish).
+  if recv_name == "Glob" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "glob" => (ctx.glob_match, ValKind::Ptr),
+      "glob_count" => (ctx.glob_match_count, ValKind::Int64),
+      other => return Err(format!("codegen: unsupported Glob method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "globtmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
   }
@@ -22762,6 +22802,20 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 150 (Path Globbing): `Glob.match` returns an `Array[String]`
+  // pointer (built directly by `glob.rs`, already carrying its own
+  // `[len: i64][elem...]` header); `.match_count` returns a plain
+  // `i64`.
+  let glob_match = module.add_function(
+    "emerald_rt_glob_match",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let glob_match_count = module.add_function(
+    "emerald_rt_glob_match_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 144 (Extended Filesystem Operations): `Path.exists`/`.is_
   // file`/`.is_dir`/`.is_symlink` cross as a plain `i64` (0/1),
   // narrowed back to a real `i1` by this call site; `.metadata`/`.
@@ -25247,6 +25301,8 @@ fn compile_to_object_impl(
     dir_entries_count,
     dir_walk,
     dir_walk_count,
+    glob_match,
+    glob_match_count,
     path_exists,
     path_is_file,
     path_is_dir,

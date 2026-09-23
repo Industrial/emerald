@@ -807,6 +807,33 @@ fn extended_filesystem_proof_em_prints_expected_sequence() {
   std::fs::remove_dir_all(&fixture_root).ok();
 }
 
+// Plan 150 (Path Globbing): `Glob.glob`/`.glob_count`, wrapping the
+// `glob` crate for real shell-style `*`/`?`/`[...]`/`**` pattern
+// matching against the real filesystem. Two real, disclosed findings
+// from actually running this plan's own worked example — see
+// `examples/path_globbing_proof.em`'s own header comment for the full
+// account: (1) exactly `extended_filesystem_proof.em`'s own finding
+// (1) for plan 144 — `File.write` never creates missing parent
+// directories, so this test creates the `plan150_demo/nested/`
+// fixture tree itself before running the example; (2) the plan's own
+// literal method name, `Glob.match`/`.match_count`, is unparseable
+// (`match` is grammar-reserved) — renamed to `Glob.glob`/`.glob_count`
+// instead, mirroring the `glob` crate's own `glob::glob` function.
+#[test]
+fn path_globbing_proof_em_prints_expected_sequence() {
+  let fixture_root = std::env::current_dir()
+    .expect("current dir")
+    .join("plan150_demo");
+  std::fs::create_dir_all(fixture_root.join("nested")).expect("create plan150_demo fixture tree");
+
+  assert_eq!(
+    compile_and_run("path_globbing_proof.em"),
+    "2\nplan150_demo/a.txt\nplan150_demo/b.txt\n1\nplan150_demo/nested/d.rs\n"
+  );
+
+  std::fs::remove_dir_all(&fixture_root).ok();
+}
+
 // Plan 132 (Tar Archives): `Tar.create`/`.extract`, `TarReader.open`/
 // `.next_entry`/`.entry_size`/`.read_entry_data`/`.close`, wrapping
 // the pure-Rust `tar` crate — a real create-then-list-then-extract
@@ -884,8 +911,5 @@ fn temp_files_proof_em_prints_expected_sequence() {
 // `examples/sqlite_todo.em`).
 #[test]
 fn sqlite_todo_em_prints_expected_sequence() {
-  assert_eq!(
-    compile_and_run("sqlite_todo.em"),
-    "1\nwrite plan 137\n"
-  );
+  assert_eq!(compile_and_run("sqlite_todo.em"), "1\nwrite plan 137\n");
 }

@@ -5709,6 +5709,50 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 150 (Path Globbing): `Glob.glob`/`.glob_count` — the
+    // identical `File`/`Dir`/`Path` reserved-namespace hardcoded-arm
+    // shape immediately above (`Glob` is never a real `ModuleDef`).
+    // Real, disclosed finding: the plan's own literal method name,
+    // `Glob.match`/`.match_count`, is unparseable — `match` is a
+    // grammar-reserved keyword (the `match X do ... end` pattern-
+    // matching statement), confirmed by actually compiling this
+    // plan's own worked example — the same category of collision
+    // plan 109's own `Sha256.new()` already hit (also reserved),
+    // resolved there by renaming rather than further widening
+    // `CallMethodName` (only ever widened once, for plan 45's own
+    // `.read`); this plan follows that same, more-established
+    // precedent and renames to `Glob.glob`/`.glob_count`, mirroring
+    // the `glob` crate's own `glob::glob` function name directly.
+    // Malformed patterns raise a catchable `NativeError`, not a typed
+    // `Result` — this plan's own Concrete Proof types both methods as
+    // bare `Array[String]`/`Int64`, never `Result[...]`, matching
+    // `Dir.walk`'s own "genuine misuse, not an anticipated Result-
+    // worthy input" precedent for this operation.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Glob") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "glob" => (vec![Type::String], Type::Array(Box::new(Type::String))),
+        "glob_count" => (vec![Type::String], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Glob has no method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 145 (Process Spawning & Control): `Process.run(cmd: String,
     // args: Array[String], argc: Int64, stdin_data: String):
     // ProcessResult` — the identical reserved-namespace hardcoded-arm

@@ -180,6 +180,7 @@ mod dir;
 mod dns;
 mod encoding;
 mod env;
+mod glob;
 // Plan 130 (Gzip/Deflate/Zlib Compression) — `Gzip`/`Deflate`/`Zlib`
 // `.compress`/`.decompress`, `GzipWriter`/`GzipReader` (+ `Deflate`/
 // `Zlib` siblings), wrapping `flate2` — see `gzip.rs`'s own module doc.
@@ -1502,6 +1503,25 @@ pub unsafe extern "C" fn emerald_rt_dir_walk(path: *const c_char) -> *mut c_void
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_dir_walk_count(path: *const c_char) -> i64 {
   catch_and_raise(move || dir::dir_walk_count(path))
+}
+
+// Plan 150 (Path Globbing): `Glob.glob`/`.glob_count` — see
+// `glob.rs`'s own module doc.
+
+/// # Safety
+/// `pattern`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_glob_match(pattern: *const c_char) -> *mut c_void {
+  catch_and_raise(move || glob::glob_match(pattern))
+}
+
+/// # Safety
+/// `pattern`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_glob_match_count(pattern: *const c_char) -> i64 {
+  catch_and_raise(move || glob::glob_match_count(pattern))
 }
 
 // Plan 144 (Extended Filesystem Operations): `Path.exists`/`.is_file`/
