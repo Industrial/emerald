@@ -1131,3 +1131,82 @@ fn progress_and_formatting_proof_em_prints_expected_sequence() {
     "done\nfalse\n"
   );
 }
+
+// Plan 180's own sibling to `compile_and_run` above: a `test`/
+// `property`/`benchmark` block is never reachable via the ordinary
+// `emerald <file>` compile path this table's other helpers all use
+// (`Item::Property`'s own doc comment) — this runs `emerald property
+// <file>` directly instead (`test_runner::run`'s own real subcommand),
+// returning `(stdout, exit code)` rather than asserting `status.
+// success()` the way every other example in this table does, since
+// `property_shrink_proof.em` below deliberately contains one failing
+// property (proving shrinking actually ran) and is expected to exit
+// non-zero.
+fn compile_and_run_property_subcommand(example: &str) -> (String, i32) {
+  let source = workspace_root().join("examples").join(example);
+  let output = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg("property")
+    .arg(&source)
+    .output()
+    .expect("failed to run `emerald property`");
+  (
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    output.status.code().unwrap_or(-1),
+  )
+}
+
+// Plan 180 (Property-Based Testing Generators) — `property "..."
+// (a: Int64, b: Int64) do ... end`'s real, generator-driven,
+// shrinking-on-failure Concrete Proof: `addition is commutative` holds
+// for every one of `proptest`'s own default 256 generated `(a, b)`
+// pairs; `subtraction finds a real bug` genuinely fails whenever
+// `a != b`, and `proptest`'s real `ValueTree::simplify()` shrinks the
+// counterexample toward zero. Two real, disclosed differences from
+// the plan's own illustrative Concrete Proof text, both found by
+// actually running this proof repeatedly rather than trusting it after
+// one observed run:
+//
+// 1. The exact shrunk pair is `a=0` and `b` equal to `1` OR `-1` —
+//    both are genuinely minimal (`proptest`'s own `TestRunner` seeds
+//    its RNG afresh, unseeded, on every run, so which of the two
+//    equally-small counterexamples it lands on varies run to run) —
+//    matching the plan's own Decision log caveat ("`a=0, b=1` (or a
+//    value `proptest` itself treats as equally minimal under its own
+//    shrink ordering)") precisely, so this only asserts `a=0` plus
+//    `b`'s own magnitude, never a hardcoded sign.
+// 2. The FAIL line's own trailing message is the failing
+//    `assert_eq`'s real, verified `AssertionError#message` — its
+//    *source location* (`desugar_assert_eq`'s own pre-existing,
+//    already-tested codegen shape — see `test_subcommand.rs`'s own
+//    `examples_property_test_em_matches_the_documented_transcript`),
+//    not "expected 1 but got -1" (those values are eagerly `puts` on
+//    their own separate lines instead, the same pre-existing
+//    behavior, not new noise this plan introduces).
+#[test]
+fn property_shrink_proof_em_shrinks_a_real_failure_to_a_minimal_counterexample() {
+  let (stdout, code) = compile_and_run_property_subcommand("property_shrink_proof.em");
+  assert_eq!(
+    code, 1,
+    "one property is deliberately broken (proving shrinking ran); full stdout:\n{stdout}"
+  );
+  assert!(
+    stdout.contains("PASS: addition is commutative (256 cases)"),
+    "missing the passing property's own PASS line; full stdout:\n{stdout}"
+  );
+  let prefix = "FAIL: subtraction finds a real bug: minimal input a=0, b=";
+  let after_prefix = stdout
+    .split(prefix)
+    .nth(1)
+    .unwrap_or_else(|| panic!("missing the shrunk-to-minimal FAIL line; full stdout:\n{stdout}"));
+  let b_str = after_prefix
+    .split(|c: char| c == ',' || c == ':')
+    .next()
+    .unwrap_or("");
+  let b: i64 = b_str
+    .parse()
+    .unwrap_or_else(|e| panic!("FAIL line's own `b=` value `{b_str}` didn't parse as i64: {e}"));
+  assert!(
+    b == 1 || b == -1,
+    "shrinking should have converged to b=1 or b=-1, found b={b}; full stdout:\n{stdout}"
+  );
+}

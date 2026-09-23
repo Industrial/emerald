@@ -190,3 +190,109 @@ guessed in advance.
   `quickcheck` dual-backend support. No change to `emerald benchmark`'s
   own, separate, already-real timing-harness mechanism (`compile_
   benchmark_harness`, verified present and unrelated to this plan).
+
+## Update (2026-09-23)
+
+All five todos are done. Per this project's append-only convention for
+finished plans, the original todos list above is left unedited; this
+section records what actually shipped and where it genuinely diverges
+from the plan's own text above.
+
+- **`leaf-cargo-dependency`** — `proptest = "1.11"` added to
+  `crates/emerald-rt/Cargo.toml`, ledger row in
+  `crates/emerald-rt/DEPENDENCIES.md` (plan 95's vetting checklist:
+  real crate, real adoption numbers, no open RustSec advisory).
+- **`leaf-property-params-grammar`** — `Item::Property` gained a real
+  `params: Vec<Param>` field; `grammar.lalrpop`'s production grew the
+  documented optional `("(" <Params> ")")?` clause, defaulting to
+  `Vec::new()` — every existing zero-param `property "..." do ... end`
+  block still parses identically. `emerald-fmt` reprints the new
+  `(a: Type, b: Type)` clause only when non-empty.
+  `emerald-sema`'s `is_property_generatable_type` rejects any declared
+  parameter type outside `Int64`/`Float64`/`String`/`Boolean` with a
+  real diagnostic, exactly as the Decision log specifies.
+- **`leaf-legacy-zero-param-compat`** — real, but shaped differently
+  than this todo's own literal text describes. Rather than a second,
+  parallel `emerald_codegen::compile_property_harness` function plus
+  driver-level routing between it and `compile_test_harness`, the
+  shipped implementation extends `compile_test_harness` itself (a
+  `HarnessCase::Simple`/`HarnessCase::Property` split inside the one
+  function) — every `Item::Test` and zero-param `Item::Property` keeps
+  the exact, byte-identical `begin...rescue AssertionError`/`PASS:`/
+  `FAIL:` handling it always had (verified: the pre-existing
+  `emerald_property_subcommand_is_a_real_alias_for_emerald_test` test
+  in `emerald-cli/tests/test_subcommand.rs` still passes unmodified),
+  and a non-empty-`params` `Item::Property` gets the new
+  generator-driven treatment in the same pass. This means
+  `emerald_driver::compile_test`/`compile_property` do not need to
+  diverge at all — `main.rs`'s existing `"property" =>
+  test_runner::run(&args)` dispatch (unchanged) already reaches the
+  new mechanism with zero CLI/driver-layer routing code, a real,
+  disclosed simplification found preferable to hand-rolling a
+  pre-parse peek to decide which of two near-duplicate harness
+  builders to call.
+- **`leaf-guarded-property-case-function`** — each parameterized
+  property's body compiles to an ordinary `__emerald_property_case_N`
+  function; the harness's own synthesized `while` loop wraps *each
+  call site* in a `begin ... rescue AssertionError => e ... end`
+  (reusing plan 11's real mechanism, not a new one) and reports
+  pass/fail plus `e.message` straight to the native session via
+  `emerald_rt_proptest_report` — never letting a raised exception
+  reach any Rust frame at all.
+- **`leaf-proptest-driver`** — real, but architecturally different
+  from this todo's own literal "Rust holds a raw callback function
+  pointer and drives the loop" text, disclosed in
+  `crates/emerald-rt/src/proptest_support.rs`'s own module doc: no
+  existing mechanism in this codebase lets native code call back into
+  already-compiled Emerald code outside `Http.serve`'s one hand-built,
+  call-site-specific LLVM trampoline (plan 101) — building a second,
+  general one from scratch was judged too large and too risky to get
+  right blind for this plan's own scope. Instead, the COMPILED
+  Emerald harness itself drives the generate/run/shrink loop via
+  ordinary sequential native calls (`emerald_rt_proptest_begin`/
+  `_current_i64`/`_current_f64`/`_current_string`/`_current_bool`/
+  `_report`/`_failed`/`_case_count`/`_fail_message`) — the same
+  "compiled Emerald calls into `emerald-rt`" direction every other
+  domain plan in this crate already uses, never the reverse. Real,
+  proptest-backed generation and shrinking: each parameter gets its
+  own independent `proptest::strategy::BoxedStrategy`, shrunk
+  coordinate-wise via `ValueTree::simplify()`/`complicate()` (the
+  library's own real API, not a hand-rolled shrink algorithm), up to
+  proptest's own default 256 cases per property.
+- **`leaf-cli-report-format`** — `PASS: <description> (<n> cases)` /
+  `FAIL: <description>: minimal input <params>: <message>`, exit code
+  1 on any failure (the harness's pre-existing `failed > 0 → raise
+  AssertionError` tail, unchanged). `examples/property_shrink_proof.em`
+  added, wired into `emerald-cli/tests/examples.rs`'s CI-checked table
+  (`property_shrink_proof_em_shrinks_a_real_failure_to_a_minimal_
+  counterexample`) via a new `compile_and_run_property_subcommand`
+  helper (the ordinary `emerald <file> -o <out>` path this table's
+  other helpers use can never compile a file containing a `property`
+  block at all — plan 47/80's own, unchanged restriction). One real,
+  disclosed difference from this plan's own Concrete Proof text,
+  found by actually running the proof rather than trusting it:
+  `assert_eq`'s `AssertionError#message` is its raise site's *source
+  location* (`desugar_assert_eq`'s own pre-existing codegen, verified
+  against already-passing tests predating this plan), never "expected
+  1 but got -1" — those values are eagerly `puts` on their own
+  separate lines instead, matching `emerald test`'s own already-shipped
+  behavior exactly, not new noise this plan introduces. The exact
+  shrunk counterexample is `a=0`, `b=1` or `b=-1` (`proptest`'s
+  `TestRunner` seeds its RNG afresh, unseeded, each run) — both
+  genuinely minimal, matching the Decision log's own "or a value
+  `proptest` itself treats as equally minimal" caveat; this plan's own
+  new `emerald-rt` unit tests
+  (`proptest_support::tests::a_property_that_always_fails_shrinks_to_
+  a_real_minimal_counterexample`) assert against this real, observed
+  behavior rather than a guessed exact value, per the plan's own
+  instruction.
+
+Gate: `cargo build --workspace`, `cargo clippy --workspace --all-targets`
+(no new warnings), `treefmt` (clean), and `cargo nextest run` across
+every touched crate (`emerald-parser`+`emerald-sema`+`emerald-fmt`:
+540/540; `emerald-codegen`: 203/203; `emerald-rt`: 245/245;
+`emerald-cli`: 180/180; `emerald-driver`: 53/54, the one failure being
+the pre-existing, environment-specific
+`cache::tests::corrupting_the_cached_object_file_forces_a_real_
+recompile_not_an_error` flake this project's own tooling notes
+disclose, confirmed unrelated by isolated re-run) all pass.
