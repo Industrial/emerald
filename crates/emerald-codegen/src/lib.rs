@@ -9348,7 +9348,11 @@ fn build_method_call<'ctx>(
         "value" => (ctx.cliparseresult_value, ValKind::Ptr),
         "positional_value" => (ctx.cliparseresult_positional_value, ValKind::Ptr),
         "error_message" => (ctx.cliparseresult_error_message, ValKind::Ptr),
-        other => return Err(format!("codegen: unsupported CliParseResult method `{other}`")),
+        other => {
+          return Err(format!(
+            "codegen: unsupported CliParseResult method `{other}`"
+          ))
+        }
       };
       let call = builder
         .build_call(fv, &call_args, "cliparseresulttmp")
@@ -24150,7 +24154,10 @@ fn compile_to_object_impl(
   );
   let cliparser_flag = module.add_function(
     "emerald_rt_cliparser_flag",
-    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    void_ty.fn_type(
+      &[i64_ty.into(), ptr_ty.into(), ptr_ty.into(), ptr_ty.into()],
+      false,
+    ),
     Some(Linkage::External),
   );
   let cliparser_option = module.add_function(
