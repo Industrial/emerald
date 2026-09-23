@@ -38,6 +38,19 @@ pub(crate) const TAG_STRING: i64 = 3;
 pub(crate) const TAG_ARRAY: i64 = 4;
 pub(crate) const TAG_OBJECT: i64 = 5;
 
+// Plan 195 (Typed Domain Errors): `JsonError`'s own variant tags,
+// declaration order, matching `emerald-sema`/`emerald-codegen`'s own
+// `json_error_enum_def` byte-for-byte — the identical convention
+// `TAG_NULL`..`TAG_OBJECT` above already establish for `JsonValue`.
+//   0 Syntax(String)        — serde_json::error::Category::Syntax
+//   1 UnexpectedEnd          — serde_json::error::Category::Eof
+//   2 Other(String)          — Category::Io | Category::Data, or any
+//                              future category this match doesn't
+//                              yet name individually
+const JSON_ERROR_TAG_SYNTAX: i32 = 0;
+const JSON_ERROR_TAG_UNEXPECTED_END: i32 = 1;
+const JSON_ERROR_TAG_OTHER: i32 = 2;
+
 pub(crate) unsafe fn alloc_enum_block(tag: i64) -> *mut i64 {
   let ptr = crate::emerald_alloc(16) as *mut i64;
   *ptr = tag;
@@ -158,19 +171,29 @@ pub(crate) unsafe fn lift_json_value(ptr: *const c_void) -> serde_json::Value {
   }
 }
 
-/// `Json.parse(s: String): Result[JsonValue, String]` — `Ok`'s own
-/// payload is `lower_json_value`'s returned pointer, widened to `i64`
-/// exactly the way `emerald_rt_result_ok` already expects any Ptr-kind
-/// Ok payload (a pointer IS an `i64` bit pattern in this backend's own
-/// representation, verified against `ValKind::Ptr`'s own single-word
-/// storage). `Err`'s payload is `serde_json::Error`'s own real
-/// `Display` text, never an empty string or a crash.
+/// `Json.parse(s: String): Result[JsonValue, JsonError]` — plan 195's
+/// retrofit of this signature's original, plan-118-shipped `Result[
+/// JsonValue, String]` shape (a disclosed, real breaking change to
+/// plan 118's public surface — see plan 195's own history file). `Ok`'s
+/// own payload is `lower_json_value`'s returned pointer, widened to
+/// `i64` exactly the way `emerald_rt_result_ok` already expects any
+/// Ptr-kind Ok payload (a pointer IS an `i64` bit pattern in this
+/// backend's own representation, verified against `ValKind::Ptr`'s own
+/// single-word storage). `Err`'s payload is a real `JsonError` enum
+/// value — classified via `serde_json::Error::classify()`'s own real,
+/// already-vendored `Category` (`Category::Eof` → `UnexpectedEnd`,
+/// `Category::Syntax` → `Syntax(msg)`, `Category::Io`/`Category::Data`
+/// → `Other(msg)`) — carrying `serde_json::Error`'s own real `Display`
+/// text on every variant, never an empty string or a crash.
 ///
 /// # Safety
 /// `s`, if non-null, must point to a valid, NUL-terminated C string.
 pub unsafe fn json_parse(s: *const c_char) -> *mut c_void {
   if s.is_null() {
-    return crate::emerald_rt_result_err_str("Json.parse: null string pointer");
+    return crate::emerald_rt_result_err_tagged_str(
+      JSON_ERROR_TAG_OTHER,
+      "Json.parse: null string pointer",
+    );
   }
   let bytes = std::ffi::CStr::from_ptr(s).to_bytes();
   match serde_json::from_slice::<serde_json::Value>(bytes) {
@@ -178,7 +201,14 @@ pub unsafe fn json_parse(s: *const c_char) -> *mut c_void {
       let ptr = lower_json_value(&v);
       crate::emerald_rt_result_ok(ptr as i64)
     }
-    Err(e) => crate::emerald_rt_result_err_str(&e.to_string()),
+    Err(e) => {
+      let tag = match e.classify() {
+        serde_json::error::Category::Eof => JSON_ERROR_TAG_UNEXPECTED_END,
+        serde_json::error::Category::Syntax => JSON_ERROR_TAG_SYNTAX,
+        serde_json::error::Category::Io | serde_json::error::Category::Data => JSON_ERROR_TAG_OTHER,
+      };
+      crate::emerald_rt_result_err_tagged_str(tag, &e.to_string())
+    }
   }
 }
 
@@ -325,16 +355,48 @@ mod tests {
     assert_eq!(out, "{\"a\":1.0,\"b\":[true,null]}");
   }
 
+  /// Reads a `Result[JsonValue, JsonError]`'s `Err` arm back into
+  /// `(tag, message)` — the `JsonError` enum block's own `[tag: i64]
+  /// [msg: *const c_char]` layout, `emerald_rt_result_err_tagged`'s
+  /// own doc comment.
+  fn err_tag_and_message(result: *const i64) -> (i64, String) {
+    assert_eq!(unsafe { *result }, 1, "expected Err");
+    let err_block = unsafe { *(result.add(1)) } as *const i64;
+    let tag = unsafe { *err_block };
+    let msg_ptr = unsafe { *(err_block.add(1) as *const *const c_char) };
+    let msg = unsafe { std::ffi::CStr::from_ptr(msg_ptr) }
+      .to_str()
+      .unwrap()
+      .to_string();
+    (tag, msg)
+  }
+
   #[test]
   fn parse_invalid_json_returns_a_real_non_empty_err_message() {
     let cstr = std::ffi::CString::new("{not json").unwrap();
     let result = unsafe { json_parse(cstr.as_ptr()) } as *const i64;
-    assert_eq!(unsafe { *result }, 1, "expected Err");
-    let msg_ptr = unsafe { *(result.add(1)) } as *const c_char;
-    let msg = unsafe { std::ffi::CStr::from_ptr(msg_ptr) }
-      .to_str()
-      .unwrap();
+    let (_tag, msg) = err_tag_and_message(result);
     assert!(!msg.is_empty());
+  }
+
+  #[test]
+  fn parse_syntax_error_is_tagged_syntax() {
+    // A stray comma is a real syntax error, not a truncation — serde_
+    // json's own `Category::Syntax`.
+    let cstr = std::ffi::CString::new("{\"a\":1,}").unwrap();
+    let result = unsafe { json_parse(cstr.as_ptr()) } as *const i64;
+    let (tag, _msg) = err_tag_and_message(result);
+    assert_eq!(tag, JSON_ERROR_TAG_SYNTAX as i64);
+  }
+
+  #[test]
+  fn parse_truncated_input_is_tagged_unexpected_end() {
+    // Valid so far, but cut off mid-object — serde_json's own
+    // `Category::Eof`.
+    let cstr = std::ffi::CString::new("{\"a\":").unwrap();
+    let result = unsafe { json_parse(cstr.as_ptr()) } as *const i64;
+    let (tag, _msg) = err_tag_and_message(result);
+    assert_eq!(tag, JSON_ERROR_TAG_UNEXPECTED_END as i64);
   }
 
   fn c_key(s: &str) -> *const c_char {

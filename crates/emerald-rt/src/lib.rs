@@ -405,6 +405,57 @@ unsafe fn emerald_rt_result_err_str(msg: &str) -> *mut c_void {
   ptr as *mut c_void
 }
 
+// Plan 195's own additive extension to plan 92's FFI/ABI convention —
+// `emerald_rt_result_err(msg)` above is kept exactly as-is (still the
+// right call for any domain that hasn't adopted this convention); this
+// is its tagged sibling for a domain that HAS. `tag` is a small,
+// per-domain `i32` discriminant owned entirely by the calling domain's
+// own module (`json.rs`'s `JSON_ERROR_TAG_*`, `regex.rs`'s
+// `REGEX_ERROR_TAG_*`, ...) — no global tag registry here or anywhere
+// else in this crate. The Err payload built is a pointer to a real,
+// `emerald_alloc`-backed two-word enum block (`[tag: i64][msg: *const
+// c_char]`), byte-for-byte the same `EnumLayout` shape `json.rs`'s own
+// `alloc_enum_block` already establishes for `JsonValue` — so a
+// `<Domain>Error` enum registered in `emerald-sema`/`emerald-codegen`
+// with matching variant order reads this block exactly like any other
+// compiler-synthesized enum value, with zero additional marshaling.
+// `msg` is stored on every variant, including ones with no Emerald-
+// visible payload field (e.g. `JsonError::UnexpectedEnd`) — a real
+// message costs nothing extra and the block's fixed 16-byte shape
+// needs a second word regardless.
+/// # Safety
+/// `msg`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_result_err_tagged(tag: i32, msg: *const c_char) -> *mut c_void {
+  let copied = if msg.is_null() {
+    alloc_and_copy_str("")
+  } else {
+    let s = std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned();
+    alloc_and_copy_str(&s)
+  };
+  emerald_rt_result_err_tagged_str_impl(tag, copied)
+}
+
+// `emerald_rt_result_err_tagged`'s own internal-Rust-caller sibling —
+// takes a real `&str` directly, the identical `emerald_rt_result_err`/
+// `emerald_rt_result_err_str` relationship above, reused for the same
+// reason (every current caller, `json.rs`/`regex.rs`, already has an
+// owned Rust `String`/`&str` in hand, not a `CString`).
+pub(crate) unsafe fn emerald_rt_result_err_tagged_str(tag: i32, msg: &str) -> *mut c_void {
+  emerald_rt_result_err_tagged_str_impl(tag, alloc_and_copy_str(msg))
+}
+
+unsafe fn emerald_rt_result_err_tagged_str_impl(tag: i32, msg: *const c_char) -> *mut c_void {
+  let enum_ptr = emerald_alloc(16) as *mut i64;
+  *enum_ptr = tag as i64;
+  *(enum_ptr.add(1) as *mut *const c_char) = msg;
+  let ptr = emerald_alloc(16) as *mut i64;
+  *ptr = 1;
+  *(ptr.add(1) as *mut *mut c_void) = enum_ptr as *mut c_void;
+  ptr as *mut c_void
+}
+
 // The FNV-1a-32 hash of s's bytes, widened to i64. Renamed from plan
 // 91's own emerald_rt_fnv1a_hash to follow this plan's naming
 // convention - a pure rename, no behavior change.

@@ -297,14 +297,18 @@ fn resource_handle_lifetime_proof_em_prints_expected_sequence() {
 
 // Plan 118 (JSON): Json.parse/JsonValue.get/.to_s against a real,
 // nested document — the Ok path (a found key, a missing key, an
-// array's own .count, and a full to_s round-trip) and a second,
-// negative Err proof (invalid JSON reaching Err with a real,
-// non-empty serde_json parser error, never a crash or empty string).
+// array's own .count, and a full to_s round-trip) and two negative
+// `Err` proofs (a real syntax error and a real truncation, each
+// landing on the correct `JsonError` variant, never a crash or empty
+// string). Plan 195 (Typed Domain Errors) retrofit: `Json.parse` now
+// returns `Result[JsonValue, JsonError]`, not `Result[JsonValue,
+// String]` — see `examples/json_demo.em`'s own updated header comment
+// for the disclosed breaking change.
 #[test]
 fn json_demo_em_prints_expected_sequence() {
   assert_eq!(
     compile_and_run("json_demo.em"),
-    "Ada\nmissing\n2\n{\"name\":\"Ada\",\"age\":36.0,\"active\":true,\"tags\":[\"math\",\"cs\"]}\nkey must be a string at line 1 column 2\n"
+    "Ada\nmissing\n2\n{\"name\":\"Ada\",\"age\":36.0,\"active\":true,\"tags\":[\"math\",\"cs\"]}\ntrailing comma at line 1 column 8\nunexpected end of input\n"
   );
 }
 
@@ -360,12 +364,16 @@ fn base64_hex_encoding_em_prints_expected_sequence() {
 // `.captures`/`.replace_all` against a date pattern, matching the
 // original plan's own predicted values exactly (adapted only for two
 // real, disclosed syntax corrections — see `examples/regex_dates.em`'s
-// own header comment).
+// own header comment), plus a real negative `Err` proof. Plan 195
+// (Typed Domain Errors) retrofit: `Regex.compile` now returns
+// `Result[Regex, RegexError]`, not `Result[Regex, String]` — see
+// `examples/regex_dates.em`'s own updated header comment for the
+// disclosed breaking change.
 #[test]
 fn regex_dates_em_prints_expected_sequence() {
   assert_eq!(
     compile_and_run("regex_dates.em"),
-    "true\n2026-09-21\n2026\n21/09/2026 and 08/01/2026\n"
+    "true\n2026-09-21\n2026\n21/09/2026 and 08/01/2026\nregex parse error:\n    (unclosed\n    ^\nerror: unclosed group\n"
   );
 }
 

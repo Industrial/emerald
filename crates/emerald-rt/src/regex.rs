@@ -28,6 +28,23 @@ const TAG: &str = "Regex";
 const OPTION_SOME: i64 = 0;
 const OPTION_NONE: i64 = 1;
 
+// Plan 195 (Typed Domain Errors): `RegexError`'s own variant tags,
+// declaration order, matching `emerald-sema`/`emerald-codegen`'s own
+// `regex_error_enum_def` byte-for-byte. The real, pinned `regex`
+// crate's own `Error` enum (`regex-1.13.1/src/error.rs`, `#[non_
+// exhaustive]`) has exactly two variants: `Syntax(String)` and
+// `CompiledTooBig(usize)` — this domain's own Decision log (plan 195)
+// keeps the minimum required `Syntax(String) | Other(String)` shape
+// rather than inventing a third named variant for `CompiledTooBig`,
+// folding it (and any future variant the crate's own `#[non_
+// exhaustive]` adds) into `Other` instead.
+//   0 Syntax(String) — regex::Error::Syntax
+//   1 Other(String)  — regex::Error::CompiledTooBig, or any future
+//                       non_exhaustive variant this match doesn't yet
+//                       name individually
+const REGEX_ERROR_TAG_SYNTAX: i32 = 0;
+const REGEX_ERROR_TAG_OTHER: i32 = 1;
+
 unsafe fn read_str<'a>(s: *const c_char) -> Result<&'a str, String> {
   if s.is_null() {
     return Err("null string pointer".to_string());
@@ -69,7 +86,10 @@ unsafe fn build_option_string_array(items: &[Option<&str>]) -> *mut c_void {
   ptr as *mut c_void
 }
 
-/// `Regex.compile(pattern: String): Result[Regex, String]`.
+/// `Regex.compile(pattern: String): Result[Regex, RegexError]` —
+/// plan 195's retrofit of this signature's original, plan-122-shipped
+/// `Result[Regex, String]` shape (a disclosed, real breaking change to
+/// plan 122's public surface — see plan 195's own history file).
 ///
 /// # Safety
 /// `pattern`, if non-null, must point to a valid, NUL-terminated C
@@ -77,14 +97,20 @@ unsafe fn build_option_string_array(items: &[Option<&str>]) -> *mut c_void {
 pub unsafe fn regex_compile(pattern: *const c_char) -> *mut c_void {
   let pattern = match read_str(pattern) {
     Ok(p) => p,
-    Err(e) => return crate::emerald_rt_result_err_str(&e),
+    Err(e) => return crate::emerald_rt_result_err_tagged_str(REGEX_ERROR_TAG_OTHER, &e),
   };
   match regex::Regex::new(pattern) {
     Ok(re) => {
       let id = handle_alloc(Box::new(re), TAG);
       crate::emerald_rt_result_ok(id)
     }
-    Err(e) => crate::emerald_rt_result_err_str(&e.to_string()),
+    Err(e) => {
+      let tag = match &e {
+        regex::Error::Syntax(_) => REGEX_ERROR_TAG_SYNTAX,
+        _ => REGEX_ERROR_TAG_OTHER,
+      };
+      crate::emerald_rt_result_err_tagged_str(tag, &e.to_string())
+    }
   }
 }
 
@@ -304,17 +330,30 @@ mod tests {
     *result_ptr.add(1)
   }
 
+  /// Reads a `Result[Regex, RegexError]`'s `Err` arm back into
+  /// `(tag, message)` — the `RegexError` enum block's own `[tag: i64]
+  /// [msg: *const c_char]` layout, `emerald_rt_result_err_tagged`'s
+  /// own doc comment.
+  unsafe fn err_tag_and_message(result_ptr: *const i64) -> (i64, String) {
+    assert_eq!(*result_ptr, 1, "expected Err discriminant");
+    let err_block = *(result_ptr.add(1)) as *const i64;
+    let tag = *err_block;
+    let msg_ptr = *(err_block.add(1) as *const *const c_char);
+    let msg = std::ffi::CStr::from_ptr(msg_ptr)
+      .to_str()
+      .unwrap()
+      .to_string();
+    (tag, msg)
+  }
+
   #[test]
   fn compile_of_an_invalid_pattern_is_a_real_err_not_a_panic() {
     unsafe {
       let bad = c("(unclosed");
       let result_ptr = regex_compile(bad.as_ptr()) as *const i64;
-      assert_eq!(*result_ptr, 1, "expected Err discriminant");
-      let msg_ptr = *(result_ptr.add(1) as *const *const c_char);
-      assert!(!std::ffi::CStr::from_ptr(msg_ptr)
-        .to_str()
-        .unwrap()
-        .is_empty());
+      let (tag, msg) = err_tag_and_message(result_ptr);
+      assert_eq!(tag, REGEX_ERROR_TAG_SYNTAX as i64);
+      assert!(!msg.is_empty());
     }
   }
 

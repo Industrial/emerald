@@ -4096,15 +4096,23 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
+      // Plan 195 (Typed Domain Errors): retrofits this signature's
+      // original, plan-118-shipped `Result[JsonValue, String]` shape —
+      // a disclosed, real breaking change to plan 118's public
+      // surface (see plan 195's own history file's Update section).
       Ok(Type::Result(
         Box::new(Type::Enum("JsonValue".to_string())),
-        Box::new(Type::String),
+        Box::new(Type::Enum("JsonError".to_string())),
       ))
     }
     // Plan 119's Decision log: `Toml.parse(s)` — the identical
     // reserved-namespace static-call shape `Json.parse` immediately
     // above uses, reusing the same `JsonValue` enum as the parsed
     // dynamic-value representation (no second `TomlValue` enum).
+    // Deliberately NOT retrofitted onto plan 195's `JsonError`
+    // convention (out of scope — plan 195's own EXECUTE phase touches
+    // only 118/122, per its own Decision log): `Toml.parse` keeps its
+    // original `Result[JsonValue, String]` shape unchanged.
     Expr::MethodCall(recv, method, args)
       if matches!(&recv.node, Expr::Ident(n) if n == "Toml") =>
     {
@@ -4283,9 +4291,13 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
+      // Plan 195 (Typed Domain Errors): retrofits this signature's
+      // original, plan-122-shipped `Result[Regex, String]` shape — a
+      // disclosed, real breaking change to plan 122's public surface
+      // (see plan 195's own history file's Update section).
       Ok(Type::Result(
         Box::new(Type::Newtype("Regex".to_string(), Box::new(Type::Int64))),
-        Box::new(Type::String),
+        Box::new(Type::Enum("RegexError".to_string())),
       ))
     }
     // Plan 124's Decision log: `Xml.parse`/`.parse_file`/`.reader_
@@ -13125,6 +13137,97 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&json_value_enum_def);
+  // Plan 195's Decision log: `JsonError` — the first real worked
+  // example of the `Result[T, <Domain>Error]` convention this plan
+  // defines, registered the identical compiler-synthesized,
+  // NON-generic, placeholder-first way `JsonValue` immediately above
+  // is (no self-reference to seed here, unlike `JsonValue`, but the
+  // same two-pass shape is reused for consistency with every other
+  // compiler-synthesized enum in this function). Variant declaration
+  // order is this enum's own tag order, verified to match `crates/
+  // emerald-rt/src/json.rs`'s own `JSON_ERROR_TAG_*` constants
+  // byte-for-byte — `Syntax`=0, `UnexpectedEnd`=1, `Other`=2.
+  let json_error_enum_def = EnumDef {
+    name: "JsonError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "JsonError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &json_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&json_error_enum_def);
+  // Plan 195's Decision log: `RegexError` — this plan's second worked
+  // example, the same registration shape `JsonError` immediately above
+  // uses. The real, pinned `regex` crate's own `Error` enum (verified
+  // against `regex-1.13.1/src/error.rs` directly, not assumed) has
+  // exactly two variants, `Syntax(String)`/`CompiledTooBig(usize)`, so
+  // this enum keeps the convention's own required minimum
+  // (`Syntax(String) | Other(String)`) rather than inventing a third,
+  // unverifiable variant — `CompiledTooBig` (and any future `#[non_
+  // exhaustive]` addition) folds into `Other`. Declaration order
+  // matches `crates/emerald-rt/src/regex.rs`'s own `REGEX_ERROR_TAG_*`
+  // constants byte-for-byte — `Syntax`=0, `Other`=1.
+  let regex_error_enum_def = EnumDef {
+    name: "RegexError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "RegexError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &regex_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&regex_error_enum_def);
   // Plan 124's Decision log: `XmlNode` — the XML-shaped sibling of
   // `JsonValue` immediately above, registered the identical compiler-
   // synthesized, NON-generic, self-referential-via-placeholder-seed

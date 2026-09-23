@@ -26,8 +26,21 @@
 # restriction this plan's own text didn't anticipate. String
 # interpolation (`"#{...}"`), which DOES support `Boolean`, is the
 # real, current way to print one.
+#
+# Plan 195 (Typed Domain Errors) retrofit, disclosed breaking change:
+# `Regex.compile`'s original, plan-122-shipped signature returned
+# `Result[Regex, String]`. It now returns `Result[Regex, RegexError]`,
+# `RegexError = Syntax(String) | Other(String)` — the real, pinned
+# `regex` crate's own `Error` enum only ever produces `Syntax(String)`
+# or `CompiledTooBig(usize)` (verified directly against `regex-1.13.1/
+# src/error.rs`), so `Other` covers the latter (and any future `#[non_
+# exhaustive]` addition) rather than inventing a variant the crate
+# can't actually distinguish. Any `.em` code still matching this
+# plan's original `Err(msg) do ... end` (a bare `String`) no longer
+# type-checks — this file's own `Err` arms below are the disclosed
+# migration.
 
-result: Result[Regex, String] = Regex.compile("([0-9]{4})-([0-9]{2})-([0-9]{2})")
+result: Result[Regex, RegexError] = Regex.compile("([0-9]{4})-([0-9]{2})-([0-9]{2})")
 
 match result do
 Ok(re) do
@@ -64,7 +77,34 @@ Ok(re) do
 
   puts re.replace_all("2026-09-21 and 2026-01-08", "$3/$2/$1")
 end
-Err(msg) do
-  puts msg
+Err(e) do
+  match e do
+  Syntax(detail) do
+    puts detail
+  end
+  Other(detail) do
+    puts detail
+  end
+  end
+end
+end
+
+# A real negative proof: an unclosed group is a genuine `regex`-crate
+# syntax error, so this always lands on `RegexError::Syntax`, never
+# `Other` — never a crash, never a silently-empty message.
+bad_result: Result[Regex, RegexError] = Regex.compile("(unclosed")
+match bad_result do
+Ok(re) do
+  puts "unexpected ok"
+end
+Err(e) do
+  match e do
+  Syntax(detail) do
+    puts detail
+  end
+  Other(detail) do
+    puts detail
+  end
+  end
 end
 end

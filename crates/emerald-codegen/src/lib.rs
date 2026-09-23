@@ -21424,6 +21424,62 @@ fn compile_to_object_impl(
     "JsonValue".to_string(),
     build_enum_layout(&json_value_enum_def_cg),
   );
+  // Plan 195: `JsonError`/`RegexError` -- codegen's own mirror of
+  // `emerald-sema`'s identical synthetic `EnumDef`s (see that crate's
+  // own Decision log). Variant declaration order matches `crates/
+  // emerald-rt/src/json.rs`'s `JSON_ERROR_TAG_*`/`regex.rs`'s
+  // `REGEX_ERROR_TAG_*` constants byte-for-byte, exactly the same
+  // convention `JsonValue`'s own `TAG_NULL`..`TAG_OBJECT` above
+  // already established. Both enums share the literal variant names
+  // `Syntax`/`Other` with each other (and `JsonError` alone with
+  // `UnexpectedEnd`) -- safe, not a collision: `build_match_result`/
+  // `check_case`'s own pattern resolution is always scoped to the
+  // scrutinee's own statically-known enum name (`ctx.enums`/`classes`
+  // lookup by THAT specific name), never a global ambiguous search --
+  // the identical reason `Option$Int64`/`Option$String` already safely
+  // share `Some`/`None` today.
+  let json_error_enum_def_cg = EnumDef {
+    name: "JsonError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "UnexpectedEnd".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "JsonError".to_string(),
+    build_enum_layout(&json_error_enum_def_cg),
+  );
+  let regex_error_enum_def_cg = EnumDef {
+    name: "RegexError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "RegexError".to_string(),
+    build_enum_layout(&regex_error_enum_def_cg),
+  );
   // Plan 124: `XmlNode`/`XmlEvent` — codegen's own mirror of `emerald-
   // sema`'s identical synthetic `EnumDef`s (see that crate's own
   // Decision log for why `XmlEvent`'s text-content variant is named
