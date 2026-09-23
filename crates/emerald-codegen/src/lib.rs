@@ -239,6 +239,8 @@ fn set_newtype_underlying(program: &Program) {
     "ZlibReader",
     // Plan 132's Decision log: `TarReader` -- the identical shape.
     "TarReader",
+    // Plan 133's Decision log: `ZipReader` -- the identical shape.
+    "ZipReader",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5437,6 +5439,17 @@ struct Ctx<'a, 'ctx> {
   tar_reader_entry_size: FunctionValue<'ctx>,
   tar_reader_read_entry_data: FunctionValue<'ctx>,
   tar_reader_close: FunctionValue<'ctx>,
+  /// Plan 133 (Zip Archives) -- `Zip.create`/`.extract`, `ZipReader.
+  /// open`/`.entry_count`/`.entry_name`/`.entry_size`/`.read_entry_
+  /// data`/`.close`, wrapping `zip`.
+  zip_create: FunctionValue<'ctx>,
+  zip_extract: FunctionValue<'ctx>,
+  zip_reader_open: FunctionValue<'ctx>,
+  zip_reader_entry_count: FunctionValue<'ctx>,
+  zip_reader_entry_name: FunctionValue<'ctx>,
+  zip_reader_entry_size: FunctionValue<'ctx>,
+  zip_reader_read_entry_data: FunctionValue<'ctx>,
+  zip_reader_close: FunctionValue<'ctx>,
   /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
   /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
   dns_resolve: FunctionValue<'ctx>,
@@ -8952,6 +8965,61 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ret_kind));
     }
+    // Plan 133's Decision log: `ZipReader#entry_count`/`#entry_name`/
+    // `#entry_size`/`#read_entry_data`/`#close` -- the identical
+    // carved-out-of-newtype shape `TarReader`'s own methods above
+    // establish, index-based (`entry_name`/`entry_size`/`read_entry_
+    // data` each take one extra `Int64` index argument) rather than
+    // cursor-based -- a real, format-driven API difference, not an
+    // inconsistency (see this plan's own Decision log). `entry_name`
+    // returns a bare `String`/`ValKind::Str`; `read_entry_data`
+    // returns a bare `Bytes`/`ValKind::Int64`, the same `TarReader#
+    // read_entry_data` convention immediately above.
+    if local_classes.get(recv_name).map(String::as_str) == Some("ZipReader") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.zip_reader_close,
+            &[recv_val.into()],
+            "zipreaderclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let (fv, ret_kind) = match method {
+        "entry_count" => (ctx.zip_reader_entry_count, ValKind::Int64),
+        "entry_name" => (ctx.zip_reader_entry_name, ValKind::Str),
+        "entry_size" => (ctx.zip_reader_entry_size, ValKind::Int64),
+        "read_entry_data" => (ctx.zip_reader_read_entry_data, ValKind::Int64),
+        other => return Err(format!("codegen: unsupported ZipReader method `{other}`")),
+      };
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let call = builder
+        .build_call(fv, &call_args, "zipreadertmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
     if local_classes.get(recv_name).map(String::as_str) == Some("UdpSocket") {
@@ -10292,6 +10360,97 @@ fn build_method_call<'ctx>(
     }
     let call = builder
       .build_call(ctx.tar_reader_open, &call_args, "tarreaderopentmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 133's Decision log: `Zip.create(archive_path: String, paths:
+  // Array[String]): Void` -- the identical `paths` `Array[String]`
+  // unpacking shape plan 132's own `Tar.create` above establishes.
+  // `Zip.extract(archive_path: String, dest_dir: String): Void`
+  // forwards both `String` arguments directly, the same uniform shape
+  // `Tar.extract` above uses.
+  if recv_name == "Zip" {
+    if method == "create" {
+      let (archive_val, _) = build_expr(
+        context,
+        builder,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (paths_val, _) = build_expr(
+        context,
+        builder,
+        &args[1],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let arr_ptr = paths_val.into_pointer_value();
+      let count_val = builder
+        .build_load(context.i64_type(), arr_ptr, "zipcreatecount")
+        .map_err(|e| e.to_string())?
+        .into_int_value();
+      let elems_base = field_ptr(context, builder, arr_ptr, 8)?;
+      builder
+        .build_call(
+          ctx.zip_create,
+          &[archive_val.into(), elems_base.into(), count_val.into()],
+          "zipcreatetmp",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
+    if method != "extract" {
+      return Err(format!("codegen: unsupported Zip static method `{method}`"));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    builder
+      .build_call(ctx.zip_extract, &call_args, "zipextracttmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+  }
+
+  // Plan 133's Decision log: `ZipReader.open(archive_path: String):
+  // ZipReader` -- the same reserved-namespace static-call shape
+  // `TarReader.open` above uses.
+  if recv_name == "ZipReader" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    if method != "open" {
+      return Err(format!(
+        "codegen: unsupported ZipReader static method `{method}`"
+      ));
+    }
+    let call = builder
+      .build_call(ctx.zip_reader_open, &call_args, "zipreaderopentmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Int64));
   }
@@ -23325,6 +23484,52 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 133 (Zip Archives): `Zip.create`'s own `paths: Array[String]`
+  // argument crosses identically to `Tar.create`'s above -- an
+  // already-unpacked `(elements_base: ptr_ty, count: i64_ty)` pair.
+  // `ZipReader#entry_name`/`#entry_size`/`#read_entry_data` each take
+  // an extra `i64_ty` index argument -- the real, format-driven
+  // index-based API shape this plan's own Decision log establishes.
+  let zip_create = module.add_function(
+    "emerald_rt_zip_create",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zip_extract = module.add_function(
+    "emerald_rt_zip_extract",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zip_reader_open = module.add_function(
+    "emerald_rt_zip_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zip_reader_entry_count = module.add_function(
+    "emerald_rt_zip_reader_entry_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zip_reader_entry_name = module.add_function(
+    "emerald_rt_zip_reader_entry_name",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zip_reader_entry_size = module.add_function(
+    "emerald_rt_zip_reader_entry_size",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zip_reader_read_entry_data = module.add_function(
+    "emerald_rt_zip_reader_read_entry_data",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let zip_reader_close = module.add_function(
+    "emerald_rt_zip_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 97 (DNS Resolution).
   let dns_resolve = module.add_function(
     "emerald_rt_dns_resolve",
@@ -24524,6 +24729,11 @@ fn compile_to_object_impl(
   // `reader: TarReader = TarReader.open(...)`, so both registries are
   // load-bearing here, not just one.
   newtypes.insert("TarReader".to_string());
+  // Plan 133's Decision log: `ZipReader` — added here as well as
+  // `NEWTYPE_UNDERLYING` above, the identical `TarReader`/`XmlReader`
+  // gap-avoidance immediately above: this plan's own Concrete Proof
+  // `Let`-binds `reader: ZipReader = ZipReader.open(...)`.
+  newtypes.insert("ZipReader".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -24869,6 +25079,14 @@ fn compile_to_object_impl(
     tar_reader_entry_size,
     tar_reader_read_entry_data,
     tar_reader_close,
+    zip_create,
+    zip_extract,
+    zip_reader_open,
+    zip_reader_entry_count,
+    zip_reader_entry_name,
+    zip_reader_entry_size,
+    zip_reader_read_entry_data,
+    zip_reader_close,
     dns_resolve,
     dns_resolve_all,
     dns_resolve_count,

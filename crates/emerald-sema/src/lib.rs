@@ -4990,6 +4990,62 @@ fn infer_expr_type(
         expr.span,
       ))
     }
+    // Plan 133's Decision log: `Zip.create(archive_path: String,
+    // paths: Array[String]): Void` / `Zip.extract(archive_path:
+    // String, dest_dir: String): Void` -- the same reserved-namespace
+    // static-call shape `Tar` above uses; every entry `Zip.create`
+    // writes is `CompressionMethod::Deflated`, no per-entry choice
+    // exposed in v1.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Zip") =>
+    {
+      let expected_params = match method.as_str() {
+        "create" => vec![Type::String, Type::Array(Box::new(Type::String))],
+        "extract" => vec![Type::String, Type::String],
+        other => {
+          return Err(Diagnostic::new(
+            format!("Zip has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      return Ok(Type::Void);
+    }
+    // Plan 133's Decision log: `ZipReader.open(archive_path: String):
+    // ZipReader` -- the same reserved-namespace static-call shape
+    // `TarReader.open` above uses.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "ZipReader") =>
+    {
+      let self_ty = Type::Newtype("ZipReader".to_string(), Box::new(Type::Int64));
+      if method == "open" {
+        check_args(
+          method,
+          args,
+          &[Type::String],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(self_ty);
+      }
+      Err(Diagnostic::new(
+        format!("ZipReader has no static method `{method}`"),
+        expr.span,
+      ))
+    }
     // Plan 96's Decision log: `UdpSocket.bind`/`.last_sender_host`/
     // `.last_sender_port` — the last two are the `_Thread_local`-
     // accessor-pair convention this plan's own text mandates in place
@@ -6375,6 +6431,39 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("TarReader has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 133's Decision log: `ZipReader#entry_count`/
+        // `#entry_name`/`#entry_size`/`#read_entry_data`/`#close` --
+        // the identical carved-out-of-`.value`-only shape `TarReader`'s
+        // own methods immediately above establish, index-based rather
+        // than cursor-based -- a real, format-driven API difference,
+        // not an inconsistency (see this plan's own Decision log).
+        if name == "ZipReader" {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "entry_count" => (vec![], Type::Int64),
+            "entry_name" => (vec![Type::Int64], Type::String),
+            "entry_size" => (vec![Type::Int64], Type::Int64),
+            "read_entry_data" => (vec![Type::Int64], bytes_ty),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("ZipReader has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -13714,6 +13803,14 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     // real, disclosed simplification from a true self-referential
     // `tar::Entries` iterator.
     "TarReader",
+    // Plan 133's Decision log: `ZipReader` — the identical shape, plan
+    // 93's own handle registry backed by a boxed `zip::ZipArchive<
+    // File>` itself (no eager per-entry read needed — see `zip.rs`'s
+    // own module doc for why the central directory makes this a real,
+    // cheap, already-available index-based operation, unlike
+    // `TarReader`'s own eager-`Vec`-of-entries workaround immediately
+    // above).
+    "ZipReader",
     // Plan 100's Decision log: `HttpResponse` — the identical shape.
     "HttpResponse",
     // Plan 101's Decision log: `HttpRequest` — the identical shape.

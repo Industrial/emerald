@@ -823,6 +823,23 @@ fn tar_roundtrip_em_prints_expected_sequence() {
   );
 }
 
+// Plan 133 (Zip Archives): `Zip.create`/`.extract`, `ZipReader.open`/
+// `.entry_count`/`.entry_name`/`.entry_size`/`.read_entry_data`/
+// `.close`, wrapping the pure-Rust-only `zip` crate (`deflate-flate2-
+// zlib-rs` feature) — a real create-then-list-then-extract round trip
+// against two real files, `entry_count()` proving the central
+// directory was written and parsed correctly, and `Zip.extract`
+// recreating the exact original bytes — see `examples/zip_roundtrip.
+// em`'s own header comment for the real, disclosed adaptations from
+// the plan's own literal Concrete Proof text.
+#[test]
+fn zip_roundtrip_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("zip_roundtrip.em"),
+"2\nzip_demo_a.txt\n68656c6c6f\nzip_demo_b.txt\n776f726c642c2061206c6f6e676572207365636f6e642066696c65207468617420636f6d707265737365732077656c6c2077656c6c2077656c6c2077656c6c\ntrue\n"
+  );
+}
+
 // Plan 145 (Process Spawning & Control): `Process.run(cmd, args, argc,
 // stdin_data): ProcessResult`, wrapping plain `std::process::Command`
 // (no third-party crate) — a zero/nonzero exit code travels back as a
