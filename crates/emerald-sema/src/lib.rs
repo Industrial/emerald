@@ -3893,6 +3893,36 @@ fn infer_expr_type(
         }
         return Ok(Type::Newtype("LogFields".to_string(), Box::new(Type::Int64)));
       }
+      // Plan 182's Decision log: `CliParser.new(name, version)` — a
+      // real, two-`String`-argument constructor, carved out of the
+      // ordinary single-argument "wrap a given underlying value"
+      // newtype constructor immediately below the same way
+      // `LogFields.new()` immediately above is carved out of it (zero
+      // arguments there, two here — neither shape is "one argument
+      // matching the underlying `Int64` type", so both must be
+      // checked before that generic path ever runs).
+      if class_name == "CliParser" {
+        if args.len() != 2 {
+          return Err(Diagnostic::new(
+            format!(
+              "`CliParser.new` expects exactly 2 arguments (name, version), found {}",
+              args.len()
+            ),
+            expr.span,
+          ));
+        }
+        check_args(
+          "CliParser.new",
+          args,
+          &[Type::String, Type::String],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(Type::Newtype("CliParser".to_string(), Box::new(Type::Int64)));
+      }
       let info = classes
         .get(class_name)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
@@ -6279,6 +6309,84 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("{name} has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 182's Decision log: `CliParser`'s own five instance
+        // methods (`.flag`/`.option`/`.positional`/`.parse`/`.close`)
+        // — the identical carved-out-of-`.value`-only shape `Regex`'s
+        // own nine methods immediately above establish.
+        if name == "CliParser" {
+          let (expected_params, ret) = match method.as_str() {
+            "flag" => (
+              vec![Type::String, Type::String, Type::String],
+              Type::Void,
+            ),
+            "option" => (
+              vec![Type::String, Type::String, Type::String, Type::Boolean],
+              Type::Void,
+            ),
+            "positional" => (
+              vec![Type::String, Type::String, Type::Boolean],
+              Type::Void,
+            ),
+            "parse" => (
+              vec![Type::Array(Box::new(Type::String)), Type::Int64],
+              Type::Newtype("CliParseResult".to_string(), Box::new(Type::Int64)),
+            ),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("CliParser has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 182's Decision log: `CliParseResult`'s own seven
+        // instance methods — the identical carved-out-of-`.value`-only
+        // shape `CliParser` immediately above establishes. `.value`/
+        // `.positional_value`/`.error_message` return `Option[String]`
+        // (plan 73's `Option[T]`, not plan 43's retired `T?`) — a
+        // parse failure is a queryable result field, never a raised
+        // `NativeError` (see this plan's own Decision log).
+        if name == "CliParseResult" {
+          let option_string = Type::Enum("Option$String".to_string());
+          let (expected_params, ret) = match method.as_str() {
+            "flag" => (vec![Type::String], Type::Boolean),
+            "value" => (vec![Type::String], option_string.clone()),
+            "positional_value" => (vec![Type::String], option_string.clone()),
+            "help_requested" => (vec![], Type::Boolean),
+            "help_text" => (vec![], Type::String),
+            "error_message" => (vec![], option_string),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("CliParseResult has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -13932,6 +14040,50 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   );
   classes.insert(
     "Tempdir".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 182's Decision log: `CliParser`/`CliParseResult` — the
+  // identical "reserved name, zero-cost `Int64` handle" shape
+  // `Regex`/`Tempfile`/`Tempdir` above already use, backed by plan
+  // 93's own `crate::handle` registry (a boxed `clap::Command` /
+  // this plan's own private `ParseOutcome` respectively, never a raw
+  // pointer smuggled through as an `Int64`). Two distinct `ClassInfo`
+  // entries, not one shared between them — `CliParser` is built up by
+  // a sequence of `.flag`/`.option`/`.positional` calls and consumed
+  // (read-only, cloned per call) by `.parse`; `CliParseResult` is
+  // `.parse`'s own output, never itself mutated. `CliParser.new(name,
+  // version)` is carved out of the ordinary single-argument newtype
+  // constructor in the `Expr::New` arm above (two `String` arguments,
+  // not one value matching the underlying `Int64`); every other
+  // method on either class is carved out of the ordinary newtype
+  // `.value`-only restriction, the same mechanism `Regex`'s own nine
+  // methods already establish.
+  classes.insert(
+    "CliParser".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  classes.insert(
+    "CliParseResult".to_string(),
     ClassInfo {
       fields: HashMap::new(),
       methods: HashMap::new(),

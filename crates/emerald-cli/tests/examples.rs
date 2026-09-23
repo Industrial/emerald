@@ -71,6 +71,41 @@ fn compile_and_run_stderr(example: &str) -> String {
   String::from_utf8_lossy(&run.stderr).into_owned()
 }
 
+// Plan 182's own sibling to `compile_and_run` above: compiles `example`
+// exactly once, then runs the resulting binary with the real, caller-
+// supplied `args` as its own real `argv` — the only way to exercise
+// `CliParser.parse(ARGV, ARGC)` against more than one fixed command
+// line, since `compile_and_run` always invokes the compiled binary
+// with zero extra arguments.
+fn compile_and_run_with_args(example: &str, args: &[&str]) -> String {
+  let source = workspace_root().join("examples").join(example);
+  let output = std::env::temp_dir().join(format!(
+    "emerald_example_{}_{}",
+    example.replace(['.', '/'], "_"),
+    std::process::id()
+  ));
+
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg(&source)
+    .arg("-o")
+    .arg(&output)
+    .status()
+    .expect("failed to run emerald-cli");
+  assert!(status.success(), "emerald-cli should succeed on {example}");
+
+  let run = Command::new(&output)
+    .args(args)
+    .output()
+    .expect("failed to run compiled binary");
+  assert!(
+    run.status.success(),
+    "{example}'s compiled binary should exit 0"
+  );
+
+  std::fs::remove_file(&output).ok();
+  String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
 #[test]
 fn rust_native_runtime_proof_em_prints_expected_sequence() {
   // Plan 91: FNV-1a-32 of "hello"/"hello world"/"" widened to Int64 —
@@ -940,4 +975,74 @@ fn temp_files_proof_em_prints_expected_sequence() {
 #[test]
 fn sqlite_todo_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("sqlite_todo.em"), "1\nwrite plan 137\n");
+}
+
+// Plan 182 (Structured CLI Flag Parsing): `CliParser.new`/`.flag`/
+// `.option`/`.positional`/`.parse`/`.close`, `CliParseResult#flag`/
+// `#value`/`#positional_value`/`#help_requested`/`#help_text`/
+// `#error_message`/`#close`, wrapping `clap`'s non-derive builder API
+// and consuming plan 45's own `ARGV`/`ARGC` directly. One compiled
+// binary (`examples/cli_flag_parsing.em`), invoked three separate
+// times with three different real `argv`s via `compile_and_run_with_
+// args`, exercising the three distinct paths this plan's own Concrete
+// Proof names — a full successful parse, a missing-required-option
+// error, and `--help`. The error/help paths assert `.contains(...)`
+// rather than an exact string, since clap's own formatted error/help
+// text is not this plan's own contract to pin byte-for-byte; the
+// success path is fully deterministic and asserted exactly, matching
+// every other example test in this file. See `examples/cli_flag_
+// parsing.em`'s own header comment for the real, disclosed deviations
+// from this plan's own literal Concrete Proof text — plus the one
+// noted just below instead, `--help`'s own default missing version
+// banner, worked around in `cli.rs`'s own `cliparser_new` via an
+// explicit `.help_template` override so the proof's "1.0.0"
+// requirement still holds.
+#[test]
+fn cli_flag_parsing_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run_with_args(
+      "cli_flag_parsing.em",
+      &["--name", "Ada", "--verbose", "extra"]
+    ),
+    "Hello, Ada\n(verbose mode on)\nextra\n"
+  );
+
+  let missing_required = compile_and_run_with_args("cli_flag_parsing.em", &[]);
+  assert!(
+    missing_required.contains("--name"),
+    "missing required --name should be named in the error message, got: {missing_required:?}"
+  );
+
+  // A real, disclosed correction found only by actually running this:
+  // clap 4's own DEFAULT help template (`clap_builder::output::
+  // help_template::DEFAULT_TEMPLATE`) omits the `{name} {version}`
+  // banner line entirely — a real v4 behavior change from v2/v3's own
+  // template, verified directly against `clap_builder`'s own source
+  // in this workspace's exact pinned version. `cli.rs`'s own
+  // `cliparser_new` works around this with an explicit `.help_
+  // template` override reintroducing that banner line, so this
+  // plan's own Concrete Proof requirement (the literal string
+  // "1.0.0" present in `--help`'s own output, not just `--version`'s)
+  // does hold, asserted below.
+  let help = compile_and_run_with_args("cli_flag_parsing.em", &["--help"]);
+  assert!(
+    help.contains("greet"),
+    "help text should contain the program name, got: {help:?}"
+  );
+  assert!(
+    help.contains("1.0.0"),
+    "help text should contain the version, got: {help:?}"
+  );
+  assert!(
+    help.contains("verbose"),
+    "help text should contain the verbose flag, got: {help:?}"
+  );
+  assert!(
+    help.contains("name"),
+    "help text should contain the name option, got: {help:?}"
+  );
+  assert!(
+    help.contains("suffix"),
+    "help text should contain the suffix positional, got: {help:?}"
+  );
 }

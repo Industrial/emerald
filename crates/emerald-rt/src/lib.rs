@@ -167,6 +167,10 @@ mod charset;
 // Plan 193 (`Set[T]`, `Deque[T]`, `PriorityQueue[T]`) — see this
 // module's own doc comment for the full account.
 mod collections;
+// Plan 182 (Structured CLI Flag Parsing) — `CliParser`/`CliParseResult`,
+// wrapping `clap`'s non-derive builder API — see `cli.rs`'s own
+// module doc.
+mod cli;
 // Named `csvs`, not `csv` — this crate's own `mod csv` would shadow
 // the external `csv` crate this module wraps, the identical collision
 // `aead.rs`/`url.rs`/`toml.rs` already hit and disclosed.
@@ -840,6 +844,148 @@ pub unsafe extern "C" fn emerald_rt_regex_split(id: i64, s: *const c_char) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_regex_split_count(id: i64, s: *const c_char) -> i64 {
   catch_and_raise(move || regex::regex_split_count(id, s))
+}
+
+// Plan 182 (Structured CLI Flag Parsing): `CliParser.new`/`.flag`/
+// `.option`/`.positional`/`.parse`/`.close`, `CliParseResult#flag`/
+// `#value`/`#positional_value`/`#help_requested`/`#help_text`/
+// `#error_message`/`#close`, dispatched by `emerald-codegen`'s own
+// hardcoded `CliParser`/`CliParseResult`-keyed method-call arms, the
+// same shape `Regex`/`Tempfile` immediately above use — see `cli.rs`'s
+// own module doc.
+
+/// # Safety
+/// `name`/`version`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparser_new(
+  name: *const c_char,
+  version: *const c_char,
+) -> i64 {
+  catch_and_raise(move || cli::cliparser_new(name, version))
+}
+
+/// # Safety
+/// `id` must be a live `CliParser` handle. `long`/`short`/`help`, if
+/// non-null, must each point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparser_flag(
+  id: i64,
+  long: *const c_char,
+  short: *const c_char,
+  help: *const c_char,
+) {
+  catch_and_raise(move || cli::cliparser_flag(id, long, short, help))
+}
+
+/// # Safety
+/// `id` must be a live `CliParser` handle. `long`/`short`/`help`, if
+/// non-null, must each point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparser_option(
+  id: i64,
+  long: *const c_char,
+  short: *const c_char,
+  help: *const c_char,
+  required: i64,
+) {
+  catch_and_raise(move || cli::cliparser_option(id, long, short, help, required))
+}
+
+/// # Safety
+/// `id` must be a live `CliParser` handle. `name`/`help`, if non-null,
+/// must each point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparser_positional(
+  id: i64,
+  name: *const c_char,
+  help: *const c_char,
+  required: i64,
+) {
+  catch_and_raise(move || cli::cliparser_positional(id, name, help, required))
+}
+
+/// # Safety
+/// `id` must be a live `CliParser` handle. `argv` must point to a
+/// buffer of at least `argc` valid, NUL-terminated C string pointers —
+/// `emerald-codegen`'s own call-site codegen guarantees this (see
+/// `cli.rs`'s own module doc for the header-skipping convention that
+/// produces it); when `argc` is `0`, `argv` is never dereferenced and
+/// may be null.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparser_parse(
+  id: i64,
+  argv: *const *const c_char,
+  argc: i64,
+) -> i64 {
+  catch_and_raise(move || cli::cliparser_parse(id, argv, argc))
+}
+
+/// # Safety
+/// Always safe to call, including on an already-closed or unknown
+/// `id` — closing is idempotent and never raises.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparser_close(id: i64) {
+  catch_and_raise(move || cli::cliparser_close(id))
+}
+
+/// # Safety
+/// `id` must be a live `CliParseResult` handle. `long`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparseresult_flag(id: i64, long: *const c_char) -> i64 {
+  catch_and_raise(move || cli::cliparseresult_flag(id, long))
+}
+
+/// # Safety
+/// `id` must be a live `CliParseResult` handle. `long`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparseresult_value(
+  id: i64,
+  long: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || cli::cliparseresult_value(id, long))
+}
+
+/// # Safety
+/// `id` must be a live `CliParseResult` handle. `name`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparseresult_positional_value(
+  id: i64,
+  name: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || cli::cliparseresult_positional_value(id, name))
+}
+
+/// # Safety
+/// `id` must be a live `CliParseResult` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparseresult_help_requested(id: i64) -> i64 {
+  catch_and_raise(move || cli::cliparseresult_help_requested(id))
+}
+
+/// # Safety
+/// `id` must be a live `CliParseResult` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparseresult_help_text(id: i64) -> *const c_char {
+  catch_and_raise(move || cli::cliparseresult_help_text(id))
+}
+
+/// # Safety
+/// `id` must be a live `CliParseResult` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparseresult_error_message(id: i64) -> *mut c_void {
+  catch_and_raise(move || cli::cliparseresult_error_message(id))
+}
+
+/// # Safety
+/// Always safe to call, including on an already-closed or unknown
+/// `id` — closing is idempotent and never raises.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_cliparseresult_close(id: i64) {
+  catch_and_raise(move || cli::cliparseresult_close(id))
 }
 
 // Plan 163 (Arbitrary-Precision Integers & Decimals): `BigInt` (a

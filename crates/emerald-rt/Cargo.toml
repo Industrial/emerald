@@ -641,6 +641,24 @@ bincode = { version = "=2.0.1", features = ["serde"] }
 # `serde_json::Value` directly), so the advisory is moot twice over.
 # `MessagePack.encode`/`.decode`'s direct backing. See DEPENDENCIES.md.
 rmp-serde = "1.3"
+# Plan 182 (Structured CLI Flag Parsing): real-checked at this plan's
+# own execution time (2026-09-23, via docs.rs) - clap 4.6.7 (published
+# 14 Sep 2026), actively maintained by the clap-rs/rust-cli teams, #1
+# in Command-line interface. Only the non-derive builder API (Command/
+# Arg/ArgAction) is used - the "derive" feature is NOT enabled in this
+# crate's default feature set, since Emerald has no macro/attribute/
+# derive system to mirror clap's usual #[derive(Parser)] ergonomics
+# (see this plan's own Decision log). No RustSec advisory found.
+# Real, disclosed correction found only by actually compiling this
+# plan's own `cli.rs`: clap's own `impl From<String> for Id`/`Str`
+# (clap_builder's `util/id.rs`/`builder/str.rs`) are both gated behind
+# a `#[cfg(feature = "string")]` NOT on by default - every arg name/
+# long/help string this module builds at runtime from a `*const
+# c_char` is a real, dynamically-owned `String` (never a `&'static
+# str` literal), so without this feature every `Arg::new`/`.long`/
+# `Command::new`/`.version` call in `cli.rs` fails to compile at all.
+# `CliParser`/`CliParseResult`'s direct backing. See DEPENDENCIES.md.
+clap = { version = "4.6", features = ["string"] }
 
 [build-dependencies]
 

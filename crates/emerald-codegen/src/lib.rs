@@ -247,6 +247,10 @@ fn set_newtype_underlying(program: &Program) {
     // they stay distinct classes despite the identical representation).
     "Tempfile",
     "Tempdir",
+    // Plan 182's Decision log: `CliParser`/`CliParseResult` -- the
+    // identical shape.
+    "CliParser",
+    "CliParseResult",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5476,6 +5480,23 @@ struct Ctx<'a, 'ctx> {
   tempdir_create: FunctionValue<'ctx>,
   tempdir_path: FunctionValue<'ctx>,
   tempdir_close: FunctionValue<'ctx>,
+  /// Plan 182 (Structured CLI Flag Parsing) — `CliParser.new`/`.flag`/
+  /// `.option`/`.positional`/`.parse`/`.close`, `CliParseResult#flag`/
+  /// `#value`/`#positional_value`/`#help_requested`/`#help_text`/
+  /// `#error_message`/`#close`, wrapping `clap`.
+  cliparser_new: FunctionValue<'ctx>,
+  cliparser_flag: FunctionValue<'ctx>,
+  cliparser_option: FunctionValue<'ctx>,
+  cliparser_positional: FunctionValue<'ctx>,
+  cliparser_parse: FunctionValue<'ctx>,
+  cliparser_close: FunctionValue<'ctx>,
+  cliparseresult_flag: FunctionValue<'ctx>,
+  cliparseresult_value: FunctionValue<'ctx>,
+  cliparseresult_positional_value: FunctionValue<'ctx>,
+  cliparseresult_help_requested: FunctionValue<'ctx>,
+  cliparseresult_help_text: FunctionValue<'ctx>,
+  cliparseresult_error_message: FunctionValue<'ctx>,
+  cliparseresult_close: FunctionValue<'ctx>,
   /// Plan 137 (SQLite) — `Sqlite.open`/`.open_memory`/`.close`/
   /// `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
   /// `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
@@ -7133,6 +7154,46 @@ fn build_expr<'ctx>(
       }
       let call = builder
         .build_call(ctx.log_fields_new, &[], "logfieldsnewtmp")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Int64))
+    }
+    // Plan 182's Decision log: `CliParser.new(name, version)` — the
+    // identical real-arguments exception to the ordinary "compiles to
+    // exactly the argument's own value" newtype-construction arm
+    // `LogFields.new()` immediately above already establishes, just
+    // with two real `String` arguments passed straight through to
+    // `emerald_rt_cliparser_new` instead of zero.
+    Expr::New(class_name, args) if class_name == "CliParser" => {
+      if args.len() != 2 {
+        return Err(format!(
+          "codegen: `CliParser.new` expects 2 arguments, found {}",
+          args.len()
+        ));
+      }
+      let (name_val, _) = build_expr(
+        context,
+        builder,
+        &args[0],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (version_val, _) = build_expr(
+        context,
+        builder,
+        &args[1],
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call = builder
+        .build_call(
+          ctx.cliparser_new,
+          &[name_val.into(), version_val.into()],
+          "cliparsernewtmp",
+        )
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Int64))
     }
@@ -9130,6 +9191,181 @@ fn build_method_call<'ctx>(
         .build_call(fv, &[recv_val.into()], "temppathtmp")
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Str));
+    }
+    // Plan 182's Decision log: `CliParser.new`/`.flag`/`.option`/
+    // `.positional`/`.parse`/`.close` — the identical carved-out-of-
+    // newtype shape `Regex`/`Tempfile` above already establish.
+    // `.parse`'s own `argv` argument (its first real, non-receiver
+    // argument) needs the identical `[len: i64]`-header-skipping
+    // `recv_name == "Process"`'s own arm below already establishes —
+    // `Array[String]`'s own representation, not a coincidence shared
+    // between the two.
+    if local_classes.get(recv_name).map(String::as_str) == Some("CliParser") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "parse" {
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+        for (i, a) in args.iter().enumerate() {
+          let (v, _) = build_expr(
+            context,
+            builder,
+            a,
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          if i == 0 {
+            let argv_ptr = field_ptr(context, builder, v.into_pointer_value(), 8)?;
+            call_args.push(argv_ptr.into());
+          } else {
+            call_args.push(v.into());
+          }
+        }
+        let call = builder
+          .build_call(ctx.cliparser_parse, &call_args, "cliparserparsetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Int64));
+      }
+      if method == "close" {
+        builder
+          .build_call(ctx.cliparser_close, &[recv_val.into()], "cliparserclosetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, kind) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        // `required: Boolean` (`.option`/`.positional`'s own last
+        // argument) crosses the FFI boundary as a plain `i64` (0/1) —
+        // `Regex#is_match`'s own "widen the other direction" trick,
+        // just on the way IN instead of out, the same shape `Deque
+        // [Boolean]#push_front`/`#push_back` above already establish.
+        let v = if kind == ValKind::Bool {
+          builder
+            .build_int_z_extend(v.into_int_value(), context.i64_type(), "cliparserboolarg")
+            .map_err(|e| e.to_string())?
+            .into()
+        } else {
+          v
+        };
+        call_args.push(v.into());
+      }
+      let fv = match method {
+        "flag" => ctx.cliparser_flag,
+        "option" => ctx.cliparser_option,
+        "positional" => ctx.cliparser_positional,
+        other => return Err(format!("codegen: unsupported CliParser method `{other}`")),
+      };
+      builder
+        .build_call(fv, &call_args, "cliparserbuildertmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
+    // Plan 182's Decision log: `CliParseResult#flag`/`#value`/
+    // `#positional_value`/`#help_requested`/`#help_text`/
+    // `#error_message`/`#close` — the same carved-out-of-newtype shape
+    // `CliParser` immediately above establishes.
+    if local_classes.get(recv_name).map(String::as_str) == Some("CliParseResult") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.cliparseresult_close,
+            &[recv_val.into()],
+            "cliparseresultclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      if method == "help_requested" {
+        let call = builder
+          .build_call(
+            ctx.cliparseresult_help_requested,
+            &[recv_val.into()],
+            "cliparseresulthelpreqtmp",
+          )
+          .map_err(|e| e.to_string())?;
+        let result = call_result(call)?;
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "cliparseresulthelpreqbool",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      if method == "help_text" {
+        let call = builder
+          .build_call(
+            ctx.cliparseresult_help_text,
+            &[recv_val.into()],
+            "cliparseresulthelptexttmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "flag" => (ctx.cliparseresult_flag, ValKind::Int64),
+        "value" => (ctx.cliparseresult_value, ValKind::Ptr),
+        "positional_value" => (ctx.cliparseresult_positional_value, ValKind::Ptr),
+        "error_message" => (ctx.cliparseresult_error_message, ValKind::Ptr),
+        other => return Err(format!("codegen: unsupported CliParseResult method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "cliparseresulttmp")
+        .map_err(|e| e.to_string())?;
+      let result = call_result(call)?;
+      if method == "flag" {
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "cliparseresultflagbool",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      return Ok((result, ret_kind));
     }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
@@ -23901,6 +24137,89 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 182 (Structured CLI Flag Parsing): `CliParser.new`/`.flag`/
+  // `.option`/`.positional`/`.parse`/`.close`, `CliParseResult#flag`/
+  // `#value`/`#positional_value`/`#help_requested`/`#help_text`/
+  // `#error_message`/`#close`, wrapping `clap` -- the same zero/one-
+  // `i64`-argument-plus-`ptr_ty`-string shapes `Regex`/`Tempfile`
+  // above already use.
+  let cliparser_new = module.add_function(
+    "emerald_rt_cliparser_new",
+    i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparser_flag = module.add_function(
+    "emerald_rt_cliparser_flag",
+    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparser_option = module.add_function(
+    "emerald_rt_cliparser_option",
+    void_ty.fn_type(
+      &[
+        i64_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        ptr_ty.into(),
+        i64_ty.into(),
+      ],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let cliparser_positional = module.add_function(
+    "emerald_rt_cliparser_positional",
+    void_ty.fn_type(
+      &[i64_ty.into(), ptr_ty.into(), ptr_ty.into(), i64_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let cliparser_parse = module.add_function(
+    "emerald_rt_cliparser_parse",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparser_close = module.add_function(
+    "emerald_rt_cliparser_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparseresult_flag = module.add_function(
+    "emerald_rt_cliparseresult_flag",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparseresult_value = module.add_function(
+    "emerald_rt_cliparseresult_value",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparseresult_positional_value = module.add_function(
+    "emerald_rt_cliparseresult_positional_value",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparseresult_help_requested = module.add_function(
+    "emerald_rt_cliparseresult_help_requested",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparseresult_help_text = module.add_function(
+    "emerald_rt_cliparseresult_help_text",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparseresult_error_message = module.add_function(
+    "emerald_rt_cliparseresult_error_message",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let cliparseresult_close = module.add_function(
+    "emerald_rt_cliparseresult_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 137 (SQLite): `Sqlite.open`/`.open_memory`/`.close`/
   // `.execute_direct`/`.prepare`/`.bind_string`/`.bind_int64`/
   // `.bind_float64`/`.bind_null`/`.execute`/`.query`/`.step`/
@@ -25264,6 +25583,13 @@ fn compile_to_object_impl(
   // create`, so both registries are load-bearing here too).
   newtypes.insert("Tempfile".to_string());
   newtypes.insert("Tempdir".to_string());
+  // Plan 182's Decision log: `CliParser`/`CliParseResult` -- added
+  // here as well as `NEWTYPE_UNDERLYING` above, the identical
+  // `Tempfile`/`Tempdir` gap-avoidance immediately above: this plan's
+  // own Concrete Proof `Let`-binds `parser: CliParser = CliParser.
+  // new(...)` and `result: CliParseResult = parser.parse(...)`.
+  newtypes.insert("CliParser".to_string());
+  newtypes.insert("CliParseResult".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -25630,6 +25956,19 @@ fn compile_to_object_impl(
     tempdir_create,
     tempdir_path,
     tempdir_close,
+    cliparser_new,
+    cliparser_flag,
+    cliparser_option,
+    cliparser_positional,
+    cliparser_parse,
+    cliparser_close,
+    cliparseresult_flag,
+    cliparseresult_value,
+    cliparseresult_positional_value,
+    cliparseresult_help_requested,
+    cliparseresult_help_text,
+    cliparseresult_error_message,
+    cliparseresult_close,
     sqlite_open,
     sqlite_open_memory,
     sqlite_close,
