@@ -1210,3 +1210,73 @@ fn property_shrink_proof_em_shrinks_a_real_failure_to_a_minimal_counterexample()
     "shrinking should have converged to b=1 or b=-1, found b={b}; full stdout:\n{stdout}"
   );
 }
+
+// Plan 102 (WebSocket): `Http.serve` (plan 101) never returns, so
+// unlike every other example in this table `websocket_proof.em`'s own
+// compiled process never exits on its own — this test spawns it in
+// the BACKGROUND, drives a real `tungstenite::connect` client directly
+// from Rust against it (the reverse role from every other proof in
+// this file, since the *Emerald* side here is the server, per this
+// plan's own Concrete Proof), and kills the process once the exchange
+// completes, rather than using `compile_and_run`'s own wait-for-exit-
+// then-assert-stdout shape at all — this file's own stdout is never
+// asserted against.
+#[test]
+fn websocket_proof_em_round_trips_a_real_echo_over_a_real_socket() {
+  let source = workspace_root().join("examples").join("websocket_proof.em");
+  let output = std::env::temp_dir().join(format!(
+    "emerald_example_websocket_proof_em_{}",
+    std::process::id()
+  ));
+
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg(&source)
+    .arg("-o")
+    .arg(&output)
+    .status()
+    .expect("failed to run emerald-cli");
+  assert!(
+    status.success(),
+    "emerald-cli should succeed on websocket_proof.em"
+  );
+
+  let mut child = Command::new(&output)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("failed to spawn compiled websocket_proof.em binary");
+  std::thread::sleep(std::time::Duration::from_millis(200));
+
+  let (mut ws, _response) = tungstenite::connect("ws://127.0.0.1:47501/ws")
+    .expect("client-side WebSocket handshake against the compiled Emerald server");
+  ws.send(tungstenite::Message::Text("hello".into()))
+    .expect("send text frame");
+  let reply = ws.read().expect("read echoed text frame");
+  assert_eq!(
+    reply
+      .into_text()
+      .expect("echoed frame should be Text")
+      .as_str(),
+    "echo: hello"
+  );
+  // Plan 102's own Concrete Proof: "then sends a Close frame and
+  // asserts the connection closes cleanly." The server's own handler
+  // (`websocket_proof.em`) calls `ws.close()` immediately after
+  // `.send_text`, so this side's own `.close()` may itself race an
+  // already-torn-down socket — real, and harmless (`let _ =`, not
+  // `.expect`) — the draining loop below is what actually proves a
+  // clean close either way, terminating on any `Err` (the real TCP
+  // connection closing) or an explicit `Close` message.
+  let _ = ws.close(None);
+  loop {
+    match ws.read() {
+      Ok(tungstenite::Message::Close(_)) => break,
+      Ok(_) => continue,
+      Err(_) => break,
+    }
+  }
+
+  let _ = child.kill();
+  let _ = child.wait();
+  std::fs::remove_file(&output).ok();
+}

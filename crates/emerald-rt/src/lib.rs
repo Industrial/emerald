@@ -266,6 +266,11 @@ mod tempfiles;
 // `TlsStream#read`/`#write`/`#close`, `TlsListener#accept`/`#close`,
 // wrapping `rustls` -- see `tls.rs`'s own module doc.
 mod tls;
+// Plan 102 (WebSocket) -- `WebSocket.connect`, `HttpRequest#upgrade`,
+// `WebSocketConnection#send_text`/`#send_binary`/`#recv`/`#close`,
+// `WebSocketMessage#kind`/`#text`/`#bytes`, wrapping `tungstenite` --
+// see `websocket.rs`'s own module doc.
+mod websocket;
 // Named `tomls`, not `toml` — this crate's own `mod toml` would shadow
 // the external `toml` crate this module wraps, the identical collision
 // `aead.rs`/`url.rs` already hit and disclosed.
@@ -3109,6 +3114,73 @@ pub unsafe extern "C" fn emerald_rt_http_request_path(id: i64) -> *const c_char 
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_http_request_body(id: i64) -> *const c_char {
   catch_and_raise(move || http_server::http_request_body(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `HttpRequest` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_request_upgrade(id: i64) -> *mut c_void {
+  catch_and_raise(move || websocket::ws_upgrade_from_http(id))
+}
+
+/// # Safety
+/// `url`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_connect(url: *const c_char) -> *mut c_void {
+  catch_and_raise(move || websocket::ws_connect(url))
+}
+
+/// # Safety
+/// `msg`, if non-null, must point to a valid, NUL-terminated C string.
+/// `id` must be a live `WebSocketConnection` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_send_text(id: i64, msg: *const c_char) -> *mut c_void {
+  catch_and_raise(move || websocket::ws_send_text(id, msg))
+}
+
+/// # Safety
+/// `id` must be a live `WebSocketConnection` handle; `bytes_id` must be
+/// a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_send_binary(id: i64, bytes_id: i64) -> *mut c_void {
+  catch_and_raise(move || websocket::ws_send_binary(id, bytes_id))
+}
+
+/// # Safety
+/// `id` must be a live `WebSocketConnection` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_recv(id: i64) -> *mut c_void {
+  catch_and_raise(move || websocket::ws_recv(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `WebSocketConnection` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_close(id: i64) {
+  catch_and_raise(move || websocket::ws_close(id))
+}
+
+/// # Safety
+/// `ptr` must point to a live `WebSocketMessage` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_message_kind(ptr: *const i64) -> i64 {
+  catch_and_raise(move || websocket::ws_message_kind(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live `WebSocketMessage` block whose `kind` is
+/// `0` (Text).
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_message_text(ptr: *const i64) -> *const c_char {
+  catch_and_raise(move || websocket::ws_message_text(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live `WebSocketMessage` block whose `kind` is
+/// `1` (Binary).
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_ws_message_bytes(ptr: *const i64) -> i64 {
+  catch_and_raise(move || websocket::ws_message_bytes(ptr))
 }
 
 /// # Safety

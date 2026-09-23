@@ -257,6 +257,10 @@ fn set_newtype_underlying(program: &Program) {
     // identical shape.
     "ConfigBuilder",
     "ConfigValue",
+    // Plan 102's Decision log: `WebSocketConnection` -- the identical
+    // shape, plan 93's own handle registry backed by a boxed
+    // `tungstenite::WebSocket<WsStream>`.
+    "WebSocketConnection",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5573,6 +5577,18 @@ struct Ctx<'a, 'ctx> {
   http_request_method: FunctionValue<'ctx>,
   http_request_path: FunctionValue<'ctx>,
   http_request_body: FunctionValue<'ctx>,
+  /// Plan 102 (WebSocket) — `HttpRequest#upgrade`, `WebSocket.connect`,
+  /// `WebSocketConnection#send_text`/`#send_binary`/`#recv`/`#close`,
+  /// `WebSocketMessage#kind`/`#text`/`#bytes`, wrapping `tungstenite`.
+  http_request_upgrade: FunctionValue<'ctx>,
+  ws_connect: FunctionValue<'ctx>,
+  ws_send_text: FunctionValue<'ctx>,
+  ws_send_binary: FunctionValue<'ctx>,
+  ws_recv: FunctionValue<'ctx>,
+  ws_close: FunctionValue<'ctx>,
+  ws_message_kind: FunctionValue<'ctx>,
+  ws_message_text: FunctionValue<'ctx>,
+  ws_message_bytes: FunctionValue<'ctx>,
   /// Plan 115 (Key Derivation Functions) — `Kdf.hkdf`/`.pbkdf2`.
   kdf_hkdf: FunctionValue<'ctx>,
   kdf_pbkdf2: FunctionValue<'ctx>,
@@ -9680,6 +9696,9 @@ fn build_method_call<'ctx>(
       return Ok((call_result(call)?, ret_kind));
     }
     // Plan 101's Decision log: `HttpRequest#method`/`#path`/`#body`.
+    // Plan 102's Decision log: `#upgrade`, returning `ValKind::Ptr` (a
+    // real `Result[WebSocketConnection, WebSocketError]` heap value)
+    // rather than the `ValKind::Str` the other three methods share.
     if local_classes.get(recv_name).map(String::as_str) == Some("HttpRequest") {
       let (recv_val, _) = build_expr(
         context,
@@ -9690,6 +9709,16 @@ fn build_method_call<'ctx>(
         local_array_elem_types,
         ctx,
       )?;
+      if method == "upgrade" {
+        let call = builder
+          .build_call(
+            ctx.http_request_upgrade,
+            &[recv_val.into()],
+            "httprequestupgradetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Ptr));
+      }
       let fv = match method {
         "method" => ctx.http_request_method,
         "path" => ctx.http_request_path,
@@ -9700,6 +9729,56 @@ fn build_method_call<'ctx>(
         .build_call(fv, &[recv_val.into()], "httprequesttmp")
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Str));
+    }
+    // Plan 102's Decision log: `WebSocketConnection#send_text`/
+    // `#send_binary`/`#recv`/`#close` — `#close` is genuinely `Void`
+    // (its own `builder.build_call` result is never read via
+    // `call_result`, matching `TlsStream#close`'s own shape); the
+    // other three each return a real `Result[_, WebSocketError]` heap
+    // value (`ValKind::Ptr`).
+    if local_classes.get(recv_name).map(String::as_str) == Some("WebSocketConnection") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      if method == "close" {
+        builder
+          .build_call(ctx.ws_close, &call_args, "wsclosetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let fv = match method {
+        "send_text" => ctx.ws_send_text,
+        "send_binary" => ctx.ws_send_binary,
+        "recv" => ctx.ws_recv,
+        other => {
+          return Err(format!(
+            "codegen: unsupported WebSocketConnection method `{other}`"
+          ))
+        }
+      };
+      let call = builder
+        .build_call(fv, &call_args, "wsconntmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Ptr));
     }
     if method != "value" {
       return Err(format!("codegen: newtype has no method `{method}`"));
@@ -12219,6 +12298,29 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ret_kind));
   }
 
+  // Plan 102's Decision log: `WebSocket.connect(url)` — the
+  // identical reserved-namespace hardcoded-arm shape `Path`/`Dns`
+  // immediately below use.
+  if recv_name == "WebSocket" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let call = builder
+      .build_call(ctx.ws_connect, &call_args, "wsconnecttmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
+  }
   // Plan 144 (Extended Filesystem Operations): `Path.exists`/`.is_
   // file`/`.is_dir`/`.is_symlink`/`.metadata`/`.unix_mode`/`.set_
   // unix_mode`/`.symlink`/`.read_link` — the identical reserved-
@@ -13001,6 +13103,38 @@ fn build_method_call<'ctx>(
         return Ok((is_true.into(), ValKind::Bool));
       }
       return Ok((result, ValKind::Int64));
+    }
+    // Plan 102's Decision log: `WebSocketMessage`'s own three
+    // zero-argument instance methods — the identical carved-out-of-
+    // the-`method_owners`-lookup shape `FileMetadata` immediately
+    // above establishes. `.text`/`.bytes` are unchecked against
+    // `.kind` (see `websocket.rs`'s own module doc for the full
+    // reasoning) — this arm just calls straight through, exactly as
+    // `FileMetadata`'s own accessors do.
+    if class_name == "WebSocketMessage" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (fv, ret_kind) = match method {
+        "kind" => (ctx.ws_message_kind, ValKind::Int64),
+        "text" => (ctx.ws_message_text, ValKind::Str),
+        "bytes" => (ctx.ws_message_bytes, ValKind::Int64),
+        other => {
+          return Err(format!(
+            "codegen: unsupported WebSocketMessage method `{other}`"
+          ));
+        }
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "websocketmessagetmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
     }
     // Plan 145 (Process Spawning & Control): `ProcessResult`'s own
     // four zero-argument instance methods — the identical carved-out-
@@ -24795,6 +24929,52 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 102 (WebSocket).
+  let http_request_upgrade = module.add_function(
+    "emerald_rt_http_request_upgrade",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_connect = module.add_function(
+    "emerald_rt_ws_connect",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_send_text = module.add_function(
+    "emerald_rt_ws_send_text",
+    ptr_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_send_binary = module.add_function(
+    "emerald_rt_ws_send_binary",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_recv = module.add_function(
+    "emerald_rt_ws_recv",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_close = module.add_function(
+    "emerald_rt_ws_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_message_kind = module.add_function(
+    "emerald_rt_ws_message_kind",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_message_text = module.add_function(
+    "emerald_rt_ws_message_text",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let ws_message_bytes = module.add_function(
+    "emerald_rt_ws_message_bytes",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 115 (Key Derivation Functions).
   let kdf_hkdf = module.add_function(
     "emerald_rt_kdf_hkdf",
@@ -25072,6 +25252,33 @@ fn compile_to_object_impl(
     doc: None,
   };
   class_defs.insert("FileMetadata".to_string(), &filemetadata_class_def);
+  // Plan 102 (WebSocket): `WebSocketMessage` — a compiler-synthesized,
+  // two-`Int64`-field class (`kind`/`payload`), the identical
+  // "resolves against the real class registry with no matching
+  // source-level declaration" shape `FileMetadata` immediately above
+  // uses.
+  let websocketmessage_class_def = ClassDef {
+    name: "WebSocketMessage".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![
+      Param {
+        name: "kind".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "payload".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+    ],
+    methods: Vec::new(),
+    type_params: Vec::new(),
+    doc: None,
+  };
+  class_defs.insert("WebSocketMessage".to_string(), &websocketmessage_class_def);
   // Plan 145 (Process Spawning & Control): `ProcessResult` — a
   // compiler-synthesized, three-field class (`stdout`/`stderr: String`,
   // `exit_code: Int64`), the identical "resolves against the real
@@ -25189,6 +25396,14 @@ fn compile_to_object_impl(
     build_class_layout("FileMetadata", &class_defs)?,
   );
   class_tags.insert("FileMetadata".to_string(), class_tags.len() as i64);
+  // Plan 102 (WebSocket): `WebSocketMessage`'s own `ClassLayout` plus
+  // `class_tags` entry — needed unconditionally, the identical reason
+  // `Decimal`'s own comment above discloses.
+  classes.insert(
+    "WebSocketMessage".to_string(),
+    build_class_layout("WebSocketMessage", &class_defs)?,
+  );
+  class_tags.insert("WebSocketMessage".to_string(), class_tags.len() as i64);
   // Plan 145 (Process Spawning & Control): `ProcessResult`'s own
   // `ClassLayout` plus `class_tags` entry — needed unconditionally,
   // the identical reason `Decimal`'s own comment above discloses.
@@ -25571,6 +25786,31 @@ fn compile_to_object_impl(
     "PathError".to_string(),
     build_enum_layout(&path_error_enum_def_cg),
   );
+  // Plan 102 (WebSocket): `WebSocketError` — codegen's own mirror of
+  // `emerald-sema`'s identical synthetic `EnumDef`.
+  let websocket_error_enum_def_cg = EnumDef {
+    name: "WebSocketError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "ConnectionClosed".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Protocol".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "WebSocketError".to_string(),
+    build_enum_layout(&websocket_error_enum_def_cg),
+  );
   // Plan 124: `XmlNode`/`XmlEvent` — codegen's own mirror of `emerald-
   // sema`'s identical synthetic `EnumDef`s (see that crate's own
   // Decision log for why `XmlEvent`'s text-content variant is named
@@ -25945,6 +26185,8 @@ fn compile_to_object_impl(
   newtypes.insert("HttpResponse".to_string());
   // Plan 101's Decision log: `HttpRequest`.
   newtypes.insert("HttpRequest".to_string());
+  // Plan 102's Decision log: `WebSocketConnection`.
+  newtypes.insert("WebSocketConnection".to_string());
   // Plan 124's Decision log: `XmlReader`.
   // Plan 191's Decision log: `ProgressBar`.
   newtypes.insert("ProgressBar".to_string());
@@ -26429,6 +26671,15 @@ fn compile_to_object_impl(
     http_request_method,
     http_request_path,
     http_request_body,
+    http_request_upgrade,
+    ws_connect,
+    ws_send_text,
+    ws_send_binary,
+    ws_recv,
+    ws_close,
+    ws_message_kind,
+    ws_message_text,
+    ws_message_bytes,
     kdf_hkdf,
     kdf_pbkdf2,
     password_hash,

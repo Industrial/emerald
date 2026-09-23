@@ -5485,6 +5485,41 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 102's Decision log: `WebSocket.connect(url)` — the same
+    // reserved-namespace static-call shape `Http`/`Url`/`Dns` already
+    // use. Returns `Result[WebSocketConnection, WebSocketError]` —
+    // `WebSocketConnection` a plan-93 opaque `Int64` handle (the
+    // identical shape `HttpRequest`/`HttpResponse` immediately above
+    // already use), `WebSocketError` a real, plan-195 Typed Domain
+    // Error (not a plain `String`, unlike plans 100/101's own
+    // `HttpError`/`Http.serve` arms — this plan was authored with
+    // plan 195's convention already in view).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "WebSocket") =>
+    {
+      if method != "connect" {
+        return Err(Diagnostic::new(
+          format!("WebSocket has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      let ws_conn_ty = Type::Newtype("WebSocketConnection".to_string(), Box::new(Type::Int64));
+      let ret = Type::Result(
+        Box::new(ws_conn_ty),
+        Box::new(Type::Enum("WebSocketError".to_string())),
+      );
+      check_args(
+        method,
+        args,
+        &[Type::String],
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 101's Decision log: `HttpResponse.build(status, body)` — the
     // plan's own literal `.new` can never reach reserved-namespace
     // dispatch at all (`"new"` is a grammar-reserved keyword parsing
@@ -7096,13 +7131,72 @@ fn infer_expr_type(
         }
         // Plan 101's Decision log: `HttpRequest#method`/`#path`/
         // `#body` — the identical carved-out shape `HttpResponse`
-        // already establishes.
+        // already establishes. Plan 102's Decision log: `#upgrade`
+        // added onto this same `HttpRequest` arm (a genuine instance
+        // method on the receiver's own newtype, not a new reserved-
+        // namespace static call), returning `Result[WebSocketConnection,
+        // WebSocketError]` — the same shape `WebSocket.connect` above
+        // returns.
         if name == "HttpRequest" {
+          if method == "upgrade" {
+            let ws_conn_ty =
+              Type::Newtype("WebSocketConnection".to_string(), Box::new(Type::Int64));
+            let ret = Type::Result(
+              Box::new(ws_conn_ty),
+              Box::new(Type::Enum("WebSocketError".to_string())),
+            );
+            check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+            return Ok(ret);
+          }
           let (expected_params, ret) = match method.as_str() {
             "method" | "path" | "body" => (vec![], Type::String),
             other => {
               return Err(Diagnostic::new(
                 format!("HttpRequest has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 102's Decision log: `WebSocketConnection#send_text`/
+        // `#send_binary`/`#recv`/`#close` — the identical carved-out
+        // shape `HttpRequest`/`HttpResponse` immediately above
+        // establish. `#send_text`/`#send_binary`/`#recv` each return a
+        // real `Result[_, WebSocketError]`; `#close` is genuinely
+        // `Void` (matching `TlsStream#close`/`UdpSocket#close`'s own
+        // precedent — `emerald-rt`'s own `.close()` never fails, per
+        // `crate::handle::handle_close`'s own "double-close/unknown
+        // handle is a harmless no-op" contract, so there is no
+        // `Result` to check here).
+        if name == "WebSocketConnection" {
+          let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+          let ws_msg_ty = Type::Class("WebSocketMessage".to_string());
+          let ws_err_ty = Type::Enum("WebSocketError".to_string());
+          let (expected_params, ret) = match method.as_str() {
+            "send_text" => (
+              vec![Type::String],
+              Type::Result(Box::new(Type::Void), Box::new(ws_err_ty.clone())),
+            ),
+            "send_binary" => (
+              vec![bytes_ty],
+              Type::Result(Box::new(Type::Void), Box::new(ws_err_ty.clone())),
+            ),
+            "recv" => (vec![], Type::Result(Box::new(ws_msg_ty), Box::new(ws_err_ty))),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("WebSocketConnection has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -14530,6 +14624,10 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     "HttpResponse",
     // Plan 101's Decision log: `HttpRequest` — the identical shape.
     "HttpRequest",
+    // Plan 102's Decision log: `WebSocketConnection` — the identical
+    // shape, plan 93's own handle registry backed by a boxed
+    // `tungstenite::WebSocket<WsStream>`.
+    "WebSocketConnection",
   ] {
     classes.insert(
       name.to_string(),
@@ -15495,6 +15593,49 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&path_error_enum_def);
+  // Plan 102 (WebSocket): `WebSocketError` — the Typed Domain Errors
+  // convention (plan 195), the identical "classify what's real, fold
+  // the rest" shape `PathError`/`DecimalError` immediately above
+  // already establish. Declaration order matches `crates/emerald-rt/
+  // src/websocket.rs`'s own `WS_ERROR_TAG_*` constants byte-for-byte
+  // — `ConnectionClosed`=0, `Protocol`=1, `Other`=2.
+  let websocket_error_enum_def = EnumDef {
+    name: "WebSocketError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "ConnectionClosed".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Protocol".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "WebSocketError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &websocket_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&websocket_error_enum_def);
   // Plan 144 (Extended Filesystem Operations): `FileMetadata` — a
   // compiler-synthesized, five-`Int64`-field class (`size`/`modified_
   // unix`/`is_dir`/`is_file`/`readonly`), the identical "ordinary
@@ -15589,6 +15730,80 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           FunctionSig {
             params: vec![],
             return_type: Type::Boolean,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+      ]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  // Plan 102 (WebSocket): `WebSocketMessage` — a compiler-synthesized,
+  // two-field class (`kind: Int64`, `payload: Int64`), the identical
+  // "ordinary `Type::Class`, real `ClassInfo.methods` entries, no
+  // `Type::Newtype` carve-out" shape `FileMetadata` immediately above
+  // uses. `fields` stays empty (Emerald source never reads the packed
+  // `[kind: i64][payload: ptr]` block directly, only through the three
+  // zero-argument instance methods below) — `.text`/`.bytes` are
+  // unchecked against `.kind`, the identical "unchecked, matching
+  // `Array`'s own existing precedent" posture plan 45's Decision log
+  // already accepted for `str[i]`/`.slice` (see `websocket.rs`'s own
+  // module doc for the full reasoning).
+  classes.insert(
+    "WebSocketMessage".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::from([
+        (
+          "kind".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Int64,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "text".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::String,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "bytes".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Newtype("Bytes".to_string(), Box::new(Type::Int64)),
             block_param: None,
             param_names: vec![],
             defaults: vec![],

@@ -726,6 +726,29 @@ config = { version = "0.15", default-features = false, features = [
 # tempfile) - no C-exception needed. `proptest_support.rs`'s direct
 # backing. See DEPENDENCIES.md.
 proptest = "1.11"
+# Plan 102 (WebSocket): tungstenite 0.30 (verified against this
+# session's own vendored `Cargo.lock` resolution — crates.io itself
+# 403s bot access, the identical access finding plans 118/154 already
+# disclosed), the plain, synchronous-mode websocket crate whose own
+# README leads with exactly the blocking `TcpListener`/`accept`/
+# `.read()`/`.send()` shape this plan's own design follows, explicitly
+# naming `tokio-tungstenite` as the alternative for callers wanting an
+# async event loop this crate has none of (plan 94's sync-first
+# posture, already established by `Http.serve`/`Http.get`). Default
+# features only — no TLS feature enabled: this plan's own Decision log
+# defers `wss://` until plan 99's shared `rustls` feature-flag
+# convention can be reconciled with it rather than picking a default
+# ahead of that plan, so `WebSocket.connect` supports `ws://` only in
+# this first pass. The RFC6455 handshake's own `Sec-WebSocket-Accept`
+# computation (SHA-1-then-base64, mandated by the protocol spec itself,
+# not a security choice this plan makes) is reused directly from
+# tungstenite's own already-linked `handshake::derive_accept_key`
+# rather than adding a redundant direct `sha1` dependency for the
+# identical, already-available computation. No RustSec advisory found
+# against `tungstenite`. `WebSocket.connect`/`.send_text`/`.send_binary`/
+# `.recv`/`.close`, `HttpRequest#upgrade`'s direct backing. See
+# DEPENDENCIES.md.
+tungstenite = "0.30"
 
 [build-dependencies]
 

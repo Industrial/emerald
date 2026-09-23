@@ -70,10 +70,40 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 const HTTP_REQUEST_TAG: &str = "HttpRequest";
 
+// Plan 102 (WebSocket)'s own real, disclosed extension of this
+// struct: `request` now holds the live `tiny_http::Request` itself
+// (previously this plan only cached its `method`/`path`/`body` as
+// plain `String`s and let the local `request` binding in `http_serve`
+// go out of scope after responding). `HttpRequest#upgrade` needs the
+// real, not-yet-`.respond`-ed `tiny_http::Request` to call its own
+// `.upgrade(...)` on — `method`/`path`/`body` stay cached separately
+// rather than re-derived from `request` after it may have been taken,
+// so `#method`/`#path`/`#body` keep working identically even on an
+// already-upgraded `HttpRequest` handle.
 struct HttpRequestData {
   method: String,
   path: String,
   body: String,
+  request: Option<tiny_http::Request>,
+}
+
+/// `HttpRequest#upgrade`'s own extraction point (plan 102) — pulls the
+/// real, live `tiny_http::Request` out of this handle's own
+/// `HttpRequestData`, leaving `None` behind so `http_serve`'s own
+/// trailing `.respond` call (below) correctly skips an
+/// already-upgraded request instead of trying to respond on a stream
+/// `tiny_http`'s own `Request::upgrade` has already fully consumed.
+/// `Err` if the handle is closed/unknown, or if this request was
+/// already taken (a second `.upgrade()` call on the same request, or
+/// one `http_serve` itself already consumed after the handler
+/// returned — not reachable in practice since `http_serve` only takes
+/// AFTER the handler returns, but defended here regardless).
+pub(crate) fn http_request_take(id: i64) -> Result<tiny_http::Request, String> {
+  let taken =
+    handle_get_mut::<HttpRequestData, Option<tiny_http::Request>>(id, HTTP_REQUEST_TAG, |r| {
+      r.request.take()
+    })?;
+  taken.ok_or_else(|| "HttpRequest#upgrade: request already upgraded".to_string())
 }
 
 unsafe fn read_str<'a>(s: *const c_char) -> Result<&'a str, String> {
@@ -135,10 +165,42 @@ pub unsafe fn http_serve(port: i64, handler: extern "C-unwind" fn(i64) -> i64) -
   for mut request in server.incoming_requests() {
     let method = request.method().to_string();
     let path = request.url().to_string();
+    // Plan 102 (WebSocket): real, disclosed finding made compiling
+    // `examples/websocket_proof.em` — for a genuine WebSocket
+    // handshake request (`Connection: Upgrade`, RFC6455 §4.1's own
+    // required header), unconditionally calling `request.as_reader()
+    // .read_to_string(...)` the way every plain (non-upgrade) request
+    // already safely does HANGS the entire connection instead of
+    // reading a real, empty body: `tiny_http` does not resolve such a
+    // request's own body length the same "no Content-Length/Transfer-
+    // Encoding means zero-length body" way it does for an ordinary
+    // request, and blocks waiting for bytes the client (already
+    // waiting on OUR OWN response) is never going to send. A real
+    // WebSocket handshake GET has no meaningful body per the spec
+    // itself regardless, so this skips the read entirely for any
+    // request carrying an `Upgrade` header (case-insensitive, the
+    // same matching `websocket.rs`'s own `Sec-WebSocket-Key` lookup
+    // uses) rather than trying to bound/fix the read.
+    let is_upgrade_request = request
+      .headers()
+      .iter()
+      .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Upgrade"));
     let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
+    if !is_upgrade_request {
+      let _ = request.as_reader().read_to_string(&mut body);
+    }
     let req_id = handle_alloc(
-      Box::new(HttpRequestData { method, path, body }),
+      Box::new(HttpRequestData {
+        method,
+        path,
+        body,
+        // Plan 102 (WebSocket): the real `tiny_http::Request` rides
+        // along inside the handle now, so `HttpRequest#upgrade`
+        // (`websocket.rs`'s own `ws_upgrade_from_http`, via this
+        // module's own `http_request_take`) has a real, not-yet-
+        // consumed request to call `.upgrade(...)` on.
+        request: Some(request),
+      }),
       HTTP_REQUEST_TAG,
     );
     // Real, secondary defensive layer only — see this module's own doc
@@ -147,14 +209,30 @@ pub unsafe fn http_serve(port: i64, handler: extern "C-unwind" fn(i64) -> i64) -
       Ok(id) => id,
       Err(_) => http_response_new_handle(500, "Internal Server Error".to_string()),
     };
-    let status = handle_get_mut::<HttpResponseData, i64>(resp_id, HTTP_RESPONSE_TAG, |r| r.status)
-      .unwrap_or(500);
-    let response_body =
-      handle_get_mut::<HttpResponseData, String>(resp_id, HTTP_RESPONSE_TAG, |r| r.body.clone())
-        .unwrap_or_else(|_| "Internal Server Error".to_string());
-    let status_code: u16 = status.clamp(100, 599) as u16;
-    let response = tiny_http::Response::from_string(response_body).with_status_code(status_code);
-    let _ = request.respond(response);
+    // Plan 102 (WebSocket): only respond here if the handler never
+    // called `.upgrade()` — an upgraded request's own `tiny_http::
+    // Request::upgrade` call already sent the real 101 response and
+    // fully consumed the underlying stream itself; a second `.respond`
+    // on it would be a real, invalid double-response. `.take()`
+    // returns `None` on an already-upgraded request (this module's
+    // own `http_request_take` already took it), so this whole block
+    // is a no-op in that case, by construction, not by a separate
+    // "was this upgraded" flag.
+    if let Ok(Some(original_request)) =
+      handle_get_mut::<HttpRequestData, Option<tiny_http::Request>>(req_id, HTTP_REQUEST_TAG, |r| {
+        r.request.take()
+      })
+    {
+      let status =
+        handle_get_mut::<HttpResponseData, i64>(resp_id, HTTP_RESPONSE_TAG, |r| r.status)
+          .unwrap_or(500);
+      let response_body =
+        handle_get_mut::<HttpResponseData, String>(resp_id, HTTP_RESPONSE_TAG, |r| r.body.clone())
+          .unwrap_or_else(|_| "Internal Server Error".to_string());
+      let status_code: u16 = status.clamp(100, 599) as u16;
+      let response = tiny_http::Response::from_string(response_body).with_status_code(status_code);
+      let _ = original_request.respond(response);
+    }
   }
   0
 }

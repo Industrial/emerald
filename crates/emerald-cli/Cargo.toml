@@ -24,3 +24,15 @@ emerald-fmt = { path = "../emerald-fmt" }
 miette = { version = "7", features = ["fancy"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Plan 102 (WebSocket): `examples.rs`'s own `websocket_proof_em_
+# round_trips_a_real_echo_over_a_real_socket` test needs a real
+# WebSocket CLIENT, driven directly from Rust, against the compiled
+# Emerald program acting as the SERVER — the reverse role from every
+# other example in this file, per this plan's own Concrete Proof. The
+# identical `tungstenite` 0.30 `emerald-rt` already depends on and
+# vets (see `crates/emerald-rt/DEPENDENCIES.md`), reused here as a
+# test-only dependency (this workspace's shared `Cargo.lock` already
+# resolves it) rather than hand-rolling a second RFC6455 client.
+tungstenite = "0.30"
