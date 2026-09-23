@@ -351,5 +351,29 @@ unicode-normalization = "0.1.25"
 # #29 directly (grapheme cluster/word/sentence boundaries). No open
 # RustSec advisory found.
 unicode-segmentation = "1.13.3"
+# Plan 163 (Arbitrary-Precision Integers & Decimals): real-checked at
+# this plan's own execution time (2026-09-23, via `cargo build`'s own
+# dependency resolution against the live registry — `crates.io`/`lib.rs`
+# direct web access was unavailable in this session) — `num-bigint` and
+# `rust_decimal` are each the standard, long-established pure-Rust
+# crate for their respective category (arbitrary-precision integer
+# arithmetic; fixed-point base-10 "financial decimal" arithmetic) — see
+# `DEPENDENCIES.md` for the resolved version/date/download-count row.
+# `num-bigint` backs `BigInt` (a `crate::handle`-registry opaque
+# `Int64` handle, the identical zero-cost-newtype shape `Regex`/
+# `XmlReader` already use — `num_bigint::BigInt`'s own internal
+# `Vec<u32>` digit storage is genuinely unbounded, so no fixed number
+# of scalar fields could ever hold it). `rust_decimal` backs `Decimal`
+# (NOT a handle — a packed two-`Int64`-field class reconstructing a
+# real `rust_decimal::Decimal` via its own documented 16-byte
+# `serialize()`/`deserialize()` wire format on every native call —
+# `rust_decimal::Decimal` is fixed at exactly 16 bytes, so two plain
+# `Int64` fields hold it exactly, with zero heap allocation and zero
+# handle-registry leak, a genuinely different and better representation
+# than `BigInt`'s handle). No RustSec advisory found against either
+# crate at the version this pin resolves to (checked against the
+# installed `cargo audit` database — see this crate's own gate run).
+num-bigint = "0.4"
+rust_decimal = "1"
 
 [build-dependencies]

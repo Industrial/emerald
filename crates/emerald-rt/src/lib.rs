@@ -144,6 +144,10 @@ pub(crate) fn tokio_rt() -> &'static tokio::runtime::Runtime {
 
 mod aead;
 mod asymmetric;
+// Plan 163 (Arbitrary-Precision Integers & Decimals), `BigInt` half —
+// see `bignum.rs`'s own module doc for why this half is a
+// `crate::handle`-registry opaque `Int64` newtype, unlike `decimal.rs`.
+mod bignum;
 mod bytes;
 // Plan 153 (Character Set / Encoding Conversion) — named `charset`,
 // not `encoding`: `mod encoding` below is already plan 123's Base64/
@@ -161,6 +165,11 @@ mod collections;
 // `aead.rs`/`url.rs`/`toml.rs` already hit and disclosed.
 #[path = "csv.rs"]
 mod csvs;
+// Plan 163 (Arbitrary-Precision Integers & Decimals), `Decimal` half —
+// see `decimal.rs`'s own module doc for why this half is a packed
+// two-`Int64`-field class, deliberately NOT a `crate::handle` registry
+// entry the way `bignum.rs`'s `BigInt` is.
+mod decimal;
 mod dns;
 mod encoding;
 mod env;
@@ -770,6 +779,113 @@ pub unsafe extern "C" fn emerald_rt_regex_split(id: i64, s: *const c_char) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_regex_split_count(id: i64, s: *const c_char) -> i64 {
   catch_and_raise(move || regex::regex_split_count(id, s))
+}
+
+// Plan 163 (Arbitrary-Precision Integers & Decimals): `BigInt` (a
+// `crate::handle`-registry opaque `Int64` handle — see `bignum.rs`'s
+// own module doc) and `Decimal` (a packed two-`Int64`-field class —
+// see `decimal.rs`'s own module doc), dispatched by `emerald-codegen`'s
+// own hardcoded `BigInt`/`Decimal`-keyed method-call arms, the same
+// shape `Regex` immediately above uses.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_bigint_from_i64(n: i64) -> i64 {
+  catch_and_raise(move || bignum::bigint_from_i64(n))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_bigint_from_s(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || bignum::bigint_from_s(s))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_bigint_factorial(n: i64) -> i64 {
+  catch_and_raise(move || bignum::bigint_factorial(n))
+}
+
+/// # Safety
+/// Always safe to call with a handle this crate itself issued.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_bigint_to_s(id: i64) -> *const c_char {
+  catch_and_raise(move || bignum::bigint_to_s(id))
+}
+
+/// # Safety
+/// Always safe to call with handles this crate itself issued.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_bigint_add(id: i64, other_id: i64) -> i64 {
+  catch_and_raise(move || bignum::bigint_add(id, other_id))
+}
+
+/// # Safety
+/// Always safe to call with handles this crate itself issued.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_bigint_mul(id: i64, other_id: i64) -> i64 {
+  catch_and_raise(move || bignum::bigint_mul(id, other_id))
+}
+
+/// # Safety
+/// `s`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_decimal_from_s(s: *const c_char) -> *mut c_void {
+  catch_and_raise(move || decimal::decimal_from_s(s))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 16-byte, `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_decimal_to_s(ptr: *const i64) -> *const c_char {
+  catch_and_raise(move || decimal::decimal_to_s(ptr))
+}
+
+/// # Safety
+/// `ptr`/`other_ptr` must each point to a live, 16-byte,
+/// `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_decimal_add(
+  ptr: *const i64,
+  other_ptr: *const i64,
+) -> *mut c_void {
+  catch_and_raise(move || decimal::decimal_add(ptr, other_ptr))
+}
+
+/// # Safety
+/// `ptr`/`other_ptr` must each point to a live, 16-byte,
+/// `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_decimal_sub(
+  ptr: *const i64,
+  other_ptr: *const i64,
+) -> *mut c_void {
+  catch_and_raise(move || decimal::decimal_sub(ptr, other_ptr))
+}
+
+/// # Safety
+/// `ptr`/`other_ptr` must each point to a live, 16-byte,
+/// `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_decimal_mul(
+  ptr: *const i64,
+  other_ptr: *const i64,
+) -> *mut c_void {
+  catch_and_raise(move || decimal::decimal_mul(ptr, other_ptr))
+}
+
+/// # Safety
+/// `ptr`/`other_ptr` must each point to a live, 16-byte,
+/// `emerald_alloc`-backed block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_decimal_div(
+  ptr: *const i64,
+  other_ptr: *const i64,
+) -> *mut c_void {
+  catch_and_raise(move || decimal::decimal_div(ptr, other_ptr))
 }
 
 // Plan 193 (`Set[T]`, `Deque[T]`, `PriorityQueue[T]`) — 54 concrete

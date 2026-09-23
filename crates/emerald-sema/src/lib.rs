@@ -5653,6 +5653,40 @@ fn infer_expr_type(
         // carved-out-of-`.value`-only shape `Regex`'s own methods
         // immediately above establish, just with one zero-arg method
         // instead of nine.
+        // Plan 163's Decision log: `BigInt`'s own three instance
+        // methods (`.to_s`/`.add`/`.mul`) — the identical carved-out-
+        // of-`.value`-only shape `Regex`'s own methods immediately
+        // above establish, just with a real return-type table instead
+        // of nine. Static methods (`.from_i64`/`.from_s`/`.factorial`)
+        // dispatch through plan 196's own generic `ClassName.method
+        // (args)` mechanism instead (`BigInt`'s own `ClassInfo.methods`
+        // entries marked `is_static: true`, registered in `check_
+        // program` alongside `BigIntError`) — no hardcoded arm needed
+        // for those, unlike `Regex.compile`'s pre-plan-196 shape.
+        if name == "BigInt" {
+          let bigint_ty = Type::Newtype("BigInt".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "to_s" => (vec![], Type::String),
+            "add" | "mul" => (vec![bigint_ty.clone()], bigint_ty.clone()),
+            other => {
+              return Err(Diagnostic::new(
+                format!("BigInt has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
         if name == "XmlReader" {
           if method != "next_event" {
             return Err(Diagnostic::new(
@@ -6044,12 +6078,6 @@ fn infer_expr_type(
           expr.span,
         );
       }
-      // Plan 45's Decision log: dispatched by checking the receiver's
-      // *inferred type* here, inside the existing generic `MethodCall`
-      // arm — not a new name-guarded arm, which would incorrectly
-      // intercept a user-defined class method sharing a name with a
-      // `String` intrinsic. Mirrors `puts`'s own "compiler intrinsic,
-      // not an overloaded function" precedent.
       // Plan 193's Decision log: `Set[T]`/`Deque[T]`/`PriorityQueue[T]`
       // dispatch the same receiver-inferred-type way `String`/`Int64`/
       // `Float64` immediately below do — never a real `ClassInfo`
@@ -13485,6 +13513,336 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&regex_error_enum_def);
+  // Plan 163's Decision log: `BigInt` — a compiler-synthesized,
+  // zero-cost `Int64` newtype (the identical "reserved name, zero-cost
+  // Int64 representation" shape `Regex`/`XmlReader` above already use),
+  // backed by `crate::handle`'s own registry in `emerald-rt` (a boxed
+  // `num_bigint::BigInt`, never a raw pointer smuggled through as an
+  // `Int64` — `num_bigint::BigInt`'s own internal `Vec<u32>` digit
+  // storage is genuinely unbounded, so no fixed number of scalar
+  // fields could ever hold it, the reason this is a handle and not a
+  // packed-field class the way `Decimal` immediately below is).
+  // `.from_i64`/`.from_s`/`.factorial` are `is_static: true` methods
+  // (plan 196's own generic `ClassName.method(args)` dispatch — no
+  // hardcoded per-name `Expr::Ident` arm needed at all, unlike
+  // `Regex.compile`'s pre-plan-196 shape). `.to_s`/`.add`/`.mul` are
+  // ordinary instance methods, carved out of the newtype `.value`-only
+  // restriction the same way `Regex`'s own nine methods are (see the
+  // `Type::Newtype` arm's own `if name == "BigInt"` block).
+  let bigint_ty = Type::Newtype("BigInt".to_string(), Box::new(Type::Int64));
+  classes.insert(
+    "BigInt".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::from([
+        (
+          "from_i64".to_string(),
+          FunctionSig {
+            params: vec![Type::Int64],
+            return_type: bigint_ty.clone(),
+            block_param: None,
+            param_names: vec!["n".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: true,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "from_s".to_string(),
+          FunctionSig {
+            params: vec![Type::String],
+            return_type: Type::Result(
+              Box::new(bigint_ty.clone()),
+              Box::new(Type::Enum("BigIntError".to_string())),
+            ),
+            block_param: None,
+            param_names: vec!["s".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: true,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "factorial".to_string(),
+          FunctionSig {
+            params: vec![Type::Int64],
+            return_type: bigint_ty.clone(),
+            block_param: None,
+            param_names: vec!["n".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: true,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+      ]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 163's Decision log: `BigIntError` — the Typed Domain Errors
+  // convention (plan 195), applied to a crate whose wrapped fallible
+  // operation (`num_bigint::BigInt::parse_bytes`) returns a bare
+  // `Option<BigInt>`, not a real Rust error TYPE at all — verified
+  // directly against the actually-vendored `num-bigint` 0.4.8. With no
+  // real error object to classify, a single required `Other(String)`
+  // escape-hatch variant (this domain's own synthesized message) is
+  // the entire, honest v1 scope — even smaller than `RegexError`'s own
+  // two-variant minimum, because there is nothing else real to name.
+  let bigint_error_enum_def = EnumDef {
+    name: "BigIntError".to_string(),
+    variants: vec![EnumVariant {
+      name: "Other".to_string(),
+      fields: vec![TypeExpr::Named("String".to_string())],
+    }],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "BigIntError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &bigint_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&bigint_error_enum_def);
+  // Plan 163's Decision log: `Decimal` — deliberately NOT a newtype
+  // handle the way `BigInt` immediately above is. `rust_decimal::
+  // Decimal` is fixed at exactly 16 bytes (its own documented
+  // `serialize()`/`deserialize([u8; 16])` contract, verified against
+  // the actually-vendored `rust_decimal` 1.43.0 directly) — an
+  // ordinary compiler-synthesized CLASS (`Type::Class`, `ClassInfo`'s
+  // default shape), never a newtype (a newtype's underlying type is
+  // restricted to a single scalar — `Decimal`'s real two-`Int64`
+  // packed representation cannot be one), and never a `crate::handle`
+  // registry entry either (no heap allocation of its own, no leak,
+  // unlike `BigInt`). `fields` stays empty here — Emerald source never
+  // reads `.lo`/`.hi` directly; only `emerald-rt`'s own native calls
+  // ever reconstruct/repack the real `rust_decimal::Decimal` value
+  // from them. Every instance method (`.to_s`/`.add`/`.sub`/`.mul`/
+  // `.div`) is an ORDINARY `ClassInfo.methods` entry — no `Type::
+  // Newtype` carve-out needed at all, unlike `BigInt`/`Regex`, because
+  // a `Type::Class` receiver already dispatches through `info.methods.
+  // get(method)` generically (`infer_expr_type`'s own established
+  // path, used by every real user-defined class already). `.from_s`
+  // is `is_static: true`, dispatched the identical plan-196 way
+  // `BigInt`'s own three statics are.
+  let decimal_ty = Type::Class("Decimal".to_string());
+  classes.insert(
+    "Decimal".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::from([
+        (
+          "from_s".to_string(),
+          FunctionSig {
+            params: vec![Type::String],
+            return_type: Type::Result(
+              Box::new(decimal_ty.clone()),
+              Box::new(Type::Enum("DecimalError".to_string())),
+            ),
+            block_param: None,
+            param_names: vec!["s".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: true,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "to_s".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::String,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "add".to_string(),
+          FunctionSig {
+            params: vec![decimal_ty.clone()],
+            return_type: decimal_ty.clone(),
+            block_param: None,
+            param_names: vec!["other".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "sub".to_string(),
+          FunctionSig {
+            params: vec![decimal_ty.clone()],
+            return_type: decimal_ty.clone(),
+            block_param: None,
+            param_names: vec!["other".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "mul".to_string(),
+          FunctionSig {
+            params: vec![decimal_ty.clone()],
+            return_type: decimal_ty.clone(),
+            block_param: None,
+            param_names: vec!["other".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+        (
+          "div".to_string(),
+          FunctionSig {
+            params: vec![decimal_ty.clone()],
+            return_type: Type::Result(
+              Box::new(decimal_ty.clone()),
+              Box::new(Type::Enum("DecimalError".to_string())),
+            ),
+            block_param: None,
+            param_names: vec!["other".to_string()],
+            defaults: vec![None],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![None],
+            return_ownership: None,
+          },
+        ),
+      ]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  // Plan 163's Decision log: `DecimalError` — classifies the real,
+  // six-variant `rust_decimal::Error` enum (verified directly against
+  // the actually-vendored `rust_decimal` 1.43.0's own `src/error.rs`,
+  // not assumed) that `Decimal.from_s`'s own `Decimal::from_str_exact`
+  // returns, plus one synthetic `DivisionByZero` variant this domain
+  // adds itself for `.div`'s own `checked_div` (which returns a bare
+  // `Option<Decimal>`, no error object at all, on both division-by-
+  // zero and overflow — `.div`'s own native implementation
+  // distinguishes the two by checking the divisor for zero itself
+  // before classifying a `None` result). Every variant carries a
+  // `String` message or no field at all — never a raw `Int64` payload
+  // — because `emerald_rt_result_err_tagged`'s own shared block shape
+  // is fixed at `[tag: i64][msg: *const c_char]`; `ScaleExceeded`'s own
+  // scale number is folded into its message text rather than carried
+  // as a second field, for exactly this reason. Declaration order
+  // matches `crates/emerald-rt/src/decimal.rs`'s own `DECIMAL_ERROR_
+  // TAG_*` constants byte-for-byte — `Syntax`=0, `ExceedsMax`=1,
+  // `BelowMin`=2, `Underflow`=3, `ScaleExceeded`=4, `DivisionByZero`=5,
+  // `Other`=6.
+  let decimal_error_enum_def = EnumDef {
+    name: "DecimalError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "ExceedsMax".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "BelowMin".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Underflow".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "ScaleExceeded".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "DivisionByZero".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "DecimalError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &decimal_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&decimal_error_enum_def);
   // Plan 124's Decision log: `XmlNode` — the XML-shaped sibling of
   // `JsonValue` immediately above, registered the identical compiler-
   // synthesized, NON-generic, self-referential-via-placeholder-seed
@@ -18333,6 +18691,110 @@ mod tests {
       errs
         .iter()
         .any(|d| d.message.contains("Int64 has no method")),
+      "{errs:?}"
+    );
+  }
+
+  // --- Plan 193: Set[T], Deque[T], PriorityQueue[T] ---
+
+  #[test]
+  fn plan_193_concrete_proof_type_checks_end_to_end() {
+    let src = "s: Set[Int64] = Set.new()\ns.add(10)\ns.add(20)\ns.add(10)\nputs s.count\nputs \"#{s.contains(20)}\"\n\nd: Deque[String] = Deque.new()\nd.push_back(\"a\")\nd.push_front(\"z\")\nputs d.pop_front()\n\npq: PriorityQueue[Int64] = PriorityQueue.new()\npq.push(5)\npq.push(1)\npq.push(9)\nputs pq.pop()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    check_program(&program).expect("plan 193's own Concrete Proof must type-check");
+  }
+
+  #[test]
+  fn set_rejects_a_float64_element_type_with_a_real_diagnostic() {
+    let src = "s: Set[Float64] = Set.new()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Set[Float64] must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("Set[T]")
+        && d.message.contains("Int64")
+        && d.message.contains("String")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn set_rejects_a_boolean_element_type() {
+    let src = "s: Set[Boolean] = Set.new()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    check_program(&program).expect_err("Set[Boolean] must be rejected (v1 scope, Decision log)");
+  }
+
+  #[test]
+  fn priority_queue_rejects_a_float64_element_type() {
+    let src = "pq: PriorityQueue[Float64] = PriorityQueue.new()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("PriorityQueue[Float64] must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("PriorityQueue[T]")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn deque_accepts_all_four_derive_serializable_primitive_element_types() {
+    let src = "a: Deque[Int64] = Deque.new()\nb: Deque[Float64] = Deque.new()\nc: Deque[String] = Deque.new()\nd: Deque[Boolean] = Deque.new()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    check_program(&program).expect("Deque[T] must accept all four derive-Serializable primitives");
+  }
+
+  #[test]
+  fn deque_rejects_a_symbol_element_type() {
+    let src = "d: Deque[Symbol] = Deque.new()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Deque[Symbol] must be rejected");
+    assert!(
+      errs.iter().any(|d| d.message.contains("Deque[T]")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn set_new_assigned_to_a_deque_typed_let_is_a_kind_mismatch() {
+    let src = "s: Set[Int64] = Deque.new()\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs =
+      check_program(&program).expect_err("`Deque.new` must not satisfy a `Set[Int64]` annotation");
+    assert!(
+      errs.iter().any(|d| d.message.contains("type mismatch")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn set_new_rejects_any_argument() {
+    let src = "s: Set[Int64] = Set.new(1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`Set.new` takes no arguments");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("takes no arguments")),
+      "{errs:?}"
+    );
+  }
+
+  #[test]
+  fn set_each_accepts_a_matching_int64_to_void_proc() {
+    let src =
+      "s: Set[Int64] = Set.new()\ns.add(1)\nprinter: Proc = do |x: Int64| puts x end\ns.each(printer)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    check_program(&program).expect("`.each` with a matching Int64 Proc must type-check");
+  }
+
+  #[test]
+  fn set_has_no_push_method_real_diagnostic_not_a_panic() {
+    let src = "s: Set[Int64] = Set.new()\ns.push(1)\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("Set has no `.push`");
+    assert!(
+      errs
+        .iter()
+        .any(|d| d.message.contains("Set has no method `push`")),
       "{errs:?}"
     );
   }

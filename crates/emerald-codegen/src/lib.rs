@@ -164,6 +164,18 @@ fn set_newtype_underlying(program: &Program) {
   // synthesized, zero-cost `Int64` newtype shape, reusing plan 93's
   // own handle registry to hold a boxed `regex::Regex`.
   map.insert("Regex".to_string(), TypeExpr::Named("Int64".to_string()));
+  // Plan 163's Decision log: `BigInt` — the identical compiler-
+  // synthesized, zero-cost `Int64` newtype shape, reusing plan 93's
+  // own handle registry to hold a boxed `num_bigint::BigInt`. A real,
+  // disclosed correction found only by actually running this plan's
+  // own example: this `NEWTYPE_UNDERLYING` map (which governs actual
+  // `ValKind` storage-kind resolution via `value_kind_for_type`) is a
+  // genuinely SEPARATE registry from `Ctx::newtypes` (the plain
+  // `HashSet<String>` `newtypes.insert("BigInt".to_string())`, below,
+  // populates) — omitting `BigInt` here left every `BigInt`-typed
+  // local's storage kind silently falling through to the generic
+  // `ValKind::Ptr` catch-all instead of the correct `ValKind::Int64`.
+  map.insert("BigInt".to_string(), TypeExpr::Named("Int64".to_string()));
   // Plan 109's Decision log: `Bytes` — a bare heap pointer
   // reinterpreted as `Int64` (see `bytes.rs`'s own module doc in
   // `emerald-rt`), never a `crate::handle` registry id; `Sha256Hasher`/
@@ -5109,6 +5121,21 @@ struct Ctx<'a, 'ctx> {
   regex_replace_all: FunctionValue<'ctx>,
   regex_split: FunctionValue<'ctx>,
   regex_split_count: FunctionValue<'ctx>,
+  /// Plan 163 (Arbitrary-Precision Integers & Decimals) — `BigInt`'s
+  /// three static methods plus its three instance methods.
+  bigint_from_i64: FunctionValue<'ctx>,
+  bigint_from_s: FunctionValue<'ctx>,
+  bigint_factorial: FunctionValue<'ctx>,
+  bigint_to_s: FunctionValue<'ctx>,
+  bigint_add: FunctionValue<'ctx>,
+  bigint_mul: FunctionValue<'ctx>,
+  /// Plan 163: `Decimal.from_s` plus its five instance methods.
+  decimal_from_s: FunctionValue<'ctx>,
+  decimal_to_s: FunctionValue<'ctx>,
+  decimal_add: FunctionValue<'ctx>,
+  decimal_sub: FunctionValue<'ctx>,
+  decimal_mul: FunctionValue<'ctx>,
+  decimal_div: FunctionValue<'ctx>,
   /// Plan 193 (`Set[T]`/`Deque[T]`/`PriorityQueue[T]`) — 54 concrete
   /// monomorphized `emerald_rt_<kind>_<elemtype>_<method>` exports
   /// (2 `Set` element types x 7 methods, 4 `Deque` element types x 7
@@ -5169,7 +5196,6 @@ struct Ctx<'a, 'ctx> {
   priority_queue_string_peek: FunctionValue<'ctx>,
   priority_queue_string_count: FunctionValue<'ctx>,
   priority_queue_string_close: FunctionValue<'ctx>,
-
   /// Plan 146 (Environment Variables) — `Env.get`/`.set`/`.remove`/
   /// `.keys`/`.keys_count`.
   env_get: FunctionValue<'ctx>,
@@ -8175,6 +8201,51 @@ fn build_method_call<'ctx>(
     // immediately above establish, just with one zero-arg method
     // returning a plain `ValKind::Ptr` (an `XmlEvent` enum block) —
     // no narrowing step needed, unlike `Regex#is_match`'s `i64`->`i1`.
+    // Plan 163's Decision log: `BigInt`'s own three instance methods —
+    // the identical carved-out-of-newtype shape `Regex`'s own nine
+    // methods immediately above establish. `.to_s` returns a
+    // `ValKind::Str` (a `String` value); `.add`/`.mul` return a bare
+    // NEW `i64` handle (never a `Result` — `BigInt` arithmetic never
+    // overflows, unlike `Decimal`'s own `.add`/`.sub`/`.mul` below).
+    if local_classes.get(recv_name).map(String::as_str) == Some("BigInt") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "to_s" {
+        let call = builder
+          .build_call(ctx.bigint_to_s, &[recv_val.into()], "bigintostmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      let fv = match method {
+        "add" => ctx.bigint_add,
+        "mul" => ctx.bigint_mul,
+        other => return Err(format!("codegen: unsupported BigInt method `{other}`")),
+      };
+      let arg = args
+        .first()
+        .ok_or_else(|| format!("codegen: `BigInt.{method}` expects 1 argument"))?;
+      let (other_val, _) = build_expr(
+        context,
+        builder,
+        arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call = builder
+        .build_call(fv, &[recv_val.into(), other_val.into()], "bigintinsttmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
+
     if local_classes.get(recv_name).map(String::as_str) == Some("XmlReader") {
       let (recv_val, _) = build_expr(
         context,
@@ -9204,6 +9275,73 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ValKind::Ptr));
   }
 
+  // Plan 163's Decision log: `BigInt.from_i64`/`.from_s`/`.factorial`
+  // — the same reserved-namespace static-call shape `Regex`
+  // immediately above uses. This plan predates plan 196's generic
+  // `is_static` method dispatch reaching this codegen backend at all
+  // (that dispatch only ever calls a real, already-compiled `Function`
+  // — `BigInt`'s three statics have no such body, only a native extern
+  // implementation) — a hardcoded arm stays the simplest, most
+  // consistent-with-precedent way to route the call.
+  if recv_name == "BigInt" {
+    let fv = match method {
+      "from_i64" => ctx.bigint_from_i64,
+      "from_s" => ctx.bigint_from_s,
+      "factorial" => ctx.bigint_factorial,
+      other => {
+        return Err(format!(
+          "codegen: unsupported BigInt static method `{other}`"
+        ));
+      }
+    };
+    let arg = args
+      .first()
+      .ok_or_else(|| format!("codegen: `BigInt.{method}` expects 1 argument"))?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(fv, &[v.into()], "bigintstatictmp")
+      .map_err(|e| e.to_string())?;
+    let result = call_result(call)?;
+    let ret_kind = if method == "from_s" {
+      ValKind::Ptr
+    } else {
+      ValKind::Int64
+    };
+    return Ok((result, ret_kind));
+  }
+  // Plan 163's Decision log: `Decimal.from_s` — the same shape as
+  // `BigInt`'s own statics immediately above.
+  if recv_name == "Decimal" {
+    if method != "from_s" {
+      return Err(format!(
+        "codegen: unsupported Decimal static method `{method}`"
+      ));
+    }
+    let arg = args
+      .first()
+      .ok_or_else(|| "codegen: `Decimal.from_s` expects 1 argument".to_string())?;
+    let (v, _) = build_expr(
+      context,
+      builder,
+      arg,
+      vars,
+      local_classes,
+      local_array_elem_types,
+      ctx,
+    )?;
+    let call = builder
+      .build_call(ctx.decimal_from_s, &[v.into()], "decimalfromstmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Ptr));
+  }
   // Plan 109's Decision log: `Sha256.hash`/`Sha512.hash`/`Sha3_256.
   // hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — the same
   // reserved-namespace static-call shape `Regex` immediately above
@@ -10845,6 +10983,59 @@ fn build_method_call<'ctx>(
           &[recv_val.into(), key_val.into()],
           "jsonobjectgettmp",
         )
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Ptr));
+    }
+    // Plan 163's Decision log: `Decimal`'s own five instance methods —
+    // NOT a newtype carve-out. A real, disclosed correction found only
+    // by actually compiling this plan's own example: `Decimal` (an
+    // ordinary `Type::Class`, not a newtype) is never routed through
+    // the EARLIER `newtypes`-gated `local_classes` dispatch block
+    // above (that block's own outer guard is `ctx.newtypes.contains
+    // (..)`, true only for `Regex`/`BigInt`/... — `Decimal` fails it,
+    // by design, and falls all the way through to here instead) — the
+    // identical reason `JsonValue.get`/`.to_s`/`.to_toml` immediately
+    // above are ALSO checked at this later point, not the earlier one:
+    // neither is a real declared method with a `method_owners` entry,
+    // so both must be intercepted here, before the `method_owners`
+    // lookup below.
+    if class_name == "Decimal" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "to_s" {
+        let call = builder
+          .build_call(ctx.decimal_to_s, &[recv_val.into()], "decimaltostmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((call_result(call)?, ValKind::Str));
+      }
+      let fv = match method {
+        "add" => ctx.decimal_add,
+        "sub" => ctx.decimal_sub,
+        "mul" => ctx.decimal_mul,
+        "div" => ctx.decimal_div,
+        other => return Err(format!("codegen: unsupported Decimal method `{other}`")),
+      };
+      let arg = args
+        .first()
+        .ok_or_else(|| format!("codegen: `Decimal.{method}` expects 1 argument"))?;
+      let (other_val, _) = build_expr(
+        context,
+        builder,
+        arg,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let call = builder
+        .build_call(fv, &[recv_val.into(), other_val.into()], "decimalinsttmp")
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Ptr));
     }
@@ -20759,7 +20950,6 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
-
   // Plan 193 (`Set[T]`/`Deque[T]`/`PriorityQueue[T]`) — every
   // method's own ABI: `Int64`/`Boolean` cross as `i64` (narrowed to a
   // real `i1` only at the call site, `Regex#is_match`'s own
@@ -21037,7 +21227,77 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
-
+  // Plan 163 (Arbitrary-Precision Integers & Decimals): `BigInt`'s own
+  // three static methods (`.from_i64`/`.from_s`/`.factorial`) plus its
+  // three instance methods (`.to_s`/`.add`/`.mul`) — every handle-
+  // returning function crosses as a plain `i64` (the same zero-cost
+  // newtype ABI `Regex`'s own handle already uses); `.from_s` returns
+  // plan 53's own `Result` layout (a heap pointer) directly.
+  let bigint_from_i64 = module.add_function(
+    "emerald_rt_bigint_from_i64",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bigint_from_s = module.add_function(
+    "emerald_rt_bigint_from_s",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bigint_factorial = module.add_function(
+    "emerald_rt_bigint_factorial",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bigint_to_s = module.add_function(
+    "emerald_rt_bigint_to_s",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bigint_add = module.add_function(
+    "emerald_rt_bigint_add",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let bigint_mul = module.add_function(
+    "emerald_rt_bigint_mul",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  // Plan 163: `Decimal.from_s` plus its five instance methods — every
+  // `Decimal` value (self AND each `other` argument) crosses as a
+  // plain heap pointer to its own packed `[lo: i64][hi: i64]` block
+  // (`ptr_ty`), never a `crate::handle` id — see `decimal.rs`'s own
+  // module doc. `.from_s`/`.div` return plan 53's own `Result` layout.
+  let decimal_from_s = module.add_function(
+    "emerald_rt_decimal_from_s",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let decimal_to_s = module.add_function(
+    "emerald_rt_decimal_to_s",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let decimal_add = module.add_function(
+    "emerald_rt_decimal_add",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let decimal_sub = module.add_function(
+    "emerald_rt_decimal_sub",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let decimal_mul = module.add_function(
+    "emerald_rt_decimal_mul",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let decimal_div = module.add_function(
+    "emerald_rt_decimal_div",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 146 (Environment Variables): `.get` returns a bare nullable
   // pointer (this call site itself builds the real `Option[String]`
   // value from it); `.set`/`.remove` return `Void`; `.keys` returns an
@@ -21852,6 +22112,43 @@ fn compile_to_object_impl(
   let mut generic_class_defs: HashMap<String, &ClassDef> = HashMap::new();
   let mut class_defs: HashMap<String, &ClassDef> = HashMap::new();
   class_defs.insert("NativeError".to_string(), &native_error_class_def);
+  // Plan 163's Decision log: `Decimal` — a compiler-synthesized,
+  // two-`Int64`-field class (`lo`/`hi`), the same "resolves against the
+  // real class registry with no matching source-level declaration"
+  // shape `NativeError` immediately above already uses. Needed here
+  // (not just in `emerald-sema`'s own registry) specifically so
+  // `ctx.classes.contains_key("Decimal")` is true — the exact
+  // condition `build_match_result`'s own `Ok(v)`/`Err(e)` binding path
+  // checks before recording a `local_classes` entry for the bound
+  // name, which is what lets `point_one.add(point_two)` (a `Decimal`
+  // value bound out of `Result[Decimal, DecimalError]`'s `Ok(v)` arm)
+  // resolve to this plan's own instance-method dispatch at all. Never
+  // constructed via a real `Decimal.new(...)` call anywhere in this
+  // plan's own worked proof — the two fields exist here purely so this
+  // bookkeeping condition fires, not because Emerald source ever reads
+  // `@lo`/`@hi` directly.
+  let decimal_class_def = ClassDef {
+    name: "Decimal".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![
+      Param {
+        name: "lo".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "hi".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+    ],
+    methods: Vec::new(),
+    type_params: Vec::new(),
+    doc: None,
+  };
+  class_defs.insert("Decimal".to_string(), &decimal_class_def);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -21895,6 +22192,25 @@ fn compile_to_object_impl(
     build_class_layout("NativeError", &class_defs)?,
   );
   class_tags.insert("NativeError".to_string(), 0);
+  // Plan 163's Decision log: `Decimal`'s own `ClassLayout` — a
+  // `class_tags` entry follows immediately below too (see its own
+  // comment for why, a real correction found only by compiling this
+  // plan's own example).
+  classes.insert(
+    "Decimal".to_string(),
+    build_class_layout("Decimal", &class_defs)?,
+  );
+  // A real, disclosed correction found only by actually compiling this
+  // plan's own example: `rescue_tag_sets`' own construction below
+  // indexes `class_tags[c_name]` unconditionally for EVERY key in
+  // `class_defs` (not just classes with a real `rescue` clause
+  // anywhere in the program) — omitting this entry, as this plan's own
+  // Decision log originally intended ("never raised/rescued, so no
+  // entry needed"), panics with "no entry found for key" instead.
+  // `Decimal` is still never actually rescued by any real `.em` code;
+  // this tag is dead weight for that purpose, kept only so this
+  // unconditional bookkeeping loop has an entry to find.
+  class_tags.insert("Decimal".to_string(), class_tags.len() as i64);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -22114,6 +22430,64 @@ fn compile_to_object_impl(
   enums.insert(
     "RegexError".to_string(),
     build_enum_layout(&regex_error_enum_def_cg),
+  );
+  // Plan 163: `BigIntError`/`DecimalError` — codegen's own mirror of
+  // `emerald-sema`'s identical synthetic `EnumDef`s (see that crate's
+  // own Decision log for the full reasoning). Variant declaration
+  // order matches `crates/emerald-rt/src/bignum.rs`'s own `BIGINT_
+  // ERROR_TAG_*`/`decimal.rs`'s own `DECIMAL_ERROR_TAG_*` constants
+  // byte-for-byte.
+  let bigint_error_enum_def_cg = EnumDef {
+    name: "BigIntError".to_string(),
+    variants: vec![EnumVariant {
+      name: "Other".to_string(),
+      fields: vec![TypeExpr::Named("String".to_string())],
+    }],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "BigIntError".to_string(),
+    build_enum_layout(&bigint_error_enum_def_cg),
+  );
+  let decimal_error_enum_def_cg = EnumDef {
+    name: "DecimalError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "Syntax".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "ExceedsMax".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "BelowMin".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Underflow".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "ScaleExceeded".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "DivisionByZero".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "DecimalError".to_string(),
+    build_enum_layout(&decimal_error_enum_def_cg),
   );
   // Plan 124: `XmlNode`/`XmlEvent` — codegen's own mirror of `emerald-
   // sema`'s identical synthetic `EnumDef`s (see that crate's own
@@ -22488,6 +22862,12 @@ fn compile_to_object_impl(
   newtypes.insert("HttpRequest".to_string());
   // Plan 124's Decision log: `XmlReader`.
   newtypes.insert("XmlReader".to_string());
+  // Plan 163's Decision log: `BigInt` (a `crate::handle`-registry
+  // opaque `Int64` handle) — `Decimal` is deliberately NOT added here,
+  // since it is an ordinary compiler-synthesized `Type::Class`, not a
+  // newtype (see `emerald-sema`'s own Decision log for the full
+  // reasoning).
+  newtypes.insert("BigInt".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -22588,6 +22968,18 @@ fn compile_to_object_impl(
     regex_replace_all,
     regex_split,
     regex_split_count,
+    bigint_from_i64,
+    bigint_from_s,
+    bigint_factorial,
+    bigint_to_s,
+    bigint_add,
+    bigint_mul,
+    decimal_from_s,
+    decimal_to_s,
+    decimal_add,
+    decimal_sub,
+    decimal_mul,
+    decimal_div,
     set_i64_new,
     set_i64_add,
     set_i64_contains,

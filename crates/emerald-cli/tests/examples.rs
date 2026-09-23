@@ -682,3 +682,22 @@ fn set_deque_priority_queue_em_prints_expected_sequence() {
     "2\ntrue\nz\n9\n"
   );
 }
+
+// Plan 163 (Arbitrary-Precision Integers & Decimals): `BigInt`
+// (`num-bigint`, a `crate::handle`-registry opaque `Int64` handle) and
+// `Decimal` (`rust_decimal`, a packed two-`Int64`-field class) — the
+// worked proof that `Int64` (25! overflows it) and `Float64` (`0.1 +
+// 0.2 != 0.3` in IEEE 754 double precision) both genuinely need a
+// replacement, for two different reasons, with two different
+// representations. Plan 195 (Typed Domain Errors) applied at this
+// plan's own EXECUTE time — `BigInt.from_s`/`Decimal.from_s`/`.div`
+// return `Result[T, BigIntError]`/`Result[T, DecimalError]`, never a
+// bare `Result[T, String]` — see `examples/bignum_decimal_proof.em`'s
+// own header comment.
+#[test]
+fn bignum_decimal_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("bignum_decimal_proof.em"),
+    "2432902008176640000\n15511210043330985984000000\ninvalid digit string for BigInt: \"not a number\"\n42\n440\n0.3\n0.1\n0.02\ndivision by zero\n0.3\nInvalid decimal: unknown character\n"
+  );
+}
