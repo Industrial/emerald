@@ -545,6 +545,27 @@ fn http_client_proof_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("http_client_proof.em"), "200\n404\n500\n");
 }
 
+// Plan 99 (TLS): network-dependent, a real client handshake against
+// IANA's own reserved, stable-by-design `example.com`. Per the plan's
+// own Concrete Proof, the exact remainder of the 64-byte read is not
+// asserted verbatim -- only that it begins with a well-formed HTTP
+// status line, since `example.com`'s own response headers are not a
+// contract this proof depends on beyond "the TLS handshake succeeded
+// and an HTTP response started arriving." Real, disclosed correction
+// found writing this example: `\r` is not a recognized escape in this
+// lexer's string-literal grammar (`emerald-parser`'s own `decode_
+// string_lit` admits only `\"`/`\n`, the same constraint plan 122's
+// own update already found) -- the request uses bare `\n` line endings
+// instead of `\r\n`, which `example.com`'s own edge server accepts.
+#[test]
+fn tls_client_em_prints_a_well_formed_status_line() {
+  let output = compile_and_run("tls_client.em");
+  assert!(
+    output.starts_with("HTTP/1."),
+    "expected a well-formed HTTP status line, got {output:?}"
+  );
+}
+
 // Plan 115 (Key Derivation Functions): RFC 5869 Test Case 1's own
 // published HKDF vector, and the `pbkdf2` crate's own published
 // doctest vector — both quoted directly, not invented (see this

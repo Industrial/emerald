@@ -4794,6 +4794,41 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 99's Decision log: `Tls.connect`/`.connect_with_roots`/
+    // `.listen` -- the same reserved-namespace static-call shape
+    // `TcpStream`/`TcpListener` already use, layered on top of them
+    // rather than opening a socket of its own.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Tls") =>
+    {
+      let stream_ty = Type::Newtype("TlsStream".to_string(), Box::new(Type::Int64));
+      let listener_ty = Type::Newtype("TlsListener".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match method.as_str() {
+        "connect" => (vec![Type::String, Type::Int64], stream_ty),
+        "connect_with_roots" => (vec![Type::String, Type::Int64, Type::String], stream_ty),
+        "listen" => (
+          vec![Type::String, Type::Int64, Type::String, Type::String],
+          listener_ty,
+        ),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Tls has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 96's Decision log: `UdpSocket.bind`/`.last_sender_host`/
     // `.last_sender_port` — the last two are the `_Thread_local`-
     // accessor-pair convention this plan's own text mandates in place
@@ -5911,6 +5946,62 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("TcpListener has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 99's Decision log: `TlsStream#read`/`#write`/`#close` --
+        // the identical carved-out shape `TcpStream` already
+        // establishes, inheriting the same short-read/partial-write
+        // semantics.
+        if name == "TlsStream" {
+          let (expected_params, ret) = match method.as_str() {
+            "read" => (vec![Type::Int64], Type::String),
+            "write" => (vec![Type::String], Type::Int64),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("TlsStream has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 99's Decision log: `TlsListener#accept`/`#close` -- the
+        // identical carved-out shape `TcpListener` already
+        // establishes; mutual TLS/client-cert verification is out of
+        // scope, so `#accept` never fails on a missing client cert.
+        if name == "TlsListener" {
+          let stream_ty = Type::Newtype("TlsStream".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "accept" => (vec![], stream_ty),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("TlsListener has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -13228,6 +13319,10 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     "TcpStream",
     "TcpListener",
     "UdpSocket",
+    // Plan 99's Decision log: `TlsStream`/`TlsListener` -- the
+    // identical shape, layered on top of `TcpStream`/`TcpListener`.
+    "TlsStream",
+    "TlsListener",
     // Plan 100's Decision log: `HttpResponse` — the identical shape.
     "HttpResponse",
     // Plan 101's Decision log: `HttpRequest` — the identical shape.

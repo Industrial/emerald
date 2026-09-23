@@ -224,6 +224,10 @@ fn set_newtype_underlying(program: &Program) {
     // `ptr`-typed load where `emerald_rt_xml_reader_next_event`'s
     // real `i64` parameter expected an `Int64`.
     "XmlReader",
+    // Plan 99's Decision log: `TlsStream`/`TlsListener` -- the
+    // identical shape, layered on top of `TcpStream`/`TcpListener`.
+    "TlsStream",
+    "TlsListener",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5324,6 +5328,17 @@ struct Ctx<'a, 'ctx> {
   tcp_listener_bind: FunctionValue<'ctx>,
   tcp_listener_accept: FunctionValue<'ctx>,
   tcp_listener_close: FunctionValue<'ctx>,
+  /// Plan 99 (TLS) -- `Tls.connect`/`.connect_with_roots`/`.listen`,
+  /// `TlsStream#read`/`#write`/`#close`, `TlsListener#accept`/
+  /// `#close`, wrapping `rustls` on top of `TcpStream`/`TcpListener`.
+  tls_connect: FunctionValue<'ctx>,
+  tls_connect_with_roots: FunctionValue<'ctx>,
+  tls_stream_read: FunctionValue<'ctx>,
+  tls_stream_write: FunctionValue<'ctx>,
+  tls_stream_close: FunctionValue<'ctx>,
+  tls_listen: FunctionValue<'ctx>,
+  tls_listener_accept: FunctionValue<'ctx>,
+  tls_listener_close: FunctionValue<'ctx>,
   udp_socket_bind: FunctionValue<'ctx>,
   udp_socket_send_to: FunctionValue<'ctx>,
   udp_socket_recv_from: FunctionValue<'ctx>,
@@ -8622,6 +8637,87 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ValKind::Int64));
     }
+    // Plan 99's Decision log: `TlsStream#read`/`#write`/`#close` --
+    // the identical carved-out shape `TcpStream` already establishes.
+    if local_classes.get(recv_name).map(String::as_str) == Some("TlsStream") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.tls_stream_close,
+            &[recv_val.into()],
+            "tlsstreamclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "read" => (ctx.tls_stream_read, ValKind::Str),
+        "write" => (ctx.tls_stream_write, ValKind::Int64),
+        other => return Err(format!("codegen: unsupported TlsStream method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "tlsstreamtmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ret_kind));
+    }
+    // Plan 99's Decision log: `TlsListener#accept`/`#close` -- the
+    // identical carved-out shape `TcpListener` already establishes.
+    if local_classes.get(recv_name).map(String::as_str) == Some("TlsListener") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        builder
+          .build_call(
+            ctx.tls_listener_close,
+            &[recv_val.into()],
+            "tlslistenerclosetmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      if method != "accept" {
+        return Err(format!(
+          "codegen: unsupported TlsListener method `{method}`"
+        ));
+      }
+      let call = builder
+        .build_call(
+          ctx.tls_listener_accept,
+          &[recv_val.into()],
+          "tlslisteneraccepttmp",
+        )
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Int64));
+    }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
     if local_classes.get(recv_name).map(String::as_str) == Some("UdpSocket") {
@@ -9670,6 +9766,35 @@ fn build_method_call<'ctx>(
     }
     let call = builder
       .build_call(ctx.tcp_listener_bind, &call_args, "tcplistenerbindtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 99's Decision log: `Tls.connect`/`.connect_with_roots`/
+  // `.listen` -- the same reserved-namespace static-call shape
+  // `TcpStream`/`TcpListener` already use.
+  if recv_name == "Tls" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "connect" => ctx.tls_connect,
+      "connect_with_roots" => ctx.tls_connect_with_roots,
+      "listen" => ctx.tls_listen,
+      other => return Err(format!("codegen: unsupported Tls static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "tlsstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Int64));
   }
@@ -21865,6 +21990,52 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 99 (TLS): `TlsStream`/`TlsListener` values cross every call
+  // here as a plain `i64_ty`, the same convention `TcpStream`/
+  // `TcpListener` immediately above already establish.
+  let tls_connect = module.add_function(
+    "emerald_rt_tls_connect",
+    i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tls_connect_with_roots = module.add_function(
+    "emerald_rt_tls_connect_with_roots",
+    i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tls_stream_read = module.add_function(
+    "emerald_rt_tls_stream_read",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tls_stream_write = module.add_function(
+    "emerald_rt_tls_stream_write",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tls_stream_close = module.add_function(
+    "emerald_rt_tls_stream_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tls_listen = module.add_function(
+    "emerald_rt_tls_listen",
+    i64_ty.fn_type(
+      &[ptr_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let tls_listener_accept = module.add_function(
+    "emerald_rt_tls_listener_accept",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tls_listener_close = module.add_function(
+    "emerald_rt_tls_listener_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   let udp_socket_bind = module.add_function(
     "emerald_rt_udp_socket_bind",
     i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
@@ -22856,6 +23027,9 @@ fn compile_to_object_impl(
   newtypes.insert("TcpStream".to_string());
   newtypes.insert("TcpListener".to_string());
   newtypes.insert("UdpSocket".to_string());
+  // Plan 99's Decision log: `TlsStream`/`TlsListener`.
+  newtypes.insert("TlsStream".to_string());
+  newtypes.insert("TlsListener".to_string());
   // Plan 100's Decision log: `HttpResponse`.
   newtypes.insert("HttpResponse".to_string());
   // Plan 101's Decision log: `HttpRequest`.
@@ -23137,6 +23311,14 @@ fn compile_to_object_impl(
     tcp_listener_bind,
     tcp_listener_accept,
     tcp_listener_close,
+    tls_connect,
+    tls_connect_with_roots,
+    tls_stream_read,
+    tls_stream_write,
+    tls_stream_close,
+    tls_listen,
+    tls_listener_accept,
+    tls_listener_close,
     udp_socket_bind,
     udp_socket_send_to,
     udp_socket_recv_from,

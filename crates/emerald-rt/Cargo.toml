@@ -191,6 +191,48 @@ url = "2.5"
 # instruction, not by depending on `socket2` (a larger, narrower-
 # purpose crate this plan doesn't otherwise need).
 libc = "0.2"
+# Plan 99: real-checked at this plan's own authoring time (2026-09-22,
+# already resolved into this workspace's own `Cargo.lock` transitively,
+# via plan 97's `hickory-resolver` DoT/DoH features and plan 100's
+# `ureq` default `rustls` feature — `rustls` 0.23.45 was already the
+# real, locked version before this plan added a direct dependency on
+# it) - Cure53 performed a real, named, independent security audit of
+# `rustls`/`ring`/`webpki` in May-June 2020, funded by ISRG (Let's
+# Encrypt's own parent organization), published at `cure53.de/pentest-
+# report_rustls.pdf` and covered independently by LWN.net; `rustls`
+# continues receiving real, current RustSec-tracked advisories and
+# fixes (RUSTSEC-2026-0285, affecting `>=0.23.13, <0.23.45`, fixed in
+# the exact 0.23.45 this workspace already resolves to) - an active
+# maintenance pipeline, not a crate coasting on a five-year-old audit.
+# Chosen outright over `openssl`/`native-tls` (a real C library
+# re-entering the trusted computing base for exactly the kind of code —
+# parsing untrusted, network-attacker-controlled input — where memory-
+# unsafety has historically been most consequential; Heartbleed remains
+# the canonical illustration), not merely tolerated. `rustls-native-
+# certs` 0.8 (not `webpki-roots`, kept below only as an explicit,
+# opt-in override) is this plan's own default root-certificate source —
+# `webpki-roots`'s own docs.rs description states it is "suitable for
+# use in applications that can always be recompiled and instantly
+# deployed," the opposite of a redistributed, operator-deployed
+# Emerald binary; `rustls-native-certs` reads whatever the OS already
+# trusts at connect time instead. `rustls-pemfile` 2.x loads
+# `Tls.listen`'s own PEM certificate chain/private key (already an
+# implicit dependency of the broader `rustls` ecosystem, not a new
+# independent vetting target) - DER-only/PKCS#12 input is out of
+# scope. `webpki-roots` 1.x (already locked transitively, added
+# directly here for `Tls.connect_with_roots("webpki")`'s own explicit
+# opt-in path) backs the Mozilla-curated, build-time-pinned
+# alternative. All four pure Rust at this API surface; `rustls`'s own
+# `ring` crypto backend (this crate's own already-established
+# C-exception, per plan 97's Decision log preferring it over
+# `aws-lc-rs`) is the sole C-exception, inherited, not newly
+# introduced. `Tls.connect`/`.connect_with_roots`/`.listen`,
+# `TlsStream#read`/`#write`/`#close`, `TlsListener#accept`/`#close`'s
+# direct backing.
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+webpki-roots = "1"
 # Plan 97: real-checked at this plan's own authoring time (2026-09-22,
 # via docs.rs) - hickory-resolver 0.26.3, the actively maintained,
 # pure-Rust-first successor to `trust-dns-resolver` (renamed when the
@@ -377,3 +419,16 @@ num-bigint = "0.4"
 rust_decimal = "1"
 
 [build-dependencies]
+
+# Plan 99's own `leaf-tests-and-example`: a `[dev-dependencies]`-only
+# addition, never linked into the real `--release` staticlib
+# `emerald-driver` embeds — `rcgen` 0.13 generates a fresh, real
+# self-signed X.509 certificate/key pair entirely in-process for
+# `tls.rs`'s own local, network-independent client/server round-trip
+# test, replacing what would otherwise need an `openssl`/`certtool`
+# CLI invocation this sandboxed test environment has no access to.
+# Widely used in exactly this role across the Rust ecosystem (`rustls`'s
+# own test suite, `quinn`, `tokio-rustls` all depend on it for the
+# identical purpose). No RustSec advisory found.
+[dev-dependencies]
+rcgen = "0.13"

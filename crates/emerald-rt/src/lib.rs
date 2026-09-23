@@ -187,6 +187,10 @@ mod random;
 mod regex;
 mod secure_compare;
 mod system;
+// Plan 99 (TLS) -- `Tls.connect`/`.connect_with_roots`/`.listen`,
+// `TlsStream#read`/`#write`/`#close`, `TlsListener#accept`/`#close`,
+// wrapping `rustls` -- see `tls.rs`'s own module doc.
+mod tls;
 // Named `tomls`, not `toml` — this crate's own `mod toml` would shadow
 // the external `toml` crate this module wraps, the identical collision
 // `aead.rs`/`url.rs` already hit and disclosed.
@@ -2323,6 +2327,75 @@ pub unsafe extern "C" fn emerald_rt_http_request_path(id: i64) -> *const c_char 
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_http_request_body(id: i64) -> *const c_char {
   catch_and_raise(move || http_server::http_request_body(id))
+}
+
+/// # Safety
+/// `host`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_connect(host: *const c_char, port: i64) -> i64 {
+  catch_and_raise(move || tls::tls_connect(host, port))
+}
+
+/// # Safety
+/// `host`/`mode`, if non-null, must point to valid, NUL-terminated C
+/// strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_connect_with_roots(
+  host: *const c_char,
+  port: i64,
+  mode: *const c_char,
+) -> i64 {
+  catch_and_raise(move || tls::tls_connect_with_roots(host, port, mode))
+}
+
+/// # Safety
+/// Always safe to call for a live `TlsStream` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_stream_read(id: i64, max_len: i64) -> *const c_char {
+  catch_and_raise(move || tls::tls_stream_read(id, max_len))
+}
+
+/// # Safety
+/// `data`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_stream_write(id: i64, data: *const c_char) -> i64 {
+  catch_and_raise(move || tls::tls_stream_write(id, data))
+}
+
+/// # Safety
+/// Always safe to call for a live `TlsStream` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_stream_close(id: i64) {
+  catch_and_raise(move || tls::tls_stream_close(id))
+}
+
+/// # Safety
+/// `host`/`cert_path`/`key_path`, if non-null, must point to valid,
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_listen(
+  host: *const c_char,
+  port: i64,
+  cert_path: *const c_char,
+  key_path: *const c_char,
+) -> i64 {
+  catch_and_raise(move || tls::tls_listen(host, port, cert_path, key_path))
+}
+
+/// # Safety
+/// Always safe to call for a live `TlsListener` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_listener_accept(id: i64) -> i64 {
+  catch_and_raise(move || tls::tls_listener_accept(id))
+}
+
+/// # Safety
+/// Always safe to call for a live `TlsListener` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tls_listener_close(id: i64) {
+  catch_and_raise(move || tls::tls_listener_close(id))
 }
 
 /// # Safety
