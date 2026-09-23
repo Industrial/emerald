@@ -5425,6 +5425,85 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.
+    // entries_count`/`.walk`/`.walk_count` — the identical reserved-
+    // namespace hardcoded-arm shape `File` immediately above uses
+    // (`Dir` is never a real `ModuleDef`, so it can never collide with
+    // `local_classes`), per plan 144's own Decision log/todo text,
+    // authored against this exact precedent.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Dir") => {
+      let (expected_params, ret) = match method.as_str() {
+        "entries" | "walk" => (vec![Type::String], Type::Array(Box::new(Type::String))),
+        "entries_count" | "walk_count" => (vec![Type::String], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Dir has no method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
+    // Plan 144 (Extended Filesystem Operations): `Path.exists`/`.is_
+    // file`/`.is_dir`/`.is_symlink`/`.metadata`/`.unix_mode`/`.set_
+    // unix_mode`/`.symlink`/`.read_link` — the identical `Dir`/`File`
+    // reserved-namespace hardcoded-arm shape immediately above.
+    // `.metadata`/`.read_link` return `Result[T, PathError]` — plan
+    // 195's Typed Domain Errors convention, superseding plan 144's own
+    // original, now-dead `T?` nullable syntax (removed by plan 73)
+    // for these two operations, see `crates/emerald-rt/src/path.rs`'s
+    // own module doc for the full reasoning.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Path") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "exists" | "is_file" | "is_dir" | "is_symlink" => (vec![Type::String], Type::Boolean),
+        "metadata" => (
+          vec![Type::String],
+          Type::Result(
+            Box::new(Type::Class("FileMetadata".to_string())),
+            Box::new(Type::Enum("PathError".to_string())),
+          ),
+        ),
+        "unix_mode" => (vec![Type::String], Type::Int64),
+        "set_unix_mode" => (vec![Type::String, Type::Int64], Type::Void),
+        "symlink" => (vec![Type::String, Type::String], Type::Void),
+        "read_link" => (
+          vec![Type::String],
+          Type::Result(
+            Box::new(Type::String),
+            Box::new(Type::Enum("PathError".to_string())),
+          ),
+        ),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Path has no method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 59's Decision log: `String.from_cstring(ptr)` — the same
     // reserved-namespace static-call shape as `File` immediately above,
     // for the same reason (`String` is never a real `ModuleDef`).
@@ -14331,6 +14410,173 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&datetime_error_enum_def);
+  // Plan 144 (Extended Filesystem Operations): `PathError` — the
+  // Typed Domain Errors convention (plan 195), classifying exactly
+  // the two real, genuinely common `std::io::ErrorKind` variants for
+  // `Path.metadata`/`Path.read_link` (`NotFound`/`PermissionDenied`),
+  // folding every other `io::Error` into `Other(String)` — the same
+  // "classify what's real, fold the rest" rule `DecimalError`/
+  // `RegexError` already established. A real, disclosed deviation
+  // from plan 144's own original text, which (authored before plan
+  // 195 existed) specified a raw nullable-pointer return (`T?`) for
+  // these two operations instead — dead syntax, removed outright by
+  // plan 73 well before plan 195 existed; `Result[T, PathError]` is
+  // this plan's actual, current-grammar return shape. Declaration
+  // order matches `crates/emerald-rt/src/path.rs`'s own `PATH_ERROR_
+  // TAG_*` constants byte-for-byte — `NotFound`=0, `PermissionDenied`
+  // =1, `Other`=2.
+  let path_error_enum_def = EnumDef {
+    name: "PathError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "NotFound".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "PermissionDenied".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "PathError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &path_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&path_error_enum_def);
+  // Plan 144 (Extended Filesystem Operations): `FileMetadata` — a
+  // compiler-synthesized, five-`Int64`-field class (`size`/`modified_
+  // unix`/`is_dir`/`is_file`/`readonly`), the identical "ordinary
+  // `Type::Class`, real `ClassInfo.methods` entries, no `Type::
+  // Newtype` carve-out" shape `Decimal` above already uses — `Path.
+  // metadata`'s own `Result[FileMetadata, PathError]` return is what
+  // this plan's own Concrete Proof binds via `match ... Ok(m) do
+  // ... end`. `fields` stays empty here (Emerald source never reads
+  // any of the five packed fields directly; only `emerald-rt`'s own
+  // native calls ever reconstruct the real `std::fs::Metadata`
+  // snapshot from them) — every real access goes through the five
+  // zero-argument instance methods below instead. A real, disclosed
+  // correction against this plan's own original text, which both
+  // proposed a dedicated `ValKind::FileMetadata` (no such per-domain
+  // `ValKind` mechanism exists anywhere in this codebase — every
+  // sibling compiler-synthesized value type uses this same "opaque
+  // heap pointer, `ClassInfo`/`ClassDef` registration" shape instead)
+  // and miscounted its own field list ("four fields" — the very next
+  // clause then names five: `size`, `modified-time`, `is_dir`, `is_
+  // file`, `readonly`).
+  classes.insert(
+    "FileMetadata".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::from([
+        (
+          "size".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Int64,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "modified_unix".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Int64,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "is_dir".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Boolean,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "is_file".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Boolean,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+        (
+          "readonly".to_string(),
+          FunctionSig {
+            params: vec![],
+            return_type: Type::Boolean,
+            block_param: None,
+            param_names: vec![],
+            defaults: vec![],
+            splat_elem: None,
+            requires: vec![],
+            is_pure: false,
+            is_static: false,
+            param_ownership: vec![],
+            return_ownership: None,
+          },
+        ),
+      ]),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
   // Plan 124's Decision log: `XmlNode` — the XML-shaped sibling of
   // `JsonValue` immediately above, registered the identical compiler-
   // synthesized, NON-generic, self-referential-via-placeholder-seed

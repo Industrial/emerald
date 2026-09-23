@@ -452,6 +452,18 @@ rust_decimal = "1"
 # Zone Database, confirming the plan's own "no second `chrono-tz`-
 # equivalent dependency needed" claim - not assumed. Pure Rust.
 jiff = "0.2.37"
+# Plan 144 (Extended Filesystem Operations): real-checked this plan's
+# own authoring time (2026-09-23, via lib.rs) - walkdir 2.5.0 (Mar 1,
+# 2024), #1 in crates.io's Filesystem category, 51.4M downloads/month,
+# used in 60,788 crates (6,888 directly), owned by BurntSushi (Andrew
+# Gallant, also the `regex`/`ripgrep` author), Unlicense/MIT. No
+# RustSec advisory found (checked via web search against the RustSec
+# advisory database). Chosen over hand-rolling recursive descent for a
+# real, non-trivial correctness reason: it tracks visited device/inode
+# pairs (via its own `same_file` dependency) to detect and skip
+# symlink cycles safely by default - `Dir.walk`'s direct backing. Pure
+# Rust.
+walkdir = "2.5"
 # Plan 130 (Gzip/Deflate/Zlib Compression): `flate2` 1.1.10 (real,
 # current pin at this plan's own authoring time, verified against its
 # own `Cargo.toml` on `rust-lang/flate2-rs`'s `main` branch) - already
@@ -490,3 +502,15 @@ flate2 = { version = "1.1.10", default-features = false, features = [
 # identical purpose). No RustSec advisory found.
 [dev-dependencies]
 rcgen = "0.13"
+# Plan 144 (Extended Filesystem Operations) - a `[dev-dependencies]`-
+# only addition, never linked into the real `--release` staticlib,
+# same role `rcgen` plays immediately above. `tempfile` 3.27.0 (Mar
+# 11, 2026), #3 in crates.io's Filesystem category - `dir.rs`'s/
+# `path.rs`'s own `#[cfg(test)]` fixtures use `tempfile::tempdir()` to
+# build a real, disposable directory tree per test rather than writing
+# into the repo working directory. A real, disclosed forward
+# reference: this plan's own todo text anticipated plan 147 would be
+# the one to first add this crate as a genuine runtime dependency -
+# plan 144 adds it here first, but only as a test fixture, never
+# reachable from the compiled `--release` staticlib.
+tempfile = "3.27"

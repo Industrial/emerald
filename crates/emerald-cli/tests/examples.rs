@@ -770,3 +770,39 @@ fn gzip_roundtrip_em_prints_expected_sequence() {
     "true\ntrue\ntrue\ntrue\n"
   );
 }
+
+// Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.entries_
+// count`/`.walk`/`.walk_count` (non-recursive `std::fs::read_dir` +
+// recursive, symlink-cycle-safe `walkdir` traversal) and `Path.exists`/
+// `.is_file`/`.is_dir`/`.is_symlink`/`.metadata`/`.unix_mode`/`.set_
+// unix_mode`/`.symlink`/`.read_link` plus `FileMetadata`'s own five
+// accessors. Three real, disclosed findings from actually running this
+// plan's own worked example — see `examples/extended_filesystem_
+// proof.em`'s own header comment for the full account: (1) the plan's
+// own Concrete Proof writes into `plan144_demo/nested/b.txt` before
+// anything ever creates `plan144_demo/nested/` (`File.write` never
+// creates missing parent directories, and no plan has ever given
+// Emerald source a directory-creation primitive) — this test creates
+// that fixture tree itself, one level up from this plan's own
+// `emerald-rt` Rust-level `tempfile::tempdir()` fixtures; (2) `Path.
+// metadata`/`.read_link` return `Result[T, PathError]` (plan 195),
+// superseding the plan's own original, now-dead `T?`/`||=` nullable
+// syntax (removed by plan 73); (3) `puts` does not accept a `Boolean`
+// argument (`emerald-sema`'s own real `Int64`/`Float64`/`String`-only
+// intrinsic), so every `Boolean` this example prints goes through an
+// `if ... do puts "true" else puts "false" end`, `examples/control_
+// flow.em`'s own precedent.
+#[test]
+fn extended_filesystem_proof_em_prints_expected_sequence() {
+  let fixture_root = std::env::current_dir()
+    .expect("current dir")
+    .join("plan144_demo");
+  std::fs::create_dir_all(fixture_root.join("nested")).expect("create plan144_demo fixture tree");
+
+  assert_eq!(
+    compile_and_run("extended_filesystem_proof.em"),
+    "2\n3\n5\nfalse\nplan144_demo/a.txt\ntrue\nfalse\ntrue\ntrue\ntrue\ntrue\nnot found\n"
+  );
+
+  std::fs::remove_dir_all(&fixture_root).ok();
+}

@@ -5226,6 +5226,30 @@ struct Ctx<'a, 'ctx> {
   env_remove: FunctionValue<'ctx>,
   env_keys: FunctionValue<'ctx>,
   env_keys_count: FunctionValue<'ctx>,
+  /// Plan 144 (Extended Filesystem Operations) — `Dir.entries`/`.
+  /// entries_count`/`.walk`/`.walk_count`.
+  dir_entries: FunctionValue<'ctx>,
+  dir_entries_count: FunctionValue<'ctx>,
+  dir_walk: FunctionValue<'ctx>,
+  dir_walk_count: FunctionValue<'ctx>,
+  /// Plan 144 (Extended Filesystem Operations) — `Path.exists`/`.is_
+  /// file`/`.is_dir`/`.is_symlink`/`.metadata`/`.unix_mode`/`.set_
+  /// unix_mode`/`.symlink`/`.read_link`, plus `FileMetadata`'s own
+  /// five zero-argument accessors.
+  path_exists: FunctionValue<'ctx>,
+  path_is_file: FunctionValue<'ctx>,
+  path_is_dir: FunctionValue<'ctx>,
+  path_is_symlink: FunctionValue<'ctx>,
+  path_metadata: FunctionValue<'ctx>,
+  path_unix_mode: FunctionValue<'ctx>,
+  path_set_unix_mode: FunctionValue<'ctx>,
+  path_symlink: FunctionValue<'ctx>,
+  path_read_link: FunctionValue<'ctx>,
+  filemetadata_size: FunctionValue<'ctx>,
+  filemetadata_modified_unix: FunctionValue<'ctx>,
+  filemetadata_is_dir: FunctionValue<'ctx>,
+  filemetadata_is_file: FunctionValue<'ctx>,
+  filemetadata_readonly: FunctionValue<'ctx>,
   /// Plan 164 (Portable Math Functions) — `Math.<name>`, a thin
   /// `Float64`-in-`Float64`-out wrapping of `libm`.
   math_sin: FunctionValue<'ctx>,
@@ -11012,6 +11036,126 @@ fn build_method_call<'ctx>(
     };
   }
 
+  // Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.
+  // entries_count`/`.walk`/`.walk_count` — the identical reserved-
+  // namespace hardcoded-arm shape `File` immediately above uses.
+  // `.entries`/`.walk` return an `Array[String]` pointer built
+  // directly by `emerald-rt`'s own `dir.rs` (already carrying its own
+  // `[len: i64][elem...]` header — no extra codegen-side wrapping
+  // needed here, the same `ValKind::Ptr` shape `Regex#find_all`/
+  // `#split` already establish).
+  if recv_name == "Dir" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "entries" => (ctx.dir_entries, ValKind::Ptr),
+      "entries_count" => (ctx.dir_entries_count, ValKind::Int64),
+      "walk" => (ctx.dir_walk, ValKind::Ptr),
+      "walk_count" => (ctx.dir_walk_count, ValKind::Int64),
+      other => return Err(format!("codegen: unsupported Dir method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "dirtmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 144 (Extended Filesystem Operations): `Path.exists`/`.is_
+  // file`/`.is_dir`/`.is_symlink`/`.metadata`/`.unix_mode`/`.set_
+  // unix_mode`/`.symlink`/`.read_link` — the identical reserved-
+  // namespace hardcoded-arm shape `File`/`Dir` immediately above use.
+  // The four Boolean predicates cross the FFI boundary as a plain
+  // `i64` (0/1), narrowed back to a real `i1` below, the same
+  // direction `Regex#is_match` already narrows. `.set_unix_mode`/
+  // `.symlink` are genuinely `Void` (`emerald-rt`'s own functions
+  // return nothing at all, matching `Env.set`/`.remove`'s own shape
+  // immediately above), so their `builder.build_call` result is never
+  // read via `call_result` at all — only `.metadata`/`.read_link`
+  // (each `Result[T, PathError]`, a real heap pointer) and the plain
+  // `Int64`s (`.unix_mode`) ever do.
+  if recv_name == "Path" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+      Vec::with_capacity(args.len());
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    return match method {
+      "exists" | "is_file" | "is_dir" | "is_symlink" => {
+        let fv = match method {
+          "exists" => ctx.path_exists,
+          "is_file" => ctx.path_is_file,
+          "is_dir" => ctx.path_is_dir,
+          _ => ctx.path_is_symlink,
+        };
+        let call = builder
+          .build_call(fv, &call_args, "pathpredicatetmp")
+          .map_err(|e| e.to_string())?;
+        let result = call_result(call)?;
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "pathpredicateboolresult",
+          )
+          .map_err(|e| e.to_string())?;
+        Ok((is_true.into(), ValKind::Bool))
+      }
+      "metadata" => {
+        let call = builder
+          .build_call(ctx.path_metadata, &call_args, "pathmetadatatmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Ptr))
+      }
+      "unix_mode" => {
+        let call = builder
+          .build_call(ctx.path_unix_mode, &call_args, "pathunixmodetmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Int64))
+      }
+      "set_unix_mode" => {
+        builder
+          .build_call(ctx.path_set_unix_mode, &call_args, "pathsetunixmodetmp")
+          .map_err(|e| e.to_string())?;
+        Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
+      }
+      "symlink" => {
+        builder
+          .build_call(ctx.path_symlink, &call_args, "pathsymlinktmp")
+          .map_err(|e| e.to_string())?;
+        Ok((context.i64_type().const_int(0, false).into(), ValKind::Void))
+      }
+      "read_link" => {
+        let call = builder
+          .build_call(ctx.path_read_link, &call_args, "pathreadlinktmp")
+          .map_err(|e| e.to_string())?;
+        Ok((call_result(call)?, ValKind::Ptr))
+      }
+      other => Err(format!("codegen: unsupported Path method `{other}`")),
+    };
+  }
+
   // Plan 59's Decision log (superseded by plan 73's own Decision log
   // below): `String.from_cstring(ptr)` — the same reserved-namespace
   // static-call shape as `File` immediately above, for the same reason
@@ -11619,6 +11763,55 @@ fn build_method_call<'ctx>(
       return Err(format!(
         "codegen: unsupported ZonedDateTime method `{method}`"
       ));
+    }
+    // Plan 144 (Extended Filesystem Operations): `FileMetadata`'s own
+    // five zero-argument instance methods — the identical carved-out-
+    // of-the-`method_owners`-lookup shape `Decimal`/`DateTime`/
+    // `ZonedDateTime` immediately above already establish (`Path.
+    // metadata`'s own `Result[FileMetadata, PathError]` return is
+    // what binds a local of this class via `match ... Ok(m) do
+    // ... end`, never a real `FileMetadata.new(...)` call). `.is_dir`/
+    // `.is_file`/`.readonly` cross the FFI boundary as a plain `i64`
+    // (0/1), narrowed back to a real `i1` here, the same direction
+    // `Regex#is_match` already narrows.
+    if class_name == "FileMetadata" {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let (fv, is_bool) = match method {
+        "size" => (ctx.filemetadata_size, false),
+        "modified_unix" => (ctx.filemetadata_modified_unix, false),
+        "is_dir" => (ctx.filemetadata_is_dir, true),
+        "is_file" => (ctx.filemetadata_is_file, true),
+        "readonly" => (ctx.filemetadata_readonly, true),
+        other => {
+          return Err(format!(
+            "codegen: unsupported FileMetadata method `{other}`"
+          ));
+        }
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "filemetadatatmp")
+        .map_err(|e| e.to_string())?;
+      let result = call_result(call)?;
+      if is_bool {
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "filemetadataboolresult",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      return Ok((result, ValKind::Int64));
     }
     // Plan 32: resolve which ancestor actually *declares* `method` —
     // only the defining class has a compiled `{Class}_{method}` symbol
@@ -21955,6 +22148,111 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[], false),
     Some(Linkage::External),
   );
+  // Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.walk`
+  // return an `Array[String]` pointer (built directly by `dir.rs`,
+  // already carrying its own `[len: i64][elem...]` header — no extra
+  // codegen-side wrapping needed); `.entries_count`/`.walk_count`
+  // return a plain `i64`.
+  let dir_entries = module.add_function(
+    "emerald_rt_dir_entries",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let dir_entries_count = module.add_function(
+    "emerald_rt_dir_entries_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let dir_walk = module.add_function(
+    "emerald_rt_dir_walk",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let dir_walk_count = module.add_function(
+    "emerald_rt_dir_walk_count",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  // Plan 144 (Extended Filesystem Operations): `Path.exists`/`.is_
+  // file`/`.is_dir`/`.is_symlink` cross as a plain `i64` (0/1),
+  // narrowed back to a real `i1` by this call site; `.metadata`/`.
+  // read_link` return plan 53's own `Result` layout (a heap pointer);
+  // `.unix_mode` a plain `i64`; `.set_unix_mode`/`.symlink` are
+  // `Void`.
+  let path_exists = module.add_function(
+    "emerald_rt_path_exists",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_is_file = module.add_function(
+    "emerald_rt_path_is_file",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_is_dir = module.add_function(
+    "emerald_rt_path_is_dir",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_is_symlink = module.add_function(
+    "emerald_rt_path_is_symlink",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_metadata = module.add_function(
+    "emerald_rt_path_metadata",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_unix_mode = module.add_function(
+    "emerald_rt_path_unix_mode",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_set_unix_mode = module.add_function(
+    "emerald_rt_path_set_unix_mode",
+    void_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_symlink = module.add_function(
+    "emerald_rt_path_symlink",
+    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let path_read_link = module.add_function(
+    "emerald_rt_path_read_link",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  // Plan 144 (Extended Filesystem Operations): `FileMetadata`'s own
+  // five zero-argument accessors — `.size`/`.modified_unix` return a
+  // plain `i64`; `.is_dir`/`.is_file`/`.readonly` cross as `i64`
+  // (0/1), narrowed the same way `Path.exists` above is.
+  let filemetadata_size = module.add_function(
+    "emerald_rt_filemetadata_size",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let filemetadata_modified_unix = module.add_function(
+    "emerald_rt_filemetadata_modified_unix",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let filemetadata_is_dir = module.add_function(
+    "emerald_rt_filemetadata_is_dir",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let filemetadata_is_file = module.add_function(
+    "emerald_rt_filemetadata_is_file",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let filemetadata_readonly = module.add_function(
+    "emerald_rt_filemetadata_readonly",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 164 (Portable Math Functions): every `Math.<name>` is a plain
   // `f64 -> f64` (or `(f64, f64) -> f64`) function.
   let one_f64_to_f64 = f64_ty.fn_type(&[f64_ty.into()], false);
@@ -23015,6 +23313,48 @@ fn compile_to_object_impl(
     doc: None,
   };
   class_defs.insert("ZonedDateTime".to_string(), &zoned_datetime_class_def);
+  // Plan 144 (Extended Filesystem Operations): `FileMetadata` — a
+  // compiler-synthesized, five-`Int64`-field class (`size`/`modified_
+  // unix`/`is_dir`/`is_file`/`readonly`), the identical "resolves
+  // against the real class registry with no matching source-level
+  // declaration" shape `Decimal`/`DateTime` immediately above use.
+  let filemetadata_class_def = ClassDef {
+    name: "FileMetadata".to_string(),
+    superclass: None,
+    implements: None,
+    derive: None,
+    fields: vec![
+      Param {
+        name: "size".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "modified_unix".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "is_dir".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "is_file".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+      Param {
+        name: "readonly".to_string(),
+        ty: TypeExpr::Named("Int64".to_string()),
+        default: None,
+      },
+    ],
+    methods: Vec::new(),
+    type_params: Vec::new(),
+    doc: None,
+  };
+  class_defs.insert("FileMetadata".to_string(), &filemetadata_class_def);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -23092,6 +23432,14 @@ fn compile_to_object_impl(
     build_class_layout("ZonedDateTime", &class_defs)?,
   );
   class_tags.insert("ZonedDateTime".to_string(), class_tags.len() as i64);
+  // Plan 144 (Extended Filesystem Operations): `FileMetadata`'s own
+  // `ClassLayout` plus `class_tags` entry — needed unconditionally,
+  // the identical reason `Decimal`'s own comment above discloses.
+  classes.insert(
+    "FileMetadata".to_string(),
+    build_class_layout("FileMetadata", &class_defs)?,
+  );
+  class_tags.insert("FileMetadata".to_string(), class_tags.len() as i64);
   for item in &program.items {
     if let Item::Class(c) = item {
       if c.type_params.is_empty() {
@@ -23387,6 +23735,31 @@ fn compile_to_object_impl(
   enums.insert(
     "DateTimeError".to_string(),
     build_enum_layout(&datetime_error_enum_def_cg),
+  );
+  // Plan 144 (Extended Filesystem Operations): `PathError` — codegen's
+  // own mirror of `emerald-sema`'s identical synthetic `EnumDef`.
+  let path_error_enum_def_cg = EnumDef {
+    name: "PathError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "NotFound".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "PermissionDenied".to_string(),
+        fields: vec![],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "PathError".to_string(),
+    build_enum_layout(&path_error_enum_def_cg),
   );
   // Plan 124: `XmlNode`/`XmlEvent` — codegen's own mirror of `emerald-
   // sema`'s identical synthetic `EnumDef`s (see that crate's own
@@ -23949,6 +24322,24 @@ fn compile_to_object_impl(
     env_remove,
     env_keys,
     env_keys_count,
+    dir_entries,
+    dir_entries_count,
+    dir_walk,
+    dir_walk_count,
+    path_exists,
+    path_is_file,
+    path_is_dir,
+    path_is_symlink,
+    path_metadata,
+    path_unix_mode,
+    path_set_unix_mode,
+    path_symlink,
+    path_read_link,
+    filemetadata_size,
+    filemetadata_modified_unix,
+    filemetadata_is_dir,
+    filemetadata_is_file,
+    filemetadata_readonly,
     math_sin,
     math_cos,
     math_tan,

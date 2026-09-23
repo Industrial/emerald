@@ -173,6 +173,10 @@ mod datetime;
 // two-`Int64`-field class, deliberately NOT a `crate::handle` registry
 // entry the way `bignum.rs`'s `BigInt` is.
 mod decimal;
+// Plan 144 (Extended Filesystem Operations), `Dir` half — non-
+// recursive listing + recursive `walkdir` traversal — see `dir.rs`'s
+// own module doc.
+mod dir;
 mod dns;
 mod encoding;
 mod env;
@@ -193,6 +197,9 @@ mod net;
 // Plan 112 (Password Hashing) — `Password.hash`/`.verify`, wrapping
 // `argon2` — see `password.rs`'s own module doc.
 mod password;
+// Plan 144 (Extended Filesystem Operations), `Path`/`FileMetadata`
+// half — see `path.rs`'s own module doc.
+mod path;
 mod random;
 mod regex;
 mod secure_compare;
@@ -1437,6 +1444,155 @@ pub unsafe extern "C" fn emerald_rt_env_keys() -> *mut c_void {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_env_keys_count() -> i64 {
   catch_and_raise(move || env::env_keys_count())
+}
+
+// Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.entries_
+// count`/`.walk`/`.walk_count` — see `dir.rs`'s own module doc.
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dir_entries(path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || dir::dir_entries(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dir_entries_count(path: *const c_char) -> i64 {
+  catch_and_raise(move || dir::dir_entries_count(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dir_walk(path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || dir::dir_walk(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_dir_walk_count(path: *const c_char) -> i64 {
+  catch_and_raise(move || dir::dir_walk_count(path))
+}
+
+// Plan 144 (Extended Filesystem Operations): `Path.exists`/`.is_file`/
+// `.is_dir`/`.is_symlink`/`.metadata`/`.unix_mode`/`.set_unix_mode`/
+// `.symlink`/`.read_link`, plus `FileMetadata`'s own five zero-
+// argument accessors — see `path.rs`'s own module doc.
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_exists(path: *const c_char) -> i64 {
+  catch_and_raise(move || path::path_exists(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_is_file(path: *const c_char) -> i64 {
+  catch_and_raise(move || path::path_is_file(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_is_dir(path: *const c_char) -> i64 {
+  catch_and_raise(move || path::path_is_dir(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_is_symlink(path: *const c_char) -> i64 {
+  catch_and_raise(move || path::path_is_symlink(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_metadata(path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || path::path_metadata(path))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 40-byte, `emerald_alloc`-backed
+/// `FileMetadata` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_filemetadata_size(ptr: *const i64) -> i64 {
+  catch_and_raise(move || path::filemetadata_size(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 40-byte, `emerald_alloc`-backed
+/// `FileMetadata` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_filemetadata_modified_unix(ptr: *const i64) -> i64 {
+  catch_and_raise(move || path::filemetadata_modified_unix(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 40-byte, `emerald_alloc`-backed
+/// `FileMetadata` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_filemetadata_is_dir(ptr: *const i64) -> i64 {
+  catch_and_raise(move || path::filemetadata_is_dir(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 40-byte, `emerald_alloc`-backed
+/// `FileMetadata` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_filemetadata_is_file(ptr: *const i64) -> i64 {
+  catch_and_raise(move || path::filemetadata_is_file(ptr))
+}
+
+/// # Safety
+/// `ptr` must point to a live, 40-byte, `emerald_alloc`-backed
+/// `FileMetadata` block.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_filemetadata_readonly(ptr: *const i64) -> i64 {
+  catch_and_raise(move || path::filemetadata_readonly(ptr))
+}
+
+// Plan 144's own Decision log: `Path.unix_mode`/`.set_unix_mode`/
+// `.symlink` are a real, disclosed Unix-only limitation (`path.rs`'s
+// own module doc) — `#[cfg(unix)]`-gated here too, matching the
+// underlying `std::os::unix::fs` gating exactly, rather than silently
+// compiling to nothing on a non-Unix target.
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_unix_mode(path: *const c_char) -> i64 {
+  catch_and_raise(move || path::path_unix_mode(path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_set_unix_mode(path: *const c_char, mode: i64) {
+  catch_and_raise(move || path::path_set_unix_mode(path, mode))
+}
+
+/// # Safety
+/// `target`/`link_path`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_symlink(target: *const c_char, link_path: *const c_char) {
+  catch_and_raise(move || path::path_symlink(target, link_path))
+}
+
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_path_read_link(path: *const c_char) -> *mut c_void {
+  catch_and_raise(move || path::path_read_link(path))
 }
 
 // Plan 164 (Portable Math Functions): `Math.<name>`, a thin f64-in-
