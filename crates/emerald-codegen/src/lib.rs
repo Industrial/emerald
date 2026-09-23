@@ -5125,6 +5125,10 @@ struct Ctx<'a, 'ctx> {
   csv_parse: FunctionValue<'ctx>,
   csv_parse_with_headers: FunctionValue<'ctx>,
   csv_write: FunctionValue<'ctx>,
+  /// Plan 106 (Advanced Async HTTP, hyper-direct) — `Http2Client.get`/
+  /// `.last_status`.
+  http2_client_get: FunctionValue<'ctx>,
+  http2_client_last_status: FunctionValue<'ctx>,
   /// Plan 124 (XML) — `Xml.parse`/`.parse_file`/`.reader_from_string`/
   /// `.reader_from_file`, `XmlReader#next_event`.
   xml_parse: FunctionValue<'ctx>,
@@ -11799,6 +11803,42 @@ fn build_method_call<'ctx>(
     };
     let call = builder
       .build_call(fv, &call_args, "csvstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
+
+  // Plan 106's Decision log: `Http2Client.get`/`.last_status` — the
+  // same reserved-namespace static-call shape `Csv`/`Json`/`Toml`
+  // already use. `.get` returns a plain `String` (`ValKind::Str`,
+  // never wrapped in `Result` — see `http2_client.rs`'s own doc
+  // comment on why a transport failure returns an empty string plus
+  // the `-1` sentinel instead of raising); `.last_status` takes no
+  // arguments and returns a plain `Int64`.
+  if recv_name == "Http2Client" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "get" => (ctx.http2_client_get, ValKind::Str),
+      "last_status" => (ctx.http2_client_last_status, ValKind::Int64),
+      other => {
+        return Err(format!(
+          "codegen: unsupported Http2Client static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "http2clientstatictmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ret_kind));
   }
@@ -23177,6 +23217,17 @@ fn compile_to_object_impl(
     ptr_ty.fn_type(&[ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 106 (Advanced Async HTTP, hyper-direct).
+  let http2_client_get = module.add_function(
+    "emerald_rt_http2_client_get",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let http2_client_last_status = module.add_function(
+    "emerald_rt_http2_client_last_status",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
   // Plan 124 (XML).
   let xml_parse = module.add_function(
     "emerald_rt_xml_parse",
@@ -26626,6 +26677,8 @@ fn compile_to_object_impl(
     csv_parse,
     csv_parse_with_headers,
     csv_write,
+    http2_client_get,
+    http2_client_last_status,
     xml_parse,
     xml_parse_file,
     xml_reader_from_string,

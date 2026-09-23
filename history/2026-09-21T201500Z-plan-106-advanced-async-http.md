@@ -10,23 +10,79 @@ maestro:
 todos:
   - id: leaf-hyper-dependency-and-vetting
     content: "Add `hyper = { version = \"1\", features = [\"client\", \"http1\", \"http2\"] }`, `hyper-util = { version = \"0.1\", features = [\"client-legacy\", \"http2\"] }`, and `http-body-util` to `crates/emerald-rt/Cargo.toml`; run through plan 95's checklist and `DEPENDENCIES.md`, noting `hyper` 1.x is deliberately low-level (its own crate docs describe it as such) and `hyper-util`'s `client-legacy` module is the real source of the connection-pooling behavior this plan exists for"
-    status: pending
+    status: done
   - id: leaf-shared-pooled-client-and-runtime
     content: "One process-wide `hyper_util::client::legacy::Client<HttpConnector, ...>` (or its rustls-backed connector when the target is `https://`, reusing plan 99's TLS setup) constructed once behind a `std::sync::OnceLock`, alongside plan 94's single lazy `tokio::runtime::Runtime` — every request this plan issues reuses the same pooled client/runtime pair, which is the entire mechanism behind the connection-reuse this plan exists to prove (`ureq`'s own simpler per-call connection model, plan 100, does not pool across separate Emerald-level calls the same way)"
-    status: pending
+    status: done
   - id: leaf-connect-request-response-buffered
     content: "`emerald_rt_h2_get(url: *const c_char, out_status: *mut i64) -> *mut c_char` — the v1-solved case: issue a GET through the shared pooled client via `runtime.block_on`, negotiate HTTP/2 when the server offers ALPN `h2` (over rustls, plan 99) or fall back to HTTP/1.1 automatically (this is `hyper`/`hyper-util`'s own real, built-in negotiation, not something this plan writes), buffer the full response body via `http_body_util::BodyExt::collect`, return it as one `CString`, exposed as `Http2Client.get(url: String): String` with status via a companion `Http2Client.last_status(): Int64`"
-    status: pending
+    status: done
   - id: leaf-connection-reuse-proof
     content: "A Rust `#[test]` issuing three sequential requests to the same host through the shared pooled client and asserting, via a counting `TcpListener`-backed local test server, that only one real TCP connection was accepted — the actual, checked proof of `leaf-shared-pooled-client-and-runtime`'s stated benefit, not merely an assertion that pooling exists because `hyper-util` says so"
-    status: pending
+    status: done
   - id: leaf-example-and-gate
     content: "`examples/http2_client.em` (the Concrete Proof below) issuing three requests against a plan-101 `tiny_http` server (HTTP/1.1 only — `tiny_http` itself has no HTTP/2 support, a real, disclosed limitation of this plan's own local proof target, noted in the Decision log) run as a companion background process, wired into the CI verification pattern plan 104/105 already established"
-    status: pending
+    status: done
 isProject: false
 ---
 
 # Plan 106 — Advanced Async HTTP (hyper-direct)
+
+## Implementation update (2026-09-23)
+
+Implemented as scoped, with one real, disclosed narrowing against this
+plan's own leaf text: **`Http2Client.get` is HTTP-only in this v1, not
+HTTP+HTTPS.** Building the rustls-backed connector this plan's own
+`leaf-shared-pooled-client-and-runtime` names ("reusing plan 99's TLS
+setup") turned out to need more than plan 99's own `rustls` setup can
+provide as-is — `tls.rs`'s `rustls::StreamOwned` is a genuinely
+*synchronous* adapter built directly on `std::net::TcpStream`, while
+`hyper`/`hyper-util`'s connector trait is asynchronous end to end.
+Bridging the two for real needs `tokio-rustls` (or `hyper-rustls` on
+top of it), neither of which is in this plan's own declared dependency
+leaf (`hyper`/`hyper-util`/`http-body-util` only). Rather than quietly
+add an unplanned dependency, `Http2Client.get` returns the disclosed
+`-1`/empty-string sentinel for any `https://` URL — a real, honest gap,
+not a silent omission. `http://` is fully supported, including the
+connection-pooling reuse that is this plan's actual stated purpose;
+`tiny_http` (this plan's own real local proof target) has no TLS
+support of its own to test against anyway, so this does not block the
+Concrete Proof.
+
+`Http2Client.get(url: String): String` / `Http2Client.last_status():
+Int64` — both plain reserved-namespace static calls (no new handle
+type; `last_status` reads a process-wide `AtomicI64` set by the most
+recent `.get` call), matching the plan's own Concrete Proof pseudocode
+exactly once `var`/`do...end` are applied (the pseudocode's own
+`i: Int64 = 0`/bare `while i < 3` are not this grammar's real mutable-
+binding/loop syntax — `var i: Int64 = 0`/`while i < 3 do ... end`,
+the same correction `multipart_upload_echo.em` already made against
+its own plan's pseudocode).
+
+`crates/emerald-rt/src/http2_client.rs`: one process-wide
+`hyper_util::client::legacy::Client<HttpConnector, Empty<Bytes>>`
+behind a `OnceLock`, reusing plan 97's already-existing shared
+`crate::tokio_rt()` directly (tokio was already a real, non-
+illustrative dependency by this plan's execution time, added by plan
+97/105 — no second runtime started). `leaf-connection-reuse-proof` is
+a Rust `#[test]` in this same file: a hand-rolled `TcpListener`-backed
+HTTP/1.1 server (not `tiny_http` — its API gives no visibility into
+real accept counts) counts real `TcpListener::accept` calls across
+three sequential `Http2Client.get` calls and asserts exactly one.
+
+`examples/http2_target_server.em` (a fixed-port `Http.serve` target)
+and `examples/http2_client.em` (the Concrete Proof) are exercised by
+`crates/emerald-cli/tests/http2_client.rs`, mirroring plan 104/105's
+own background-process CI pattern — the client here is an ordinary
+process (not an `Http.serve` handler), so its stdout is asserted on
+directly rather than needing plan 105's own response-body workaround
+for `Http.serve`'s stdout-buffering gap.
+
+Verified via `cargo build --workspace`; `cargo nextest run --workspace
+--no-fail-fast`; `cargo clippy --workspace --all-targets`; `treefmt`;
+`cargo audit --ignore RUSTSEC-2023-0071`. See the commit message for
+the final test count.
+
 
 Plan 100 wraps `ureq` for the common case: one blocking call, one request,
 one buffered response, no connection state carried between calls. Plan 101

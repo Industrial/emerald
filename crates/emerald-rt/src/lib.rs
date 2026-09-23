@@ -206,6 +206,7 @@ mod glob;
 mod gzip;
 mod handle;
 mod hashing;
+mod http2_client;
 mod http_client;
 mod http_server;
 mod humantime;
@@ -3082,6 +3083,24 @@ pub unsafe extern "C" fn emerald_rt_http_response_status(id: i64) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_http_response_body(id: i64) -> *const c_char {
   catch_and_raise(move || http_client::http_response_body(id))
+}
+
+/// Plan 106 (Advanced Async HTTP, hyper-direct).
+///
+/// # Safety
+/// `url`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http2_client_get(url: *const c_char) -> *const c_char {
+  catch_and_raise(move || http2_client::http2_client_get(url))
+}
+
+/// Plan 106 (Advanced Async HTTP, hyper-direct).
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http2_client_last_status() -> i64 {
+  catch_and_raise(move || http2_client::http2_client_last_status())
 }
 
 /// # Safety

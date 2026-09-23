@@ -5739,6 +5739,39 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 106's Decision log: `Http2Client.get`/`.last_status` — the
+    // same reserved-namespace static-call shape `Csv`/`Json`/`Toml`
+    // already use. `.get` returns a plain `String`, never wrapped in
+    // `Result` (a transport/parse failure sets `.last_status()` to the
+    // disclosed `-1` sentinel and returns an empty `String` instead of
+    // raising — the identical convention plan 100's own `Http.get`
+    // established one layer up, per this plan's own Decision log).
+    // `.last_status` takes no arguments and returns a plain `Int64`.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Http2Client") =>
+    {
+      let (expected_params, ret) = match method.as_str() {
+        "get" => (vec![Type::String], Type::String),
+        "last_status" => (vec![], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Http2Client has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 146's Decision log: `Env.get`/`.set`/`.remove`/`.keys`/
     // `.keys_count` — the same reserved-namespace static-call shape
     // `Json`/`Base64`/`Hex`/`Regex` use. `.get` returns `Option[String]`
