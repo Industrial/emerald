@@ -4403,6 +4403,32 @@ fn infer_expr_type(
         Box::new(Type::Enum("RegexError".to_string())),
       ))
     }
+    // Plan 147's Decision log: `Tempfile.create`/`Tempdir.create` —
+    // the same reserved-namespace static-call shape `Regex.compile`
+    // immediately above uses. Never `Result`-wrapped (unlike `Regex.
+    // compile`) — a real creation failure raises a plain, catchable
+    // `NativeError` instead, matching `File`'s own functions and plan
+    // 145's `Process.run` (see `tempfile.rs`'s own module doc in
+    // `emerald-rt` for the full reasoning). Every OTHER `Tempfile`/
+    // `Tempdir` method (`.path`/`.close`) is an instance method on an
+    // already-created receiver, dispatched by the `Type::Newtype` arm
+    // further below, never reached from here.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Tempfile" || n == "Tempdir") =>
+    {
+      let name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      if method != "create" {
+        return Err(Diagnostic::new(
+          format!("{name} has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+      Ok(Type::Newtype(name.to_string(), Box::new(Type::Int64)))
+    }
     // Plan 124's Decision log: `Xml.parse`/`.parse_file`/`.reader_
     // from_string`/`.reader_from_file` — the same reserved-namespace
     // static-call shape `Regex.compile` immediately above uses.
@@ -6069,6 +6095,34 @@ fn infer_expr_type(
           }
           check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
           return Ok(Type::Enum("XmlEvent".to_string()));
+        }
+        // Plan 147's Decision log: `Tempfile#path`/`#close`,
+        // `Tempdir#path`/`#close` — the identical carved-out-of-
+        // `.value`-only shape `XmlReader#next_event` immediately above
+        // establishes, just with two methods shared across both
+        // newtypes (their method tables are identical).
+        if name == "Tempfile" || name == "Tempdir" {
+          let (expected_params, ret) = match method.as_str() {
+            "path" => (vec![], Type::String),
+            "close" => (vec![], Type::Void),
+            other => {
+              return Err(Diagnostic::new(
+                format!("{name} has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
         }
         // Plan 109's Decision log: `Bytes#to_hex` — the same carved-
         // out-of-`.value`-only shape `Regex`'s own methods immediately
@@ -13654,6 +13708,49 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   // with one zero-arg method instead of nine.
   classes.insert(
     "XmlReader".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 147's Decision log: `Tempfile`/`Tempdir` — the identical
+  // "reserved name, zero-cost `Int64` handle" shape `Regex`/
+  // `XmlReader` above already use, backed by plan 93's own
+  // `crate::handle` registry in `emerald-rt` (a boxed `tempfile::
+  // NamedTempFile`/`tempfile::TempDir` respectively, never a raw
+  // pointer smuggled through as an `Int64`). Two distinct `ClassInfo`
+  // entries, not one shared between them — they wrap genuinely
+  // different underlying types with different drop/delete behavior
+  // (see `tempfile.rs`'s own module doc in `emerald-rt`), even though
+  // their Emerald-visible method tables (`.path`/`.close`) happen to
+  // be identical. `Tempfile.create`/`Tempdir.create` are reserved-
+  // namespace static intrinsics (this `Expr::MethodCall` arm's own
+  // sibling above); `.path`/`.close` are carved out of the ordinary
+  // newtype `.value`-only restriction, the same mechanism `Regex`'s
+  // own nine methods already establish.
+  classes.insert(
+    "Tempfile".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  classes.insert(
+    "Tempdir".to_string(),
     ClassInfo {
       fields: HashMap::new(),
       methods: HashMap::new(),

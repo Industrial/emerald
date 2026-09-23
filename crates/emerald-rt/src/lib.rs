@@ -212,6 +212,14 @@ mod system;
 // `.next_entry`/`.entry_size`/`.read_entry_data`/`.close`, wrapping
 // `tar` -- see `tar.rs`'s own module doc.
 mod tar;
+// Plan 147 (Temporary Files & Directories) -- `Tempfile.create`/
+// `.path`/`.close`, `Tempdir.create`/`.path`/`.close` -- see
+// `tempfile.rs`'s own module doc for why this is `mod tempfiles`
+// (`#[path]`-redirected), not a bare `mod tempfile;` (a real collision
+// against this crate's own `tempfile` dependency name, not a sibling
+// module -- unlike `csvs`/`tomls`/`urls`/`charset`'s own collisions).
+#[path = "tempfile.rs"]
+mod tempfiles;
 // Plan 99 (TLS) -- `Tls.connect`/`.connect_with_roots`/`.listen`,
 // `TlsStream#read`/`#write`/`#close`, `TlsListener#accept`/`#close`,
 // wrapping `rustls` -- see `tls.rs`'s own module doc.
@@ -3236,6 +3244,64 @@ pub unsafe extern "C" fn emerald_rt_zip_reader_read_entry_data(id: i64, index: i
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zip_reader_close(id: i64) {
   catch_and_raise(move || zip::zip_reader_close(id))
+}
+
+// Plan 147 (Temporary Files & Directories): `Tempfile.create`/`.path`/
+// `.close`, `Tempdir.create`/`.path`/`.close` -- see `tempfile.rs`'s
+// own module doc.
+
+/// `Tempfile.create(): Tempfile`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tempfile_create() -> i64 {
+  catch_and_raise(tempfiles::tempfile_create)
+}
+
+/// `Tempfile#path(self): String`.
+///
+/// # Safety
+/// `id` must be a live `Tempfile` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tempfile_path(id: i64) -> *const c_char {
+  catch_and_raise(move || tempfiles::tempfile_path(id))
+}
+
+/// `Tempfile#close(self): Void`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tempfile_close(id: i64) {
+  catch_and_raise(move || tempfiles::tempfile_close(id))
+}
+
+/// `Tempdir.create(): Tempdir`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tempdir_create() -> i64 {
+  catch_and_raise(tempfiles::tempdir_create)
+}
+
+/// `Tempdir#path(self): String`.
+///
+/// # Safety
+/// `id` must be a live `Tempdir` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tempdir_path(id: i64) -> *const c_char {
+  catch_and_raise(move || tempfiles::tempdir_path(id))
+}
+
+/// `Tempdir#close(self): Void`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_tempdir_close(id: i64) {
+  catch_and_raise(move || tempfiles::tempdir_close(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

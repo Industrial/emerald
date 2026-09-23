@@ -241,6 +241,12 @@ fn set_newtype_underlying(program: &Program) {
     "TarReader",
     // Plan 133's Decision log: `ZipReader` -- the identical shape.
     "ZipReader",
+    // Plan 147's Decision log: `Tempfile`/`Tempdir` -- the identical
+    // shape, two distinct newtypes sharing this one `Int64` handle
+    // representation (see `emerald-sema`'s own Decision log for why
+    // they stay distinct classes despite the identical representation).
+    "Tempfile",
+    "Tempdir",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5450,6 +5456,15 @@ struct Ctx<'a, 'ctx> {
   zip_reader_entry_size: FunctionValue<'ctx>,
   zip_reader_read_entry_data: FunctionValue<'ctx>,
   zip_reader_close: FunctionValue<'ctx>,
+  /// Plan 147 (Temporary Files & Directories) — `Tempfile.create`/
+  /// `.path`/`.close`, `Tempdir.create`/`.path`/`.close`, wrapping
+  /// `tempfile`.
+  tempfile_create: FunctionValue<'ctx>,
+  tempfile_path: FunctionValue<'ctx>,
+  tempfile_close: FunctionValue<'ctx>,
+  tempdir_create: FunctionValue<'ctx>,
+  tempdir_path: FunctionValue<'ctx>,
+  tempdir_close: FunctionValue<'ctx>,
   /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
   /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
   dns_resolve: FunctionValue<'ctx>,
@@ -9020,6 +9035,53 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((call_result(call)?, ret_kind));
     }
+    // Plan 147's Decision log: `Tempfile#path`/`#close`,
+    // `Tempdir#path`/`#close` -- the identical carved-out-of-newtype
+    // shape `TarReader`/`ZipReader`'s own methods immediately above
+    // establish, one shared arm since both newtypes expose the
+    // identical two-method Emerald surface even though they wrap
+    // genuinely different underlying Rust types (see `emerald-rt`'s
+    // own `tempfile.rs` module doc).
+    if matches!(
+      local_classes.get(recv_name).map(String::as_str),
+      Some("Tempfile") | Some("Tempdir")
+    ) {
+      let is_tempfile = local_classes.get(recv_name).map(String::as_str) == Some("Tempfile");
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      if method == "close" {
+        let fv = if is_tempfile {
+          ctx.tempfile_close
+        } else {
+          ctx.tempdir_close
+        };
+        builder
+          .build_call(fv, &[recv_val.into()], "tempresourceclosetmp")
+          .map_err(|e| e.to_string())?;
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      if method != "path" {
+        return Err(format!(
+          "codegen: unsupported Tempfile/Tempdir method `{method}`"
+        ));
+      }
+      let fv = if is_tempfile {
+        ctx.tempfile_path
+      } else {
+        ctx.tempdir_path
+      };
+      let call = builder
+        .build_call(fv, &[recv_val.into()], "temppathtmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((call_result(call)?, ValKind::Str));
+    }
     // Plan 96's Decision log: `UdpSocket#send_to`/`#recv_from`/
     // `#close`.
     if local_classes.get(recv_name).map(String::as_str) == Some("UdpSocket") {
@@ -10451,6 +10513,30 @@ fn build_method_call<'ctx>(
     }
     let call = builder
       .build_call(ctx.zip_reader_open, &call_args, "zipreaderopentmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
+  // Plan 147's Decision log: `Tempfile.create(): Tempfile`/
+  // `Tempdir.create(): Tempdir` -- the same reserved-namespace
+  // static-call shape `TarReader.open`/`ZipReader.open` immediately
+  // above use, with zero arguments instead of one. Never `Result`-
+  // wrapped -- a real creation failure raises a plain, catchable
+  // `NativeError` from the Rust side instead (see `tempfile.rs`'s own
+  // module doc in `emerald-rt`).
+  if recv_name == "Tempfile" || recv_name == "Tempdir" {
+    if method != "create" {
+      return Err(format!(
+        "codegen: unsupported {recv_name} static method `{method}`"
+      ));
+    }
+    let fv = if recv_name == "Tempfile" {
+      ctx.tempfile_create
+    } else {
+      ctx.tempdir_create
+    };
+    let call = builder
+      .build_call(fv, &[], "tempcreatetmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Int64));
   }
@@ -23530,6 +23616,41 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 147 (Temporary Files & Directories): `Tempfile.create`/
+  // `.path`/`.close`, `Tempdir.create`/`.path`/`.close` -- the same
+  // zero/one-`i64`-argument shapes `TarReader.open`/`#close` above
+  // use. `.path` returns `ptr_ty` (a `String`), the same `Regex.
+  // replace` convention.
+  let tempfile_create = module.add_function(
+    "emerald_rt_tempfile_create",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let tempfile_path = module.add_function(
+    "emerald_rt_tempfile_path",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tempfile_close = module.add_function(
+    "emerald_rt_tempfile_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tempdir_create = module.add_function(
+    "emerald_rt_tempdir_create",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let tempdir_path = module.add_function(
+    "emerald_rt_tempdir_path",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let tempdir_close = module.add_function(
+    "emerald_rt_tempdir_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 97 (DNS Resolution).
   let dns_resolve = module.add_function(
     "emerald_rt_dns_resolve",
@@ -24734,6 +24855,13 @@ fn compile_to_object_impl(
   // gap-avoidance immediately above: this plan's own Concrete Proof
   // `Let`-binds `reader: ZipReader = ZipReader.open(...)`.
   newtypes.insert("ZipReader".to_string());
+  // Plan 147's Decision log: `Tempfile`/`Tempdir` -- added here as
+  // well as `NEWTYPE_UNDERLYING` above, per `XmlReader`/`TarReader`/
+  // `ZipReader`'s own disclosed finding immediately above (this
+  // plan's own Concrete Proof `Let`-binds `tf: Tempfile = Tempfile.
+  // create`, so both registries are load-bearing here too).
+  newtypes.insert("Tempfile".to_string());
+  newtypes.insert("Tempdir".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -25087,6 +25215,12 @@ fn compile_to_object_impl(
     zip_reader_entry_size,
     zip_reader_read_entry_data,
     zip_reader_close,
+    tempfile_create,
+    tempfile_path,
+    tempfile_close,
+    tempdir_create,
+    tempdir_path,
+    tempdir_close,
     dns_resolve,
     dns_resolve_all,
     dns_resolve_count,

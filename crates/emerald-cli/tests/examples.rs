@@ -856,3 +856,20 @@ fn process_spawning_proof_em_prints_expected_sequence() {
     "hello from emerald\n\n0\ntrue\n1\nfalse\nspawn failed\n"
   );
 }
+
+// Plan 147 (Temporary Files & Directories): `Tempfile.create`/`.path`/
+// `.close`, `Tempdir.create`/`.path`/`.close`, wrapping the pure-Rust
+// `tempfile` crate — `Tempfile`'s own path really exists on disk while
+// open (proven by composing plan 45's `File.write`/`.read` and plan
+// 144's `Path.exists` against it) and is really gone after `.close()`;
+// `Tempdir`'s own nested contents are all gone too, not just its
+// top-level entry. See `examples/temp_files_proof.em`'s own header
+// comment for the one real, disclosed deviation from this plan's own
+// literal Concrete Proof text.
+#[test]
+fn temp_files_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("temp_files_proof.em"),
+    "temporary contents\ntrue\nfalse\ntrue\nfalse\n"
+  );
+}
