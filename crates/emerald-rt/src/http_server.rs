@@ -85,6 +85,16 @@ struct HttpRequestData {
   path: String,
   body: String,
   request: Option<tiny_http::Request>,
+  // Plan 105 (Multipart/Form-Data Parsing)'s own real, disclosed fix,
+  // found only by actually POSTing a real binary (non-UTF-8) upload
+  // through this plan's own worked example: `body` above is filled
+  // via `String::from_utf8_lossy` now, not `read_to_string` directly
+  // (see `http_serve`'s own comment at the real read site) — `body`
+  // alone is no longer a faithful byte-for-byte source for anything
+  // that needs the request's REAL bytes, so `body_bytes` keeps those
+  // separately for `multipart.rs`'s own `Multipart.start` (via
+  // `http_request_body_bytes` below) to parse instead.
+  body_bytes: Vec<u8>,
 }
 
 /// `HttpRequest#upgrade`'s own extraction point (plan 102) — pulls the
@@ -185,10 +195,22 @@ pub unsafe fn http_serve(port: i64, handler: extern "C-unwind" fn(i64) -> i64) -
       .headers()
       .iter()
       .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Upgrade"));
-    let mut body = String::new();
+    // Plan 105's own real, disclosed fix: raw bytes first, `body`
+    // derived lossily from them — `read_to_string` used to read
+    // directly into a `String` and silently drop the ENTIRE body
+    // on any single invalid-UTF-8 byte (its own real, documented
+    // behavior leaves the target `String` unchanged on that `Err`,
+    // which the pre-existing `let _ = ...` here already discarded,
+    // so this was invisible until a real binary multipart upload —
+    // exactly the kind of body a file upload routinely contains —
+    // needed the real bytes back). `body_bytes` below is now the
+    // canonical source; `body` stays for `#body`'s own existing
+    // (lossy, best-effort) `String` contract.
+    let mut body_bytes = Vec::new();
     if !is_upgrade_request {
-      let _ = request.as_reader().read_to_string(&mut body);
+      let _ = request.as_reader().read_to_end(&mut body_bytes);
     }
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     let req_id = handle_alloc(
       Box::new(HttpRequestData {
         method,
@@ -200,6 +222,7 @@ pub unsafe fn http_serve(port: i64, handler: extern "C-unwind" fn(i64) -> i64) -
         // module's own `http_request_take`) has a real, not-yet-
         // consumed request to call `.upgrade(...)` on.
         request: Some(request),
+        body_bytes,
       }),
       HTTP_REQUEST_TAG,
     );
@@ -274,6 +297,65 @@ pub fn http_request_body(id: i64) -> *const c_char {
   match handle_get_mut::<HttpRequestData, String>(id, HTTP_REQUEST_TAG, |r| r.body.clone()) {
     Ok(s) => unsafe { crate::alloc_and_copy_str(&s) },
     Err(e) => unsafe { crate::raise_native_error(&e) },
+  }
+}
+
+/// Plan 105 (Multipart/Form-Data Parsing)'s own extraction point,
+/// mirroring `http_request_take`'s own doc comment immediately above
+/// — the raw bytes of a request's own already fully-buffered body
+/// (see this module's own `http_serve`, which reads the whole thing
+/// via `request.as_reader().read_to_end` before any handler ever
+/// runs), for `multipart.rs`'s own `BodyStream` to feed to `multer`
+/// incrementally. Reads `body_bytes`, never the lossily-`String`-
+/// converted `body` field (which would corrupt a real binary upload's
+/// exact bytes on any invalid-UTF-8 byte — see `HttpRequestData`'s own
+/// doc comment). Never itself does any multipart parsing — that stays
+/// entirely in `multipart.rs`.
+pub(crate) fn http_request_body_bytes(id: i64) -> Result<Vec<u8>, String> {
+  handle_get_mut::<HttpRequestData, Vec<u8>>(id, HTTP_REQUEST_TAG, |r| r.body_bytes.clone())
+}
+
+/// `HttpRequest#content_type_boundary(self): String` — plan 105
+/// (Multipart/Form-Data Parsing)'s own real, disclosed deviation from
+/// its Concrete Proof's assumed `HttpServer.content_type_boundary`
+/// static call (`HttpServer` does not exist as a real namespace at
+/// all — the identical finding plan 104's own `sse_ticker.em` already
+/// disclosed for `HttpServer.listen`/`.port`/`.accept`): a genuine new
+/// instance method on the existing `HttpRequest` newtype, alongside
+/// `#method`/`#path`/`#body`/`#upgrade` immediately above, not a new
+/// reserved namespace of its own. Parses the request's own real
+/// `Content-Type` header via `multer::parse_boundary` — raises a
+/// NativeError (plan 92's exception channel) on a missing header or a
+/// `Content-Type` that isn't genuine `multipart/form-data` with a real
+/// `boundary` parameter, mirroring `http_request_take`'s own "already
+/// upgraded" abort for a request this handle's own live
+/// `tiny_http::Request` is no longer holding.
+pub unsafe fn http_request_content_type_boundary(id: i64) -> *const c_char {
+  let result =
+    handle_get_mut::<HttpRequestData, Result<String, String>>(id, HTTP_REQUEST_TAG, |r| {
+      let request = r
+        .request
+        .as_ref()
+        .ok_or_else(|| "HttpRequest#content_type_boundary: request already upgraded".to_string())?;
+      let content_type = request
+        .headers()
+        .iter()
+        .find(|h| {
+          h.field
+            .as_str()
+            .as_str()
+            .eq_ignore_ascii_case("Content-Type")
+        })
+        .map(|h| h.value.as_str().to_string())
+        .ok_or_else(|| {
+          "HttpRequest#content_type_boundary: request has no Content-Type header".to_string()
+        })?;
+      multer::parse_boundary(&content_type)
+        .map_err(|e| format!("HttpRequest#content_type_boundary: {e}"))
+    });
+  match result {
+    Ok(Ok(boundary)) => crate::alloc_and_copy_str(&boundary),
+    Ok(Err(e)) | Err(e) => crate::raise_native_error(&e),
   }
 }
 

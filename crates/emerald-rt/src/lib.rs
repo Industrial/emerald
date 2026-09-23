@@ -301,6 +301,10 @@ mod xml;
 // `.entry_count`/`.entry_name`/`.entry_size`/`.read_entry_data`/
 // `.close`, wrapping `zip` -- see `zip.rs`'s own module doc.
 mod zip;
+// Plan 105 (Multipart/Form-Data Parsing) -- `Multipart.start`/
+// `.next_field`, `Field.name`/`.filename`/`.read_chunk`/`.close`,
+// wrapping `multer` -- see `multipart.rs`'s own module doc.
+mod multipart;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -3220,6 +3224,57 @@ pub unsafe extern "C" fn emerald_rt_sse_comment(stream: i64, text: *const c_char
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_sse_close(stream: i64) -> i64 {
   catch_and_raise(move || sse::sse_close(stream))
+}
+
+/// # Safety
+/// Always safe to call for a live `HttpRequest` handle whose own
+/// `tiny_http::Request` hasn't already been taken.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_http_request_content_type_boundary(id: i64) -> *const c_char {
+  catch_and_raise(move || http_server::http_request_content_type_boundary(id))
+}
+
+/// # Safety
+/// `request` must be a live `HttpRequest` handle; `boundary`, if
+/// non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_multipart_start(request: i64, boundary: *const c_char) -> i64 {
+  catch_and_raise(move || multipart::multipart_start(request, boundary))
+}
+
+/// # Safety
+/// `multipart` must be a live `Multipart` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_multipart_next_field(multipart: i64) -> i64 {
+  catch_and_raise(move || multipart::multipart_next_field(multipart))
+}
+
+/// # Safety
+/// `field` must be a live `Field` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_field_name(field: i64) -> *const c_char {
+  catch_and_raise(move || multipart::field_name(field))
+}
+
+/// # Safety
+/// `field` must be a live `Field` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_field_filename(field: i64) -> *mut c_char {
+  catch_and_raise(move || multipart::field_filename(field))
+}
+
+/// # Safety
+/// `field` must be a live `Field` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_field_read_chunk(field: i64, max_bytes: i64) -> *mut c_char {
+  catch_and_raise(move || multipart::field_read_chunk(field, max_bytes))
+}
+
+/// # Safety
+/// Always safe to call for any `Int64`, live `Field` handle or not.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_field_close(field: i64) -> i64 {
+  catch_and_raise(move || multipart::field_close(field))
 }
 
 /// # Safety

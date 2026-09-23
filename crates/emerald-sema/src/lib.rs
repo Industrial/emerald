@@ -5620,6 +5620,82 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 105's Decision log: `Multipart.start`/`.next_field` — the
+    // same reserved-namespace static-call shape `Dns`/`Kdf`/`Sse`
+    // already use. `.begin` consumes plan 101's own `HttpRequest`
+    // newtype plus the `String` boundary (from `HttpRequest#content_
+    // type_boundary`, added onto the existing `HttpRequest` instance-
+    // method arm below — `HttpServer` is not a real namespace, the
+    // identical finding plan 104's own `sse_ticker.em` already made
+    // for `HttpServer.listen`/`.port`/`.accept`) and returns a plain
+    // `Int64` handle; `.next_field` returns a plain `Int64` too (`0`
+    // reserved as the "no more fields" sentinel per plan 93's own
+    // handle convention, never wrapped in `Result`).
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Multipart") =>
+    {
+      let http_request_ty = Type::Newtype("HttpRequest".to_string(), Box::new(Type::Int64));
+      let (expected_params, ret) = match method.as_str() {
+        "start" => (vec![http_request_ty, Type::String], Type::Int64),
+        "next_field" => (vec![Type::Int64], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Multipart has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
+    // Plan 105's Decision log: `Field.name`/`.filename`/`.read_chunk`/
+    // `.close` — the same reserved-namespace static-call shape
+    // `Multipart` immediately above uses (a `Field` handle is never a
+    // `Let`-bindable newtype variable, exactly like `Multipart`'s own
+    // handle). `.name` is genuinely not nullable (a malformed part
+    // missing its own required `Content-Disposition` `name` parameter
+    // is an aborted parse, not a nullable field-of-a-field); `.filename`
+    // and `.read_chunk` are both genuinely nullable `Option[String]`
+    // (a plain text field has no filename; `nil` from `.read_chunk`
+    // marks genuine end-of-field), the same `Option$String` shape
+    // `Env.get`/`String.from_cstring` already establish.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Field") =>
+    {
+      let option_string = Type::Enum("Option$String".to_string());
+      let (expected_params, ret) = match method.as_str() {
+        "name" => (vec![Type::Int64], Type::String),
+        "filename" => (vec![Type::Int64], option_string.clone()),
+        "read_chunk" => (vec![Type::Int64, Type::Int64], option_string),
+        "close" => (vec![Type::Int64], Type::Int64),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Field has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 121's Decision log: `Csv.parse`/`.parse_with_headers`/
     // `.write` — the same reserved-namespace static-call shape `Json`/
     // `Toml` already use. Deliberately does NOT reuse `JsonValue` — a
@@ -7187,6 +7263,14 @@ fn infer_expr_type(
           }
           let (expected_params, ret) = match method.as_str() {
             "method" | "path" | "body" => (vec![], Type::String),
+            // Plan 105's Decision log: `HttpRequest#content_type_
+            // boundary` — this plan's own real, disclosed adaptation
+            // of its Concrete Proof's assumed `HttpServer.content_
+            // type_boundary(req)` static call (`HttpServer` is not a
+            // real namespace — see this arm's own comment above for
+            // plan 104's identical prior finding): a genuine instance
+            // method alongside `#method`/`#path`/`#body` instead.
+            "content_type_boundary" => (vec![], Type::String),
             other => {
               return Err(Diagnostic::new(
                 format!("HttpRequest has no method `{other}`"),

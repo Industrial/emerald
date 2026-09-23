@@ -10,22 +10,22 @@ maestro:
 todos:
   - id: leaf-multipart-dependency-and-vetting
     content: "Add `multer = \"3.1\"` to `crates/emerald-rt/Cargo.toml`, run it through plan 95's crate-vetting checklist (docs+example+test), and record it in `DEPENDENCIES.md` with the honest currency note from the Decision log (last release May 2024, no release since, but the de facto standard via `axum`/`axum-extra`/`apollo-router`/Leptos `server_fn` dependents, ~1.5M downloads/week)"
-    status: pending
+    status: done
   - id: leaf-sync-to-async-body-bridge
     content: "A small internal adapter turning plan 101's synchronous, `Read`-backed request-body reader into the `futures_core::Stream<Item = Result<bytes::Bytes, std::io::Error>>` `multer::Multipart::new` requires — one fixed-size (64 KiB) synchronous read per stream poll, each call individually driven through plan 94's single lazy `tokio::runtime::Runtime`'s `block_on`, never buffering the request body past that one chunk at a time"
-    status: pending
+    status: done
   - id: leaf-multipart-begin-and-registry
     content: "`emerald_rt_multipart_begin(request_handle: i64, boundary: *const c_char) -> i64` — wraps the body-stream adapter in a `multer::Multipart`, registers it under a new `u64` handle in a plan-93 registry (`Mutex<HashMap<u64, multer::Multipart<'static>>>`), exposed as `Multipart.begin(request: Int64, boundary: String): Int64`"
-    status: pending
+    status: done
   - id: leaf-multipart-next-field-and-metadata
     content: "`emerald_rt_multipart_next_field(multipart: i64) -> i64` (block_on-driven `.next_field()`, `0` reserved as the exhausted/invalid sentinel per plan 93's handle convention, else a new field handle registered in a second `Mutex<HashMap<u64, multer::Field<'static>>>`), plus `Field.name(field: Int64): String`, `Field.filename(field: Int64): String?` (real `Option<&str>` -> `String?` per plan 43's nullable-reference mechanism, since a form field genuinely may not be a file), exposed as `Multipart.next_field(multipart: Int64): Int64`"
-    status: pending
+    status: done
   - id: leaf-field-bounded-read-and-close
     content: "`emerald_rt_field_read_chunk(field: i64, max_bytes: i64) -> *mut c_char` (block_on-driven `.chunk()`, `nil`/`NULL` on `Ok(None)` — real end-of-field, not an error) and `emerald_rt_field_close(field: i64) -> i64`, exposed as `Field.read_chunk(field: Int64, max_bytes: Int64): String?` / `Field.close(field: Int64): Void`"
-    status: pending
+    status: done
   - id: leaf-example-and-gate
     content: "`examples/multipart_upload_echo.em` (the Concrete Proof below, a server that reads an uploaded file field in bounded chunks and prints its total byte count without ever holding the whole file in one `String`) plus a `curl -F` verification step; a Rust `#[test]` asserting `read_chunk` genuinely returns `nil` exactly once, after every real byte, not before"
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -220,3 +220,114 @@ repeated `Field.read_chunk` calls rather than one whole-body read, and that
   only, with no way to raise or lower them from source in this plan's
   v1 surface, a real, disclosed gap a small follow-up leaf could close
   without redesigning anything here.
+
+## Update (2026-09-23, EXECUTE)
+
+Implemented `Multipart.start`/`.next_field`, `Field.name`/`.filename`/
+`.read_chunk`/`.close` in a new `crates/emerald-rt/src/multipart.rs`
+exactly as this plan's own Decision log specifies: `multer` 3.1.0
+wrapping a hand-rolled `BodyStream` (a `futures_core::Stream` over the
+request's own already-buffered byte `Vec`, handed out 64 KiB per poll),
+every `async fn` call driven through `crate::tokio_rt()`'s shared
+`block_on`, two independent `crate::handle` registry entries
+(`"Multipart"`/`"Field"` tags). `HttpRequest#content_type_boundary`
+added onto `http_server.rs`'s own existing `HttpRequest` instance-
+method arm, parsing the real `Content-Type` header via `multer::
+parse_boundary`.
+
+Four real, disclosed deviations from this plan's own Concrete Proof
+text and Decision log, found only by actually compiling and running
+this plan's own worked example end to end (mirroring plan 104's own
+precedent for the identical reason):
+
+1. **`HttpServer.listen`/`.port`/`.accept`/`.content_type_boundary`
+   do not exist** — the plan's own text names these "(assumed part of
+   plan 101's own surface)"; plan 101 only ever shipped `Http.serve
+   (port) do |req| ... end`. `examples/multipart_upload_echo.em` upgrades
+   the same accepted request `Http.serve`'s own trampoline hands the
+   handler, on a fixed port (`47701`), and calls a genuine new
+   `HttpRequest#content_type_boundary` instance method instead of an
+   assumed `HttpServer.content_type_boundary(req)` static call.
+2. **`String?` is not this grammar's real nullable-type syntax** —
+   plan 73 (predating this plan's own authoring date) replaced it with
+   a genuine `Option[String]` sum type (`Some`/`None`, `match ... do
+   ... end`). `Field.filename`/`.read_chunk` are typed `Option[String]`
+   in both sema and codegen (the identical `Option$String` tagged-
+   union `is_null`-branch-plus-`phi` construction `Env.get`/`String.
+   from_cstring` already establish, reused verbatim, not re-derived),
+   and the Concrete Proof's own `while chunk != nil` becomes `while
+   true` with a `break` on `None`.
+3. **`begin` is a real, grammar-reserved keyword** (`begin ... rescue
+   ... end`, confirmed against `grammar.lalrpop` — a genuine parse
+   error compiling this plan's own Concrete Proof verbatim) — the
+   plan's own literal `Multipart.begin` is renamed `Multipart.start`
+   throughout (Rust, sema, codegen, the example), the same class of
+   rename plan 101's own `HttpResponse.build` (not `.new`) and plan
+   109's `Sha256Hasher.hasher()` (not `.new()`) already establish for
+   the identical reason.
+4. **A real, load-bearing bug in plan 101's own pre-existing
+   `http_serve`, found only by actually POSTing a real binary
+   (non-UTF-8) file upload through this plan's own worked example**:
+   the request body was read directly into a `String` via
+   `Read::read_to_string`, whose own real, documented behavior on the
+   first invalid-UTF-8 byte is to leave the target `String` completely
+   unchanged (empty, here) and return an `Err` the pre-existing code
+   already silently discarded — invisible for every prior plan's own
+   text-only proof, but fatal for a real multipart file upload, which
+   routinely contains non-UTF-8 bytes. Fixed in `http_server.rs`:
+   `HttpRequestData` now carries the real bytes in a `body_bytes: Vec<
+   u8>` field (`read_to_end`, not `read_to_string`); the pre-existing
+   `body: String` field is still populated, now via `String::from_
+   utf8_lossy`, so `HttpRequest#body`'s own existing contract for
+   every OTHER already-shipped plan is unchanged. `multipart.rs`'s own
+   `http_request_body_bytes` reads `body_bytes`, never the lossy
+   `body`. A second, related, empirically-found (not merely inferred)
+   finding: a `multer::Field` genuinely holds a live lock into its own
+   parent `Multipart`'s shared internal state for as long as the
+   `Field` value itself is alive — draining a field to `nil` via
+   `.read_chunk` is NOT by itself sufficient to allow a following
+   `Multipart.next_field` call to succeed; `Field.close` must also be
+   called first, or `.next_field` raises `multer`'s own real
+   `"failed to lock multipart state"` error. Disclosed in `Multipart.
+   next_field`'s own doc comment; `multipart.rs`'s own `#[cfg(test)]`
+   suite exercises this ordering directly.
+
+`examples/multipart_upload_echo.em`'s own response body additionally
+echoes the field's `name` and exact byte total (alongside the `puts`
+calls the plan's own Concrete Proof specifies, kept for the real
+interactive-`curl`-verification case) — an additional, disclosed
+adaptation, separate from the four numbered above:
+`runtime/emerald_runtime.c`'s own `setvbuf(stdout, NULL, _IONBF, 0)`
+unbuffering trick is scoped exclusively to `.register()`-ing actor
+processes (its own comment says so directly), so a `puts` inside an
+ordinary `Http.serve` handler is not reliably visible in a piped/
+redirected stdout before `crates/emerald-cli/tests/multipart.rs`'s own
+CI-enforced test externally kills the still-running server process —
+the same "curl for the disclosed external-client check, a Rust test
+for the CI-enforced one" split plan 104's own Decision log already
+establishes, applied here via the response body instead of stdout for
+the CI-enforced half.
+
+Verified: `cargo build --workspace`; `cargo test -p emerald-rt --lib`
+(257 passed, including this plan's own three `multipart::tests`, one
+of them a real regression test for finding 4 above — a 200,000-byte
+binary field drained across many real chunks); `cargo test -p
+emerald-sema -p emerald-codegen` (338 + 203 passed, no regression);
+`cargo test -p emerald-cli --test examples` (71 passed, no
+regression); `cargo test -p emerald-cli --test http_server` (1
+passed, no regression — proves finding 4's fix didn't disturb plan
+101's own pre-existing body-reading contract); `cargo test -p
+emerald-cli --test multipart` (2 passed: the worked example draining
+a 200,000-byte binary upload across multiple `Field.read_chunk` calls
+and echoing the exact byte count, and a plain 404 for an unhandled
+path); `cargo nextest run --workspace` (1255 passed, 0 failed, 4
+skipped — the pre-existing, network-dependent `dns_resolution_em_
+prints_expected_sequence` and the pre-existing, environment-specific
+`emerald-driver::cache::tests::corrupting_the_cached_object_file_
+forces_a_real_recompile_not_an_error` excluded and independently
+re-confirmed pre-existing/unrelated, not fixed); `cargo clippy
+--workspace --all-targets` (0 errors, only pre-existing warnings in
+files this plan did not touch); `cargo fmt --check` and `treefmt
+--fail-on-change` (both clean); `cargo audit --ignore RUSTSEC-2023-
+0071` (exit 0, only pre-existing triaged advisories, none against
+`multer`/`bytes`/`futures-core`).

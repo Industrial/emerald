@@ -1024,6 +1024,7 @@ dependencies = [
  "base64 0.23.1",
  "bincode",
  "blake3",
+ "bytes",
  "chacha20poly1305",
  "clap",
  "config",
@@ -1032,6 +1033,7 @@ dependencies = [
  "ed25519-dalek",
  "encoding_rs",
  "flate2",
+ "futures-core",
  "getrandom 0.4.3",
  "glob",
  "hex",
@@ -1043,6 +1045,7 @@ dependencies = [
  "libc",
  "libm",
  "md-5",
+ "multer",
  "num-bigint",
  "pbkdf2",
  "proptest",
@@ -2282,6 +2285,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2326,6 +2335,23 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]

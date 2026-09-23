@@ -749,6 +749,30 @@ proptest = "1.11"
 # `.recv`/`.close`, `HttpRequest#upgrade`'s direct backing. See
 # DEPENDENCIES.md.
 tungstenite = "0.30"
+# Plan 105 (Multipart/Form-Data Parsing): `multer` 3.1 — per this
+# plan's own Decision log, the de facto standard `multipart/form-data`
+# parser underneath `axum`/`axum-extra`, Apollo's `apollo-router`, and
+# Leptos's `server_fn` (all list it as a direct or optional dependency,
+# per crates.io's own dependents listing, checked at the plan's own
+# authoring time), despite a real, disclosed staleness gap (no release
+# since 3.1.0, May 4, 2024) — accepted per plan 95's vetting bar since
+# RFC 7578 parsing is a bounded, non-fast-moving problem and no
+# actively-maintained pure-Rust alternative with comparable adoption
+# surfaced. `Multipart.start`/`.next_field`, `Field.name`/`.filename`/
+# `.read_chunk`/`.close`'s direct backing. See DEPENDENCIES.md.
+multer = "3.1"
+# `bytes`/`futures-core` — both already resolved transitively into
+# this workspace's own `Cargo.lock` before this plan (via `tokio`'s
+# own dependency graph, the identical "already resolved, promoted to
+# direct" situation plan 99's own `rustls` comment already discloses),
+# promoted to direct dependencies here so `multipart.rs`'s own
+# `BodyStream` (plan 105's sync-to-async request-body bridge — see its
+# own module doc) can implement `futures_core::Stream<Item =
+# Result<bytes::Bytes, std::io::Error>>` directly, the exact type
+# `multer::Multipart::new` requires. No RustSec advisory found against
+# either crate.
+bytes = "1"
+futures-core = "0.3"
 
 [build-dependencies]
 

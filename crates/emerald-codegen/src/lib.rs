@@ -5595,6 +5595,16 @@ struct Ctx<'a, 'ctx> {
   sse_send: FunctionValue<'ctx>,
   sse_comment: FunctionValue<'ctx>,
   sse_close: FunctionValue<'ctx>,
+  /// Plan 105 (Multipart/Form-Data Parsing) — `HttpRequest#content_
+  /// type_boundary`, `Multipart.start`/`.next_field`, `Field.name`/
+  /// `.filename`/`.read_chunk`/`.close`, wrapping `multer`.
+  http_request_content_type_boundary: FunctionValue<'ctx>,
+  multipart_start: FunctionValue<'ctx>,
+  multipart_next_field: FunctionValue<'ctx>,
+  field_name: FunctionValue<'ctx>,
+  field_filename: FunctionValue<'ctx>,
+  field_read_chunk: FunctionValue<'ctx>,
+  field_close: FunctionValue<'ctx>,
   /// Plan 115 (Key Derivation Functions) — `Kdf.hkdf`/`.pbkdf2`.
   kdf_hkdf: FunctionValue<'ctx>,
   kdf_pbkdf2: FunctionValue<'ctx>,
@@ -9729,6 +9739,10 @@ fn build_method_call<'ctx>(
         "method" => ctx.http_request_method,
         "path" => ctx.http_request_path,
         "body" => ctx.http_request_body,
+        // Plan 105's Decision log: `#content_type_boundary` — the
+        // same carved-out instance-method shape `#method`/`#path`/
+        // `#body` immediately above already establish.
+        "content_type_boundary" => ctx.http_request_content_type_boundary,
         other => return Err(format!("codegen: unsupported HttpRequest method `{other}`")),
       };
       let call = builder
@@ -11559,6 +11573,177 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ValKind::Int64));
   }
 
+  // Plan 105's Decision log: `Multipart.start`/`.next_field` — the
+  // same reserved-namespace static-call shape `Sse`/`Dns`/`Kdf`
+  // already use, both a uniform `ValKind::Int64` passthrough (a
+  // handle from `.begin`, a handle-or-`0`-sentinel from `.next_field`,
+  // per plan 93's own convention — never wrapped in `Result`).
+  if recv_name == "Multipart" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "start" => ctx.multipart_start,
+      "next_field" => ctx.multipart_next_field,
+      other => {
+        return Err(format!(
+          "codegen: unsupported Multipart static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "multipartstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+  // Plan 105's Decision log: `Field.name`/`.filename`/`.read_chunk`/
+  // `.close` — the same reserved-namespace static-call shape
+  // `Multipart` immediately above uses. `.name`/`.close` are plain
+  // passthroughs (`ValKind::Str`/`ValKind::Int64` respectively);
+  // `.filename`/`.read_chunk` each return a bare nullable `*mut
+  // c_char` from the Rust side that this call site itself builds into
+  // a real tagged `Option[String]` value from, the identical
+  // `is_null`-branch-plus-`phi` pattern `Env.get`/`String.from_cstring`
+  // already establish (reused verbatim, not re-derived, for each).
+  if recv_name == "Field" {
+    if method == "filename" || method == "read_chunk" {
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let fv = if method == "filename" {
+        ctx.field_filename
+      } else {
+        ctx.field_read_chunk
+      };
+      let call = builder
+        .build_call(fv, &call_args, "fieldnullablestrtmp")
+        .map_err(|e| e.to_string())?;
+      let ptr_val = call_result(call)?.into_pointer_value();
+      let enum_name = "Option$String";
+      let layout = ctx.enums.get(enum_name).ok_or_else(|| {
+        format!(
+          "codegen: internal error — `Option$String` was not pre-instantiated for `Field.{method}`"
+        )
+      })?;
+      let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `Some` variant".to_string()
+      })?;
+      let none_tag = *layout.variant_tags.get("None").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `None` variant".to_string()
+      })?;
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let is_null = builder
+        .build_is_null(ptr_val, "fieldnullableisnull")
+        .map_err(|e| e.to_string())?;
+
+      let entry_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block")?;
+      let func = entry_block
+        .get_parent()
+        .ok_or("codegen: internal error — block has no parent function")?;
+      let some_block = context.append_basic_block(func, "fieldnullable.some");
+      let none_block = context.append_basic_block(func, "fieldnullable.none");
+      let merge_block = context.append_basic_block(func, "fieldnullable.merge");
+      builder
+        .build_conditional_branch(is_null, none_block, some_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(some_block);
+      let some_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "fieldnullablesome")
+        .map_err(|e| e.to_string())?;
+      let some_ptr = call_result(some_alloc)?.into_pointer_value();
+      let some_tag_ptr = field_ptr(context, builder, some_ptr, 0)?;
+      builder
+        .build_store(some_tag_ptr, context.i64_type().const_int(some_tag, false))
+        .map_err(|e| e.to_string())?;
+      let some_field_ptr = field_ptr(context, builder, some_ptr, 8)?;
+      builder
+        .build_store(some_field_ptr, ptr_val)
+        .map_err(|e| e.to_string())?;
+      let some_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after some")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(none_block);
+      let none_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "fieldnullablenone")
+        .map_err(|e| e.to_string())?;
+      let none_ptr = call_result(none_alloc)?.into_pointer_value();
+      let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
+      builder
+        .build_store(none_tag_ptr, context.i64_type().const_int(none_tag, false))
+        .map_err(|e| e.to_string())?;
+      let none_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after none")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
+      let phi = builder
+        .build_phi(
+          local_llvm_type(context, &ValKind::Ptr),
+          "fieldnullableresult",
+        )
+        .map_err(|e| e.to_string())?;
+      let some_val: BasicValueEnum = some_ptr.into();
+      let none_val: BasicValueEnum = none_ptr.into();
+      phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
+      return Ok((phi.as_basic_value(), ValKind::Ptr));
+    }
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "name" => (ctx.field_name, ValKind::Str),
+      "close" => (ctx.field_close, ValKind::Int64),
+      other => {
+        return Err(format!(
+          "codegen: unsupported Field static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "fieldstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
+  }
   // Plan 101's Decision log: `HttpResponse.build(status, body)` — the
   // plan's own literal `.new` can never reach reserved-namespace
   // dispatch (`"new"` is grammar-reserved), renamed here for the same
@@ -25038,6 +25223,44 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 105 (Multipart/Form-Data Parsing) — `HttpRequest#content_
+  // type_boundary`, `Multipart.start`/`.next_field`, `Field.name`/
+  // `.filename`/`.read_chunk`/`.close`, wrapping `multer`.
+  let http_request_content_type_boundary = module.add_function(
+    "emerald_rt_http_request_content_type_boundary",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let multipart_start = module.add_function(
+    "emerald_rt_multipart_start",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let multipart_next_field = module.add_function(
+    "emerald_rt_multipart_next_field",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let field_name = module.add_function(
+    "emerald_rt_field_name",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let field_filename = module.add_function(
+    "emerald_rt_field_filename",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let field_read_chunk = module.add_function(
+    "emerald_rt_field_read_chunk",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let field_close = module.add_function(
+    "emerald_rt_field_close",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 115 (Key Derivation Functions).
   let kdf_hkdf = module.add_function(
     "emerald_rt_kdf_hkdf",
@@ -26262,6 +26485,16 @@ fn compile_to_object_impl(
   // ... end`'s own block body is exactly that case, hit directly by
   // this plan's own Concrete Proof).
   newtypes.insert("Sse".to_string());
+  // Plan 105's Decision log: `Multipart`/`Field` — the identical bare
+  // reserved-namespace shape `Sse` immediately above discloses (never
+  // `Let`-bindable newtype values, plain `Int64`-in/out reserved-
+  // namespace statics) — `Multipart.start(req, boundary)`/`Field.
+  // name(field)` etc. inside `Http.serve(...) do |req| ... end`'s own
+  // block body hit the identical `build_inline_lambda` free-variable
+  // false-positive `Sse`'s own comment above already names, closed the
+  // same way: registered here only, never in `NEWTYPE_UNDERLYING`.
+  newtypes.insert("Multipart".to_string());
+  newtypes.insert("Field".to_string());
   // Plan 124's Decision log: `XmlReader`.
   // Plan 191's Decision log: `ProgressBar`.
   newtypes.insert("ProgressBar".to_string());
@@ -26759,6 +26992,13 @@ fn compile_to_object_impl(
     sse_send,
     sse_comment,
     sse_close,
+    http_request_content_type_boundary,
+    multipart_start,
+    multipart_next_field,
+    field_name,
+    field_filename,
+    field_read_chunk,
+    field_close,
     kdf_hkdf,
     kdf_pbkdf2,
     password_hash,
