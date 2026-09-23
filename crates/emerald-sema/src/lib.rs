@@ -3988,6 +3988,35 @@ fn infer_expr_type(
         )?;
         return Ok(Type::Newtype("ProgressBar".to_string(), Box::new(Type::Int64)));
       }
+      // Plan 184's Decision log: `Totp.new(issuer, account,
+      // secret_base32)` — the identical real-argument carve-out
+      // `CliParser.new(name, version)`/`ProgressBar.new(total)` above
+      // establish, just with three real `String` arguments and a
+      // `Result`-wrapped return (plan 195's Typed Domain Errors
+      // convention, applied fresh here — see `totp.rs`'s own module
+      // doc for the full "lands after 195, retrofit directly"
+      // account), since a malformed/too-short secret is a real,
+      // anticipated failure this constructor can hit. Every OTHER
+      // `Totp` static method (`.generate_secret`) is not the literal
+      // reserved `new` token and is dispatched by the ordinary
+      // `Expr::MethodCall` reserved-namespace arm elsewhere, never
+      // routed through `Expr::New` at all.
+      if class_name == "Totp" {
+        check_args(
+          "Totp.new",
+          args,
+          &[Type::String, Type::String, Type::String],
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(Type::Result(
+          Box::new(Type::Newtype("Totp".to_string(), Box::new(Type::Int64))),
+          Box::new(Type::Enum("TotpError".to_string())),
+        ));
+      }
       let info = classes
         .get(class_name)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
@@ -4697,6 +4726,27 @@ fn infer_expr_type(
         Box::new(Type::Newtype("Regex".to_string(), Box::new(Type::Int64))),
         Box::new(Type::Enum("RegexError".to_string())),
       ))
+    }
+    // Plan 184's Decision log: `Totp.generate_secret()` — the same
+    // reserved-namespace static-call shape `Regex.compile` immediately
+    // above uses. `Totp.new(...)` is the literal reserved `new` token,
+    // parsed as `Expr::New` rather than `Expr::MethodCall` — handled by
+    // that AST node's own dedicated carve-out (see `Expr::New`'s
+    // `class_name == "Totp"` arm, alongside `CliParser.new`/
+    // `ProgressBar.new`), never reached from here. Every OTHER `Totp`
+    // method is an instance method on an already-constructed
+    // `Totp`-newtype-typed receiver, dispatched by the `Type::Newtype`
+    // arm further below.
+    Expr::MethodCall(recv, method, args) if matches!(&recv.node, Expr::Ident(n) if n == "Totp") =>
+    {
+      if method != "generate_secret" {
+        return Err(Diagnostic::new(
+          format!("Totp has no static method `{method}`"),
+          expr.span,
+        ));
+      }
+      check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
+      Ok(Type::String)
     }
     // Plan 147's Decision log: `Tempfile.create`/`Tempdir.create` —
     // the same reserved-namespace static-call shape `Regex.compile`
@@ -7091,6 +7141,34 @@ fn infer_expr_type(
           }
           check_args(method, args, &[], env, sigs, classes, self_fields, gctx)?;
           return Ok(Type::Void);
+        }
+        // Plan 184's Decision log: `Totp#generate_current`/
+        // `#check_current`/`#provisioning_uri` — the identical
+        // carved-out shape `Sha256Hasher`/`AeadKey`/`Ed25519KeyPair`
+        // immediately below already establish.
+        if name == "Totp" {
+          let (expected_params, ret) = match method.as_str() {
+            "generate_current" => (vec![], Type::String),
+            "check_current" => (vec![Type::String], Type::Boolean),
+            "provisioning_uri" => (vec![], Type::String),
+            other => {
+              return Err(Diagnostic::new(
+                format!("Totp has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
         }
         // Plan 111's Decision log: `Ed25519KeyPair#sign`/`#public_key`
         // — the identical carved-out shape `Sha256Hasher`/`AeadKey`
@@ -15051,6 +15129,10 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     // shape, plan 93's own handle registry backed by a boxed
     // `tungstenite::WebSocket<WsStream>`.
     "WebSocketConnection",
+    // Plan 184's Decision log: `Totp` — the identical "reserved name,
+    // zero-cost `Int64` handle" shape, plan 93's own handle registry
+    // backed by a boxed `totp_rs::Totp`.
+    "Totp",
   ] {
     classes.insert(
       name.to_string(),
@@ -16545,6 +16627,46 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     seen_variant_names.insert(v.name.clone());
   }
   enum_defs.push(&xml_event_enum_def);
+  // Plan 184's Decision log: `TotpError` — plan 195's Typed Domain
+  // Errors convention, applied fresh here (plan 184 was authored
+  // before plan 195 landed but is executed after it — see `totp.rs`'s
+  // own module doc for the full "lands after 195, retrofit directly"
+  // account). Declaration order matches `crates/emerald-rt/src/
+  // totp.rs`'s own `TOTP_ERROR_TAG_*` constants byte-for-byte —
+  // `InvalidSecret`=0, `Other`=1.
+  let totp_error_enum_def = EnumDef {
+    name: "TotpError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "InvalidSecret".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  classes.insert(
+    "TotpError".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: Some(Vec::new()),
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: None,
+    },
+  );
+  for v in &totp_error_enum_def.variants {
+    seen_variant_names.insert(v.name.clone());
+  }
+  enum_defs.push(&totp_error_enum_def);
   for item in &program.items {
     if let Item::Enum(e) = item {
       if !e.type_params.is_empty() {

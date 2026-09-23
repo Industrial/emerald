@@ -322,6 +322,11 @@ mod zip;
 // `.next_field`, `Field.name`/`.filename`/`.read_chunk`/`.close`,
 // wrapping `multer` -- see `multipart.rs`'s own module doc.
 mod multipart;
+// Plan 184 (TOTP/HOTP Two-Factor Authentication) -- `Totp.new`/
+// `.generate_secret`, `Totp#generate_current`/`#check_current`/
+// `#provisioning_uri`, wrapping `totp-rs` -- see `totp.rs`'s own
+// module doc.
+mod totp;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -4390,6 +4395,49 @@ pub unsafe extern "C" fn emerald_rt_x509_certificate_public_key_algorithm(
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_x509_certificate_close(id: i64) {
   catch_and_raise(move || x509::x509_certificate_close(id))
+}
+
+// Plan 184 (TOTP/HOTP Two-Factor Authentication): `Totp` -- see
+// `totp.rs`'s own module doc.
+
+/// # Safety
+/// `issuer`/`account`/`secret_base32`, if non-null, must each point to
+/// a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_totp_new(
+  issuer: *const c_char,
+  account: *const c_char,
+  secret_base32: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || totp::totp_new(issuer, account, secret_base32))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_totp_generate_secret() -> *const c_char {
+  catch_and_raise(totp::totp_generate_secret)
+}
+
+/// # Safety
+/// Always safe to call for a live `Totp` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_totp_generate_current(id: i64) -> *const c_char {
+  catch_and_raise(move || totp::totp_generate_current(id))
+}
+
+/// # Safety
+/// `code`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_totp_check_current(id: i64, code: *const c_char) -> i64 {
+  catch_and_raise(move || totp::totp_check_current(id, code))
+}
+
+/// # Safety
+/// Always safe to call for a live `Totp` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_totp_provisioning_uri(id: i64) -> *const c_char {
+  catch_and_raise(move || totp::totp_provisioning_uri(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

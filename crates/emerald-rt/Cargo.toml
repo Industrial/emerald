@@ -893,6 +893,27 @@ http-body-util = "0.1"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
 oid-registry = "0.8"
+# Plan 184 (TOTP/HOTP Two-Factor Authentication): real-checked at this
+# plan's own execution time (2026-09-23, via `cargo info` against the
+# live crates.io registry) - totp-rs 6.0.0, published 6 Aug 2026,
+# "RFC-compliant TOTP implementation," maintained by a single
+# consistent owner (`constantoine`) since its first release. No
+# RustSec advisory found. Links `hmac`/`sha1`/`sha2` internally (the
+# same RustCrypto HMAC/SHA family plan 109 also wraps for Emerald's own
+# general-purpose hashing surface) but does not call back into
+# `emerald-rt`'s plan-109 exports — an architectural, not call-graph,
+# relationship (see `totp.rs`'s own module doc). Non-default features
+# enabled: `gen_secret` (pulls in `rand 0.10`, `Totp.generate_secret`'s
+# direct backing — a real, disclosed second `rand` major alongside the
+# workspace's existing `rand 0.8` (plan 111's `rsa` pairing), since
+# `totp-rs`'s own `rand` dependency is pinned to `^0.10` with no
+# override available; Cargo resolves both majors independently, no
+# conflict) and `otpauth` (pulls in `url 2.4`/`percent-encoding`,
+# `Totp#provisioning_uri`'s direct backing via `.to_url()`). All pure
+# Rust. `Totp.new`/`.generate_secret`, `Totp#generate_current`/
+# `#check_current`/`#provisioning_uri`'s direct backing. See
+# DEPENDENCIES.md.
+totp-rs = { version = "6.0", features = ["gen_secret", "otpauth"] }
 
 [build-dependencies]
 

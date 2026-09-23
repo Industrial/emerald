@@ -265,6 +265,8 @@ fn set_newtype_underlying(program: &Program) {
     // identical shape.
     "X509KeyPair",
     "X509Certificate",
+    // Plan 184's Decision log: `Totp` -- the identical shape.
+    "Totp",
   ] {
     map.insert(name.to_string(), TypeExpr::Named("Int64".to_string()));
   }
@@ -5427,6 +5429,14 @@ struct Ctx<'a, 'ctx> {
   x509_certificate_not_after: FunctionValue<'ctx>,
   x509_certificate_public_key_algorithm: FunctionValue<'ctx>,
   x509_certificate_close: FunctionValue<'ctx>,
+  /// Plan 184 (TOTP/HOTP Two-Factor Authentication) — `Totp.new`/
+  /// `.generate_secret`, `Totp#generate_current`/`#check_current`/
+  /// `#provisioning_uri`.
+  totp_new: FunctionValue<'ctx>,
+  totp_generate_secret: FunctionValue<'ctx>,
+  totp_generate_current: FunctionValue<'ctx>,
+  totp_check_current: FunctionValue<'ctx>,
+  totp_provisioning_uri: FunctionValue<'ctx>,
   /// Plan 113 (Cryptographically Secure Random Number Generation) —
   /// `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`.
   random_secure_hex: FunctionValue<'ctx>,
@@ -7344,6 +7354,38 @@ fn build_expr<'ctx>(
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Int64))
     }
+    // Plan 184's Decision log: `Totp.new(issuer, account,
+    // secret_base32)` — the identical real-argument carve-out
+    // `CliParser.new(name, version)`/`ProgressBar.new(total)` above
+    // establish, just with three real `String` arguments and a
+    // `ValKind::Ptr` result (`emerald_rt_totp_new` already returns
+    // plan 53's own `Result` layout directly, zero additional
+    // marshaling — the same shape `Regex.compile` uses).
+    Expr::New(class_name, args) if class_name == "Totp" => {
+      if args.len() != 3 {
+        return Err(format!(
+          "codegen: `Totp.new` expects 3 arguments, found {}",
+          args.len()
+        ));
+      }
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let call = builder
+        .build_call(ctx.totp_new, &call_args, "totpnewtmp")
+        .map_err(|e| e.to_string())?;
+      Ok((call_result(call)?, ValKind::Ptr))
+    }
     // Plan 193's Decision log: `Set.new()`/`Deque.new()`/
     // `PriorityQueue.new()` are ALWAYS handled by `build_stmt`'s own
     // dedicated `Stmt::Let` arm (the enclosing `Let`'s own declared
@@ -8572,6 +8614,57 @@ fn build_method_call<'ctx>(
             result.into_int_value(),
             context.i64_type().const_int(0, false),
             "regexismatchbool",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      return Ok((result, ret_kind));
+    }
+    // Plan 184's Decision log: `Totp`'s own three instance methods —
+    // the identical carved-out-of-newtype shape `Regex`'s own nine
+    // methods immediately above establish. `.check_current` narrows
+    // the same `i64` (0/1) ABI value back into a real `i1`, the same
+    // `Regex#is_match` trick immediately above.
+    if local_classes.get(recv_name).map(String::as_str) == Some("Totp") {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind) = match method {
+        "generate_current" => (ctx.totp_generate_current, ValKind::Str),
+        "check_current" => (ctx.totp_check_current, ValKind::Int64),
+        "provisioning_uri" => (ctx.totp_provisioning_uri, ValKind::Str),
+        other => return Err(format!("codegen: unsupported Totp method `{other}`")),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "totptmp")
+        .map_err(|e| e.to_string())?;
+      let result = call_result(call)?;
+      if method == "check_current" {
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "totpcheckcurrentbool",
           )
           .map_err(|e| e.to_string())?;
         return Ok((is_true.into(), ValKind::Bool));
@@ -10577,6 +10670,24 @@ fn build_method_call<'ctx>(
       .build_call(ctx.regex_compile, &[v.into()], "regexcompiletmp")
       .map_err(|e| e.to_string())?;
     return Ok((call_result(call)?, ValKind::Ptr));
+  }
+
+  // Plan 184's Decision log: `Totp.generate_secret()` — the same
+  // reserved-namespace static-call shape `Regex.compile` immediately
+  // above uses. `Totp.new(...)` is the literal reserved `new` token,
+  // parsed as `Expr::New` rather than reaching this static-call
+  // dispatch at all — handled by that AST node's own dedicated
+  // carve-out instead (alongside `CliParser.new`/`ProgressBar.new`).
+  if recv_name == "Totp" {
+    if method != "generate_secret" {
+      return Err(format!(
+        "codegen: unsupported Totp static method `{method}`"
+      ));
+    }
+    let call = builder
+      .build_call(ctx.totp_generate_secret, &[], "totpgeneratesecrettmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Str));
   }
 
   // Plan 163's Decision log: `BigInt.from_i64`/`.from_s`/`.factorial`
@@ -24773,6 +24884,37 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 184 (TOTP/HOTP Two-Factor Authentication): `.new` returns
+  // plan 53's own `Result` layout (a heap pointer); `.generate_secret`/
+  // `.generate_current`/`.provisioning_uri` return `String` (a heap
+  // pointer); `.check_current` returns a plain `i64` (0 or 1, the same
+  // `regex_is_match` convention this crate already establishes for
+  // `Boolean`).
+  let totp_new = module.add_function(
+    "emerald_rt_totp_new",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let totp_generate_secret = module.add_function(
+    "emerald_rt_totp_generate_secret",
+    ptr_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let totp_generate_current = module.add_function(
+    "emerald_rt_totp_generate_current",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let totp_check_current = module.add_function(
+    "emerald_rt_totp_check_current",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let totp_provisioning_uri = module.add_function(
+    "emerald_rt_totp_provisioning_uri",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 113 (Cryptographically Secure Random Number Generation):
   // `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`. `.shuffle`
   // takes the array's own bare heap pointer directly.
@@ -26384,6 +26526,29 @@ fn compile_to_object_impl(
     "RegexError".to_string(),
     build_enum_layout(&regex_error_enum_def_cg),
   );
+  // Plan 184: `TotpError` -- codegen's own mirror of `emerald-sema`'s
+  // identical synthetic `EnumDef` (see that crate's own Decision log).
+  // Variant declaration order matches `crates/emerald-rt/src/totp.rs`'s
+  // own `TOTP_ERROR_TAG_*` constants byte-for-byte.
+  let totp_error_enum_def_cg = EnumDef {
+    name: "TotpError".to_string(),
+    variants: vec![
+      EnumVariant {
+        name: "InvalidSecret".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+      EnumVariant {
+        name: "Other".to_string(),
+        fields: vec![TypeExpr::Named("String".to_string())],
+      },
+    ],
+    type_params: vec![],
+    doc: None,
+  };
+  enums.insert(
+    "TotpError".to_string(),
+    build_enum_layout(&totp_error_enum_def_cg),
+  );
   // Plan 163: `BigIntError`/`DecimalError` — codegen's own mirror of
   // `emerald-sema`'s identical synthetic `EnumDef`s (see that crate's
   // own Decision log for the full reasoning). Variant declaration
@@ -27027,6 +27192,9 @@ fn compile_to_object_impl(
   // parse(...)`.
   newtypes.insert("X509KeyPair".to_string());
   newtypes.insert("X509Certificate".to_string());
+  // Plan 184's Decision log: `Totp` -- the identical "both registries
+  // need the entry" gap-avoidance immediately above.
+  newtypes.insert("Totp".to_string());
 
   let gen_ctx = Ctx {
     user_func_ids: &user_func_ids,
@@ -27502,6 +27670,11 @@ fn compile_to_object_impl(
     x509_certificate_not_after,
     x509_certificate_public_key_algorithm,
     x509_certificate_close,
+    totp_new,
+    totp_generate_secret,
+    totp_generate_current,
+    totp_check_current,
+    totp_provisioning_uri,
     encoding_decode,
     encoding_decode_strict,
     encoding_encode,

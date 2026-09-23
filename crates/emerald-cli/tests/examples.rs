@@ -512,6 +512,38 @@ fn crypto_asymmetric_proof_em_prints_expected_sequence() {
   );
 }
 
+// Plan 184 (TOTP/HOTP Two-Factor Authentication): `Totp.new`,
+// `Totp#generate_current`/`#check_current`/`#provisioning_uri` — see
+// `totp_2fa.em`'s own header comment for the two real, disclosed
+// deviations from this plan's own literally-quoted Concrete Proof
+// (`Result[Totp, TotpError]` in place of a bare `Totp`; the plan's own
+// literal secret doubled to clear `totp_rs`'s real 128-bit minimum).
+// `code` (line 1) is genuinely time-dependent — checked for shape
+// (six ASCII digits) here rather than asserted as a fixed literal,
+// exactly as this plan's own Concrete Proof describes; `valid`/
+// `invalid`/`uri` (lines 2-4) are fully deterministic given the fixed
+// issuer/account/secret this example uses and are asserted exactly.
+#[test]
+fn totp_2fa_em_prints_expected_sequence() {
+  let output = compile_and_run("totp_2fa.em");
+  let mut lines = output.lines();
+  let code = lines.next().expect("line 1: code");
+  assert_eq!(code.len(), 6, "code should be six digits, got {code:?}");
+  assert!(
+    code.chars().all(|c| c.is_ascii_digit()),
+    "code should be all ASCII digits, got {code:?}"
+  );
+  let rest: Vec<&str> = lines.collect();
+  assert_eq!(
+    rest,
+    vec![
+      "true",
+      "false",
+      "otpauth://totp/Emerald%20Corp:alice%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Emerald%20Corp",
+    ]
+  );
+}
+
 // Plan 117 (Constant-Time Comparison): `SecureCompare.eq` — the
 // return-value correctness is what's checkable at this level (the
 // constant-time property is `subtle`'s own, verified upstream).
