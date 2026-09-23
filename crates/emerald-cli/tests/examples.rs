@@ -913,3 +913,16 @@ fn temp_files_proof_em_prints_expected_sequence() {
 fn sqlite_todo_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("sqlite_todo.em"), "1\nwrite plan 137\n");
 }
+
+// Plan 142 (Embedded ACID Database, redb): `Redb.open`/`.table`/
+// `.begin_write`/`.table_insert`/`.commit`/`.begin_read`/`.table_get`/
+// `.close`, wrapping `redb` -- two rows written and committed in one
+// write transaction, then read back through a separate read
+// transaction, with a genuine miss defaulted via `match`/`Some`/
+// `None` (a real, disclosed correction against this plan's own
+// Concrete Proof text, which used dead `String?`/`||=` syntax removed
+// outright by plan 73 -- see `examples/redb_kv.em`'s own header).
+#[test]
+fn redb_kv_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("redb_kv.em"), "Ada\nGrace\nnot found\n");
+}

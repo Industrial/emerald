@@ -5496,6 +5496,24 @@ struct Ctx<'a, 'ctx> {
   sqlite_begin: FunctionValue<'ctx>,
   sqlite_commit: FunctionValue<'ctx>,
   sqlite_rollback: FunctionValue<'ctx>,
+  /// Plan 142 (Embedded ACID Database, redb) -- `Redb.open`/`.close`/
+  /// `.table`/`.begin_write`/`.begin_read`/`.table_insert`/
+  /// `.table_get`/`.table_remove`/`.commit`/`.abort`, wrapping
+  /// `redb`. Every handle (database, table schema, write
+  /// transaction, read transaction) is a bare `i64` -- the same
+  /// Decision-log shape `Sqlite` immediately above uses, so no
+  /// separate instance-method-on-newtype-receiver dispatch arm
+  /// exists anywhere else in this file for `Redb` either.
+  redb_open: FunctionValue<'ctx>,
+  redb_close: FunctionValue<'ctx>,
+  redb_table: FunctionValue<'ctx>,
+  redb_begin_write: FunctionValue<'ctx>,
+  redb_begin_read: FunctionValue<'ctx>,
+  redb_table_insert: FunctionValue<'ctx>,
+  redb_table_get: FunctionValue<'ctx>,
+  redb_table_remove: FunctionValue<'ctx>,
+  redb_commit: FunctionValue<'ctx>,
+  redb_abort: FunctionValue<'ctx>,
   /// Plan 97 (DNS Resolution) — `Dns.resolve`/`.resolve_all`/
   /// `.resolve_count`/`.configure`, wrapping `hickory-resolver`.
   dns_resolve: FunctionValue<'ctx>,
@@ -11069,6 +11087,159 @@ fn build_method_call<'ctx>(
         .map_err(|e| e.to_string())?;
       return Ok((is_true.into(), ValKind::Bool));
     }
+    return Ok((result, ret_kind));
+  }
+
+  // Plan 142's Decision log: `Redb.open`/`.close`/`.table`/
+  // `.begin_write`/`.begin_read`/`.table_insert`/`.table_get`/
+  // `.table_remove`/`.commit`/`.abort` -- the same reserved-namespace
+  // static-call shape `Sqlite` immediately above uses: every handle
+  // (database, table schema, write transaction, read transaction)
+  // crosses as a bare `i64`, never a `Type::Newtype` receiver, so no
+  // separate instance-method-on-newtype-receiver dispatch arm exists
+  // anywhere else in this file for `Redb` either. `.table_insert`/
+  // `.table_get`/`.table_remove` return a bare nullable `*mut c_char`
+  // from the Rust side; this call site builds the real tagged
+  // `Option[String]` value from it, the identical `is_null`-branch-
+  // plus-`phi` pattern `Env.get` immediately below already
+  // establishes -- reused verbatim, not re-derived.
+  if recv_name == "Redb" {
+    if matches!(method, "table_insert" | "table_get" | "table_remove") {
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        call_args.push(v.into());
+      }
+      let fv = match method {
+        "table_insert" => ctx.redb_table_insert,
+        "table_get" => ctx.redb_table_get,
+        "table_remove" => ctx.redb_table_remove,
+        _ => unreachable!(),
+      };
+      let call = builder
+        .build_call(fv, &call_args, "redbtablecalltmp")
+        .map_err(|e| e.to_string())?;
+      let ptr_val = call_result(call)?.into_pointer_value();
+      let enum_name = "Option$String";
+      let layout = ctx.enums.get(enum_name).ok_or_else(|| {
+        format!(
+          "codegen: internal error — `Option$String` was not pre-instantiated for `Redb.{method}`"
+        )
+      })?;
+      let some_tag = *layout.variant_tags.get("Some").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `Some` variant".to_string()
+      })?;
+      let none_tag = *layout.variant_tags.get("None").ok_or_else(|| {
+        "codegen: internal error — `Option$String` has no `None` variant".to_string()
+      })?;
+      let size_val = context.i64_type().const_int(layout.size, false);
+      let is_null = builder
+        .build_is_null(ptr_val, "redbtableisnull")
+        .map_err(|e| e.to_string())?;
+
+      let entry_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block")?;
+      let func = entry_block
+        .get_parent()
+        .ok_or("codegen: internal error — block has no parent function")?;
+      let some_block = context.append_basic_block(func, "redbtable.some");
+      let none_block = context.append_basic_block(func, "redbtable.none");
+      let merge_block = context.append_basic_block(func, "redbtable.merge");
+      builder
+        .build_conditional_branch(is_null, none_block, some_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(some_block);
+      let some_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "redbtablesome")
+        .map_err(|e| e.to_string())?;
+      let some_ptr = call_result(some_alloc)?.into_pointer_value();
+      let some_tag_ptr = field_ptr(context, builder, some_ptr, 0)?;
+      builder
+        .build_store(some_tag_ptr, context.i64_type().const_int(some_tag, false))
+        .map_err(|e| e.to_string())?;
+      let some_field_ptr = field_ptr(context, builder, some_ptr, 8)?;
+      builder
+        .build_store(some_field_ptr, ptr_val)
+        .map_err(|e| e.to_string())?;
+      let some_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after some")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(none_block);
+      let none_alloc = builder
+        .build_call(ctx.alloc, &[size_val.into()], "redbtablenone")
+        .map_err(|e| e.to_string())?;
+      let none_ptr = call_result(none_alloc)?.into_pointer_value();
+      let none_tag_ptr = field_ptr(context, builder, none_ptr, 0)?;
+      builder
+        .build_store(none_tag_ptr, context.i64_type().const_int(none_tag, false))
+        .map_err(|e| e.to_string())?;
+      let none_end_block = builder
+        .get_insert_block()
+        .ok_or("codegen: internal error — no current block after none")?;
+      builder
+        .build_unconditional_branch(merge_block)
+        .map_err(|e| e.to_string())?;
+
+      builder.position_at_end(merge_block);
+      let phi = builder
+        .build_phi(local_llvm_type(context, &ValKind::Ptr), "redbtableresult")
+        .map_err(|e| e.to_string())?;
+      let some_val: BasicValueEnum = some_ptr.into();
+      let none_val: BasicValueEnum = none_ptr.into();
+      phi.add_incoming(&[(&some_val, some_end_block), (&none_val, none_end_block)]);
+      return Ok((phi.as_basic_value(), ValKind::Ptr));
+    }
+
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let void_fv = match method {
+      "close" => Some(ctx.redb_close),
+      "commit" => Some(ctx.redb_commit),
+      "abort" => Some(ctx.redb_abort),
+      _ => None,
+    };
+    if let Some(fv) = void_fv {
+      builder
+        .build_call(fv, &call_args, "redbstatictmp")
+        .map_err(|e| e.to_string())?;
+      return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+    }
+    let (fv, ret_kind) = match method {
+      "open" => (ctx.redb_open, ValKind::Int64),
+      "table" => (ctx.redb_table, ValKind::Int64),
+      "begin_write" => (ctx.redb_begin_write, ValKind::Int64),
+      "begin_read" => (ctx.redb_begin_read, ValKind::Int64),
+      other => return Err(format!("codegen: unsupported Redb static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "redbstatictmp")
+      .map_err(|e| e.to_string())?;
+    let result = call_result(call)?;
     return Ok((result, ret_kind));
   }
 
@@ -23907,6 +24078,64 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 142 (Embedded ACID Database, redb): `Redb.open`/`.close`/
+  // `.table`/`.begin_write`/`.begin_read`/`.table_insert`/
+  // `.table_get`/`.table_remove`/`.commit`/`.abort` -- every handle is
+  // a bare `i64`; `.table_insert`/`.table_get`/`.table_remove` return
+  // `ptr_ty` (a nullable `String?`), the same `Env.get` convention.
+  let redb_open = module.add_function(
+    "emerald_rt_redb_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_close = module.add_function(
+    "emerald_rt_redb_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_table = module.add_function(
+    "emerald_rt_redb_table",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_begin_write = module.add_function(
+    "emerald_rt_redb_begin_write",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_begin_read = module.add_function(
+    "emerald_rt_redb_begin_read",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_table_insert = module.add_function(
+    "emerald_rt_redb_table_insert",
+    ptr_ty.fn_type(
+      &[i64_ty.into(), i64_ty.into(), ptr_ty.into(), ptr_ty.into()],
+      false,
+    ),
+    Some(Linkage::External),
+  );
+  let redb_table_get = module.add_function(
+    "emerald_rt_redb_table_get",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_table_remove = module.add_function(
+    "emerald_rt_redb_table_remove",
+    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_commit = module.add_function(
+    "emerald_rt_redb_commit",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let redb_abort = module.add_function(
+    "emerald_rt_redb_abort",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 97 (DNS Resolution).
   let dns_resolve = module.add_function(
     "emerald_rt_dns_resolve",
@@ -25497,6 +25726,16 @@ fn compile_to_object_impl(
     sqlite_begin,
     sqlite_commit,
     sqlite_rollback,
+    redb_open,
+    redb_close,
+    redb_table,
+    redb_begin_write,
+    redb_begin_read,
+    redb_table_insert,
+    redb_table_get,
+    redb_table_remove,
+    redb_commit,
+    redb_abort,
     dns_resolve,
     dns_resolve_all,
     dns_resolve_count,

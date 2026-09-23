@@ -206,6 +206,17 @@ mod path;
 // `process.rs`'s own module doc.
 mod process;
 mod random;
+// Plan 142 (Embedded ACID Database, redb) -- `Redb.open`/`.close`/
+// `.table`/`.begin_write`/`.begin_read`/`.table_insert`/`.table_get`/
+// `.table_remove`/`.commit`/`.abort`, wrapping `redb` -- see
+// `redb_kv.rs`'s own module doc. Named `redb_kv`, not a bare `mod
+// redb;` -- this crate's own `mod redb` would shadow the external
+// `redb` crate this module wraps, the identical collision
+// `tempfile.rs`'s/`toml.rs`'s/`url.rs`'s own modules already
+// disclose, dodged here the same way `csvs`/`unicode` dodge it (a
+// plain differently named module, no `#[path]` redirect needed since
+// the file itself was never going to be named `redb.rs` either).
+mod redb_kv;
 mod regex;
 mod secure_compare;
 // Plan 137 (SQLite) — `Sqlite.open`/`.open_memory`/`.close`/
@@ -3508,6 +3519,121 @@ pub unsafe extern "C" fn emerald_rt_sqlite_commit(conn: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_sqlite_rollback(conn: i64) {
   catch_and_raise(move || sqlite::sqlite_rollback(conn))
+}
+
+// Plan 142 (Embedded ACID Database, redb): `Redb.open`/`.close`/
+// `.table`/`.begin_write`/`.begin_read`/`.table_insert`/`.table_get`/
+// `.table_remove`/`.commit`/`.abort` -- see `redb_kv.rs`'s own module
+// doc. Every handle is a bare `i64`; `.table_insert`/`.table_get`/
+// `.table_remove` return a bare nullable `*mut c_char` (a `String?`),
+// the same `Env.get` convention.
+
+/// `Redb.open(path: String): Int64`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || redb_kv::redb_open(path))
+}
+
+/// `Redb.close(db: Int64): Void`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_close(db: i64) {
+  catch_and_raise(move || redb_kv::redb_close(db))
+}
+
+/// `Redb.table(name: String): Int64`.
+///
+/// # Safety
+/// `name`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_table(name: *const c_char) -> i64 {
+  catch_and_raise(move || redb_kv::redb_table(name))
+}
+
+/// `Redb.begin_write(db: Int64): Int64`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_begin_write(db: i64) -> i64 {
+  catch_and_raise(move || redb_kv::redb_begin_write(db))
+}
+
+/// `Redb.begin_read(db: Int64): Int64`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_begin_read(db: i64) -> i64 {
+  catch_and_raise(move || redb_kv::redb_begin_read(db))
+}
+
+/// `Redb.table_insert(txn: Int64, table: Int64, key: String, value:
+/// String): String?`.
+///
+/// # Safety
+/// `key`/`value`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_table_insert(
+  txn: i64,
+  table: i64,
+  key: *const c_char,
+  value: *const c_char,
+) -> *mut c_char {
+  catch_and_raise(move || redb_kv::redb_table_insert(txn, table, key, value))
+}
+
+/// `Redb.table_get(txn: Int64, table: Int64, key: String): String?`.
+///
+/// # Safety
+/// `key`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_table_get(
+  txn: i64,
+  table: i64,
+  key: *const c_char,
+) -> *mut c_char {
+  catch_and_raise(move || redb_kv::redb_table_get(txn, table, key))
+}
+
+/// `Redb.table_remove(txn: Int64, table: Int64, key: String):
+/// String?`.
+///
+/// # Safety
+/// `key`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_table_remove(
+  txn: i64,
+  table: i64,
+  key: *const c_char,
+) -> *mut c_char {
+  catch_and_raise(move || redb_kv::redb_table_remove(txn, table, key))
+}
+
+/// `Redb.commit(txn: Int64): Void`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_commit(txn: i64) {
+  catch_and_raise(move || redb_kv::redb_commit(txn))
+}
+
+/// `Redb.abort(txn: Int64): Void`.
+///
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_redb_abort(txn: i64) {
+  catch_and_raise(move || redb_kv::redb_abort(txn))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

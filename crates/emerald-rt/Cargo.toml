@@ -574,6 +574,17 @@ tempfile = "3.27"
 # or end-user machine. No RustSec advisory found against `rusqlite`
 # itself. `Sqlite.*`'s direct backing. See DEPENDENCIES.md.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Plan 142 (Embedded ACID Database, redb): real-checked at this plan's
+# own execution time (2026-09-23) — `redb` 4.3.0, released six days
+# before this plan's own history file, its 38th stable release,
+# 1.9M downloads/month and climbing week over week — actively
+# maintained where plan 141's own `sled` has not published a release
+# since 2024-10-11 (see this plan's own Decision log, and plan 141's
+# own Decision log, for the full comparative account). Pure Rust,
+# ACID-transactional, B-tree-based, MVCC (concurrent readers alongside
+# one writer). No RustSec advisory found. `Redb.*`'s direct backing.
+# See DEPENDENCIES.md.
+redb = "4"
 
 [build-dependencies]
 

@@ -4564,6 +4564,66 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 142's Decision log: `Redb.open`/`.close`/`.table`/
+    // `.begin_write`/`.begin_read`/`.table_insert`/`.table_get`/
+    // `.table_remove`/`.commit`/`.abort` — the same reserved-namespace
+    // static-call shape `Sqlite` immediately above uses: every handle
+    // in this surface (database, table schema, write transaction,
+    // read transaction) is a bare `Int64`, never a `Type::Newtype` —
+    // the identical shape `Sqlite`'s own Decision log already chose.
+    // `.table_insert`/`.table_get`/`.table_remove` all return
+    // `Option[String]`, mirroring `redb`'s own real `Option<
+    // AccessGuard<V>>` return shape for `insert`/`get`/`remove` alike
+    // — the previous value for `insert`/`remove`, the current value
+    // for `get` — the same nullable-`String`-to-`Option[String]`
+    // marshaling `Env.get` already establishes. No function in this
+    // surface is `Result`-wrapped — a real `redb` error (a write
+    // attempted through a read transaction, a closed/unknown handle,
+    // a genuine storage error) raises a plain, catchable
+    // `NativeError` instead, `Sqlite`'s own convention.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Redb") =>
+    {
+      let option_string = Type::Enum("Option$String".to_string());
+      let (expected_params, ret) = match method.as_str() {
+        "open" => (vec![Type::String], Type::Int64),
+        "close" => (vec![Type::Int64], Type::Void),
+        "table" => (vec![Type::String], Type::Int64),
+        "begin_write" => (vec![Type::Int64], Type::Int64),
+        "begin_read" => (vec![Type::Int64], Type::Int64),
+        "table_insert" => (
+          vec![Type::Int64, Type::Int64, Type::String, Type::String],
+          option_string.clone(),
+        ),
+        "table_get" => (
+          vec![Type::Int64, Type::Int64, Type::String],
+          option_string.clone(),
+        ),
+        "table_remove" => (
+          vec![Type::Int64, Type::Int64, Type::String],
+          option_string.clone(),
+        ),
+        "commit" => (vec![Type::Int64], Type::Void),
+        "abort" => (vec![Type::Int64], Type::Void),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Redb has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 109's Decision log: `Sha256.hash`/`Sha512.hash`/`Sha3_256.
     // hash`/`Sha3_512.hash`/`Blake3.hash`/`Md5.hash` — six reserved-
     // namespace static intrinsics, identically shaped to `Regex.
