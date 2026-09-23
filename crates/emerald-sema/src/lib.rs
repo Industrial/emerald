@@ -5010,6 +5010,81 @@ fn infer_expr_type(
       )?;
       Ok(ret)
     }
+    // Plan 114's Decision log: `Jwt.encode_hs256`/`.verify_hs256`/
+    // `.verify_hs256_with_issuer`/`.encode_rs256`/`.verify_rs256`/
+    // `.verify_rs256_with_issuer`/`.encode_es256`/`.verify_es256`/
+    // `.verify_es256_with_issuer`/`.peek_header` — the same reserved-
+    // namespace static-call shape `Password`/`SecureCompare` immediately
+    // above use. Claims are `Hash[String, String]` (this plan's own
+    // Decision log: a real, disclosed v1 simplification). `verify_*`'s
+    // own `Option[Hash[String, String]]` return type is built via
+    // `mangle_type_expr` directly (not a hand-typed literal string),
+    // so this arm's own mangled enum name always matches whatever
+    // `instantiate_generic_enum`'s own unconditional pre-instantiation
+    // (in `check_program`, immediately before `sigs` construction)
+    // actually registered under `classes`, regardless of `TypeExpr`'s
+    // own `Display` formatting details.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Jwt") =>
+    {
+      let hash_string_string = TypeExpr::Generic(
+        "Hash".to_string(),
+        vec![
+          TypeExpr::Named("String".to_string()),
+          TypeExpr::Named("String".to_string()),
+        ],
+      );
+      let option_hash_string_string =
+        Type::Enum(format!("Option${}", mangle_type_expr(&hash_string_string)));
+      let hash_ty = Type::Hash(Box::new(Type::String), Box::new(Type::String));
+      let (expected_params, ret) = match method.as_str() {
+        "encode_hs256" => (vec![hash_ty.clone(), Type::String], Type::String),
+        "verify_hs256" => (
+          vec![Type::String, Type::String],
+          option_hash_string_string.clone(),
+        ),
+        "verify_hs256_with_issuer" => (
+          vec![Type::String, Type::String, Type::String],
+          option_hash_string_string.clone(),
+        ),
+        "encode_rs256" => (vec![hash_ty.clone(), Type::String], Type::String),
+        "verify_rs256" => (
+          vec![Type::String, Type::String],
+          option_hash_string_string.clone(),
+        ),
+        "verify_rs256_with_issuer" => (
+          vec![Type::String, Type::String, Type::String],
+          option_hash_string_string.clone(),
+        ),
+        "encode_es256" => (vec![hash_ty.clone(), Type::String], Type::String),
+        "verify_es256" => (
+          vec![Type::String, Type::String],
+          option_hash_string_string.clone(),
+        ),
+        "verify_es256_with_issuer" => (
+          vec![Type::String, Type::String, Type::String],
+          option_hash_string_string,
+        ),
+        "peek_header" => (vec![Type::String], Type::String),
+        other => {
+          return Err(Diagnostic::new(
+            format!("Jwt has no static method `{other}`"),
+            expr.span,
+          ));
+        }
+      };
+      check_args(
+        method,
+        args,
+        &expected_params,
+        env,
+        sigs,
+        classes,
+        self_fields,
+        gctx,
+      )?;
+      Ok(ret)
+    }
     // Plan 113's Decision log: `Random.secure_hex`/`.secure_token`/
     // `.int`/`.shuffle` — the same reserved-namespace static-call
     // shape immediately above. `.secure_hex`/`.secure_token` are
@@ -16412,6 +16487,39 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
           "Option".to_string(),
           vec![TypeExpr::Named("String".to_string())],
         )],
+      )],
+      &generic_classes,
+      &generic_enums,
+      &mut classes,
+      &mut in_progress,
+    ) {
+      diags.push(d);
+    }
+  }
+  // Plan 114: `Jwt.verify_hs256`/`.verify_hs256_with_issuer`/
+  // `.verify_rs256`/`.verify_rs256_with_issuer`/`.verify_es256`/
+  // `.verify_es256_with_issuer`'s own real return type is `Option[
+  // Hash[String, String]]` — unconditionally pre-instantiated here,
+  // the identical "regardless of whether this specific program ever
+  // writes it as literal annotation text" reasoning as `Option[String]`/
+  // `Option[JsonValue]`/`Option[Array[Option[String]]]` above. This
+  // plan's own Concrete Proof DOES write `Hash[String, String]?`
+  // literally as a `Let` annotation (so the textual-annotation
+  // discovery pass immediately above would likely also catch it), but
+  // a caller who instead passes `Jwt.verify_hs256(...)`'s result
+  // straight into an expression without ever spelling out that
+  // annotation must not depend on incidental discovery — the same
+  // robustness argument the three blocks above already make.
+  {
+    let mut in_progress = Vec::new();
+    if let Err(d) = instantiate_generic_enum(
+      "Option",
+      &[TypeExpr::Generic(
+        "Hash".to_string(),
+        vec![
+          TypeExpr::Named("String".to_string()),
+          TypeExpr::Named("String".to_string()),
+        ],
       )],
       &generic_classes,
       &generic_enums,

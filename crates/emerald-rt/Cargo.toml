@@ -773,6 +773,28 @@ multer = "3.1"
 # either crate.
 bytes = "1"
 futures-core = "0.3"
+# Plan 114 (JSON Web Tokens): `jsonwebtoken` 11 — per this plan's own
+# Decision log, the `rust_crypto` backend feature is selected over the
+# crate's other option (`aws_lc_rs`) deliberately: verified against the
+# crate's own `lib.rs` dependency listing, `rust_crypto` pulls in
+# `hmac`/`sha2`/`ed25519-dalek`/`p256`/`p384`/`rsa` — the same
+# RustCrypto-maintained, pure-Rust crate family plans 109/111/112/115/
+# 117 already depend on directly, not `ring`/`aws-lc-rs` (a natural but
+# incorrect assumption for pre-9.x `jsonwebtoken` versions, which
+# defaulted to `ring` with no backend choice at all). A real, disclosed
+# correction against this plan's own text, found only by actually
+# vendoring and reading the crate's own `Cargo.toml`: the crate's own
+# `default = ["use_pem"]` feature is silently dropped by
+# `default-features = false`, and `EncodingKey::from_rsa_pem`/
+# `from_ec_pem`/`DecodingKey::from_rsa_pem`/`from_ec_pem` (this plan's
+# own RS256/ES256 key constructors, `#[cfg(feature = "use_pem")]` in
+# the crate's own source) do not exist at all without it — `"use_pem"`
+# is added back explicitly alongside `"rust_crypto"` below. See
+# DEPENDENCIES.md.
+jsonwebtoken = { version = "11", default-features = false, features = [
+  "rust_crypto",
+  "use_pem",
+] }
 # Plan 106 (Advanced Async HTTP, hyper-direct): real-checked at this
 # plan's own execution time (2026-09-23, via searxng/docs.rs) - hyper
 # 1.x (`hyperium`-org owned, 14-17M downloads/week per the plan's own
@@ -824,6 +846,20 @@ http-body-util = "0.1"
 # identical purpose). No RustSec advisory found.
 [dev-dependencies]
 rcgen = "0.13"
+# Plan 114 (JSON Web Tokens): `p256` 0.13.2 — a `[dev-dependencies]`-
+# only addition, `jwt.rs`'s own ES256 round-trip `#[test]` needs a
+# real P-256 keypair to generate PEM key material for, and this exact
+# version is already resolved transitively into this workspace's own
+# `Cargo.lock` via `jsonwebtoken`'s own `rust_crypto` backend feature
+# (`Cargo.toml`'s own `jsonwebtoken` row above) — this line promotes
+# visibility for test code only (Rust 2018+'s extern prelude admits
+# only a crate's own *direct* dependencies), the identical "already
+# resolved, promoted to direct" situation `bytes`/`futures-core` above
+# already disclose, adding zero new entries to the dependency tree.
+# Default features (`arithmetic`, `ecdsa`, `pem`, `std`) already cover
+# `SecretKey::random`/`.to_pkcs8_pem`/`.public_key().to_public_key_pem`
+# — no extra feature flags needed.
+p256 = "0.13"
 # Plan 144 (Extended Filesystem Operations) originally added `tempfile`
 # here as a `[dev-dependencies]`-only fixture crate (`dir.rs`'s/
 # `path.rs`'s own `#[cfg(test)]` fixtures use `tempfile::tempdir()`),

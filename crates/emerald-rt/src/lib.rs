@@ -211,6 +211,10 @@ mod http_client;
 mod http_server;
 mod humantime;
 mod json;
+// Plan 114 (JSON Web Tokens) — `Jwt.encode_hs256`/`.verify_hs256`/
+// `.encode_rs256`/`.verify_rs256`/`.encode_es256`/`.verify_es256`/
+// `.peek_header` — see `jwt.rs`'s own module doc.
+mod jwt;
 mod kdf;
 mod log;
 mod math;
@@ -4154,6 +4158,125 @@ pub unsafe extern "C" fn emerald_rt_msgpack_encode(obj: *const c_void) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_msgpack_decode(id: i64) -> *mut c_void {
   catch_and_raise(move || msgpack::msgpack_decode(id))
+}
+
+// Plan 114 (JSON Web Tokens): `Jwt.encode_hs256`/`.verify_hs256`/
+// `.verify_hs256_with_issuer`/`.encode_rs256`/`.verify_rs256`/
+// `.verify_rs256_with_issuer`/`.encode_es256`/`.verify_es256`/
+// `.verify_es256_with_issuer`/`.peek_header` — see `jwt.rs`'s own
+// module doc.
+
+/// # Safety
+/// `claims` must point to a real `Hash[String, String]` buffer;
+/// `secret`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_encode_hs256(
+  claims: *const c_void,
+  secret: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || jwt::jwt_encode_hs256(claims, secret))
+}
+
+/// # Safety
+/// `token`/`secret`, if non-null, must point to valid, NUL-terminated
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_verify_hs256(
+  token: *const c_char,
+  secret: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || jwt::jwt_verify_hs256(token, secret))
+}
+
+/// # Safety
+/// `token`/`secret`/`issuer`, if non-null, must point to valid,
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_verify_hs256_with_issuer(
+  token: *const c_char,
+  secret: *const c_char,
+  issuer: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || jwt::jwt_verify_hs256_with_issuer(token, secret, issuer))
+}
+
+/// # Safety
+/// `claims` must point to a real `Hash[String, String]` buffer;
+/// `private_key_pem`, if non-null, must point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_encode_rs256(
+  claims: *const c_void,
+  private_key_pem: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || jwt::jwt_encode_rs256(claims, private_key_pem))
+}
+
+/// # Safety
+/// `token`/`public_key_pem`, if non-null, must point to valid,
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_verify_rs256(
+  token: *const c_char,
+  public_key_pem: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || jwt::jwt_verify_rs256(token, public_key_pem))
+}
+
+/// # Safety
+/// `token`/`public_key_pem`/`issuer`, if non-null, must point to
+/// valid, NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_verify_rs256_with_issuer(
+  token: *const c_char,
+  public_key_pem: *const c_char,
+  issuer: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || jwt::jwt_verify_rs256_with_issuer(token, public_key_pem, issuer))
+}
+
+/// # Safety
+/// `claims` must point to a real `Hash[String, String]` buffer;
+/// `private_key_pem`, if non-null, must point to a valid,
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_encode_es256(
+  claims: *const c_void,
+  private_key_pem: *const c_char,
+) -> *const c_char {
+  catch_and_raise(move || jwt::jwt_encode_es256(claims, private_key_pem))
+}
+
+/// # Safety
+/// `token`/`public_key_pem`, if non-null, must point to valid,
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_verify_es256(
+  token: *const c_char,
+  public_key_pem: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || jwt::jwt_verify_es256(token, public_key_pem))
+}
+
+/// # Safety
+/// `token`/`public_key_pem`/`issuer`, if non-null, must point to
+/// valid, NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_verify_es256_with_issuer(
+  token: *const c_char,
+  public_key_pem: *const c_char,
+  issuer: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || jwt::jwt_verify_es256_with_issuer(token, public_key_pem, issuer))
+}
+
+/// # Safety
+/// `token`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_jwt_peek_header(token: *const c_char) -> *const c_char {
+  catch_and_raise(move || jwt::jwt_peek_header(token))
 }
 
 // Real, expected consequence of introducing genuine cross-archive

@@ -5391,6 +5391,20 @@ struct Ctx<'a, 'ctx> {
   /// Plan 112 (Password Hashing) — `Password.hash`/`.verify`.
   password_hash: FunctionValue<'ctx>,
   password_verify: FunctionValue<'ctx>,
+  /// Plan 114 (JSON Web Tokens) — `Jwt.encode_hs256`/`.verify_hs256`/
+  /// `.verify_hs256_with_issuer`/`.encode_rs256`/`.verify_rs256`/
+  /// `.verify_rs256_with_issuer`/`.encode_es256`/`.verify_es256`/
+  /// `.verify_es256_with_issuer`/`.peek_header`.
+  jwt_encode_hs256: FunctionValue<'ctx>,
+  jwt_verify_hs256: FunctionValue<'ctx>,
+  jwt_verify_hs256_with_issuer: FunctionValue<'ctx>,
+  jwt_encode_rs256: FunctionValue<'ctx>,
+  jwt_verify_rs256: FunctionValue<'ctx>,
+  jwt_verify_rs256_with_issuer: FunctionValue<'ctx>,
+  jwt_encode_es256: FunctionValue<'ctx>,
+  jwt_verify_es256: FunctionValue<'ctx>,
+  jwt_verify_es256_with_issuer: FunctionValue<'ctx>,
+  jwt_peek_header: FunctionValue<'ctx>,
   /// Plan 113 (Cryptographically Secure Random Number Generation) —
   /// `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`.
   random_secure_hex: FunctionValue<'ctx>,
@@ -10772,6 +10786,50 @@ fn build_method_call<'ctx>(
         ))
       }
     }
+  }
+
+  // Plan 114's Decision log: `Jwt.encode_hs256`/`.verify_hs256`/
+  // `.verify_hs256_with_issuer`/`.encode_rs256`/`.verify_rs256`/
+  // `.verify_rs256_with_issuer`/`.encode_es256`/`.verify_es256`/
+  // `.verify_es256_with_issuer`/`.peek_header` — the same reserved-
+  // namespace static-call shape `Password`/`SecureCompare` immediately
+  // above use. Every `encode_*`/`.peek_header` returns a plain
+  // `String` (`ValKind::Str`); every `verify_*` returns `Option[
+  // Hash[String, String]]` (`ValKind::Ptr` — the Rust side already
+  // builds the real `[tag: i64][payload: 8]` enum block directly, the
+  // same convention `Csv.parse`/`Xml.parse`'s own `Result`-returning
+  // arms below already use for a compound return type).
+  if recv_name == "Jwt" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let (fv, ret_kind) = match method {
+      "encode_hs256" => (ctx.jwt_encode_hs256, ValKind::Str),
+      "verify_hs256" => (ctx.jwt_verify_hs256, ValKind::Ptr),
+      "verify_hs256_with_issuer" => (ctx.jwt_verify_hs256_with_issuer, ValKind::Ptr),
+      "encode_rs256" => (ctx.jwt_encode_rs256, ValKind::Str),
+      "verify_rs256" => (ctx.jwt_verify_rs256, ValKind::Ptr),
+      "verify_rs256_with_issuer" => (ctx.jwt_verify_rs256_with_issuer, ValKind::Ptr),
+      "encode_es256" => (ctx.jwt_encode_es256, ValKind::Str),
+      "verify_es256" => (ctx.jwt_verify_es256, ValKind::Ptr),
+      "verify_es256_with_issuer" => (ctx.jwt_verify_es256_with_issuer, ValKind::Ptr),
+      "peek_header" => (ctx.jwt_peek_header, ValKind::Str),
+      other => return Err(format!("codegen: unsupported Jwt static method `{other}`")),
+    };
+    let call = builder
+      .build_call(fv, &call_args, "jwtstatictmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ret_kind));
   }
 
   // Plan 113's Decision log: `Random.secure_hex`/`.secure_token`/
@@ -24412,6 +24470,65 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 114 (JSON Web Tokens): `Jwt.encode_hs256`/`.verify_hs256`/
+  // `.verify_hs256_with_issuer`/`.encode_rs256`/`.verify_rs256`/
+  // `.verify_rs256_with_issuer`/`.encode_es256`/`.verify_es256`/
+  // `.verify_es256_with_issuer`/`.peek_header`. Every `encode_*` takes
+  // `(claims: ptr, key: ptr) -> ptr` (a `Hash[String, String]` param,
+  // a `String` key/secret param, a `String` return); every `verify_*`
+  // takes `(token: ptr, key: ptr[, issuer: ptr]) -> ptr` (an
+  // `Option[Hash[String, String]]` return, `Ptr` like every other
+  // compound return type in this file).
+  let jwt_encode_hs256 = module.add_function(
+    "emerald_rt_jwt_encode_hs256",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_verify_hs256 = module.add_function(
+    "emerald_rt_jwt_verify_hs256",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_verify_hs256_with_issuer = module.add_function(
+    "emerald_rt_jwt_verify_hs256_with_issuer",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_encode_rs256 = module.add_function(
+    "emerald_rt_jwt_encode_rs256",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_verify_rs256 = module.add_function(
+    "emerald_rt_jwt_verify_rs256",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_verify_rs256_with_issuer = module.add_function(
+    "emerald_rt_jwt_verify_rs256_with_issuer",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_encode_es256 = module.add_function(
+    "emerald_rt_jwt_encode_es256",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_verify_es256 = module.add_function(
+    "emerald_rt_jwt_verify_es256",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_verify_es256_with_issuer = module.add_function(
+    "emerald_rt_jwt_verify_es256_with_issuer",
+    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let jwt_peek_header = module.add_function(
+    "emerald_rt_jwt_peek_header",
+    ptr_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 113 (Cryptographically Secure Random Number Generation):
   // `Random.secure_hex`/`.secure_token`/`.int`/`.shuffle`. `.shuffle`
   // takes the array's own bare heap pointer directly.
@@ -27056,6 +27173,16 @@ fn compile_to_object_impl(
     kdf_pbkdf2,
     password_hash,
     password_verify,
+    jwt_encode_hs256,
+    jwt_verify_hs256,
+    jwt_verify_hs256_with_issuer,
+    jwt_encode_rs256,
+    jwt_verify_rs256,
+    jwt_verify_rs256_with_issuer,
+    jwt_encode_es256,
+    jwt_verify_es256,
+    jwt_verify_es256_with_issuer,
+    jwt_peek_header,
     encoding_decode,
     encoding_decode_strict,
     encoding_encode,

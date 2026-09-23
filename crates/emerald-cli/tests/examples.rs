@@ -1357,3 +1357,27 @@ fn sse_ticker_em_streams_three_framed_events_over_a_real_socket() {
   let _ = child.wait();
   std::fs::remove_file(&output).ok();
 }
+
+// Plan 114 (JSON Web Tokens): `Jwt.encode_hs256`/`.verify_hs256`/
+// `.verify_hs256_with_issuer`/`.peek_header` — see `jwt_proof.em`'s
+// own header comment for the one real, disclosed deviation from this
+// plan's own literally-quoted Concrete Proof token (`Hash[String,
+// String]`'s string-only claims cannot reproduce the real jwt.io
+// token's unquoted numeric `"iat"` byte-for-byte) -- everything else
+// (round-trip claim recovery, tamper detection against the real,
+// independently-verifiable jwt.io token, header inspection, issuer
+// validation) is reproduced exactly. `token`'s own value (line 1) is
+// deterministic -- HMAC-SHA256 over the same insertion-ordered claims
+// every run -- so it is asserted exactly, not merely checked for shape.
+#[test]
+fn jwt_proof_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("jwt_proof.em"),
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoiMTUxNjIzOTAyMiJ9.-N29Lo09lK26mpCcyv0ig6zURJDbim5L7K4wHnuH6S0\n\
+     John Doe\n\
+     verification failed\n\
+     {\"typ\":\"JWT\",\"alg\":\"HS256\"}\n\
+     42\n\
+     verification failed\n"
+  );
+}
