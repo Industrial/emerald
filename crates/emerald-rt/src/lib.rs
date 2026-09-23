@@ -212,14 +212,6 @@ mod system;
 // `.next_entry`/`.entry_size`/`.read_entry_data`/`.close`, wrapping
 // `tar` -- see `tar.rs`'s own module doc.
 mod tar;
-// Plan 147 (Temporary Files & Directories) -- `Tempfile.create`/
-// `.path`/`.close`, `Tempdir.create`/`.path`/`.close` -- see
-// `tempfile.rs`'s own module doc for why this is `mod tempfiles`
-// (`#[path]`-redirected), not a bare `mod tempfile;` (a real collision
-// against this crate's own `tempfile` dependency name, not a sibling
-// module -- unlike `csvs`/`tomls`/`urls`/`charset`'s own collisions).
-#[path = "tempfile.rs"]
-mod tempfiles;
 // Plan 99 (TLS) -- `Tls.connect`/`.connect_with_roots`/`.listen`,
 // `TlsStream#read`/`#write`/`#close`, `TlsListener#accept`/`#close`,
 // wrapping `rustls` -- see `tls.rs`'s own module doc.
@@ -246,6 +238,10 @@ mod unicode;
 #[path = "url.rs"]
 mod urls;
 mod xml;
+// Plan 133 (Zip Archives) -- `Zip.create`/`.extract`, `ZipReader.open`/
+// `.entry_count`/`.entry_name`/`.entry_size`/`.read_entry_data`/
+// `.close`, wrapping `zip` -- see `zip.rs`'s own module doc.
+mod zip;
 
 // NativeError's class tag - fixed and reserved, assigned before any
 // user-declared class in emerald-codegen's own class-tag-assignment
@@ -3158,62 +3154,88 @@ pub unsafe extern "C" fn emerald_rt_tar_reader_close(id: i64) {
   catch_and_raise(move || tar::tar_reader_close(id))
 }
 
-// Plan 147 (Temporary Files & Directories): `Tempfile.create`/`.path`/
-// `.close`, `Tempdir.create`/`.path`/`.close` -- see `tempfile.rs`'s
-// own module doc.
+// Plan 133 (Zip Archives): `Zip.create`/`.extract`, `ZipReader.open`/
+// `.entry_count`/`.entry_name`/`.entry_size`/`.read_entry_data`/
+// `.close` -- see `zip.rs`'s own module doc.
 
-/// `Tempfile.create(): Tempfile`.
+/// `Zip.create(archive_path: String, paths: Array[String]): Void`.
 ///
 /// # Safety
-/// Always safe to call.
+/// `archive_path`, if non-null, must point to a valid, NUL-terminated
+/// C string. `path_ptrs` must point to `count` valid `*const c_char`
+/// entries, each itself a valid, NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn emerald_rt_tempfile_create() -> i64 {
-  catch_and_raise(tempfiles::tempfile_create)
+pub unsafe extern "C" fn emerald_rt_zip_create(
+  archive_path: *const c_char,
+  path_ptrs: *const *const c_char,
+  count: i64,
+) {
+  catch_and_raise(move || zip::zip_create(archive_path, path_ptrs, count))
 }
 
-/// `Tempfile#path(self): String`.
+/// `Zip.extract(archive_path: String, dest_dir: String): Void`.
 ///
 /// # Safety
-/// `id` must be a live `Tempfile` handle.
+/// `archive_path`/`dest_dir`, if non-null, must each point to a valid,
+/// NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn emerald_rt_tempfile_path(id: i64) -> *const c_char {
-  catch_and_raise(move || tempfiles::tempfile_path(id))
+pub unsafe extern "C" fn emerald_rt_zip_extract(
+  archive_path: *const c_char,
+  dest_dir: *const c_char,
+) {
+  catch_and_raise(move || zip::zip_extract(archive_path, dest_dir))
 }
 
-/// `Tempfile#close(self): Void`.
+/// `ZipReader.open(archive_path: String): ZipReader`.
 ///
 /// # Safety
-/// Always safe to call.
+/// `archive_path`, if non-null, must point to a valid, NUL-terminated
+/// C string.
 #[no_mangle]
-pub unsafe extern "C" fn emerald_rt_tempfile_close(id: i64) {
-  catch_and_raise(move || tempfiles::tempfile_close(id))
+pub unsafe extern "C" fn emerald_rt_zip_reader_open(archive_path: *const c_char) -> i64 {
+  catch_and_raise(move || zip::zip_reader_open(archive_path))
 }
 
-/// `Tempdir.create(): Tempdir`.
+/// `ZipReader#entry_count(self): Int64`.
 ///
 /// # Safety
-/// Always safe to call.
+/// `id` must be a live `ZipReader` handle.
 #[no_mangle]
-pub unsafe extern "C" fn emerald_rt_tempdir_create() -> i64 {
-  catch_and_raise(tempfiles::tempdir_create)
+pub unsafe extern "C" fn emerald_rt_zip_reader_entry_count(id: i64) -> i64 {
+  catch_and_raise(move || zip::zip_reader_entry_count(id))
 }
 
-/// `Tempdir#path(self): String`.
+/// `ZipReader#entry_name(self, i: Int64): String`.
 ///
 /// # Safety
-/// `id` must be a live `Tempdir` handle.
+/// `id` must be a live `ZipReader` handle.
 #[no_mangle]
-pub unsafe extern "C" fn emerald_rt_tempdir_path(id: i64) -> *const c_char {
-  catch_and_raise(move || tempfiles::tempdir_path(id))
+pub unsafe extern "C" fn emerald_rt_zip_reader_entry_name(id: i64, index: i64) -> *const c_char {
+  catch_and_raise(move || zip::zip_reader_entry_name(id, index))
 }
 
-/// `Tempdir#close(self): Void`.
+/// `ZipReader#entry_size(self, i: Int64): Int64`.
 ///
 /// # Safety
-/// Always safe to call.
+/// `id` must be a live `ZipReader` handle.
 #[no_mangle]
-pub unsafe extern "C" fn emerald_rt_tempdir_close(id: i64) {
-  catch_and_raise(move || tempfiles::tempdir_close(id))
+pub unsafe extern "C" fn emerald_rt_zip_reader_entry_size(id: i64, index: i64) -> i64 {
+  catch_and_raise(move || zip::zip_reader_entry_size(id, index))
+}
+
+/// `ZipReader#read_entry_data(self, i: Int64): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `ZipReader` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zip_reader_read_entry_data(id: i64, index: i64) -> i64 {
+  catch_and_raise(move || zip::zip_reader_read_entry_data(id, index))
+}
+
+/// `ZipReader#close(self): Void`.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_zip_reader_close(id: i64) {
+  catch_and_raise(move || zip::zip_reader_close(id))
 }
 
 // Real, expected consequence of introducing genuine cross-archive
