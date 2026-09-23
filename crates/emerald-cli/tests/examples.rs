@@ -665,3 +665,20 @@ fn unicode_normalization_segmentation_proof_em_prints_expected_sequence() {
 fn static_methods_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("static_methods.em"), "0\n0\n5\n7\n");
 }
+
+// Plan 193 (`Set[T]`, `Deque[T]`, `PriorityQueue[T]`) — inception-3
+// §4.3's own "missing collection primitives" gap. All three route
+// through `emerald-rt`'s plan-93 resource-handle registry, backed
+// directly by Rust's own `std::collections` (`HashSet`, `VecDeque`,
+// `BinaryHeap`) — see this plan's own Decision log
+// (`history/2026-09-22T223900Z-plan-193-set-deque-priority-queue.md`)
+// for the full account, including the two real, disclosed grammar
+// corrections found while writing this example (explicit `.new()`,
+// `puts` needing string interpolation for a `Boolean`).
+#[test]
+fn set_deque_priority_queue_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("set_deque_priority_queue.em"),
+    "2\ntrue\nz\n9\n"
+  );
+}

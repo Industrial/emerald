@@ -41,6 +41,23 @@ pub enum Type {
   /// (plan 25's Decision log: `Int64` keys only, a flat linear-scan
   /// representation in codegen — not a real hash table).
   Hash(Box<Type>, Box<Type>),
+  /// `Set[Elem]` (plan 193's Decision log) — `Int64`/`String` elements
+  /// only (Rust's own `f64` has no `Eq`/`Hash`; `Boolean` is a
+  /// low-value element out of v1 scope). Handle-backed (`emerald-rt`'s
+  /// plan-93 `crate::handle` registry over a real `std::collections::
+  /// HashSet<T>`), NOT a raw contiguous buffer the way `Array[T]`/
+  /// `Hash[K,V]` are — see this plan's own Decision log for why that
+  /// split is deliberate.
+  Set(Box<Type>),
+  /// `Deque[Elem]` (plan 193) — `Int64`/`Float64`/`String`/`Boolean`
+  /// elements (`derive Serializable`'s own four supported primitive
+  /// types). Handle-backed over a real `std::collections::VecDeque<T>`.
+  Deque(Box<Type>),
+  /// `PriorityQueue[Elem]` (plan 193) — `Int64`/`String` elements only,
+  /// the same scope `Set[T]` carries. A max-heap (Rust's own `std::
+  /// collections::BinaryHeap<T>` default `Ord`, unmodified — Decision
+  /// log) — handle-backed.
+  PriorityQueue(Box<Type>),
   /// A closure's parameter types and return type. Unlike `Type::Class`,
   /// which is just a name backed by a separate `ClassInfo` registry,
   /// there's no such registry for lambdas — the signature has to travel
@@ -543,6 +560,82 @@ fn resolve_type(
         (0, 0),
       )),
     },
+    // Plan 193's Decision log: `Set[T]`/`PriorityQueue[T]` are
+    // `Int64`/`String` only — `f64` has no `Eq`/`Hash`/`Ord` in safe
+    // Rust (not a self-imposed limitation), `Boolean` is out of v1
+    // scope. Rejected here, at the one shared `resolve_type` path
+    // every annotation position (a `Let`, a field, a param, nested
+    // inside another generic) already funnels through — never a
+    // silent fallback.
+    TypeExpr::Generic(name, args) if name == "Set" => match args.as_slice() {
+      [elem] => {
+        let elem_ty = resolve_type(elem, classes)?;
+        if !matches!(elem_ty, Type::Int64 | Type::String) {
+          return Err(Diagnostic::new(
+            format!("`Set[T]` supports Int64 or String elements only, found `Set[{elem}]`"),
+            (0, 0),
+          ));
+        }
+        Ok(Type::Set(Box::new(elem_ty)))
+      }
+      _ => Err(Diagnostic::new(
+        format!(
+          "`Set` takes exactly one type argument, found {}",
+          args.len()
+        ),
+        (0, 0),
+      )),
+    },
+    // Plan 193: `Deque[T]` carries neither `Set`/`PriorityQueue`'s
+    // hashing/ordering constraint — scoped instead to `derive
+    // Serializable`'s own four already-supported primitive types.
+    TypeExpr::Generic(name, args) if name == "Deque" => match args.as_slice() {
+      [elem] => {
+        let elem_ty = resolve_type(elem, classes)?;
+        if !matches!(
+          elem_ty,
+          Type::Int64 | Type::Float64 | Type::String | Type::Boolean
+        ) {
+          return Err(Diagnostic::new(
+            format!(
+              "`Deque[T]` supports Int64, Float64, String, or Boolean elements only, found \
+               `Deque[{elem}]`"
+            ),
+            (0, 0),
+          ));
+        }
+        Ok(Type::Deque(Box::new(elem_ty)))
+      }
+      _ => Err(Diagnostic::new(
+        format!(
+          "`Deque` takes exactly one type argument, found {}",
+          args.len()
+        ),
+        (0, 0),
+      )),
+    },
+    TypeExpr::Generic(name, args) if name == "PriorityQueue" => match args.as_slice() {
+      [elem] => {
+        let elem_ty = resolve_type(elem, classes)?;
+        if !matches!(elem_ty, Type::Int64 | Type::String) {
+          return Err(Diagnostic::new(
+            format!(
+              "`PriorityQueue[T]` supports Int64 or String elements only, found \
+               `PriorityQueue[{elem}]`"
+            ),
+            (0, 0),
+          ));
+        }
+        Ok(Type::PriorityQueue(Box::new(elem_ty)))
+      }
+      _ => Err(Diagnostic::new(
+        format!(
+          "`PriorityQueue` takes exactly one type argument, found {}",
+          args.len()
+        ),
+        (0, 0),
+      )),
+    },
     TypeExpr::Generic(name, args) if name == "Pair" => match args.as_slice() {
       [k, v] => Ok(Type::Pair(
         Box::new(resolve_type(k, classes)?),
@@ -801,6 +894,11 @@ fn type_to_type_expr(t: &Type) -> TypeExpr {
       "Hash".to_string(),
       vec![type_to_type_expr(k), type_to_type_expr(v)],
     ),
+    Type::Set(e) => TypeExpr::Generic("Set".to_string(), vec![type_to_type_expr(e)]),
+    Type::Deque(e) => TypeExpr::Generic("Deque".to_string(), vec![type_to_type_expr(e)]),
+    Type::PriorityQueue(e) => {
+      TypeExpr::Generic("PriorityQueue".to_string(), vec![type_to_type_expr(e)])
+    }
     Type::Pair(k, v) => TypeExpr::Generic(
       "Pair".to_string(),
       vec![type_to_type_expr(k), type_to_type_expr(v)],
@@ -1895,6 +1993,11 @@ fn type_annotation_string(ty: &Type) -> Option<String> {
       let k = type_annotation_string(k)?;
       let v = type_annotation_string(v)?;
       Some(format!("Hash[{k}, {v}]"))
+    }
+    Type::Set(elem) => type_annotation_string(elem).map(|e| format!("Set[{e}]")),
+    Type::Deque(elem) => type_annotation_string(elem).map(|e| format!("Deque[{e}]")),
+    Type::PriorityQueue(elem) => {
+      type_annotation_string(elem).map(|e| format!("PriorityQueue[{e}]"))
     }
     Type::Generic(_, _)
     | Type::Proc(_, _)
@@ -5947,6 +6050,105 @@ fn infer_expr_type(
       // intercept a user-defined class method sharing a name with a
       // `String` intrinsic. Mirrors `puts`'s own "compiler intrinsic,
       // not an overloaded function" precedent.
+      // Plan 193's Decision log: `Set[T]`/`Deque[T]`/`PriorityQueue[T]`
+      // dispatch the same receiver-inferred-type way `String`/`Int64`/
+      // `Float64` immediately below do — never a real `ClassInfo`
+      // entry (no `Type::Set`/`Type::Deque`/`Type::PriorityQueue`
+      // receiver can ever collide with a user class's own method
+      // table, the same soundness argument `Array`/`Hash` above make
+      // for themselves).
+      if let Type::Set(elem) = &recv_ty {
+        if method == "each" {
+          let [arg] = args.as_slice() else {
+            return Err(Diagnostic::new(
+              format!("`.each` expects exactly 1 argument, found {}", args.len()),
+              expr.span,
+            ));
+          };
+          check_enumerable_proc_arg(
+            arg,
+            &[(**elem).clone()],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(Type::Void);
+        }
+        let (expected_params, ret) = match method.as_str() {
+          "add" | "contains" | "remove" => (vec![(**elem).clone()], Type::Boolean),
+          "count" => (vec![], Type::Int64),
+          "close" => (vec![], Type::Void),
+          other => {
+            return Err(Diagnostic::new(format!("Set has no method `{other}`"), expr.span));
+          }
+        };
+        check_args(
+          method,
+          args,
+          &expected_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(ret);
+      }
+      if let Type::Deque(elem) = &recv_ty {
+        let (expected_params, ret) = match method.as_str() {
+          "push_front" | "push_back" => (vec![(**elem).clone()], Type::Void),
+          "pop_front" | "pop_back" => (vec![], (**elem).clone()),
+          "count" => (vec![], Type::Int64),
+          "close" => (vec![], Type::Void),
+          other => {
+            return Err(Diagnostic::new(format!("Deque has no method `{other}`"), expr.span));
+          }
+        };
+        check_args(
+          method,
+          args,
+          &expected_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(ret);
+      }
+      if let Type::PriorityQueue(elem) = &recv_ty {
+        let (expected_params, ret) = match method.as_str() {
+          "push" => (vec![(**elem).clone()], Type::Void),
+          "pop" | "peek" => (vec![], (**elem).clone()),
+          "count" => (vec![], Type::Int64),
+          "close" => (vec![], Type::Void),
+          other => {
+            return Err(Diagnostic::new(
+              format!("PriorityQueue has no method `{other}`"),
+              expr.span,
+            ));
+          }
+        };
+        check_args(
+          method,
+          args,
+          &expected_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(ret);
+      }
+      // Plan 45's Decision log: dispatched by checking the receiver's
+      // *inferred type* here, inside the existing generic `MethodCall`
+      // arm — not a new name-guarded arm, which would incorrectly
+      // intercept a user-defined class method sharing a name with a
+      // `String` intrinsic. Mirrors `puts`'s own "compiler intrinsic,
+      // not an overloaded function" precedent.
       if recv_ty == Type::String {
         let Some((expected_params, ret)) = string_intrinsic_signature(method) else {
           return Err(Diagnostic::new(
@@ -7520,6 +7722,61 @@ fn check_stmt(
             "type mismatch in `{name}: {ty} = ...?`: declared type {declared:?}, unwrapped value has type {unwrapped:?}"
           ),
           inner.span,
+        ));
+      }
+      declare_local(env, mutable_locals, name, declared, *is_var);
+      Ok(())
+    }
+    // Plan 193's Decision log: `s: Set[Int64] = Set.new` / `d: Deque[
+    // String] = Deque.new` / `pq: PriorityQueue[Int64] = PriorityQueue
+    // .new` — the fourth expected-type-providing `.new` shape (`Array.
+    // new(size)`/`Ok`/`Err` above, a real generic class's own `.new()`
+    // immediately below). Checked HERE, before plan 58's own Stack-
+    // style arm immediately below: that arm's guard (`base ==
+    // class_name`) would otherwise match these too, then panic on its
+    // own `let Type::Class(mangled) = &declared else { unreachable!
+    // (...) }` — `resolve_type`'s new `Set`/`Deque`/`PriorityQueue`
+    // arms return `Type::Set`/`Type::Deque`/`Type::PriorityQueue`,
+    // never `Type::Class`. Construction takes no arguments — a real,
+    // named diagnostic on any argument, never a silent ignore. Scoped
+    // to `Let` only (not `Assign`/`Return`) — a real, disclosed
+    // narrowing matching this plan's own "prove the core shape first"
+    // scope (Decision log's "Out of scope" section); `Expr::New`'s
+    // ordinary, ClassInfo-keyed arm already rejects `Set`/`Deque`/
+    // `PriorityQueue.new` used any other way with its own honest
+    // "undefined class" diagnostic.
+    Stmt::Let {
+      name,
+      ty,
+      value: Spanned {
+        node: Expr::New(class_name, args),
+        ..
+      },
+      is_var,
+    } if class_name == "Set" || class_name == "Deque" || class_name == "PriorityQueue" => {
+      let declared = resolve_type(ty, classes)?;
+      let matches_kind = matches!(
+        (&declared, class_name.as_str()),
+        (Type::Set(_), "Set")
+          | (Type::Deque(_), "Deque")
+          | (Type::PriorityQueue(_), "PriorityQueue")
+      );
+      if !matches_kind {
+        return Err(Diagnostic::new(
+          format!(
+            "type mismatch in `{name}: {ty} = {class_name}.new`: `{class_name}.new` produces a \
+             `{class_name}`, not {declared:?}"
+          ),
+          stmt.span,
+        ));
+      }
+      if !args.is_empty() {
+        return Err(Diagnostic::new(
+          format!(
+            "`{class_name}.new` takes no arguments, found {}",
+            args.len()
+          ),
+          stmt.span,
         ));
       }
       declare_local(env, mutable_locals, name, declared, *is_var);

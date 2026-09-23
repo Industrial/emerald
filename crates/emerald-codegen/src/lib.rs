@@ -497,6 +497,19 @@ fn value_kind_for_type(ty: &TypeExpr) -> ValKind {
     // type's own `Display` string alongside class names — see
     // `build_index`) already carries without needing a whole new
     // parameter threaded through every codegen function in this file.
+    // Plan 193's Decision log: `Set[T]`/`Deque[T]`/`PriorityQueue[T]`
+    // are handle-backed (a plain `i64` id into `emerald-rt`'s plan-93
+    // registry — see `crates/emerald-rt/src/collections.rs`'s own
+    // module doc), NOT a real heap pointer the way every OTHER
+    // `TypeExpr::Generic` (`Array[T]`, `Hash[K,V]`, a real generic
+    // class instantiation, ...) is — checked here, before the generic
+    // `Ptr` catch-all immediately below, the same "checked before the
+    // generic bucket, which would otherwise be silently wrong for this
+    // one shape specifically" precedent the newtype arm above already
+    // establishes for itself.
+    TypeExpr::Generic(base, _) if base == "Set" || base == "Deque" || base == "PriorityQueue" => {
+      ValKind::Int64
+    }
     TypeExpr::Generic(..) | TypeExpr::Func(..) => ValKind::Ptr,
     // `Tuple` is valid only as a function's own declared return kind
     // (`ret_kind_for_type`'s own dedicated handling below) — reached
@@ -5096,6 +5109,67 @@ struct Ctx<'a, 'ctx> {
   regex_replace_all: FunctionValue<'ctx>,
   regex_split: FunctionValue<'ctx>,
   regex_split_count: FunctionValue<'ctx>,
+  /// Plan 193 (`Set[T]`/`Deque[T]`/`PriorityQueue[T]`) — 54 concrete
+  /// monomorphized `emerald_rt_<kind>_<elemtype>_<method>` exports
+  /// (2 `Set` element types x 7 methods, 4 `Deque` element types x 7
+  /// methods, 2 `PriorityQueue` element types x 6 methods), one field
+  /// per export — see `crates/emerald-rt/src/collections.rs`'s own
+  /// module doc for the full account.
+  set_i64_new: FunctionValue<'ctx>,
+  set_i64_add: FunctionValue<'ctx>,
+  set_i64_contains: FunctionValue<'ctx>,
+  set_i64_remove: FunctionValue<'ctx>,
+  set_i64_count: FunctionValue<'ctx>,
+  set_i64_each: FunctionValue<'ctx>,
+  set_i64_close: FunctionValue<'ctx>,
+  set_string_new: FunctionValue<'ctx>,
+  set_string_add: FunctionValue<'ctx>,
+  set_string_contains: FunctionValue<'ctx>,
+  set_string_remove: FunctionValue<'ctx>,
+  set_string_count: FunctionValue<'ctx>,
+  set_string_each: FunctionValue<'ctx>,
+  set_string_close: FunctionValue<'ctx>,
+  deque_i64_new: FunctionValue<'ctx>,
+  deque_i64_push_front: FunctionValue<'ctx>,
+  deque_i64_push_back: FunctionValue<'ctx>,
+  deque_i64_pop_front: FunctionValue<'ctx>,
+  deque_i64_pop_back: FunctionValue<'ctx>,
+  deque_i64_count: FunctionValue<'ctx>,
+  deque_i64_close: FunctionValue<'ctx>,
+  deque_f64_new: FunctionValue<'ctx>,
+  deque_f64_push_front: FunctionValue<'ctx>,
+  deque_f64_push_back: FunctionValue<'ctx>,
+  deque_f64_pop_front: FunctionValue<'ctx>,
+  deque_f64_pop_back: FunctionValue<'ctx>,
+  deque_f64_count: FunctionValue<'ctx>,
+  deque_f64_close: FunctionValue<'ctx>,
+  deque_string_new: FunctionValue<'ctx>,
+  deque_string_push_front: FunctionValue<'ctx>,
+  deque_string_push_back: FunctionValue<'ctx>,
+  deque_string_pop_front: FunctionValue<'ctx>,
+  deque_string_pop_back: FunctionValue<'ctx>,
+  deque_string_count: FunctionValue<'ctx>,
+  deque_string_close: FunctionValue<'ctx>,
+  deque_bool_new: FunctionValue<'ctx>,
+  deque_bool_push_front: FunctionValue<'ctx>,
+  deque_bool_push_back: FunctionValue<'ctx>,
+  deque_bool_pop_front: FunctionValue<'ctx>,
+  deque_bool_pop_back: FunctionValue<'ctx>,
+  deque_bool_count: FunctionValue<'ctx>,
+  deque_bool_close: FunctionValue<'ctx>,
+  priority_queue_i64_new: FunctionValue<'ctx>,
+  priority_queue_i64_push: FunctionValue<'ctx>,
+  priority_queue_i64_pop: FunctionValue<'ctx>,
+  priority_queue_i64_peek: FunctionValue<'ctx>,
+  priority_queue_i64_count: FunctionValue<'ctx>,
+  priority_queue_i64_close: FunctionValue<'ctx>,
+  priority_queue_string_new: FunctionValue<'ctx>,
+  priority_queue_string_push: FunctionValue<'ctx>,
+  priority_queue_string_pop: FunctionValue<'ctx>,
+  priority_queue_string_peek: FunctionValue<'ctx>,
+  priority_queue_string_count: FunctionValue<'ctx>,
+  priority_queue_string_close: FunctionValue<'ctx>,
+
   /// Plan 146 (Environment Variables) — `Env.get`/`.set`/`.remove`/
   /// `.keys`/`.keys_count`.
   env_get: FunctionValue<'ctx>,
@@ -6862,6 +6936,24 @@ fn build_expr<'ctx>(
         .map_err(|e| e.to_string())?;
       Ok((call_result(call)?, ValKind::Int64))
     }
+    // Plan 193's Decision log: `Set.new()`/`Deque.new()`/
+    // `PriorityQueue.new()` are ALWAYS handled by `build_stmt`'s own
+    // dedicated `Stmt::Let` arm (the enclosing `Let`'s own declared
+    // element type is the only place the concrete monomorphized
+    // export lives — `build_expr` alone never sees it, mirroring
+    // `Array.new`/`Stack.new()`'s own identical constraint). Guarded
+    // here, before the newtype fallback immediately below (whose own
+    // `&args[0]` would index out of bounds on these three's real
+    // zero-argument call) — reached only if sema's own `Let`-only
+    // scope was somehow bypassed, a real internal-error `Err`, never
+    // a panic.
+    Expr::New(class_name, _)
+      if class_name == "Set" || class_name == "Deque" || class_name == "PriorityQueue" =>
+    {
+      Err(format!(
+        "codegen: internal error — `{class_name}.new` reached outside its own dedicated `Let`-arm codegen (sema should have rejected this)"
+      ))
+    }
     Expr::New(class_name, args) if !ctx.classes.contains_key(class_name) => build_expr(
       context,
       builder,
@@ -8565,6 +8657,205 @@ fn build_method_call<'ctx>(
     );
   }
 
+  // Plan 193's Decision log: `Set[T]`/`Deque[T]`/`PriorityQueue[T]`
+  // method-call dispatch — re-parses the `local_classes` tag's own
+  // `mangle_type_expr` form (`"Set$Int64"`) to recover which of the
+  // 44 non-`each` concrete monomorphized `emerald_rt_*` exports this
+  // call needs, the same `local_classes`-tag-keyed shape `Regex`/
+  // `XmlReader` immediately above already use — `Regex` just never
+  // needed a second axis (an element type) of its own.
+  if let Some(tag) = local_classes.get(recv_name).cloned() {
+    let parsed = tag
+      .strip_prefix("Set$")
+      .map(|e| ("Set", e.to_string()))
+      .or_else(|| tag.strip_prefix("Deque$").map(|e| ("Deque", e.to_string())))
+      .or_else(|| {
+        tag
+          .strip_prefix("PriorityQueue$")
+          .map(|e| ("PriorityQueue", e.to_string()))
+      });
+    if let Some((kind, elem)) = parsed {
+      let (recv_val, _) = build_expr(
+        context,
+        builder,
+        recv,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      // `.each` (`Set[Int64]`/`Set[String]` only — Decision log):
+      // materializes a real `Array[T]` snapshot via the matching
+      // RT `_each` export, then reuses exactly the same loop-and-
+      // call-block shape `build_array_each` establishes for a real
+      // `Array[T]` receiver — a real, disclosed simplification (no
+      // Emerald-closure-calling-convention exists anywhere in
+      // `emerald-rt`), not a functional gap: the block still runs
+      // once per element, just in `HashSet::iter`'s own real,
+      // insertion-order-unspecified iteration order.
+      if kind == "Set" && method == "each" {
+        let [proc_arg] = args else {
+          return Err(format!(
+            "codegen: internal error — `.each` expects exactly 1 argument, found {} (sema should have rejected this)",
+            args.len()
+          ));
+        };
+        let (each_fn, elem_kind) = match elem.as_str() {
+          "Int64" => (ctx.set_i64_each, ValKind::Int64),
+          "String" => (ctx.set_string_each, ValKind::Str),
+          other => {
+            return Err(format!(
+              "codegen: internal error — unsupported Set element type `{other}`"
+            ));
+          }
+        };
+        let func = builder
+          .get_insert_block()
+          .and_then(|b| b.get_parent())
+          .ok_or_else(|| {
+            "codegen: internal error — `.each` has no enclosing function".to_string()
+          })?;
+        let call = builder
+          .build_call(each_fn, &[recv_val.into()], "seteachtmp")
+          .map_err(|e| e.to_string())?;
+        let arr_ptr = call_result(call)?.into_pointer_value();
+        let i64_ty = context.i64_type();
+        let count_val = builder
+          .build_load(i64_ty, arr_ptr, "seteachcount")
+          .map_err(|e| e.to_string())?
+          .into_int_value();
+        let elem_llvm_ty = local_llvm_type(context, &elem_kind);
+        let elems_base = field_ptr(context, builder, arr_ptr, 8)?;
+        build_count_loop(context, builder, func, count_val, |builder, idx| {
+          let elem_ptr = unsafe {
+            builder
+              .build_in_bounds_gep(elem_llvm_ty, elems_base, &[idx], "seteachelemptr")
+              .map_err(|e| e.to_string())?
+          };
+          let elem_val = builder
+            .build_load(elem_llvm_ty, elem_ptr, "seteachelemval")
+            .map_err(|e| e.to_string())?;
+          call_named_proc(
+            context,
+            builder,
+            proc_arg,
+            &[elem_val],
+            vars,
+            local_classes,
+            local_array_elem_types,
+            ctx,
+          )?;
+          Ok(())
+        })?;
+        return Ok((i64_ty.const_int(0, false).into(), ValKind::Void));
+      }
+
+      let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![recv_val.into()];
+      for a in args {
+        let (v, _) = build_expr(
+          context,
+          builder,
+          a,
+          vars,
+          local_classes,
+          local_array_elem_types,
+          ctx,
+        )?;
+        // `Deque[Boolean]#push_front`/`#push_back` cross the FFI
+        // boundary as a plain `i64` (0/1) — `Regex#is_match`'s own
+        // "widen the other direction" trick (that arm's own doc
+        // comment), just on the way IN instead of out.
+        let v =
+          if kind == "Deque" && elem == "Boolean" && matches!(method, "push_front" | "push_back") {
+            builder
+              .build_int_z_extend(v.into_int_value(), context.i64_type(), "dequeboolarg")
+              .map_err(|e| e.to_string())?
+              .into()
+          } else {
+            v
+          };
+        call_args.push(v.into());
+      }
+      let (fv, ret_kind, narrow_bool) = match (kind, elem.as_str(), method) {
+        ("Set", "Int64", "add") => (ctx.set_i64_add, ValKind::Bool, true),
+        ("Set", "Int64", "contains") => (ctx.set_i64_contains, ValKind::Bool, true),
+        ("Set", "Int64", "remove") => (ctx.set_i64_remove, ValKind::Bool, true),
+        ("Set", "Int64", "count") => (ctx.set_i64_count, ValKind::Int64, false),
+        ("Set", "Int64", "close") => (ctx.set_i64_close, ValKind::Void, false),
+        ("Set", "String", "add") => (ctx.set_string_add, ValKind::Bool, true),
+        ("Set", "String", "contains") => (ctx.set_string_contains, ValKind::Bool, true),
+        ("Set", "String", "remove") => (ctx.set_string_remove, ValKind::Bool, true),
+        ("Set", "String", "count") => (ctx.set_string_count, ValKind::Int64, false),
+        ("Set", "String", "close") => (ctx.set_string_close, ValKind::Void, false),
+        ("Deque", "Int64", "push_front") => (ctx.deque_i64_push_front, ValKind::Void, false),
+        ("Deque", "Int64", "push_back") => (ctx.deque_i64_push_back, ValKind::Void, false),
+        ("Deque", "Int64", "count") => (ctx.deque_i64_count, ValKind::Int64, false),
+        ("Deque", "Int64", "close") => (ctx.deque_i64_close, ValKind::Void, false),
+        ("Deque", "Int64", "pop_front") => (ctx.deque_i64_pop_front, ValKind::Int64, false),
+        ("Deque", "Int64", "pop_back") => (ctx.deque_i64_pop_back, ValKind::Int64, false),
+        ("Deque", "Float64", "push_front") => (ctx.deque_f64_push_front, ValKind::Void, false),
+        ("Deque", "Float64", "push_back") => (ctx.deque_f64_push_back, ValKind::Void, false),
+        ("Deque", "Float64", "count") => (ctx.deque_f64_count, ValKind::Int64, false),
+        ("Deque", "Float64", "close") => (ctx.deque_f64_close, ValKind::Void, false),
+        ("Deque", "Float64", "pop_front") => (ctx.deque_f64_pop_front, ValKind::Float64, false),
+        ("Deque", "Float64", "pop_back") => (ctx.deque_f64_pop_back, ValKind::Float64, false),
+        ("Deque", "String", "push_front") => (ctx.deque_string_push_front, ValKind::Void, false),
+        ("Deque", "String", "push_back") => (ctx.deque_string_push_back, ValKind::Void, false),
+        ("Deque", "String", "count") => (ctx.deque_string_count, ValKind::Int64, false),
+        ("Deque", "String", "close") => (ctx.deque_string_close, ValKind::Void, false),
+        ("Deque", "String", "pop_front") => (ctx.deque_string_pop_front, ValKind::Str, false),
+        ("Deque", "String", "pop_back") => (ctx.deque_string_pop_back, ValKind::Str, false),
+        ("Deque", "Boolean", "push_front") => (ctx.deque_bool_push_front, ValKind::Void, false),
+        ("Deque", "Boolean", "push_back") => (ctx.deque_bool_push_back, ValKind::Void, false),
+        ("Deque", "Boolean", "count") => (ctx.deque_bool_count, ValKind::Int64, false),
+        ("Deque", "Boolean", "close") => (ctx.deque_bool_close, ValKind::Void, false),
+        ("Deque", "Boolean", "pop_front") => (ctx.deque_bool_pop_front, ValKind::Bool, true),
+        ("Deque", "Boolean", "pop_back") => (ctx.deque_bool_pop_back, ValKind::Bool, true),
+        ("PriorityQueue", "Int64", "push") => (ctx.priority_queue_i64_push, ValKind::Void, false),
+        ("PriorityQueue", "Int64", "count") => {
+          (ctx.priority_queue_i64_count, ValKind::Int64, false)
+        }
+        ("PriorityQueue", "Int64", "close") => (ctx.priority_queue_i64_close, ValKind::Void, false),
+        ("PriorityQueue", "Int64", "pop") => (ctx.priority_queue_i64_pop, ValKind::Int64, false),
+        ("PriorityQueue", "Int64", "peek") => (ctx.priority_queue_i64_peek, ValKind::Int64, false),
+        ("PriorityQueue", "String", "push") => {
+          (ctx.priority_queue_string_push, ValKind::Void, false)
+        }
+        ("PriorityQueue", "String", "count") => {
+          (ctx.priority_queue_string_count, ValKind::Int64, false)
+        }
+        ("PriorityQueue", "String", "close") => {
+          (ctx.priority_queue_string_close, ValKind::Void, false)
+        }
+        ("PriorityQueue", "String", "pop") => (ctx.priority_queue_string_pop, ValKind::Str, false),
+        ("PriorityQueue", "String", "peek") => {
+          (ctx.priority_queue_string_peek, ValKind::Str, false)
+        }
+        (k, e, other) => {
+          return Err(format!("codegen: unsupported {k}[{e}] method `{other}`"));
+        }
+      };
+      let call = builder
+        .build_call(fv, &call_args, "collectiontmp")
+        .map_err(|e| e.to_string())?;
+      if ret_kind == ValKind::Void {
+        return Ok((context.i64_type().const_int(0, false).into(), ValKind::Void));
+      }
+      let result = call_result(call)?;
+      if narrow_bool {
+        let is_true = builder
+          .build_int_compare(
+            IntPredicate::NE,
+            result.into_int_value(),
+            context.i64_type().const_int(0, false),
+            "collectionbooltmp",
+          )
+          .map_err(|e| e.to_string())?;
+        return Ok((is_true.into(), ValKind::Bool));
+      }
+      return Ok((result, ret_kind));
+    }
+  }
   // Plan 42 (enumerable stdlib): `each`/`map`/`select`/`filter`/
   // `reduce`/`inject`/`each_with_index`/`count`/`sum`/`sort` on an
   // `Array[T]`/`Hash[K,V]`-typed receiver — see `build_enumerable_
@@ -15014,6 +15305,71 @@ fn build_stmt<'a, 'ctx>(
       }
       Ok(false)
     }
+    // Plan 193's Decision log: `s: Set[Int64] = Set.new()` / `d: Deque[
+    // String] = Deque.new()` / `pq: PriorityQueue[Int64] =
+    // PriorityQueue.new()` — the same "`build_expr`'s generic
+    // `Expr::New` arm can't see the enclosing `Let`'s own declared
+    // element type" shape `Array.new`/`Stack.new()` immediately below
+    // already establish, just crossing the FFI boundary (plan 93's
+    // handle registry) instead of either of those two's own in-
+    // process allocation. Placed BEFORE the `Stack.new()`-style arm
+    // immediately below: that arm's own guard (`base == class_name`)
+    // would otherwise match these too, then fail on its own
+    // `ctx.classes.get(&mangled)` (never a real registered class
+    // layout — these three are handle-backed `i64`s, not `ClassInfo`
+    // layouts). Sema already guarantees 0 arguments and a real,
+    // supported element type reach here — this arm's own `Err`s are
+    // real internal-error fallbacks, never expected to fire on a
+    // sema-accepted program.
+    Stmt::Let {
+      name,
+      ty,
+      value: Spanned {
+        node: Expr::New(class_name, args),
+        ..
+      },
+      ..
+    } if class_name == "Set" || class_name == "Deque" || class_name == "PriorityQueue" => {
+      if !args.is_empty() {
+        return Err(format!(
+          "codegen: internal error — `{class_name}.new` expects 0 arguments, found {} (sema should have rejected this)",
+          args.len()
+        ));
+      }
+      let elem = match ty {
+        TypeExpr::Generic(base, targs) if base == class_name => {
+          targs.first().and_then(|t| t.as_named())
+        }
+        _ => None,
+      };
+      let new_fn = match (class_name.as_str(), elem) {
+        ("Set", Some("Int64")) => ctx.set_i64_new,
+        ("Set", Some("String")) => ctx.set_string_new,
+        ("Deque", Some("Int64")) => ctx.deque_i64_new,
+        ("Deque", Some("Float64")) => ctx.deque_f64_new,
+        ("Deque", Some("String")) => ctx.deque_string_new,
+        ("Deque", Some("Boolean")) => ctx.deque_bool_new,
+        ("PriorityQueue", Some("Int64")) => ctx.priority_queue_i64_new,
+        ("PriorityQueue", Some("String")) => ctx.priority_queue_string_new,
+        _ => {
+          return Err(format!(
+            "codegen: internal error — `{name}: {ty} = {class_name}.new()` has an unsupported element type (sema should have rejected this)"
+          ));
+        }
+      };
+      let call = builder
+        .build_call(new_fn, &[], "collectionnewtmp")
+        .map_err(|e| e.to_string())?;
+      let handle_val = call_result(call)?;
+      local_classes.insert(name.clone(), mangle_type_expr(ty));
+      let (dst, _) = *vars
+        .get(name)
+        .expect("pre-allocated by prealloc_lets for every reachable Let");
+      builder
+        .build_store(dst, handle_val)
+        .map_err(|e| e.to_string())?;
+      Ok(false)
+    }
     // Plan 58: `s: Stack[Int64] = Stack.new()`, the ordinary (not
     // stack-allocated — see the `object_allocas` arm just above for
     // that path) heap-allocating case. `build_expr`'s own generic
@@ -20403,6 +20759,285 @@ fn compile_to_object_impl(
     i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
     Some(Linkage::External),
   );
+
+  // Plan 193 (`Set[T]`/`Deque[T]`/`PriorityQueue[T]`) — every
+  // method's own ABI: `Int64`/`Boolean` cross as `i64` (narrowed to a
+  // real `i1` only at the call site, `Regex#is_match`'s own
+  // established convention), `Float64` as `f64`, `String` and
+  // `Set[T]#each`'s materialized `Array[T]` snapshot as `ptr_ty`
+  // (the crate's shared opaque-pointer-sized bucket for anything
+  // heap-allocated), `.close` as `void`.
+  let set_i64_new = module.add_function(
+    "emerald_rt_set_i64_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let set_i64_add = module.add_function(
+    "emerald_rt_set_i64_add",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_i64_contains = module.add_function(
+    "emerald_rt_set_i64_contains",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_i64_remove = module.add_function(
+    "emerald_rt_set_i64_remove",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_i64_count = module.add_function(
+    "emerald_rt_set_i64_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_i64_each = module.add_function(
+    "emerald_rt_set_i64_each",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_i64_close = module.add_function(
+    "emerald_rt_set_i64_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_string_new = module.add_function(
+    "emerald_rt_set_string_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let set_string_add = module.add_function(
+    "emerald_rt_set_string_add",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_string_contains = module.add_function(
+    "emerald_rt_set_string_contains",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_string_remove = module.add_function(
+    "emerald_rt_set_string_remove",
+    i64_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_string_count = module.add_function(
+    "emerald_rt_set_string_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_string_each = module.add_function(
+    "emerald_rt_set_string_each",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let set_string_close = module.add_function(
+    "emerald_rt_set_string_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_i64_new = module.add_function(
+    "emerald_rt_deque_i64_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let deque_i64_push_front = module.add_function(
+    "emerald_rt_deque_i64_push_front",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_i64_push_back = module.add_function(
+    "emerald_rt_deque_i64_push_back",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_i64_pop_front = module.add_function(
+    "emerald_rt_deque_i64_pop_front",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_i64_pop_back = module.add_function(
+    "emerald_rt_deque_i64_pop_back",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_i64_count = module.add_function(
+    "emerald_rt_deque_i64_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_i64_close = module.add_function(
+    "emerald_rt_deque_i64_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_f64_new = module.add_function(
+    "emerald_rt_deque_f64_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let deque_f64_push_front = module.add_function(
+    "emerald_rt_deque_f64_push_front",
+    void_ty.fn_type(&[i64_ty.into(), f64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_f64_push_back = module.add_function(
+    "emerald_rt_deque_f64_push_back",
+    void_ty.fn_type(&[i64_ty.into(), f64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_f64_pop_front = module.add_function(
+    "emerald_rt_deque_f64_pop_front",
+    f64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_f64_pop_back = module.add_function(
+    "emerald_rt_deque_f64_pop_back",
+    f64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_f64_count = module.add_function(
+    "emerald_rt_deque_f64_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_f64_close = module.add_function(
+    "emerald_rt_deque_f64_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_string_new = module.add_function(
+    "emerald_rt_deque_string_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let deque_string_push_front = module.add_function(
+    "emerald_rt_deque_string_push_front",
+    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_string_push_back = module.add_function(
+    "emerald_rt_deque_string_push_back",
+    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_string_pop_front = module.add_function(
+    "emerald_rt_deque_string_pop_front",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_string_pop_back = module.add_function(
+    "emerald_rt_deque_string_pop_back",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_string_count = module.add_function(
+    "emerald_rt_deque_string_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_string_close = module.add_function(
+    "emerald_rt_deque_string_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_bool_new = module.add_function(
+    "emerald_rt_deque_bool_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let deque_bool_push_front = module.add_function(
+    "emerald_rt_deque_bool_push_front",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_bool_push_back = module.add_function(
+    "emerald_rt_deque_bool_push_back",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_bool_pop_front = module.add_function(
+    "emerald_rt_deque_bool_pop_front",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_bool_pop_back = module.add_function(
+    "emerald_rt_deque_bool_pop_back",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_bool_count = module.add_function(
+    "emerald_rt_deque_bool_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let deque_bool_close = module.add_function(
+    "emerald_rt_deque_bool_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_i64_new = module.add_function(
+    "emerald_rt_priority_queue_i64_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_i64_push = module.add_function(
+    "emerald_rt_priority_queue_i64_push",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_i64_pop = module.add_function(
+    "emerald_rt_priority_queue_i64_pop",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_i64_peek = module.add_function(
+    "emerald_rt_priority_queue_i64_peek",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_i64_count = module.add_function(
+    "emerald_rt_priority_queue_i64_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_i64_close = module.add_function(
+    "emerald_rt_priority_queue_i64_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_string_new = module.add_function(
+    "emerald_rt_priority_queue_string_new",
+    i64_ty.fn_type(&[], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_string_push = module.add_function(
+    "emerald_rt_priority_queue_string_push",
+    void_ty.fn_type(&[i64_ty.into(), ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_string_pop = module.add_function(
+    "emerald_rt_priority_queue_string_pop",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_string_peek = module.add_function(
+    "emerald_rt_priority_queue_string_peek",
+    ptr_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_string_count = module.add_function(
+    "emerald_rt_priority_queue_string_count",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let priority_queue_string_close = module.add_function(
+    "emerald_rt_priority_queue_string_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+
   // Plan 146 (Environment Variables): `.get` returns a bare nullable
   // pointer (this call site itself builds the real `Option[String]`
   // value from it); `.set`/`.remove` return `Void`; `.keys` returns an
@@ -21953,6 +22588,60 @@ fn compile_to_object_impl(
     regex_replace_all,
     regex_split,
     regex_split_count,
+    set_i64_new,
+    set_i64_add,
+    set_i64_contains,
+    set_i64_remove,
+    set_i64_count,
+    set_i64_each,
+    set_i64_close,
+    set_string_new,
+    set_string_add,
+    set_string_contains,
+    set_string_remove,
+    set_string_count,
+    set_string_each,
+    set_string_close,
+    deque_i64_new,
+    deque_i64_push_front,
+    deque_i64_push_back,
+    deque_i64_pop_front,
+    deque_i64_pop_back,
+    deque_i64_count,
+    deque_i64_close,
+    deque_f64_new,
+    deque_f64_push_front,
+    deque_f64_push_back,
+    deque_f64_pop_front,
+    deque_f64_pop_back,
+    deque_f64_count,
+    deque_f64_close,
+    deque_string_new,
+    deque_string_push_front,
+    deque_string_push_back,
+    deque_string_pop_front,
+    deque_string_pop_back,
+    deque_string_count,
+    deque_string_close,
+    deque_bool_new,
+    deque_bool_push_front,
+    deque_bool_push_back,
+    deque_bool_pop_front,
+    deque_bool_pop_back,
+    deque_bool_count,
+    deque_bool_close,
+    priority_queue_i64_new,
+    priority_queue_i64_push,
+    priority_queue_i64_pop,
+    priority_queue_i64_peek,
+    priority_queue_i64_count,
+    priority_queue_i64_close,
+    priority_queue_string_new,
+    priority_queue_string_push,
+    priority_queue_string_pop,
+    priority_queue_string_peek,
+    priority_queue_string_count,
+    priority_queue_string_close,
     env_get,
     env_set,
     env_remove,

@@ -153,6 +153,9 @@ mod bytes;
 // same way `csvs`/`tomls`/`urls` already dodge their own external-
 // crate-name collisions.
 mod charset;
+// Plan 193 (`Set[T]`, `Deque[T]`, `PriorityQueue[T]`) — see this
+// module's own doc comment for the full account.
+mod collections;
 // Named `csvs`, not `csv` — this crate's own `mod csv` would shadow
 // the external `csv` crate this module wraps, the identical collision
 // `aead.rs`/`url.rs`/`toml.rs` already hit and disclosed.
@@ -767,6 +770,390 @@ pub unsafe extern "C" fn emerald_rt_regex_split(id: i64, s: *const c_char) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_regex_split_count(id: i64, s: *const c_char) -> i64 {
   catch_and_raise(move || regex::regex_split_count(id, s))
+}
+
+// Plan 193 (`Set[T]`, `Deque[T]`, `PriorityQueue[T]`) — 54 concrete
+// monomorphized exports, dispatched by `emerald-codegen`'s own
+// `local_classes`-tag-keyed `Set$<Elem>`/`Deque$<Elem>`/
+// `PriorityQueue$<Elem>` method-call arm — see `collections.rs`'s
+// own module doc for the full account.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_i64_new() -> i64 {
+  catch_and_raise(collections::set_i64_new)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_i64_add(id: i64, v: i64) -> i64 {
+  catch_and_raise(move || collections::set_i64_add(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_i64_contains(id: i64, v: i64) -> i64 {
+  catch_and_raise(move || collections::set_i64_contains(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_i64_remove(id: i64, v: i64) -> i64 {
+  catch_and_raise(move || collections::set_i64_remove(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_i64_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::set_i64_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_i64_each(id: i64) -> *mut c_void {
+  catch_and_raise(move || collections::set_i64_each(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_i64_close(id: i64) {
+  catch_and_raise(move || collections::set_i64_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_string_new() -> i64 {
+  catch_and_raise(collections::set_string_new)
+}
+
+/// # Safety
+/// `v`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_string_add(id: i64, v: *const c_char) -> i64 {
+  catch_and_raise(move || collections::set_string_add(id, v))
+}
+
+/// # Safety
+/// `v`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_string_contains(id: i64, v: *const c_char) -> i64 {
+  catch_and_raise(move || collections::set_string_contains(id, v))
+}
+
+/// # Safety
+/// `v`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_string_remove(id: i64, v: *const c_char) -> i64 {
+  catch_and_raise(move || collections::set_string_remove(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_string_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::set_string_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_string_each(id: i64) -> *mut c_void {
+  catch_and_raise(move || collections::set_string_each(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_set_string_close(id: i64) {
+  catch_and_raise(move || collections::set_string_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_i64_new() -> i64 {
+  catch_and_raise(collections::deque_i64_new)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_i64_push_front(id: i64, v: i64) {
+  catch_and_raise(move || collections::deque_i64_push_front(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_i64_push_back(id: i64, v: i64) {
+  catch_and_raise(move || collections::deque_i64_push_back(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_i64_pop_front(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_i64_pop_front(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_i64_pop_back(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_i64_pop_back(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_i64_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_i64_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_i64_close(id: i64) {
+  catch_and_raise(move || collections::deque_i64_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_f64_new() -> i64 {
+  catch_and_raise(collections::deque_f64_new)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_f64_push_front(id: i64, v: f64) {
+  catch_and_raise(move || collections::deque_f64_push_front(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_f64_push_back(id: i64, v: f64) {
+  catch_and_raise(move || collections::deque_f64_push_back(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_f64_pop_front(id: i64) -> f64 {
+  catch_and_raise(move || collections::deque_f64_pop_front(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_f64_pop_back(id: i64) -> f64 {
+  catch_and_raise(move || collections::deque_f64_pop_back(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_f64_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_f64_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_f64_close(id: i64) {
+  catch_and_raise(move || collections::deque_f64_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_string_new() -> i64 {
+  catch_and_raise(collections::deque_string_new)
+}
+
+/// # Safety
+/// `v`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_string_push_front(id: i64, v: *const c_char) {
+  catch_and_raise(move || collections::deque_string_push_front(id, v))
+}
+
+/// # Safety
+/// `v`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_string_push_back(id: i64, v: *const c_char) {
+  catch_and_raise(move || collections::deque_string_push_back(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_string_pop_front(id: i64) -> *const c_char {
+  catch_and_raise(move || collections::deque_string_pop_front(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_string_pop_back(id: i64) -> *const c_char {
+  catch_and_raise(move || collections::deque_string_pop_back(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_string_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_string_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_string_close(id: i64) {
+  catch_and_raise(move || collections::deque_string_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_bool_new() -> i64 {
+  catch_and_raise(collections::deque_bool_new)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_bool_push_front(id: i64, v: i64) {
+  catch_and_raise(move || collections::deque_bool_push_front(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_bool_push_back(id: i64, v: i64) {
+  catch_and_raise(move || collections::deque_bool_push_back(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_bool_pop_front(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_bool_pop_front(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_bool_pop_back(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_bool_pop_back(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_bool_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::deque_bool_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_deque_bool_close(id: i64) {
+  catch_and_raise(move || collections::deque_bool_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_i64_new() -> i64 {
+  catch_and_raise(collections::priority_queue_i64_new)
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_i64_push(id: i64, v: i64) {
+  catch_and_raise(move || collections::priority_queue_i64_push(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_i64_pop(id: i64) -> i64 {
+  catch_and_raise(move || collections::priority_queue_i64_pop(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_i64_peek(id: i64) -> i64 {
+  catch_and_raise(move || collections::priority_queue_i64_peek(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_i64_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::priority_queue_i64_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_i64_close(id: i64) {
+  catch_and_raise(move || collections::priority_queue_i64_close(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_string_new() -> i64 {
+  catch_and_raise(collections::priority_queue_string_new)
+}
+
+/// # Safety
+/// `v`, if non-null, must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_string_push(id: i64, v: *const c_char) {
+  catch_and_raise(move || collections::priority_queue_string_push(id, v))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_string_pop(id: i64) -> *const c_char {
+  catch_and_raise(move || collections::priority_queue_string_pop(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_string_peek(id: i64) -> *const c_char {
+  catch_and_raise(move || collections::priority_queue_string_peek(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_string_count(id: i64) -> i64 {
+  catch_and_raise(move || collections::priority_queue_string_count(id))
+}
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_priority_queue_string_close(id: i64) {
+  catch_and_raise(move || collections::priority_queue_string_close(id))
 }
 
 // Plan 124 (XML Parsing): `Xml.parse`/`.parse_file`/`.reader_from_
