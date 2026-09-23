@@ -1046,3 +1046,65 @@ fn cli_flag_parsing_em_prints_expected_sequence() {
     "help text should contain the suffix positional, got: {help:?}"
   );
 }
+
+// Plan 183 (Layered Configuration Loading): `ConfigBuilder`/
+// `ConfigValue`, wrapping the `config` crate — one compiled binary
+// (`examples/layered_config.em`), run from a fixed temporary
+// directory containing a real `app.toml` fixture, with a real
+// `APP__SERVER__PORT` environment variable set and a real `--port
+// 7070` argv, so this plan's own precedence order (CLI flag >
+// environment variable > config file) is demonstrated by genuine
+// layered inputs, not asserted in prose alone — the identical
+// standard `compile_and_run_with_args` already sets for plan 182's
+// own `cli_flag_parsing.em`, extended here with a real fixture file
+// and a real environment variable neither of that function's own
+// simpler siblings supports.
+#[test]
+fn layered_config_em_prints_expected_sequence() {
+  let source = workspace_root().join("examples").join("layered_config.em");
+  let output = std::env::temp_dir().join(format!(
+    "emerald_example_layered_config_em_{}",
+    std::process::id()
+  ));
+
+  let status = Command::new(env!("CARGO_BIN_EXE_emerald"))
+    .arg(&source)
+    .arg("-o")
+    .arg(&output)
+    .status()
+    .expect("failed to run emerald-cli");
+  assert!(
+    status.success(),
+    "emerald-cli should succeed on layered_config.em"
+  );
+
+  let fixture_dir = std::env::temp_dir().join(format!(
+    "emerald_example_layered_config_fixture_{}",
+    std::process::id()
+  ));
+  std::fs::create_dir_all(&fixture_dir).expect("failed to create fixture dir");
+  std::fs::write(
+    fixture_dir.join("app.toml"),
+    "[server]\nport = 8080\nhost = \"0.0.0.0\"\n",
+  )
+  .expect("failed to write app.toml fixture");
+
+  let run = Command::new(&output)
+    .args(["--port", "7070"])
+    .env("APP__SERVER__PORT", "9090")
+    .current_dir(&fixture_dir)
+    .output()
+    .expect("failed to run compiled binary");
+  assert!(
+    run.status.success(),
+    "layered_config.em's compiled binary should exit 0"
+  );
+
+  std::fs::remove_file(&output).ok();
+  std::fs::remove_dir_all(&fixture_dir).ok();
+
+  assert_eq!(
+    String::from_utf8_lossy(&run.stdout).into_owned(),
+    "7070\n0.0.0.0\n"
+  );
+}

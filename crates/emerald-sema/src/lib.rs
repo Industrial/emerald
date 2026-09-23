@@ -3923,6 +3923,27 @@ fn infer_expr_type(
         )?;
         return Ok(Type::Newtype("CliParser".to_string(), Box::new(Type::Int64)));
       }
+      // Plan 183's Decision log: `ConfigBuilder.new()` — the identical
+      // zero-argument carve-out `LogFields.new()` above already
+      // establishes, for the identical reason (`ConfigBuilder` is
+      // registered as a `NativeHandle`-style `Int64` newtype purely
+      // for its zero-cost representation, never constructed by
+      // wrapping a given underlying value).
+      if class_name == "ConfigBuilder" {
+        if !args.is_empty() {
+          return Err(Diagnostic::new(
+            format!(
+              "`ConfigBuilder.new` takes no arguments, found {}",
+              args.len()
+            ),
+            expr.span,
+          ));
+        }
+        return Ok(Type::Newtype(
+          "ConfigBuilder".to_string(),
+          Box::new(Type::Int64),
+        ));
+      }
       let info = classes
         .get(class_name)
         .ok_or_else(|| Diagnostic::new(format!("undefined class `{class_name}`"), expr.span))?;
@@ -6387,6 +6408,83 @@ fn infer_expr_type(
             other => {
               return Err(Diagnostic::new(
                 format!("CliParseResult has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 183's Decision log: `ConfigBuilder`'s own six instance
+        // methods — the identical carved-out-of-`.value`-only shape
+        // `CliParser` above establishes. `.add_cli_overrides` takes a
+        // real `CliParseResult` newtype value (plan 182's own output,
+        // never a second `ARGV` parse), an `Array[String]` of keys to
+        // read from it, and the array's own companion `Int64` count
+        // (`Array[T]`'s own no-length-prefix representation, the
+        // identical reason `CliParser#parse`'s own `argv`/`argc` pair
+        // is two parameters, not one).
+        if name == "ConfigBuilder" {
+          let cli_parse_result_ty =
+            Type::Newtype("CliParseResult".to_string(), Box::new(Type::Int64));
+          let (expected_params, ret) = match method.as_str() {
+            "add_defaults_file" => (vec![Type::String], Type::Void),
+            "add_config_file" => (vec![Type::String], Type::Void),
+            "add_env_prefix" => (vec![Type::String], Type::Void),
+            "add_cli_overrides" => (
+              vec![
+                cli_parse_result_ty,
+                Type::Array(Box::new(Type::String)),
+                Type::Int64,
+              ],
+              Type::Void,
+            ),
+            "build" => (
+              vec![],
+              Type::Newtype("ConfigValue".to_string(), Box::new(Type::Int64)),
+            ),
+            other => {
+              return Err(Diagnostic::new(
+                format!("ConfigBuilder has no method `{other}`"),
+                expr.span,
+              ));
+            }
+          };
+          check_args(
+            method,
+            args,
+            &expected_params,
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          return Ok(ret);
+        }
+        // Plan 183's Decision log: `ConfigValue`'s own three typed
+        // getters — the identical carved-out-of-`.value`-only shape
+        // `CliParser`/`ConfigBuilder` above establish. A missing key
+        // and a present-but-wrong-shape key both collapse to `None`
+        // (this plan's own Decision log) — never a second `Result[T,
+        // String]`-shaped error channel.
+        if name == "ConfigValue" {
+          let (expected_params, ret) = match method.as_str() {
+            "get_string" => (vec![Type::String], Type::Enum("Option$String".to_string())),
+            "get_int" => (vec![Type::String], Type::Enum("Option$Int64".to_string())),
+            "get_bool" => (vec![Type::String], Type::Enum("Option$Boolean".to_string())),
+            other => {
+              return Err(Diagnostic::new(
+                format!("ConfigValue has no method `{other}`"),
                 expr.span,
               ));
             }
@@ -14084,6 +14182,48 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
   );
   classes.insert(
     "CliParseResult".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  // Plan 183's Decision log: `ConfigBuilder`/`ConfigValue` — the
+  // identical "reserved name, zero-cost `Int64` handle" shape
+  // `CliParser`/`CliParseResult` immediately above already use, backed
+  // by plan 93's own `crate::handle` registry (a boxed `config::
+  // ConfigBuilder<DefaultState>` / this crate's own already-merged
+  // `config::Config` respectively). Two distinct `ClassInfo` entries —
+  // `ConfigBuilder` is built up by a sequence of `.add_defaults_file`/
+  // `.add_config_file`/`.add_env_prefix`/`.add_cli_overrides` calls
+  // and consumed by `.build`; `ConfigValue` is `.build`'s own output,
+  // never itself mutated. `ConfigBuilder.new()` is carved out of the
+  // ordinary single-argument newtype constructor in the `Expr::New`
+  // arm above (zero arguments, the identical `LogFields.new()` shape);
+  // every other method on either class is carved out of the ordinary
+  // newtype `.value`-only restriction.
+  classes.insert(
+    "ConfigBuilder".to_string(),
+    ClassInfo {
+      fields: HashMap::new(),
+      methods: HashMap::new(),
+      is_module: false,
+      superclass: None,
+      implements: None,
+      enum_variants: None,
+      is_actor: false,
+      generic_methods: HashMap::new(),
+      newtype_underlying: Some(Type::Int64),
+    },
+  );
+  classes.insert(
+    "ConfigValue".to_string(),
     ClassInfo {
       fields: HashMap::new(),
       methods: HashMap::new(),

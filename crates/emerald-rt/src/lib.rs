@@ -171,6 +171,14 @@ mod collections;
 // wrapping `clap`'s non-derive builder API — see `cli.rs`'s own
 // module doc.
 mod cli;
+// Plan 183 (Layered Configuration Loading) — `ConfigBuilder`/
+// `ConfigValue`, wrapping the `config` crate — see `config.rs`'s own
+// module doc. Named `configs`, not `config` — this crate's own `mod
+// config` would shadow the external `config` crate this module wraps,
+// the identical collision `csvs`/`tomls`/`urls` already hit and
+// disclosed.
+#[path = "config.rs"]
+mod configs;
 // Named `csvs`, not `csv` — this crate's own `mod csv` would shadow
 // the external `csv` crate this module wraps, the identical collision
 // `aead.rs`/`url.rs`/`toml.rs` already hit and disclosed.
@@ -927,6 +935,103 @@ pub unsafe extern "C" fn emerald_rt_cliparser_parse(
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_cliparser_close(id: i64) {
   catch_and_raise(move || cli::cliparser_close(id))
+}
+
+// Plan 183 (Layered Configuration Loading): `ConfigBuilder.new`/
+// `.add_defaults_file`/`.add_config_file`/`.add_env_prefix`/
+// `.add_cli_overrides`/`.build`, `ConfigValue#get_string`/`#get_int`/
+// `#get_bool`, dispatched by `emerald-codegen`'s own hardcoded
+// `ConfigBuilder`/`ConfigValue`-keyed method-call arms, the same shape
+// `CliParser`/`CliParseResult` immediately above use — see
+// `config.rs`'s own module doc.
+
+/// # Safety
+/// Always safe to call.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configbuilder_new() -> i64 {
+  catch_and_raise(move || configs::configbuilder_new())
+}
+
+/// # Safety
+/// `id` must be a live `ConfigBuilder` handle. `path`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configbuilder_add_defaults_file(id: i64, path: *const c_char) {
+  catch_and_raise(move || configs::configbuilder_add_defaults_file(id, path))
+}
+
+/// # Safety
+/// `id` must be a live `ConfigBuilder` handle. `path`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configbuilder_add_config_file(id: i64, path: *const c_char) {
+  catch_and_raise(move || configs::configbuilder_add_config_file(id, path))
+}
+
+/// # Safety
+/// `id` must be a live `ConfigBuilder` handle. `prefix`, if non-null,
+/// must point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configbuilder_add_env_prefix(id: i64, prefix: *const c_char) {
+  catch_and_raise(move || configs::configbuilder_add_env_prefix(id, prefix))
+}
+
+/// # Safety
+/// `id` must be a live `ConfigBuilder` handle. `result_id` must be a
+/// live `CliParseResult` handle. `keys` must point to a buffer of at
+/// least `count` valid, NUL-terminated C string pointers —
+/// `emerald-codegen`'s own call-site codegen guarantees this (see
+/// `config.rs`'s own module doc for the header-skipping convention
+/// that produces it); when `count` is `0`, `keys` is never
+/// dereferenced and may be null.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configbuilder_add_cli_overrides(
+  id: i64,
+  result_id: i64,
+  keys: *const *const c_char,
+  count: i64,
+) {
+  catch_and_raise(move || configs::configbuilder_add_cli_overrides(id, result_id, keys, count))
+}
+
+/// # Safety
+/// `id` must be a live `ConfigBuilder` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configbuilder_build(id: i64) -> i64 {
+  catch_and_raise(move || configs::configbuilder_build(id))
+}
+
+/// # Safety
+/// `id` must be a live `ConfigValue` handle. `key`, if non-null, must
+/// point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configvalue_get_string(
+  id: i64,
+  key: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || configs::configvalue_get_string(id, key))
+}
+
+/// # Safety
+/// `id` must be a live `ConfigValue` handle. `key`, if non-null, must
+/// point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configvalue_get_int(
+  id: i64,
+  key: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || configs::configvalue_get_int(id, key))
+}
+
+/// # Safety
+/// `id` must be a live `ConfigValue` handle. `key`, if non-null, must
+/// point to a valid, NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_configvalue_get_bool(
+  id: i64,
+  key: *const c_char,
+) -> *mut c_void {
+  catch_and_raise(move || configs::configvalue_get_bool(id, key))
 }
 
 /// # Safety
