@@ -72,3 +72,13 @@ yarn-debug.log*
 yarn-error.log*
 editors/vscode/dist/
 editors/vscode/*.vsix
+
+# Temporary local test artifacts
+/.tmpdir_test/
+crates/emerald-cli/demo.tar
+crates/emerald-cli/demo.zip
+crates/emerald-cli/tar_demo_*.txt
+crates/emerald-cli/tar_demo_out/
+crates/emerald-cli/zip_demo_*.txt
+crates/emerald-cli/zip_demo_out/
+crates/emerald-rt/target/
