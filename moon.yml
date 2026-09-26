@@ -45,7 +45,12 @@ tasks:
   audit:
     description: 'Run cargo audit for known Rust security advisories'
     command: 'cargo'
-    args: ['audit']
+    # --ignore RUSTSEC-2023-0071: deliberate, scoped exception, not a
+    # blanket suppression habit — see AGENTS.md's "Build / test /
+    # verify" section for the full justification (plan 111's rsa
+    # dependency, no patched version exists). A future advisory added
+    # here must carry the same kind of documented justification.
+    args: ['audit', '--ignore', 'RUSTSEC-2023-0071']
     inputs:
       - 'Cargo.toml'
       - 'Cargo.lock'
