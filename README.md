@@ -9,18 +9,18 @@ class Point
   x: Float64
   y: Float64
 
-  def initialize(x: Float64, y: Float64) -> Void
+  fn initialize(x: Float64, y: Float64): Void do
     @x = x
     @y = y
   end
 
-  def distance_from_origin -> Float64
+  fn distance_from_origin: Float64 do
     Math.sqrt(@x * @x + @y * @y)
   end
 end
 
-p = Point.new(3.0, 4.0)
-puts p.distance_from_origin  # 5.0
+p: Point = Point.new(3.0, 4.0)
+puts p.distance_from_origin  # 5
 ```
 
 Emerald keeps Ruby's classes, blocks, symbols, string interpolation, exceptions, and modules — and cuts everything that would stop the compiler from knowing every type at compile time: no `eval`, no `method_missing`, no monkey-patching, no open classes, no duck typing. On top of that static core it adds algebraic data types, a `Result[T,E]` error channel, and an Erlang/Pony-inspired actor model — isolated per-actor heaps, supervision trees, and location-transparent distributed actors over real TCP with automatic consistent-hash cluster placement. See [`spec/SPEC.md`](spec/SPEC.md) for the full shape and what's deliberately *not* here.
