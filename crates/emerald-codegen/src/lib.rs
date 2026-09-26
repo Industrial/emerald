@@ -4507,6 +4507,15 @@ fn declare_wire_class_codecs<'ctx>(
       wire_safe.push(name.clone());
     }
   }
+  // `classes` is a HashMap, so `.keys()` iteration order is randomized
+  // per-process — left unsorted, two compiles of the identical source
+  // would declare (and therefore lay out in the object file) these
+  // classes' `_encode`/`_decode` functions in a different order each
+  // time, breaking byte-for-byte reproducibility (caught by
+  // `emerald-driver`'s cache::tests::corrupting_the_cached_object_file_
+  // forces_a_real_recompile_not_an_error, which recompiles the same
+  // source twice in one process and asserts identical bytes).
+  wire_safe.sort();
 
   let encode_ty = void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
   let decode_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
