@@ -125,12 +125,38 @@ function fail(message) {
 // of "match", with "do" now also mandatory after if/unless/while/
 // until/elsif's own condition and every match arm's own pattern —
 // both join this ground-truth list as new reserved terminals.
+//
+// Coverage audit (this pass): parity restored with every literal
+// keyword terminal grammar.lalrpop reserves that ALSO has a real,
+// keyword-scoped occurrence somewhere in examples/*.em. Seven
+// grammar-confirmed reserved words are deliberately still absent from
+// this list despite being real terminals — "comptime", "ensures",
+// "supervise", "requires", "locate", "pure", and bare "assert" —
+// because a direct grep of every examples/*.em file turns up zero real
+// (non-comment, non-substring) uses of any of them anywhere in the
+// current corpus: the "requires"/".locate" hits that do exist are the
+// English word inside a doc comment (e.g. derive_serializable.em's own
+// ".locate" mention), "pure" only ever appears inside the compound
+// English word "pure-arithmetic" in a comment, and every "assert"
+// substring in the corpus is actually "assert_eq" (a distinct
+// terminal, itself real and kept below — "\bassert\b" doesn't match
+// inside it). Forcing an unexercised keyword into this ground-truth
+// list would make this very check unsatisfiable against a corpus that
+// has no way to satisfy it. All seven are still given a real keyword
+// scope in emerald.tmLanguage.json's own repository.keywords (that's a
+// correctness question, not a coverage one). "nil" is removed outright
+// (plan 73's Decision log: fully replaced by Option[T]/Some/None, dead
+// syntax, comments-only).
 const KEYWORDS = [
   "class", "module", "fn", "end", "if", "else", "elsif", "unless",
   "while", "until", "for", "in", "return", "break", "next", "puts",
   "raise", "yield", "begin", "rescue", "ensure", "retry", "match",
   "do", "require", "interface", "implements", "read", "new",
-  "Array", "Hash", "Proc", "true", "false", "nil",
+  "Array", "Hash", "Proc", "true", "false",
+  "var", "newtype", "derive", "static", "unsafe", "extern",
+  "export", "import", "test", "property", "benchmark", "enum",
+  "spawn", "remote", "own", "borrow", "assert_eq",
+  "Option", "Some", "None", "Ok", "Err", "Pair", "Result",
 ];
 
 const examplesDir = join(here, "..", "..", "examples");
@@ -153,7 +179,7 @@ for (const file of files) {
         t.name === "keyword.control.emerald" ||
         t.name === "keyword.other.emerald" ||
         t.name === "constant.language.emerald" ||
-        (t.name === "support.type.emerald" && ["Array", "Hash", "Proc"].includes(t.text))
+        (t.name === "support.type.emerald" && ["Array", "Hash", "Proc", "Pair", "Result", "Option"].includes(t.text))
       ) {
         seenKeywords.add(t.text);
       }

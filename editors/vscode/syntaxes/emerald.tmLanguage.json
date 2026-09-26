@@ -61,26 +61,27 @@
 			"match": "@[A-Za-z_][A-Za-z0-9_]*"
 		},
 		"keywords": {
-			"comment": "Plan 71: 'def' -> 'fn'; 'case'/'when' are deleted outright in favor of 'match', with every arm (including the '_' wildcard default) now closed by its own 'do' ... 'end' — 'do' also becomes mandatory after if/unless/while/until/elsif's own condition, and introduces the bare do|params| ... end lambda literal (plan 10's arrow-lambda is gone).",
+			"comment": "Plan 71: 'def' -> 'fn'; 'case'/'when' are deleted outright in favor of 'match', with every arm (including the '_' wildcard default) now closed by its own 'do' ... 'end' — 'do' also becomes mandatory after if/unless/while/until/elsif's own condition, and introduces the bare do|params| ... end lambda literal (plan 10's arrow-lambda is gone). Coverage audit (this pass): this block had stopped at plan 71's own keyword set; restored parity with every literal keyword terminal grammar.lalrpop actually reserves since — 'var' (plan 72), 'newtype' (81), 'derive'/'comptime' (61), 'requires'/'ensures' (62), 'spawn' (54), 'remote' (60), 'locate' (65), 'supervise' (57), 'unsafe'/'extern' (59), 'own'/'borrow' (83), 'static' (196), 'export'/'import' (76), 'test'/'property'/'benchmark' (47/80), and the 'Ok'/'Err'/'Some'/'None' constructor keywords plans 53/73's Result/Option destructuring relies on — see grammar.lalrpop's own per-production comments for each citation.",
 			"patterns": [
 				{
 					"name": "keyword.control.emerald",
-					"match": "\\b(if|else|elsif|unless|while|until|for|in|return|break|next|begin|rescue|ensure|retry|match|do|yield)\\b"
+					"match": "\\b(if|else|elsif|unless|while|until|for|in|return|break|next|begin|rescue|ensure|retry|match|do|yield|_)\\b"
 				},
 				{
 					"name": "keyword.other.emerald",
-					"match": "\\b(class|module|fn|end|interface|implements|require|read|new|puts|raise)\\b"
+					"match": "\\b(class|module|fn|end|interface|implements|require|read|new|puts|raise|var|static|pure|comptime|newtype|derive|unsafe|extern|export|import|test|property|benchmark|enum|spawn|remote|locate|supervise|own|borrow|assert|assert_eq|Some|None|Ok|Err)\\b"
 				}
 			]
 		},
 		"constants": {
+			"comment": "Plan 73's Decision log: 'nil' was fully replaced by 'Option[T]'/'Some'/'None' and no longer appears as real keyword usage anywhere — dropped from this ground-truth list (dead syntax, comments-only).",
 			"name": "constant.language.emerald",
-			"match": "\\b(true|false|nil)\\b"
+			"match": "\\b(true|false)\\b"
 		},
 		"types": {
-			"comment": "Array/Hash/Proc are real grammar.lalrpop terminals (TypeName); the rest are plain Ident tokens sema resolves as builtin type names, not grammar keywords — still given a distinct scope here since a TextMate grammar has no sema of its own to defer to.",
+			"comment": "Array/Hash/Pair/Result/Proc are real grammar.lalrpop terminals (TypeName); Option (plan 73) and the rest are plain Ident tokens sema resolves as builtin type names, not grammar keywords — still given a distinct scope here since a TextMate grammar has no sema of its own to defer to.",
 			"name": "support.type.emerald",
-			"match": "\\b(Array|Hash|Proc|Int64|Float64|Bool|Boolean|String|Nil|Symbol|Void)\\b"
+			"match": "\\b(Array|Hash|Pair|Result|Proc|Option|Int64|Float64|Bool|Boolean|String|Nil|Symbol|Void)\\b"
 		},
 		"numbers": {
 			"patterns": [

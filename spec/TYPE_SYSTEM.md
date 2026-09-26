@@ -1,6 +1,10 @@
 # Emerald — TYPE_SYSTEM.md
 
-**Status:** v1 type universe
+**Status:** v1 type universe, with §1's "kinds of types" table amended
+(this pass) to place `actor` instances and `interface`'s own no-
+runtime-representation status precisely, alongside the pre-existing
+`class`/`struct`/value-type kinds — not a re-derivation of the rest of
+this document, which is left as first written except where noted.
 **Governing question (inception §9, §2.2):** what is the smallest
 modification to Ruby's object model that gives static types without
 importing another language's type system wholesale?
@@ -14,8 +18,17 @@ Emerald v1 has three kinds of types:
 | Kind | Examples | Representation |
 |---|---|---|
 | Value types | `Boolean`, `Int8`..`Int64`, `UInt8`..`UInt64`, `Float32`, `Float64`, `Symbol` | Unboxed; no allocation, no identity, compared by value. |
-| Reference types | `String`, `Array[T]`, `Hash[K, V]`, `Range[T]`, `class` instances | Heap-allocated, compared by reference unless the type defines `==`. |
+| Reference types | `String`, `Array[T]`, `Hash[K, V]`, `Range[T]`, `class` instances, `actor` instances | Heap/region-allocated, compared by reference unless the type defines `==`. An `actor` instance additionally owns its own isolated region (plan 54, `RUNTIME.md` §2) — a representation detail on top of, not instead of, ordinary reference-type layout. |
 | `struct` types | user-defined `struct Foo` | Value semantics (copied, unboxed when small) — see §5. |
+
+An `interface` (`GRAMMAR.md` §17) is not a fourth kind of type in this
+table — it has no runtime representation of its own at all (no vtable, no
+boxing). It is a purely compile-time, nominal constraint checked against
+whichever concrete `class` implements it; every interface-typed call site
+is resolved and compiled against that concrete implementing type, per
+generic instantiation, exactly like any other generic bound (§1's own
+"no ownership/borrow system" mirrors the same "no dynamic dispatch
+machinery" stance this project holds throughout).
 
 This mirrors inception §12: no ownership/borrow system, a conventional
 managed runtime for reference types, unboxed primitive/value operations.

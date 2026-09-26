@@ -1,6 +1,8 @@
 # Emerald — SEMANTICS.md
 
-**Status:** v1 semantic decisions
+**Status:** v1 semantic decisions, with one small §3 addition (this pass)
+for `static` methods' no-receiver dispatch rule — everything else below is
+left as first written except where noted.
 **Purpose:** answer every question inception §19 lists, one section per
 question group, as numbered decisions — not restated questions. Where
 [`TYPE_SYSTEM.md`](./TYPE_SYSTEM.md) already locked part of an answer (Nil,
@@ -80,6 +82,14 @@ summarized here for completeness against inception §19's question list:
    type-annotation requirement as positional parameters.
 4. **Default arguments are retained**, per `GRAMMAR.md` §6 — the default
    expression's type must match the parameter's declared type.
+5. **A `static fn` method has no receiver at all — not merely a
+   differently-typed one** (plan 196, `GRAMMAR.md` §21). This is checked
+   the same way a top-level function's own lack of `self` already is:
+   `@field`/bare `self` inside a `static fn` body is a compile error, not
+   silently treated as referring to whatever instance called it (there is
+   no such instance). Dispatch at `ClassName.static_method(args)` is a
+   direct, compile-time-resolved call — no vtable, matching this
+   document's own no-dynamic-dispatch stance everywhere else.
 
 ---
 
