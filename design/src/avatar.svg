@@ -1,0 +1,15 @@
+<svg viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="200" height="200" fill="#0D1117"/>
+  <g transform="translate(20,0)">
+    <path d="M36,20 L124,20 L140,36 L140,164 L124,180 L36,180 L20,164 L20,36 Z" fill="#50C878" stroke="#2F6B4F" stroke-width="4" stroke-linejoin="round"/>
+    <path d="M48,42 L112,42 L123,54 L123,146 L112,158 L48,158 L37,146 L37,54 Z" fill="none" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="36" y1="20" x2="48" y2="42" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="124" y1="20" x2="112" y2="42" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="140" y1="36" x2="123" y2="54" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="140" y1="164" x2="123" y2="146" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="124" y1="180" x2="112" y2="158" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="36" y1="180" x2="48" y2="158" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="20" y1="164" x2="37" y2="146" stroke="#2F6B4F" stroke-width="3"/>
+    <line x1="20" y1="36" x2="37" y2="54" stroke="#2F6B4F" stroke-width="3"/>
+  </g>
+</svg>

@@ -1,5 +1,7 @@
 # Emerald
 
+<img src="design/src/banner.svg" alt="Emerald" width="640">
+
 A statically-typed, ahead-of-time compiled language derived from Ruby's syntax and object model — native code (via LLVM) or WebAssembly, no interpreter, no bytecode VM, no dynamic runtime.
 
 ```ruby

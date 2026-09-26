@@ -1,0 +1,29 @@
+[package]
+name = "emerald-design-tools"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Deliberately standalone: this package renders the Emerald project's
+# visual-identity SVGs to platform-specific rasters and is not part of
+# the compiler workspace rooted at /data/Code/emerald/Cargo.toml (see
+# AGENTS.md — that workspace is scoped to crates/, the compiler
+# pipeline). The empty [workspace] table below pins this manifest as
+# its own workspace root so `cargo` does not try to fold it into (or
+# search for) the parent workspace, and it keeps its own Cargo.lock.
+[workspace]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+ico = "0.5.0"
+# Only need PNG header/dimension probing (verify) — full decoder support
+# for other formats isn't needed, so trim default-features.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+resvg = "0.48.1"
+tiny-skia = "0.12.0"
+usvg = "0.48.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
