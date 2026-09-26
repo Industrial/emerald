@@ -5685,7 +5685,7 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
-      return Ok(Type::Void);
+      Ok(Type::Void)
     }
     // Plan 132's Decision log: `TarReader.open(archive_path: String):
     // TarReader` — the same reserved-namespace static-call shape
@@ -5741,7 +5741,7 @@ fn infer_expr_type(
         self_fields,
         gctx,
       )?;
-      return Ok(Type::Void);
+      Ok(Type::Void)
     }
     // Plan 133's Decision log: `ZipReader.open(archive_path: String):
     // ZipReader` -- the same reserved-namespace static-call shape

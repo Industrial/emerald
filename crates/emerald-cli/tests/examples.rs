@@ -1279,10 +1279,7 @@ fn property_shrink_proof_em_shrinks_a_real_failure_to_a_minimal_counterexample()
     .split(prefix)
     .nth(1)
     .unwrap_or_else(|| panic!("missing the shrunk-to-minimal FAIL line; full stdout:\n{stdout}"));
-  let b_str = after_prefix
-    .split(|c: char| c == ',' || c == ':')
-    .next()
-    .unwrap_or("");
+  let b_str = after_prefix.split([',', ':']).next().unwrap_or("");
   let b: i64 = b_str
     .parse()
     .unwrap_or_else(|e| panic!("FAIL line's own `b=` value `{b_str}` didn't parse as i64: {e}"));

@@ -2790,7 +2790,7 @@ pub unsafe extern "C" fn emerald_rt_progressbar_new(total: i64) -> i64 {
 /// Always safe to call.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_progressbar_new_spinner() -> i64 {
-  catch_and_raise(move || progress::progressbar_new_spinner())
+  catch_and_raise(progress::progressbar_new_spinner)
 }
 
 /// # Safety
@@ -2830,7 +2830,7 @@ pub unsafe extern "C" fn emerald_rt_console_styled(
 /// Always safe to call.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_console_is_terminal() -> i64 {
-  catch_and_raise(move || progress::console_is_terminal())
+  catch_and_raise(progress::console_is_terminal)
 }
 
 // Plan 112 (Password Hashing): `Password.hash`/`.verify` — see
@@ -3149,7 +3149,7 @@ pub unsafe extern "C" fn emerald_rt_http2_client_get(url: *const c_char) -> *con
 /// Always safe to call.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_http2_client_last_status() -> i64 {
-  catch_and_raise(move || http2_client::http2_client_last_status())
+  catch_and_raise(http2_client::http2_client_last_status)
 }
 
 /// # Safety
@@ -3631,36 +3631,54 @@ pub unsafe extern "C" fn emerald_rt_string_sentence_split_count(s: *const c_char
 // hash` already establish.
 
 /// `Gzip.compress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_gzip_compress(data_id: i64) -> i64 {
   catch_and_raise(move || gzip::gzip_compress(data_id))
 }
 
 /// `Gzip.decompress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_gzip_decompress(data_id: i64) -> i64 {
   catch_and_raise(move || gzip::gzip_decompress(data_id))
 }
 
 /// `Deflate.compress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_deflate_compress(data_id: i64) -> i64 {
   catch_and_raise(move || gzip::deflate_compress(data_id))
 }
 
 /// `Deflate.decompress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_deflate_decompress(data_id: i64) -> i64 {
   catch_and_raise(move || gzip::deflate_decompress(data_id))
 }
 
 /// `Zlib.compress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_compress(data_id: i64) -> i64 {
   catch_and_raise(move || gzip::zlib_compress(data_id))
 }
 
 /// `Zlib.decompress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_decompress(data_id: i64) -> i64 {
   catch_and_raise(move || gzip::zlib_decompress(data_id))
@@ -3677,12 +3695,19 @@ pub unsafe extern "C" fn emerald_rt_gzip_writer_open(path: *const c_char) -> i64
 }
 
 /// `GzipWriter#write_chunk(self, data: Bytes): Void`.
+///
+/// # Safety
+/// `id` must be a live `GzipWriter` handle; `data_id` must be a live
+/// `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_gzip_writer_write_chunk(id: i64, data_id: i64) {
   catch_and_raise(move || gzip::gzip_writer_write_chunk(id, data_id))
 }
 
 /// `GzipWriter#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `GzipWriter` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_gzip_writer_close(id: i64) {
   catch_and_raise(move || gzip::gzip_writer_close(id))
@@ -3699,12 +3724,18 @@ pub unsafe extern "C" fn emerald_rt_gzip_reader_open(path: *const c_char) -> i64
 }
 
 /// `GzipReader#read_chunk(self, max_len: Int64): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `GzipReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_gzip_reader_read_chunk(id: i64, max_len: i64) -> i64 {
   catch_and_raise(move || gzip::gzip_reader_read_chunk(id, max_len))
 }
 
 /// `GzipReader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `GzipReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_gzip_reader_close(id: i64) {
   catch_and_raise(move || gzip::gzip_reader_close(id))
@@ -3721,12 +3752,19 @@ pub unsafe extern "C" fn emerald_rt_deflate_writer_open(path: *const c_char) -> 
 }
 
 /// `DeflateWriter#write_chunk(self, data: Bytes): Void`.
+///
+/// # Safety
+/// `id` must be a live `DeflateWriter` handle; `data_id` must be a
+/// live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_deflate_writer_write_chunk(id: i64, data_id: i64) {
   catch_and_raise(move || gzip::deflate_writer_write_chunk(id, data_id))
 }
 
 /// `DeflateWriter#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `DeflateWriter` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_deflate_writer_close(id: i64) {
   catch_and_raise(move || gzip::deflate_writer_close(id))
@@ -3743,12 +3781,18 @@ pub unsafe extern "C" fn emerald_rt_deflate_reader_open(path: *const c_char) -> 
 }
 
 /// `DeflateReader#read_chunk(self, max_len: Int64): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `DeflateReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_deflate_reader_read_chunk(id: i64, max_len: i64) -> i64 {
   catch_and_raise(move || gzip::deflate_reader_read_chunk(id, max_len))
 }
 
 /// `DeflateReader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `DeflateReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_deflate_reader_close(id: i64) {
   catch_and_raise(move || gzip::deflate_reader_close(id))
@@ -3765,12 +3809,19 @@ pub unsafe extern "C" fn emerald_rt_zlib_writer_open(path: *const c_char) -> i64
 }
 
 /// `ZlibWriter#write_chunk(self, data: Bytes): Void`.
+///
+/// # Safety
+/// `id` must be a live `ZlibWriter` handle; `data_id` must be a live
+/// `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_writer_write_chunk(id: i64, data_id: i64) {
   catch_and_raise(move || gzip::zlib_writer_write_chunk(id, data_id))
 }
 
 /// `ZlibWriter#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `ZlibWriter` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_writer_close(id: i64) {
   catch_and_raise(move || gzip::zlib_writer_close(id))
@@ -3787,12 +3838,18 @@ pub unsafe extern "C" fn emerald_rt_zlib_reader_open(path: *const c_char) -> i64
 }
 
 /// `ZlibReader#read_chunk(self, max_len: Int64): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `ZlibReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_reader_read_chunk(id: i64, max_len: i64) -> i64 {
   catch_and_raise(move || gzip::zlib_reader_read_chunk(id, max_len))
 }
 
 /// `ZlibReader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `ZlibReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zlib_reader_close(id: i64) {
   catch_and_raise(move || gzip::zlib_reader_close(id))
@@ -3805,12 +3862,18 @@ pub unsafe extern "C" fn emerald_rt_zlib_reader_close(id: i64) {
 // immediately above.
 
 /// `Zstd.compress(data: Bytes, level: Int64): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zstd_compress(data_id: i64, level: i64) -> i64 {
   catch_and_raise(move || zstds::zstd_compress(data_id, level))
 }
 
 /// `Zstd.decompress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zstd_decompress(data_id: i64) -> i64 {
   catch_and_raise(move || zstds::zstd_decompress(data_id))
@@ -3827,12 +3890,19 @@ pub unsafe extern "C" fn emerald_rt_zstd_writer_open(path: *const c_char, level:
 }
 
 /// `ZstdWriter#write_chunk(self, data: Bytes): Void`.
+///
+/// # Safety
+/// `id` must be a live `ZstdWriter` handle; `data_id` must be a live
+/// `Bytes` value.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zstd_writer_write_chunk(id: i64, data_id: i64) {
   catch_and_raise(move || zstds::zstd_writer_write_chunk(id, data_id))
 }
 
 /// `ZstdWriter#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `ZstdWriter` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zstd_writer_close(id: i64) {
   catch_and_raise(move || zstds::zstd_writer_close(id))
@@ -3849,12 +3919,18 @@ pub unsafe extern "C" fn emerald_rt_zstd_reader_open(path: *const c_char) -> i64
 }
 
 /// `ZstdReader#read_chunk(self, max_len: Int64): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `ZstdReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zstd_reader_read_chunk(id: i64, max_len: i64) -> i64 {
   catch_and_raise(move || zstds::zstd_reader_read_chunk(id, max_len))
 }
 
 /// `ZstdReader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `ZstdReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zstd_reader_close(id: i64) {
   catch_and_raise(move || zstds::zstd_reader_close(id))
@@ -3903,24 +3979,36 @@ pub unsafe extern "C" fn emerald_rt_tar_reader_open(archive_path: *const c_char)
 }
 
 /// `TarReader#next_entry(self): Option[String]`.
+///
+/// # Safety
+/// `id` must be a live `TarReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_tar_reader_next_entry(id: i64) -> *mut c_void {
   catch_and_raise(move || tar::tar_reader_next_entry(id))
 }
 
 /// `TarReader#entry_size(self): Int64`.
+///
+/// # Safety
+/// `id` must be a live `TarReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_tar_reader_entry_size(id: i64) -> i64 {
   catch_and_raise(move || tar::tar_reader_entry_size(id))
 }
 
 /// `TarReader#read_entry_data(self): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `TarReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_tar_reader_read_entry_data(id: i64) -> i64 {
   catch_and_raise(move || tar::tar_reader_read_entry_data(id))
 }
 
 /// `TarReader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `TarReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_tar_reader_close(id: i64) {
   catch_and_raise(move || tar::tar_reader_close(id))
@@ -4005,6 +4093,9 @@ pub unsafe extern "C" fn emerald_rt_zip_reader_read_entry_data(id: i64, index: i
 }
 
 /// `ZipReader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `ZipReader` handle.
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zip_reader_close(id: i64) {
   catch_and_raise(move || zip::zip_reader_close(id))

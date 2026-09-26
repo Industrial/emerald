@@ -148,10 +148,7 @@ fn writer_open(path: &str, level: i32) -> io::Result<zstd::stream::Encoder<'stat
 fn writer_write_all(state: &mut WriterState, data: &[u8]) -> io::Result<()> {
   match state.inner.as_mut() {
     Some(w) => w.write_all(data),
-    None => Err(io::Error::new(
-      io::ErrorKind::Other,
-      "write_chunk on a closed writer",
-    )),
+    None => Err(io::Error::other("write_chunk on a closed writer")),
   }
 }
 
