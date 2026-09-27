@@ -568,6 +568,29 @@ zstd = { version = "0.14", default-features = false }
 # file/in-memory buffer); no Emerald-level `FrameInfo` configuration
 # surface is exposed in v1. See DEPENDENCIES.md.
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
+# Plan 135 (Brotli Compression): `brotli` 9.0 (`dropbox/rust-brotli`) —
+# verified this session against its own README to be, in the
+# maintainer's own stated project requirement, "Direct no-stdlib port
+# of the C brotli compressor to Rust... no dependency on the Rust
+# stdlib," i.e. a genuine line-by-line transliteration of Google's
+# reference C implementation into Rust, not a `bindgen`/FFI wrapper
+# around a compiled `libbrotli` the way plan 131's own `zstd` binds
+# `libzstd` — a real, load-bearing pure-Rust distinction this plan
+# checks rather than assumes, matching this batch's own crate-vetting
+# convention (plan 95). `default-features = false, features = ["std"]`
+# declines this crate's own optional `ffi`/`ffi-api` features (a
+# C-ABI-compatible `libbrotli.so` drop-in surface for *non-Rust*
+# callers — irrelevant to this crate's own Rust-to-Rust calls) and its
+# `simd`/`seccomp` features (nightly-toolchain-dependent per the
+# crate's own changelog, and this project's toolchain is pinned to
+# stable), while `std` keeps the crate's own real default stream/
+# allocator conveniences (`BrotliCompress`/`BrotliDecompress`,
+# `CompressorWriter`, `Decompressor`) this module's one-shot and
+# streaming APIs both use, over its real, irrelevant-here `no_std`
+# capability. No RustSec advisory found. `Brotli.compress`/
+# `.decompress`, `BrotliWriter`/`BrotliReader`'s direct backing. See
+# DEPENDENCIES.md.
+brotli = { version = "9.0", default-features = false, features = ["std"] }
 # Plan 132 (Tar Archives): `tar` 0.4.46 (real, current pin at this
 # plan's own authoring time, verified against its own `README.md`/
 # `Cargo.toml` on `alexcrichton/tar-rs`'s `main` branch) - the de facto

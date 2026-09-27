@@ -936,6 +936,18 @@ fn lz4_roundtrip_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("lz4_roundtrip.em"), "true\ntrue\ntrue\n");
 }
 
+// Plan 135 (Brotli Compression): `Brotli.compress`/`.decompress` round-
+// tripping a real, repetitive input at both a fast (1) and the
+// slowest/best (11) real brotli quality level — see `examples/brotli_
+// roundtrip.em`'s own header comment for the real, disclosed
+// adaptations from the plan's own literal Concrete Proof text, reused
+// verbatim from plan 130's own `gzip_roundtrip.em`/plan 131's own
+// `zstd_roundtrip.em`/plan 134's own `lz4_roundtrip.em`.
+#[test]
+fn brotli_roundtrip_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("brotli_roundtrip.em"), "true\ntrue\ntrue\n");
+}
+
 // Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.entries_
 // count`/`.walk`/`.walk_count` (non-recursive `std::fs::read_dir` +
 // recursive, symlink-cycle-safe `walkdir` traversal) and `Path.exists`/

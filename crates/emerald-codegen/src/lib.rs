@@ -247,6 +247,10 @@ fn set_newtype_underlying(program: &Program) {
     // shape.
     "Lz4Writer",
     "Lz4Reader",
+    // Plan 135's Decision log: `BrotliWriter`/`BrotliReader` -- the
+    // identical shape.
+    "BrotliWriter",
+    "BrotliReader",
     // Plan 132's Decision log: `TarReader` -- the identical shape.
     "TarReader",
     // Plan 133's Decision log: `ZipReader` -- the identical shape.
@@ -5568,6 +5572,16 @@ struct Ctx<'a, 'ctx> {
   lz4_reader_open: FunctionValue<'ctx>,
   lz4_reader_read_chunk: FunctionValue<'ctx>,
   lz4_reader_close: FunctionValue<'ctx>,
+  // Plan 135 (Brotli Compression) -- `Brotli.compress`/`.decompress`,
+  // `BrotliWriter`/`BrotliReader`, wrapping `brotli`.
+  brotli_compress: FunctionValue<'ctx>,
+  brotli_decompress: FunctionValue<'ctx>,
+  brotli_writer_open: FunctionValue<'ctx>,
+  brotli_writer_write_chunk: FunctionValue<'ctx>,
+  brotli_writer_close: FunctionValue<'ctx>,
+  brotli_reader_open: FunctionValue<'ctx>,
+  brotli_reader_read_chunk: FunctionValue<'ctx>,
+  brotli_reader_close: FunctionValue<'ctx>,
   /// Plan 132 (Tar Archives) — `Tar.create`/`.extract`, `TarReader.
   /// open`/`.next_entry`/`.entry_size`/`.read_entry_data`/`.close`,
   /// wrapping `tar`.
@@ -9536,7 +9550,9 @@ fn build_method_call<'ctx>(
     // out shape `TlsStream` above establishes.
     if matches!(
       local_classes.get(recv_name).map(String::as_str),
-      Some("GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter" | "Lz4Writer")
+      Some(
+        "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter" | "Lz4Writer" | "BrotliWriter"
+      )
     ) {
       let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
       let (recv_val, _) = build_expr(
@@ -9554,6 +9570,7 @@ fn build_method_call<'ctx>(
         "ZlibWriter" => (ctx.zlib_writer_close, ctx.zlib_writer_write_chunk),
         "ZstdWriter" => (ctx.zstd_writer_close, ctx.zstd_writer_write_chunk),
         "Lz4Writer" => (ctx.lz4_writer_close, ctx.lz4_writer_write_chunk),
+        "BrotliWriter" => (ctx.brotli_writer_close, ctx.brotli_writer_write_chunk),
         _ => unreachable!(),
       };
       if method == "close" {
@@ -9590,7 +9607,9 @@ fn build_method_call<'ctx>(
     // out shape `TlsStream` above establishes.
     if matches!(
       local_classes.get(recv_name).map(String::as_str),
-      Some("GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader" | "Lz4Reader")
+      Some(
+        "GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader" | "Lz4Reader" | "BrotliReader"
+      )
     ) {
       let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
       let (recv_val, _) = build_expr(
@@ -9608,6 +9627,7 @@ fn build_method_call<'ctx>(
         "ZlibReader" => (ctx.zlib_reader_close, ctx.zlib_reader_read_chunk),
         "ZstdReader" => (ctx.zstd_reader_close, ctx.zstd_reader_read_chunk),
         "Lz4Reader" => (ctx.lz4_reader_close, ctx.lz4_reader_read_chunk),
+        "BrotliReader" => (ctx.brotli_reader_close, ctx.brotli_reader_read_chunk),
         _ => unreachable!(),
       };
       if method == "close" {
@@ -11703,6 +11723,40 @@ fn build_method_call<'ctx>(
     return Ok((call_result(call)?, ValKind::Int64));
   }
 
+  // Plan 135's Decision log: `Brotli.compress(data: Bytes, quality:
+  // Int64): Bytes` / `Brotli.decompress(data: Bytes): Bytes` -- the
+  // same generic args-forwarding shape `Zstd` immediately above uses;
+  // `.compress`'s real second `quality: Int64` argument is just one
+  // more entry in the same per-arg build loop.
+  if recv_name == "Brotli" {
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
+    for a in args {
+      let (v, _) = build_expr(
+        context,
+        builder,
+        a,
+        vars,
+        local_classes,
+        local_array_elem_types,
+        ctx,
+      )?;
+      call_args.push(v.into());
+    }
+    let fv = match method {
+      "compress" => ctx.brotli_compress,
+      "decompress" => ctx.brotli_decompress,
+      other => {
+        return Err(format!(
+          "codegen: unsupported Brotli static method `{other}`"
+        ))
+      }
+    };
+    let call = builder
+      .build_call(fv, &call_args, "brotlicompresstmp")
+      .map_err(|e| e.to_string())?;
+    return Ok((call_result(call)?, ValKind::Int64));
+  }
+
   // Plan 130's Decision log: `GzipWriter.open`/`DeflateWriter.open`/
   // `ZlibWriter.open`/`GzipReader.open`/`DeflateReader.open`/
   // `ZlibReader.open` -- the same reserved-namespace static-call shape
@@ -11719,6 +11773,8 @@ fn build_method_call<'ctx>(
       | "ZstdReader"
       | "Lz4Writer"
       | "Lz4Reader"
+      | "BrotliWriter"
+      | "BrotliReader"
   ) {
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
     for a in args {
@@ -11749,6 +11805,8 @@ fn build_method_call<'ctx>(
       "ZstdReader" => ctx.zstd_reader_open,
       "Lz4Writer" => ctx.lz4_writer_open,
       "Lz4Reader" => ctx.lz4_reader_open,
+      "BrotliWriter" => ctx.brotli_writer_open,
+      "BrotliReader" => ctx.brotli_reader_open,
       _ => unreachable!(),
     };
     let call = builder
@@ -25824,6 +25882,52 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 135 (Brotli Compression): `Brotli.compress`'s real second
+  // `quality: Int64` argument crosses as a plain `i64_ty`, the same
+  // convention every other `Int64` value already uses; `BrotliWriter.
+  // open` similarly takes a real second `i64_ty` quality argument
+  // `GzipWriter.open` never needed -- the same shape plan 131's own
+  // `Zstd`/`ZstdWriter` already establish for their own `level: Int64`.
+  let brotli_compress = module.add_function(
+    "emerald_rt_brotli_compress",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let brotli_decompress = module.add_function(
+    "emerald_rt_brotli_decompress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let brotli_writer_open = module.add_function(
+    "emerald_rt_brotli_writer_open",
+    i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let brotli_writer_write_chunk = module.add_function(
+    "emerald_rt_brotli_writer_write_chunk",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let brotli_writer_close = module.add_function(
+    "emerald_rt_brotli_writer_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let brotli_reader_open = module.add_function(
+    "emerald_rt_brotli_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let brotli_reader_read_chunk = module.add_function(
+    "emerald_rt_brotli_reader_read_chunk",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let brotli_reader_close = module.add_function(
+    "emerald_rt_brotli_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 132 (Tar Archives): `Tar.create`'s own `paths: Array[String]`
   // argument crosses as its own already-unpacked `(elements_base:
   // ptr_ty, count: i64_ty)` pair, not the array's header-inclusive
@@ -27889,6 +27993,12 @@ fn compile_to_object_impl(
   // `GzipReader` gap plan 131's own execution already found and fixed.
   newtypes.insert("Lz4Writer".to_string());
   newtypes.insert("Lz4Reader".to_string());
+  // Plan 135's Decision log: `BrotliWriter`/`BrotliReader` -- added
+  // here as well as `NEWTYPE_UNDERLYING` above, per the same
+  // `GzipWriter`/`GzipReader` gap plan 131's own execution already
+  // found and fixed.
+  newtypes.insert("BrotliWriter".to_string());
+  newtypes.insert("BrotliReader".to_string());
   // Plan 163's Decision log: `BigInt` (a `crate::handle`-registry
   // opaque `Int64` handle) — `Decimal` is deliberately NOT added here,
   // since it is an ordinary compiler-synthesized `Type::Class`, not a
@@ -28318,6 +28428,14 @@ fn compile_to_object_impl(
     lz4_reader_open,
     lz4_reader_read_chunk,
     lz4_reader_close,
+    brotli_compress,
+    brotli_decompress,
+    brotli_writer_open,
+    brotli_writer_write_chunk,
+    brotli_writer_close,
+    brotli_reader_open,
+    brotli_reader_read_chunk,
+    brotli_reader_close,
     tar_create,
     tar_extract,
     tar_reader_open,

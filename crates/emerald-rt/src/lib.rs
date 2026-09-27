@@ -155,6 +155,14 @@ mod bignum;
 // `bincode.rs`'s own module doc for the full account.
 #[path = "bincode.rs"]
 mod bincodes;
+// Plan 135 (Brotli Compression) — `Brotli.compress`/`.decompress`,
+// `BrotliWriter`/`BrotliReader`, wrapping `brotli` — see `brotli.rs`'s
+// own module doc. Named `brotlis`, not `brotli` — this crate's own
+// `mod brotli` would shadow the external `brotli` crate this module
+// wraps, the identical collision `zstds`'s own `#[path]` dodge
+// immediately below (alphabetically) already establishes.
+#[path = "brotli.rs"]
+mod brotlis;
 mod bytes;
 mod cbor;
 // Plan 153 (Character Set / Encoding Conversion) — named `charset`,
@@ -4020,6 +4028,90 @@ pub unsafe extern "C" fn emerald_rt_lz4_reader_read_chunk(id: i64, max_len: i64)
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_lz4_reader_close(id: i64) {
   catch_and_raise(move || lz4::lz4_reader_close(id))
+}
+
+// Plan 135 (Brotli Compression): `Brotli.compress`/`.decompress`,
+// `BrotliWriter`/`BrotliReader` — see `brotli.rs`'s own module doc.
+// Every `Bytes` value (parameter or return) crosses this boundary as a
+// plain `i64`, identical to plan 130's/131's/134's `Gzip`/`Zstd`/`Lz4`
+// immediately above; `.compress`'s/`.open`'s real second `quality:
+// Int64` argument crosses as a plain `i64`, the same convention plan
+// 131's own `Zstd.compress`/`ZstdWriter.open` already establish for
+// their own `level: Int64`.
+
+/// `Brotli.compress(data: Bytes, quality: Int64): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_compress(data_id: i64, quality: i64) -> i64 {
+  catch_and_raise(move || brotlis::brotli_compress(data_id, quality))
+}
+
+/// `Brotli.decompress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_decompress(data_id: i64) -> i64 {
+  catch_and_raise(move || brotlis::brotli_decompress(data_id))
+}
+
+/// `BrotliWriter.open(path: String, quality: Int64): BrotliWriter`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_writer_open(path: *const c_char, quality: i64) -> i64 {
+  catch_and_raise(move || brotlis::brotli_writer_open(path, quality))
+}
+
+/// `BrotliWriter#write_chunk(self, data: Bytes): Void`.
+///
+/// # Safety
+/// `id` must be a live `BrotliWriter` handle; `data_id` must be a live
+/// `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_writer_write_chunk(id: i64, data_id: i64) {
+  catch_and_raise(move || brotlis::brotli_writer_write_chunk(id, data_id))
+}
+
+/// `BrotliWriter#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `BrotliWriter` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_writer_close(id: i64) {
+  catch_and_raise(move || brotlis::brotli_writer_close(id))
+}
+
+/// `BrotliReader.open(path: String): BrotliReader`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_reader_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || brotlis::brotli_reader_open(path))
+}
+
+/// `BrotliReader#read_chunk(self, max_len: Int64): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `BrotliReader` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_reader_read_chunk(id: i64, max_len: i64) -> i64 {
+  catch_and_raise(move || brotlis::brotli_reader_read_chunk(id, max_len))
+}
+
+/// `BrotliReader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `BrotliReader` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_brotli_reader_close(id: i64) {
+  catch_and_raise(move || brotlis::brotli_reader_close(id))
 }
 
 // Plan 132 (Tar Archives): `Tar.create`/`.extract`, `TarReader.open`/

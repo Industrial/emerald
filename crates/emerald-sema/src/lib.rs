@@ -5691,6 +5691,87 @@ fn infer_expr_type(
         expr.span,
       ))
     }
+    // Plan 135's Decision log: `Brotli.compress(data: Bytes, quality:
+    // Int64): Bytes` / `Brotli.decompress(data: Bytes): Bytes` — the
+    // same reserved-namespace static-call shape `Zstd` above uses,
+    // with brotli's own real `0..=11` quality range in place of
+    // Zstandard's `1..=22` level range; the underlying crate clamps an
+    // out-of-range value rather than erroring, so this arm does not
+    // pre-validate one either.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if n == "Brotli") =>
+    {
+      let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
+      match method.as_str() {
+        "compress" => {
+          check_args(
+            method,
+            args,
+            &[bytes_ty.clone(), Type::Int64],
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(bytes_ty)
+        }
+        "decompress" => {
+          check_args(
+            method,
+            args,
+            std::slice::from_ref(&bytes_ty),
+            env,
+            sigs,
+            classes,
+            self_fields,
+            gctx,
+          )?;
+          Ok(bytes_ty)
+        }
+        other => Err(Diagnostic::new(
+          format!("Brotli has no static method `{other}`"),
+          expr.span,
+        )),
+      }
+    }
+    // Plan 135's Decision log: `BrotliWriter.open(path: String,
+    // quality: Int64): BrotliWriter` / `BrotliReader.open(path:
+    // String): BrotliReader` — the same reserved-namespace static-call
+    // shape `ZstdWriter.open`/`ZstdReader.open` above use, except
+    // `BrotliWriter.open` takes brotli's own `quality: Int64` parameter
+    // (see `Brotli.compress` above) in place of Zstandard's `level`.
+    Expr::MethodCall(recv, method, args)
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "BrotliWriter" | "BrotliReader")) =>
+    {
+      let recv_name = match &recv.node {
+        Expr::Ident(n) => n.as_str(),
+        _ => unreachable!(),
+      };
+      let self_ty = Type::Newtype(recv_name.to_string(), Box::new(Type::Int64));
+      if method == "open" {
+        let expected_params: Vec<Type> = if recv_name == "BrotliWriter" {
+          vec![Type::String, Type::Int64]
+        } else {
+          vec![Type::String]
+        };
+        check_args(
+          method,
+          args,
+          &expected_params,
+          env,
+          sigs,
+          classes,
+          self_fields,
+          gctx,
+        )?;
+        return Ok(self_ty);
+      }
+      Err(Diagnostic::new(
+        format!("{recv_name} has no static method `{method}`"),
+        expr.span,
+      ))
+    }
     // Plan 132's Decision log: `Tar.create(archive_path: String,
     // paths: Array[String]): Void` / `Tar.extract(archive_path:
     // String, dest_dir: String): Void` — the same reserved-namespace
@@ -7798,7 +7879,7 @@ fn infer_expr_type(
         // carved-out shape `TlsStream` immediately above establishes.
         if matches!(
           name.as_str(),
-          "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter" | "Lz4Writer"
+          "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter" | "Lz4Writer" | "BrotliWriter"
         ) {
           let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
           let (expected_params, ret) = match method.as_str() {
@@ -7829,7 +7910,7 @@ fn infer_expr_type(
         // carved-out shape `TlsStream` above establishes.
         if matches!(
           name.as_str(),
-          "GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader" | "Lz4Reader"
+          "GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader" | "Lz4Reader" | "BrotliReader"
         ) {
           let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
           let (expected_params, ret) = match method.as_str() {
@@ -15552,6 +15633,12 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     // `lz4_flex::frame::{FrameEncoder,FrameDecoder}<File>` respectively.
     "Lz4Writer",
     "Lz4Reader",
+    // Plan 135's Decision log: `BrotliWriter`/`BrotliReader` — the
+    // identical shape, plan 93's own handle registry backed by a
+    // boxed `brotli::{CompressorWriter,Decompressor}<File>`
+    // respectively.
+    "BrotliWriter",
+    "BrotliReader",
     // Plan 132's Decision log: `TarReader` — the identical shape, plan
     // 93's own handle registry backed by a boxed `Vec<(String, Vec<
     // u8>)>` (every entry's name and content, read eagerly by `.open`)
