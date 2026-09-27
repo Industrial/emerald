@@ -99,9 +99,10 @@ unsafe fn read_str<'a>(s: *const c_char) -> Result<&'a str, String> {
 // is intentionally left for the crate's own `SanitizeParams` to clamp,
 // not pre-validated here.
 fn brotli_encoder_params(quality: i64) -> BrotliEncoderParams {
-  let mut params = BrotliEncoderParams::default();
-  params.quality = quality as i32;
-  params
+  BrotliEncoderParams {
+    quality: quality as i32,
+    ..Default::default()
+  }
 }
 
 // --- One-shot `Brotli.compress`/`.decompress` --------------------------
