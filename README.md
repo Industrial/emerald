@@ -51,8 +51,8 @@ emerald test examples/test_framework.em          # PASS/FAIL runner
 
 ## Status, measured
 
-- **43.7k lines of Rust**, 8 crates, **758 tests passing**, 0 clippy warnings — reproducible with `cargo nextest run --workspace`.
-- **10-15% of standard Ruby's language-and-stdlib surface**, by design (see `history/`'s plan-of-plans) — a deliberate ceiling, not a target of 100%.
+- **107k lines of Rust**, 10 crates, **1,353 tests passing** (3 skipped), 0 clippy warnings, 0 new `cargo audit` findings — reproducible with `cargo nextest run --workspace`.
+- **A deliberately curated subset of standard Ruby's language-and-stdlib surface, not a target of 100%** (see `history/`'s plan-of-plans): v1 shipped roughly 10-15%, since expanded by a large native-runtime stdlib batch (networking, crypto, data formats, compression, databases, OS integration, text processing, observability, media codecs) — still growing, so no single current percentage is claimed here. Capabilities that would require `eval`/`method_missing`/monkey-patching/runtime reflection are declined permanently, not deferred.
 - **Benchmarks** (`benchmarks/REPORT.md`, 6 programs × 10 runs × 6 languages, methodology disclosed in full): beats Ruby 6×–43× on every benchmark measured; beats Crystal — the closest existing comparable language — on one benchmark and ties a second, still behind it on the rest; behind C/C++/Rust on all of them, by a gap that's real and only partly explained.
 - **No garbage collector and no ownership system** — a disclosed, currently-permanent design choice (`spec/RUNTIME.md` §1), not a bug. Short-lived programs and arena/actor-scoped allocation are unaffected; unbounded allocation outside a region leaks.
 
@@ -71,6 +71,7 @@ None of this is rounded up. Where a claim couldn't be verified directly it isn't
 | [`editors/README.md`](editors/README.md) | VSCode/Cursor, Neovim, Helix, Zed, MCP client setup |
 | [`benchmarks/REPORT.md`](benchmarks/REPORT.md) | Full performance methodology and results |
 | [`RELEASING.md`](RELEASING.md) | Release process |
+| [`design/README.md`](design/README.md) | Visual identity — gem mark, wordmark, banner, colors; CC0 |
 
 ## Contributing
 
