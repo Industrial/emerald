@@ -322,9 +322,15 @@ fn strip_param_ownership(ty: &TypeExpr) -> (Option<Ownership>, &TypeExpr) {
 fn param_plain_type(
   ty: &TypeExpr,
   classes: &HashMap<String, ClassInfo>,
+  // Plan 22's own scoped alternative (see `resolve_type`'s doc comment):
+  // `Param` carries no span of its own anywhere in this AST (a larger,
+  // separate refactor this plan doesn't take on), so every caller here
+  // passes `(0, 0)` today — an honest, disclosed residual gap, not a
+  // regression from before this plan.
+  span: (usize, usize),
 ) -> Result<Type, Diagnostic> {
   let (_, inner) = strip_param_ownership(ty);
-  resolve_type(inner, classes)
+  resolve_type(inner, classes, span)
 }
 
 /// Shared by classes and modules (plan 12's Decision log — modules reuse
@@ -505,6 +511,16 @@ const NATIVE_GENERIC_NAMES: [&str; 4] = ["Array", "Hash", "Pair", "Result"];
 fn resolve_type(
   texpr: &TypeExpr,
   classes: &HashMap<String, ClassInfo>,
+  // Plan 22's scoped alternative (see this fn's own updated doc comment
+  // below): the annotation's own enclosing span — e.g. a `Let`'s
+  // `stmt.span` — rather than a pinpoint sub-span for which bracketed
+  // part of a compound type is at fault. Propagated unchanged through
+  // every recursive call in this function, since no finer-grained
+  // `TypeExpr`-internal span exists without wrapping `TypeExpr` itself
+  // in `Spanned` (a far larger, higher-risk change this plan explicitly
+  // declined — see the Decision log). Replaces every previously
+  // hardcoded `(0, 0)` in this function.
+  span: (usize, usize),
 ) -> Result<Type, Diagnostic> {
   match texpr {
     // Plan 83's Decision log (`spec/OWNERSHIP.md` §2/§6): `own`/
@@ -527,9 +543,9 @@ fn resolve_type(
          type (spec/OWNERSHIP.md §2) — not as a field, a `Let`, a return type, or nested inside \
          another type"
       ),
-      (0, 0),
+      span,
     )),
-    TypeExpr::Named(name) => resolve_named_type(name, classes),
+    TypeExpr::Named(name) => resolve_named_type(name, classes, span),
     // Plan 88: `Array[Elem]`/`Hash[K, V]`/`Pair[K, V]`/`Result[T, E]`
     // are no longer their own hand-rolled grammar alternatives with
     // their own flat-string format — they're just `TypeExpr::Generic`
@@ -538,26 +554,26 @@ fn resolve_type(
     // directly, so `Array[Array[Int64]]`/`Hash[K, Array[V]]` etc. now
     // genuinely nest — the actual point of this plan's own AST change.
     TypeExpr::Generic(name, args) if name == "Array" => match args.as_slice() {
-      [elem] => Ok(Type::Array(Box::new(resolve_type(elem, classes)?))),
+      [elem] => Ok(Type::Array(Box::new(resolve_type(elem, classes, span)?))),
       _ => Err(Diagnostic::new(
         format!(
           "`Array` takes exactly one type argument, found {}",
           args.len()
         ),
-        (0, 0),
+        span,
       )),
     },
     TypeExpr::Generic(name, args) if name == "Hash" => match args.as_slice() {
       [k, v] => Ok(Type::Hash(
-        Box::new(resolve_type(k, classes)?),
-        Box::new(resolve_type(v, classes)?),
+        Box::new(resolve_type(k, classes, span)?),
+        Box::new(resolve_type(v, classes, span)?),
       )),
       _ => Err(Diagnostic::new(
         format!(
           "`Hash` takes exactly two type arguments, found {}",
           args.len()
         ),
-        (0, 0),
+        span,
       )),
     },
     // Plan 193's Decision log: `Set[T]`/`PriorityQueue[T]` are
@@ -569,11 +585,11 @@ fn resolve_type(
     // silent fallback.
     TypeExpr::Generic(name, args) if name == "Set" => match args.as_slice() {
       [elem] => {
-        let elem_ty = resolve_type(elem, classes)?;
+        let elem_ty = resolve_type(elem, classes, span)?;
         if !matches!(elem_ty, Type::Int64 | Type::String) {
           return Err(Diagnostic::new(
             format!("`Set[T]` supports Int64 or String elements only, found `Set[{elem}]`"),
-            (0, 0),
+            span,
           ));
         }
         Ok(Type::Set(Box::new(elem_ty)))
@@ -583,7 +599,7 @@ fn resolve_type(
           "`Set` takes exactly one type argument, found {}",
           args.len()
         ),
-        (0, 0),
+        span,
       )),
     },
     // Plan 193: `Deque[T]` carries neither `Set`/`PriorityQueue`'s
@@ -591,7 +607,7 @@ fn resolve_type(
     // Serializable`'s own four already-supported primitive types.
     TypeExpr::Generic(name, args) if name == "Deque" => match args.as_slice() {
       [elem] => {
-        let elem_ty = resolve_type(elem, classes)?;
+        let elem_ty = resolve_type(elem, classes, span)?;
         if !matches!(
           elem_ty,
           Type::Int64 | Type::Float64 | Type::String | Type::Boolean
@@ -601,7 +617,7 @@ fn resolve_type(
               "`Deque[T]` supports Int64, Float64, String, or Boolean elements only, found \
                `Deque[{elem}]`"
             ),
-            (0, 0),
+            span,
           ));
         }
         Ok(Type::Deque(Box::new(elem_ty)))
@@ -611,19 +627,19 @@ fn resolve_type(
           "`Deque` takes exactly one type argument, found {}",
           args.len()
         ),
-        (0, 0),
+        span,
       )),
     },
     TypeExpr::Generic(name, args) if name == "PriorityQueue" => match args.as_slice() {
       [elem] => {
-        let elem_ty = resolve_type(elem, classes)?;
+        let elem_ty = resolve_type(elem, classes, span)?;
         if !matches!(elem_ty, Type::Int64 | Type::String) {
           return Err(Diagnostic::new(
             format!(
               "`PriorityQueue[T]` supports Int64 or String elements only, found \
                `PriorityQueue[{elem}]`"
             ),
-            (0, 0),
+            span,
           ));
         }
         Ok(Type::PriorityQueue(Box::new(elem_ty)))
@@ -633,33 +649,33 @@ fn resolve_type(
           "`PriorityQueue` takes exactly one type argument, found {}",
           args.len()
         ),
-        (0, 0),
+        span,
       )),
     },
     TypeExpr::Generic(name, args) if name == "Pair" => match args.as_slice() {
       [k, v] => Ok(Type::Pair(
-        Box::new(resolve_type(k, classes)?),
-        Box::new(resolve_type(v, classes)?),
+        Box::new(resolve_type(k, classes, span)?),
+        Box::new(resolve_type(v, classes, span)?),
       )),
       _ => Err(Diagnostic::new(
         format!(
           "`Pair` takes exactly two type arguments, found {}",
           args.len()
         ),
-        (0, 0),
+        span,
       )),
     },
     TypeExpr::Generic(name, args) if name == "Result" => match args.as_slice() {
       [t, e] => Ok(Type::Result(
-        Box::new(resolve_type(t, classes)?),
-        Box::new(resolve_type(e, classes)?),
+        Box::new(resolve_type(t, classes, span)?),
+        Box::new(resolve_type(e, classes, span)?),
       )),
       _ => Err(Diagnostic::new(
         format!(
           "`Result` takes exactly two type arguments, found {}",
           args.len()
         ),
-        (0, 0),
+        span,
       )),
     },
     // Plan 88: `Proc[Args..., Ret]` resolves DIRECTLY to a real,
@@ -669,9 +685,9 @@ fn resolve_type(
     TypeExpr::Func(params, ret) => {
       let params = params
         .iter()
-        .map(|p| resolve_type(p, classes))
+        .map(|p| resolve_type(p, classes, span))
         .collect::<Result<Vec<_>, _>>()?;
-      let ret = resolve_type(ret, classes)?;
+      let ret = resolve_type(ret, classes, span)?;
       Ok(Type::Proc(params, Box::new(ret)))
     }
     // Plan 58's Decision log: a generic-class instantiation (`Stack[
@@ -695,10 +711,7 @@ fn resolve_type(
       match classes.get(&mangled) {
         Some(info) if info.enum_variants.is_some() => Ok(Type::Enum(mangled)),
         Some(_) => Ok(Type::Class(mangled)),
-        None => Err(Diagnostic::new(
-          format!("unknown type `{name}[...]`"),
-          (0, 0),
-        )),
+        None => Err(Diagnostic::new(format!("unknown type `{name}[...]`"), span)),
       }
     }
     // Legal ONLY as a function's declared return type
@@ -708,7 +721,7 @@ fn resolve_type(
     // shape.
     TypeExpr::Tuple(_) => Err(Diagnostic::new(
       format!("tuple type `{texpr}` is only allowed as a function's declared return type"),
-      (0, 0),
+      span,
     )),
   }
 }
@@ -718,6 +731,7 @@ fn resolve_type(
 fn resolve_named_type(
   name: &str,
   classes: &HashMap<String, ClassInfo>,
+  span: (usize, usize),
 ) -> Result<Type, Diagnostic> {
   match name {
     "Int64" => Ok(Type::Int64),
@@ -774,7 +788,7 @@ fn resolve_named_type(
     // module name is excluded here so `x: MathUtils = ...` correctly
     // falls through to the `unknown type` error below, not `Type::Class`.
     other if classes.get(other).is_some_and(|c| !c.is_module) => Ok(Type::Class(other.to_string())),
-    other => Err(Diagnostic::new(format!("unknown type `{other}`"), (0, 0))),
+    other => Err(Diagnostic::new(format!("unknown type `{other}`"), span)),
   }
 }
 
@@ -1002,7 +1016,7 @@ fn resolve_with_type_param(
   let concrete_texpr = type_to_type_expr(concrete);
   let mut subst: HashMap<&str, &TypeExpr> = HashMap::new();
   subst.insert(param_name, &concrete_texpr);
-  resolve_type(&substitute_type_params(raw, &subst), classes)
+  resolve_type(&substitute_type_params(raw, &subst), classes, (0, 0))
 }
 
 const GENERIC_INSTANTIATION_DEPTH_LIMIT: usize = 32;
@@ -1027,7 +1041,7 @@ fn resolve_substituted_type(
       instantiate_generic_class(base, args, generic_classes, classes, in_progress)?;
     }
   }
-  resolve_type(&substituted, classes)
+  resolve_type(&substituted, classes, (0, 0))
 }
 
 /// Checks a single type argument against a single bound (one entry of a
@@ -1515,7 +1529,7 @@ fn build_generic_enum_info(
           )?;
         }
       }
-      field_types.push(resolve_type(&substituted, classes)?);
+      field_types.push(resolve_type(&substituted, classes, (0, 0))?);
     }
     variants.push((v.name.clone(), field_types));
   }
@@ -1968,7 +1982,7 @@ fn resolve_maybe_generic_type(
       return Ok(Type::Generic(tp.name.clone(), tp.bounds.clone()));
     }
   }
-  match resolve_type(ty, classes) {
+  match resolve_type(ty, classes, (0, 0)) {
     Ok(t) => Ok(t),
     Err(e) => {
       let names: HashSet<&str> = class_type_params
@@ -2032,6 +2046,7 @@ fn type_annotation_string(ty: &Type) -> Option<String> {
 fn resolve_return_type(
   texpr: &TypeExpr,
   classes: &HashMap<String, ClassInfo>,
+  span: (usize, usize),
 ) -> Result<Type, Diagnostic> {
   // Plan 83's Decision log (`spec/OWNERSHIP.md` §2, §10's rule 4): a
   // `borrow`/`borrow var` return type is rejected here, unconditionally
@@ -2058,17 +2073,17 @@ fn resolve_return_type(
          `emerald_region_destroy` at this exact function's return, strictly before the borrow's \
          lexical scope (extending into the caller) could still be live; see spec/OWNERSHIP.md §2"
       ),
-      (0, 0),
+      span,
     ));
   }
   if let TypeExpr::Tuple(parts) = texpr {
     let elem_types = parts
       .iter()
-      .map(|part| resolve_type(part, classes))
+      .map(|part| resolve_type(part, classes, span))
       .collect::<Result<Vec<_>, _>>()?;
     return Ok(Type::Tuple(elem_types));
   }
-  resolve_type(texpr, classes)
+  resolve_type(texpr, classes, span)
 }
 
 /// Plan 59's Decision log: an `unsafe extern "C" { ... }` fn's own
@@ -2167,20 +2182,20 @@ fn function_signature(
   let params = f
     .params
     .iter()
-    .map(|p| param_plain_type(&p.ty, classes))
+    .map(|p| param_plain_type(&p.ty, classes, (0, 0)))
     .collect::<Result<Vec<_>, _>>()?;
   let param_ownership = f
     .params
     .iter()
     .map(|p| strip_param_ownership(&p.ty).0)
     .collect();
-  let return_type = resolve_return_type(&f.return_type, classes)?;
+  let return_type = resolve_return_type(&f.return_type, classes, (0, 0))?;
   let param_names = f.params.iter().map(|p| p.name.clone()).collect();
   let defaults = f.params.iter().map(|p| p.default.clone()).collect();
   let splat_elem = f
     .splat_param
     .as_ref()
-    .map(|p| resolve_type(&p.ty, classes))
+    .map(|p| resolve_type(&p.ty, classes, (0, 0)))
     .transpose()?;
   Ok(FunctionSig {
     params,
@@ -2227,19 +2242,23 @@ fn function_signature_with_subst(
     .collect();
   let params = substituted_param_types
     .iter()
-    .map(|ty| param_plain_type(ty, classes))
+    .map(|ty| param_plain_type(ty, classes, (0, 0)))
     .collect::<Result<Vec<_>, _>>()?;
   let param_ownership = substituted_param_types
     .iter()
     .map(|ty| strip_param_ownership(ty).0)
     .collect();
-  let return_type = resolve_return_type(&substitute_type_params(&f.return_type, subst), classes)?;
+  let return_type = resolve_return_type(
+    &substitute_type_params(&f.return_type, subst),
+    classes,
+    (0, 0),
+  )?;
   let param_names = f.params.iter().map(|p| p.name.clone()).collect();
   let defaults = f.params.iter().map(|p| p.default.clone()).collect();
   let splat_elem = f
     .splat_param
     .as_ref()
-    .map(|p| resolve_type(&substitute_type_params(&p.ty, subst), classes))
+    .map(|p| resolve_type(&substitute_type_params(&p.ty, subst), classes, (0, 0)))
     .transpose()?;
   Ok(FunctionSig {
     params,
@@ -2377,7 +2396,7 @@ fn build_flattened_class_info(
           (0, 0),
         ));
       }
-      fields.insert(f.name.clone(), resolve_type(&f.ty, classes)?);
+      fields.insert(f.name.clone(), resolve_type(&f.ty, classes, (0, 0))?);
       field_owner.insert(f.name.clone(), class_name.clone());
     }
     for m in &c.methods {
@@ -2498,7 +2517,7 @@ fn module_info(
 fn actor_info(a: &ActorDef, classes: &HashMap<String, ClassInfo>) -> Result<ClassInfo, Diagnostic> {
   let mut fields = HashMap::new();
   for f in &a.fields {
-    fields.insert(f.name.clone(), resolve_type(&f.ty, classes)?);
+    fields.insert(f.name.clone(), resolve_type(&f.ty, classes, (0, 0))?);
   }
   let mut methods = HashMap::new();
   for m in &a.methods {
@@ -3656,7 +3675,10 @@ fn infer_expr_type(
           if inner.as_named() == Some(g.type_param.as_str()) {
             Ok(concrete.clone())
           } else {
-            resolve_type(inner, classes)
+            // `expr.span` (the call expression itself) is the closest
+            // available span here — `g.params_raw` carries no span of
+            // its own (plan 22's scoped alternative).
+            resolve_type(inner, classes, expr.span)
           }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3673,7 +3695,7 @@ fn infer_expr_type(
       if g.return_type_raw.as_named() == Some(g.type_param.as_str()) {
         Ok(concrete)
       } else {
-        resolve_type(&g.return_type_raw, classes)
+        resolve_type(&g.return_type_raw, classes, expr.span)
       }
     }
     // Plan 53's Decision log: `is_valid_int`/`parse_digits` are
@@ -4308,11 +4330,14 @@ fn infer_expr_type(
             ..
           } => {
             if ty != class_name {
+              // Plan 22's Part 2: `value.span` (the `{class_name}.spawn(...)`
+              // call itself, already bound above via `value @ ...`) is
+              // narrower than the whole `Let` statement.
               return Err(Diagnostic::new(
                 format!(
                   "`supervise do ... end`: `{name}: {ty} = {class_name}.spawn(...)` — declared type must match the spawned class `{class_name}`"
                 ),
-                stmt.span,
+                value.span,
               ));
             }
             let actual = infer_expr_type(value, env, sigs, classes, self_fields, gctx)?;
@@ -6775,7 +6800,9 @@ fn infer_expr_type(
           if raw.as_named() == Some("Self") {
             Ok(self_ty.clone())
           } else {
-            resolve_type(raw, classes)
+            // `expr.span` — the closest available span (`iface_method`'s
+            // own params carry none, plan 22's scoped alternative).
+            resolve_type(raw, classes, expr.span)
           }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -6792,7 +6819,7 @@ fn infer_expr_type(
       if iface_method.return_type_raw.as_named() == Some("Self") {
         Ok(self_ty)
       } else {
-        resolve_type(&iface_method.return_type_raw, classes)
+        resolve_type(&iface_method.return_type_raw, classes, expr.span)
       }
     }
     // Plan 57 (supervision trees): `.child(:name)` on a `Supervisor`-
@@ -8883,7 +8910,7 @@ fn infer_lambda_type(
   let mut lambda_env = env.clone();
   let mut param_types = Vec::with_capacity(params.len());
   for p in params {
-    let t = resolve_type(&p.ty, classes)?;
+    let t = resolve_type(&p.ty, classes, (0, 0))?;
     param_types.push(t.clone());
     lambda_env.insert(p.name.clone(), t);
   }
@@ -9714,19 +9741,22 @@ fn check_stmt(
     Stmt::Let {
       name,
       ty,
-      value: Spanned {
+      value: value @ Spanned {
         node: Expr::ArrayNew(size),
         ..
       },
       is_var,
     } => {
-      let declared = resolve_type(ty, classes)?;
+      let declared = resolve_type(ty, classes, stmt.span)?;
       if !matches!(declared, Type::Array(_)) {
+        // Plan 22's Part 2: `value.span` (the `Array.new(...)` call
+        // itself) is narrower than the whole `Let` statement (`stmt.span`)
+        // — already available here via the `value @ ...` binding.
         return Err(Diagnostic::new(
           format!(
             "type mismatch in `{name}: {ty} = Array.new(...)`: `Array.new` produces an Array, not {declared:?}"
           ),
-          stmt.span,
+          value.span,
         ));
       }
       let size_ty = infer_expr_type(size, env, sigs, classes, self_fields, gctx)?;
@@ -9750,7 +9780,7 @@ fn check_stmt(
       },
       is_var,
     } => {
-      let declared = resolve_type(ty, classes)?;
+      let declared = resolve_type(ty, classes, stmt.span)?;
       check_result_construction(&declared, value, env, sigs, classes, self_fields, gctx)?;
       declare_local(env, mutable_locals, name, declared, *is_var);
       Ok(())
@@ -9767,7 +9797,7 @@ fn check_stmt(
       is_var,
     } => {
       let unwrapped = check_try(inner, return_type, env, sigs, classes, self_fields, gctx)?;
-      let declared = resolve_type(ty, classes)?;
+      let declared = resolve_type(ty, classes, stmt.span)?;
       if !is_assignable(&unwrapped, &declared) {
         return Err(Diagnostic::new(
           format!(
@@ -9800,13 +9830,13 @@ fn check_stmt(
     Stmt::Let {
       name,
       ty,
-      value: Spanned {
+      value: value @ Spanned {
         node: Expr::New(class_name, args),
         ..
       },
       is_var,
     } if class_name == "Set" || class_name == "Deque" || class_name == "PriorityQueue" => {
-      let declared = resolve_type(ty, classes)?;
+      let declared = resolve_type(ty, classes, stmt.span)?;
       let matches_kind = matches!(
         (&declared, class_name.as_str()),
         (Type::Set(_), "Set")
@@ -9814,21 +9844,29 @@ fn check_stmt(
           | (Type::PriorityQueue(_), "PriorityQueue")
       );
       if !matches_kind {
+        // Plan 22's Part 2: `value.span` (the `{class_name}.new` call
+        // itself) is narrower than the whole `Let` statement.
         return Err(Diagnostic::new(
           format!(
             "type mismatch in `{name}: {ty} = {class_name}.new`: `{class_name}.new` produces a \
              `{class_name}`, not {declared:?}"
           ),
-          stmt.span,
+          value.span,
         ));
       }
       if !args.is_empty() {
+        // Plan 22's Part 2: a span covering the actual excess argument(s)
+        // — already available via `args`, narrower than `stmt.span`.
+        let args_span = (
+          args.first().expect("guarded by !args.is_empty()").span.0,
+          args.last().expect("guarded by !args.is_empty()").span.1,
+        );
         return Err(Diagnostic::new(
           format!(
             "`{class_name}.new` takes no arguments, found {}",
             args.len()
           ),
-          stmt.span,
+          args_span,
         ));
       }
       declare_local(env, mutable_locals, name, declared, *is_var);
@@ -9851,7 +9889,7 @@ fn check_stmt(
       },
       is_var,
     } if matches!(ty, TypeExpr::Generic(base, _) if base == class_name) => {
-      let declared = resolve_type(ty, classes)?;
+      let declared = resolve_type(ty, classes, stmt.span)?;
       let Type::Class(mangled) = &declared else {
         unreachable!("resolve_type's generic-instantiation branch always returns Type::Class");
       };
@@ -9889,7 +9927,7 @@ fn check_stmt(
       value,
       is_var,
     } => {
-      let declared = resolve_type(ty, classes)?;
+      let declared = resolve_type(ty, classes, stmt.span)?;
       // Plan 73's Decision log: an `Option[T]`'s `Some`/`None`
       // construction, the fourth "expected-type-providing position"
       // this compiler now has (mirroring `Ok`/`Err`'s dedicated `Let`
@@ -10629,7 +10667,7 @@ fn check_begin(
   )?;
   for rescue in rescues {
     if let Some(class_name) = &rescue.class_name {
-      let rescue_ty = resolve_type(&TypeExpr::Named(class_name.clone()), classes)?;
+      let rescue_ty = resolve_type(&TypeExpr::Named(class_name.clone()), classes, (0, 0))?;
       if !matches!(rescue_ty, Type::Class(_)) {
         // `RescueClause` carries no span of its own (ast.rs never wraps
         // it in `Spanned` — see plan 22's own scope note); an honest
@@ -12171,21 +12209,21 @@ fn rebuild_purity_env(
   for p in &f.params {
     // Plan 83: `param_plain_type`, matching `check_function_body`'s/
     // `check_method_body`'s own identical param-env-building call.
-    if let Ok(t) = param_plain_type(&p.ty, classes) {
+    if let Ok(t) = param_plain_type(&p.ty, classes, (0, 0)) {
       env.insert(p.name.clone(), t);
     }
   }
   if self_fields.is_none() {
     if let Some(p) = &f.splat_param {
-      if let Ok(elem_ty) = resolve_type(&p.ty, classes) {
+      if let Ok(elem_ty) = resolve_type(&p.ty, classes, (0, 0)) {
         env.insert(p.name.clone(), Type::Array(Box::new(elem_ty)));
       }
     }
   }
   let declared_return = if self_fields.is_some() {
-    resolve_type(&f.return_type, classes).unwrap_or(Type::Void)
+    resolve_type(&f.return_type, classes, (0, 0)).unwrap_or(Type::Void)
   } else {
-    resolve_return_type(&f.return_type, classes).unwrap_or(Type::Void)
+    resolve_return_type(&f.return_type, classes, (0, 0)).unwrap_or(Type::Void)
   };
   // Plan 72: this re-run's result is discarded (see the doc comment
   // above) and `mutable_locals` is never inspected afterward — a fresh,
@@ -14170,7 +14208,7 @@ fn check_function_body(
     // plain underlying type either way (this plan's own disclosed
     // codegen/type-checking passthrough); `check_ownership_call_args`
     // below is what actually enforces the four liveness rules.
-    let plain_ty = param_plain_type(&p.ty, classes)?;
+    let plain_ty = param_plain_type(&p.ty, classes, (0, 0))?;
     let (ownership, _) = strip_param_ownership(&p.ty);
     let mutable_by_value_borrow = matches!(ownership, Some(Ownership::BorrowVar))
       && matches!(
@@ -14191,10 +14229,10 @@ fn check_function_body(
   // it exactly like any other array-typed local. Plan 72: same
   // immutable-by-construction rule as an ordinary parameter above.
   if let Some(p) = &f.splat_param {
-    let elem_ty = resolve_type(&p.ty, classes)?;
+    let elem_ty = resolve_type(&p.ty, classes, (0, 0))?;
     env.insert(p.name.clone(), Type::Array(Box::new(elem_ty)));
   }
-  let declared_return = resolve_return_type(&f.return_type, classes)?;
+  let declared_return = resolve_return_type(&f.return_type, classes, (0, 0))?;
   check_contracts(f, &env, &declared_return, sigs, classes, gctx)?;
   check_block(
     &f.body,
@@ -14305,9 +14343,9 @@ fn check_method_body(
   for p in &m.params {
     // Plan 83: see `check_function_body`'s identical `param_plain_type`
     // call for the full rationale.
-    env.insert(p.name.clone(), param_plain_type(&p.ty, classes)?);
+    env.insert(p.name.clone(), param_plain_type(&p.ty, classes, (0, 0))?);
   }
-  let declared_return = resolve_type(&m.return_type, classes)?;
+  let declared_return = resolve_type(&m.return_type, classes, (0, 0))?;
   // Plan 196's Decision log: a `static` method's body is checked with
   // `self_fields: None` — the exact same no-receiver mechanism `check_
   // function_body`'s own top-level-function body already uses (a
@@ -14530,12 +14568,12 @@ fn check_one_block_call_site(
   diags: &mut Vec<Diagnostic>,
 ) {
   let Some(Spanned {
+    span: blk_span,
     node: Expr::Lambda {
       params: blk_params,
       body: blk_body,
       ..
     },
-    ..
   }) = args.last()
   else {
     let span = args.last().map(|a| a.span).unwrap_or((0, 0));
@@ -14550,7 +14588,10 @@ fn check_one_block_call_site(
   let mut blk_env: HashMap<String, Type> = HashMap::new();
   let mut blk_param_types = Vec::with_capacity(blk_params.len());
   for p in blk_params {
-    let t = match resolve_type(&p.ty, classes) {
+    // The block literal's own span (`*blk_span`) is the closest available
+    // annotation position for a block param's type — `Param` itself
+    // carries no span (plan 22's scoped alternative, see `resolve_type`).
+    let t = match resolve_type(&p.ty, classes, *blk_span) {
       Ok(t) => t,
       Err(d) => {
         diags.push(d);
@@ -14584,7 +14625,7 @@ fn check_one_block_call_site(
   };
   let mut callee_env: HashMap<String, Type> = HashMap::new();
   for p in &callee.params {
-    let t = match resolve_type(&p.ty, classes) {
+    let t = match resolve_type(&p.ty, classes, (0, 0)) {
       Ok(t) => t,
       Err(d) => {
         diags.push(d);
@@ -14648,7 +14689,7 @@ fn check_yields_against_block(
         }
       }
       Stmt::Let { name, ty, .. } => {
-        if let Ok(t) = resolve_type(ty, classes) {
+        if let Ok(t) = resolve_type(ty, classes, stmt.span) {
           env.insert(name.clone(), t);
         }
       }
@@ -14673,7 +14714,7 @@ fn check_yields_against_block(
         check_yields_against_block(body, expected, env, sigs, classes, gctx)?;
         for rescue in rescues {
           if let Some(class_name) = &rescue.class_name {
-            if let Ok(t) = resolve_type(&TypeExpr::Named(class_name.clone()), classes) {
+            if let Ok(t) = resolve_type(&TypeExpr::Named(class_name.clone()), classes, stmt.span) {
               env.insert(rescue.var.clone(), t);
             }
           }
@@ -14900,7 +14941,7 @@ fn register_newtypes(
       ));
       continue;
     }
-    let underlying = match resolve_type(&n.underlying, classes) {
+    let underlying = match resolve_type(&n.underlying, classes, (0, 0)) {
       Ok(t) => t,
       Err(d) => {
         diags.push(d);
@@ -17257,7 +17298,7 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     for v in &e.variants {
       let mut field_types = Vec::new();
       for f in &v.fields {
-        match resolve_type(f, &classes) {
+        match resolve_type(f, &classes, (0, 0)) {
           Ok(t) => field_types.push(t),
           Err(d) => {
             diags.push(d);
@@ -18026,9 +18067,9 @@ fn check_interface_conformance(
     if m.type_params.is_empty() {
       let expected_params = expected_params_raw
         .iter()
-        .map(|(_, raw)| resolve_type(raw, classes))
+        .map(|(_, raw)| resolve_type(raw, classes, (0, 0)))
         .collect::<Result<Vec<_>, _>>()?;
-      let expected_return = resolve_type(&expected_return_raw, classes)?;
+      let expected_return = resolve_type(&expected_return_raw, classes, (0, 0))?;
       let Some(actual) = info.methods.get(&m.method_name) else {
         return Err(Diagnostic::new(
           format!(
@@ -18148,14 +18189,14 @@ fn check_generic_function_body(
     let t = if inner_ty.as_named() == Some(g.type_param.as_str()) {
       Type::Generic(g.type_param.clone(), g.bounds.clone())
     } else {
-      resolve_type(inner_ty, classes)?
+      resolve_type(inner_ty, classes, (0, 0))?
     };
     env.insert(p.name.clone(), t);
   }
   let declared_return = if f.return_type.as_named() == Some(g.type_param.as_str()) {
     Type::Generic(g.type_param.clone(), g.bounds.clone())
   } else {
-    resolve_type(&f.return_type, classes)?
+    resolve_type(&f.return_type, classes, (0, 0))?
   };
   // Plan 72's Decision log: a generic function's own parameter is
   // immutable by construction, same as an ordinary function's — the
@@ -19605,7 +19646,7 @@ mod tests {
       panic!("expected a Function");
     };
     let classes = HashMap::new();
-    let resolved = resolve_type(&f.params[0].ty, &classes).expect("should resolve");
+    let resolved = resolve_type(&f.params[0].ty, &classes, (0, 0)).expect("should resolve");
     assert_eq!(
       resolved,
       Type::Proc(
@@ -20011,6 +20052,76 @@ mod tests {
     assert_eq!(errs[0].span, (0, "break".len()));
   }
 
+  // Plan 22's own remaining gap, closed here: `TypeExpr` had no span of
+  // its own anywhere in this AST (`resolve_type`/`resolve_named_type`/
+  // `resolve_return_type` all hardcoded `(0, 0)`), verified live via a
+  // real `own Int64` misplacement reporting line 1, column 1 regardless
+  // of where the actual annotation was. Fixed via the scoped alternative
+  // (this plan's own Decision log): the annotation's own enclosing
+  // `Let`'s `stmt.span`, threaded as an explicit parameter, replacing
+  // every hardcoded `(0, 0)` in the `resolve_type` family.
+
+  #[test]
+  fn illegal_own_type_position_diagnostic_span_points_at_the_real_let_statement() {
+    // Before this fix: `(0, 0)` — line 1, column 1 — regardless of where
+    // `bad: own Int64 = 5` actually appears in the source.
+    let src = "x: Int64 = 1\ny: Int64 = 2\nbad: own Int64 = 5\nputs bad\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`own` is illegal outside a parameter position");
+    let d = errs
+      .iter()
+      .find(|d| {
+        d.message
+          .contains("is only valid as a function or method parameter")
+      })
+      .expect("expected the illegal-`own`-position diagnostic");
+    let stmt_str = "bad: own Int64 = 5";
+    let start = src
+      .find(stmt_str)
+      .expect("source contains the Let statement");
+    assert_eq!(d.span, (start, start + stmt_str.len()));
+  }
+
+  #[test]
+  fn set_arity_diagnostic_span_points_at_the_real_let_statement() {
+    // `Set` is not a grammar-reserved generic (unlike `Array`/`Hash`/
+    // `Pair`/`Result`, each grammar-fixed to their own exact arity) —
+    // `Set[Int64, Int64]` really does parse, reaching `resolve_type`'s
+    // own arity check. Before this fix: `(0, 0)` — line 1, column 1.
+    let src = "x: Int64 = 1\ny: Int64 = 2\nbad: Set[Int64, Int64] = Set.new()\nputs bad\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`Set` takes exactly one type argument");
+    let d = errs
+      .iter()
+      .find(|d| d.message.contains("`Set` takes exactly one type argument"))
+      .expect("expected the Set-arity diagnostic");
+    let stmt_str = "bad: Set[Int64, Int64] = Set.new()";
+    let start = src
+      .find(stmt_str)
+      .expect("source contains the Let statement");
+    assert_eq!(d.span, (start, start + stmt_str.len()));
+  }
+
+  #[test]
+  fn array_new_type_mismatch_diagnostic_span_is_narrower_than_the_whole_let_statement() {
+    // Part 2's own tightening: `value.span` (the `Array.new(...)` call
+    // itself), not `stmt.span` (the whole `bad: Int64 = Array.new(3)`
+    // statement) — proves the diagnostic excludes the `bad: Int64 = `
+    // declared-type prefix, not just that it's non-degenerate.
+    let src = "bad: Int64 = Array.new(3)\nputs bad\n";
+    let program = emerald_parser::parse(src).expect("should parse");
+    let errs = check_program(&program).expect_err("`Array.new` produces an Array, not Int64");
+    let d = errs
+      .iter()
+      .find(|d| d.message.contains("`Array.new` produces an Array"))
+      .expect("expected the Array.new type-mismatch diagnostic");
+    let call_str = "Array.new(3)";
+    let start = src
+      .find(call_str)
+      .expect("source contains the Array.new call");
+    assert_eq!(d.span, (start, start + call_str.len()));
+  }
+
   // Plan 52 (algebraic data types and exhaustive pattern matching).
 
   const SHAPE_ENUM_WORKED_EXAMPLE: &str = "enum Shape = Circle(Float64) | Square(Float64) | Rectangle(Float64, Float64)\n\ncircle: Shape = Circle(2.0)\nsquare: Shape = Square(3.0)\nrect: Shape = Rectangle(4.0, 5.0)\n\nvar area: Float64 = 0.0\nmatch circle do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch square do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n\nmatch rect do\n  Circle(r) do  area = 3.14159 * r * r\n  end\n  Square(s) do  area = s * s\n  end\n  Rectangle(w, h) do  area = w * h\n  end\nend\nputs area\n";
@@ -20152,7 +20263,7 @@ mod tests {
         TypeExpr::Named("String".to_string()),
       ],
     );
-    let ty = resolve_type(&texpr, &classes).expect("should resolve");
+    let ty = resolve_type(&texpr, &classes, (0, 0)).expect("should resolve");
     assert_eq!(
       ty,
       Type::Result(Box::new(Type::Int64), Box::new(Type::String))
