@@ -3,6 +3,7 @@ name = "emerald-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # Plan 46: the shipped binary is `emerald` (matches `emerald new`/
 # `build`/`run`/legacy invocations); the crate/package name stays

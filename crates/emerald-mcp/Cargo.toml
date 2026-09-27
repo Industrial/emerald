@@ -3,6 +3,7 @@ name = "emerald-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 emerald-driver = { path = "../emerald-driver" }

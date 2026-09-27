@@ -54,12 +54,15 @@
 	},
 	"scripts": {
 		"build": "esbuild extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
-		"vscode:prepublish": "npm run build"
+		"vscode:prepublish": "npm run build",
+		"package": "vsce package",
+		"publish": "vsce publish"
 	},
 	"dependencies": {
 		"vscode-languageclient": "^9.0.0"
 	},
 	"devDependencies": {
+		"@vscode/vsce": "^3.6.2",
 		"esbuild": "^0.28.0"
 	}
 }
