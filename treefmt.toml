@@ -78,9 +78,23 @@ command = "alejandra"
 includes = ["*.nix"]
 priority = 1
 
+# Plan 27: `.github/workflows/release.yml` is genuine, unedited `cargo
+# dist generate` output (see RELEASING.md) -- actionlint's own embedded
+# shellcheck pass flags 5 real but info/style-level findings in it
+# (SC2086 unquoted var, SC2129 redirect style) that this repo's pre-push
+# gate otherwise treats as a hard failure, silently blocking every push
+# since this file first landed (confirmed: `treefmt --fail-on-change=
+# false` exits 1 on these alone, even with zero files changed). The same
+# "don't fight the generator" precedent `formatter.javascript`'s own
+# `package-lock.json` exclusion below already sets for this exact
+# situation. A future `dist generate` re-run would just reproduce the
+# identical findings, so excluding the file here (rather than hand-
+# editing tool output with shellcheck-disable comments that regeneration
+# would strip anyway) is the fix that actually survives a regen.
 [formatter.github-actions]
 command = "actionlint"
 includes = [".github/workflows/*.yml"]
+excludes = [".github/workflows/release.yml"]
 priority = 2
 
 [formatter.bash]
