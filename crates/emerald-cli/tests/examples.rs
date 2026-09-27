@@ -174,6 +174,14 @@ fn strings_em_prints_expected_sequence() {
 }
 
 #[test]
+fn heredoc_em_prints_expected_sequence() {
+  assert_eq!(
+    compile_and_run("heredoc.em"),
+    "Hello, Emerald!\nWelcome to squiggly heredocs.\n\n  first line, indented four spaces\nsecond line, indented two spaces\n    third line, indented six spaces\n\n"
+  );
+}
+
+#[test]
 fn symbols_em_prints_expected_sequence() {
   assert_eq!(compile_and_run("symbols.em"), "82\n100\n1\n0\n");
 }

@@ -28,6 +28,12 @@ mod grammar {
 // on the generated parser) deliberately doesn't have.
 mod interpolate;
 
+// Plan 36 (heredocs): `<<~IDENT` squiggly heredocs — a raw-source
+// preprocessing pass, run before `grammar.lalrpop` ever sees the
+// source. See the module's own doc comment for why this can't be a
+// `match {}` token like every other terminal.
+mod heredoc;
+
 pub use ast::{
   expand_derives, ActorDef, CaseArm, CasePattern, ClassDef, CompareOp, Contract, EnumDef,
   EnumVariant, Expr, ExternBlock, ExternFn, Function, InterfaceDef, Item, ModuleDef, NewtypeDef,
@@ -807,9 +813,26 @@ fn infer_simple_expr_type(
 
 pub fn parse_named(src: &str, name: &str) -> Result<Program, Vec<ParseError>> {
   let mut recovered = Vec::new();
-  // Plan 77: computed once, up front, over the raw source — see
-  // `collect_doc_comments`'s own doc comment for why this has to
-  // happen before the grammar ever runs, not after like `fill_
+  // Plan 36 (heredocs): runs FIRST, before `collect_doc_comments` —
+  // not just before the grammar. `collect_doc_comments` keys its map
+  // by raw byte offset, and those offsets have to line up with the
+  // offsets `grammar::grammar::ProgramParser` itself reports via `@L`
+  // when it parses `src` a few lines down — which is the
+  // heredoc-EXPANDED text, not the original. Expanding first and then
+  // reassigning `src` to the expanded text means every subsequent
+  // offset-based operation in this function (`collect_doc_comments`,
+  // `fill_contract_text`, `rewrite_assert_locations`, and every
+  // `ParseError` span) already agrees, with no special-casing needed —
+  // exactly the same one-`src`-variable-throughout shape this function
+  // had before heredocs existed. `heredoc::expand_heredocs` preserves
+  // the original file's total line count (see its own doc comment), so
+  // a doc comment/declaration textually AFTER a heredoc still gets the
+  // same line number it would have had without this pass.
+  let expanded = heredoc::expand_heredocs(src, name).map_err(|e| vec![e])?;
+  let src = expanded.as_str();
+  // Plan 77: computed once, up front, over the (heredoc-expanded)
+  // source — see `collect_doc_comments`'s own doc comment for why this
+  // has to happen before the grammar ever runs, not after like `fill_
   // contract_text`/`rewrite_assert_locations` below.
   let docs = collect_doc_comments(src);
   let result = grammar::grammar::ProgramParser::new().parse(&mut recovered, &docs, src);
