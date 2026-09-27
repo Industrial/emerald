@@ -5537,8 +5537,13 @@ fn infer_expr_type(
     // `TcpStream#read`/`TlsStream#read` already establish (this plan's
     // own Concrete Proof assigns `Gzip.decompress`'s result straight to
     // a `Bytes`-typed `let`, never through a `match`/`Result`).
+    // Plan 134's Decision log: `Lz4.compress`/`.decompress` joins this
+    // same arm directly — unlike `Zstd` (a real, exposed `level: Int64`
+    // parameter), LZ4's block format has no per-call level knob, so its
+    // `.compress` takes exactly the same single `Bytes` argument
+    // `Gzip`/`Deflate`/`Zlib` already do.
     Expr::MethodCall(recv, method, args)
-      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "Gzip" | "Deflate" | "Zlib")) =>
+      if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(), "Gzip" | "Deflate" | "Zlib" | "Lz4")) =>
     {
       let recv_name = match &recv.node {
         Expr::Ident(n) => n.as_str(),
@@ -5568,10 +5573,16 @@ fn infer_expr_type(
     // `ZlibReader.open` — the same reserved-namespace static-call shape
     // `TcpListener.bind` immediately below uses, plan 93's opaque-
     // handle-plus-explicit-`.close()` model applied to a file-backed
-    // compression stream for the first time in this batch.
+    // compression stream for the first time in this batch. Plan 134's
+    // Decision log: `Lz4Writer.open`/`Lz4Reader.open` join this same
+    // arm directly — like `GzipWriter`/`GzipReader` (and unlike
+    // `ZstdWriter`, which needs its own real `level: Int64` second
+    // parameter), LZ4 has no per-call level knob, so `.open` takes
+    // exactly the same single `path: String` argument.
     Expr::MethodCall(recv, method, args)
       if matches!(&recv.node, Expr::Ident(n) if matches!(n.as_str(),
-        "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "GzipReader" | "DeflateReader" | "ZlibReader")) =>
+        "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "GzipReader" | "DeflateReader" | "ZlibReader"
+          | "Lz4Writer" | "Lz4Reader")) =>
     {
       let recv_name = match &recv.node {
         Expr::Ident(n) => n.as_str(),
@@ -7785,7 +7796,10 @@ fn infer_expr_type(
         // Plan 130's Decision log: `GzipWriter#write_chunk`/`#close`
         // (+ `DeflateWriter`/`ZlibWriter` siblings) — the identical
         // carved-out shape `TlsStream` immediately above establishes.
-        if matches!(name.as_str(), "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter") {
+        if matches!(
+          name.as_str(),
+          "GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter" | "Lz4Writer"
+        ) {
           let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
           let (expected_params, ret) = match method.as_str() {
             "write_chunk" => (vec![bytes_ty], Type::Void),
@@ -7813,7 +7827,10 @@ fn infer_expr_type(
         // (+ `DeflateReader`/`ZlibReader` siblings) — an empty `Bytes`
         // signals EOF, per this plan's own leaf text; the identical
         // carved-out shape `TlsStream` above establishes.
-        if matches!(name.as_str(), "GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader") {
+        if matches!(
+          name.as_str(),
+          "GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader" | "Lz4Reader"
+        ) {
           let bytes_ty = Type::Newtype("Bytes".to_string(), Box::new(Type::Int64));
           let (expected_params, ret) = match method.as_str() {
             "read_chunk" => (vec![Type::Int64], bytes_ty),
@@ -15530,6 +15547,11 @@ pub fn check_program(program: &Program) -> Result<(), Vec<Diagnostic>> {
     // boxed `zstd::stream::{Encoder,Decoder}<File>` respectively.
     "ZstdWriter",
     "ZstdReader",
+    // Plan 134's Decision log: `Lz4Writer`/`Lz4Reader` — the identical
+    // shape, plan 93's own handle registry backed by a boxed
+    // `lz4_flex::frame::{FrameEncoder,FrameDecoder}<File>` respectively.
+    "Lz4Writer",
+    "Lz4Reader",
     // Plan 132's Decision log: `TarReader` — the identical shape, plan
     // 93's own handle registry backed by a boxed `Vec<(String, Vec<
     // u8>)>` (every entry's name and content, read eagerly by `.open`)

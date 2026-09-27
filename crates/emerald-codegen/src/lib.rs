@@ -243,6 +243,10 @@ fn set_newtype_underlying(program: &Program) {
     // identical shape.
     "ZstdWriter",
     "ZstdReader",
+    // Plan 134's Decision log: `Lz4Writer`/`Lz4Reader` -- the identical
+    // shape.
+    "Lz4Writer",
+    "Lz4Reader",
     // Plan 132's Decision log: `TarReader` -- the identical shape.
     "TarReader",
     // Plan 133's Decision log: `ZipReader` -- the identical shape.
@@ -5554,6 +5558,16 @@ struct Ctx<'a, 'ctx> {
   zstd_reader_open: FunctionValue<'ctx>,
   zstd_reader_read_chunk: FunctionValue<'ctx>,
   zstd_reader_close: FunctionValue<'ctx>,
+  // Plan 134 (LZ4 Compression) -- `Lz4.compress`/`.decompress`,
+  // `Lz4Writer`/`Lz4Reader`, wrapping `lz4_flex`.
+  lz4_compress: FunctionValue<'ctx>,
+  lz4_decompress: FunctionValue<'ctx>,
+  lz4_writer_open: FunctionValue<'ctx>,
+  lz4_writer_write_chunk: FunctionValue<'ctx>,
+  lz4_writer_close: FunctionValue<'ctx>,
+  lz4_reader_open: FunctionValue<'ctx>,
+  lz4_reader_read_chunk: FunctionValue<'ctx>,
+  lz4_reader_close: FunctionValue<'ctx>,
   /// Plan 132 (Tar Archives) — `Tar.create`/`.extract`, `TarReader.
   /// open`/`.next_entry`/`.entry_size`/`.read_entry_data`/`.close`,
   /// wrapping `tar`.
@@ -9522,7 +9536,7 @@ fn build_method_call<'ctx>(
     // out shape `TlsStream` above establishes.
     if matches!(
       local_classes.get(recv_name).map(String::as_str),
-      Some("GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter")
+      Some("GzipWriter" | "DeflateWriter" | "ZlibWriter" | "ZstdWriter" | "Lz4Writer")
     ) {
       let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
       let (recv_val, _) = build_expr(
@@ -9539,6 +9553,7 @@ fn build_method_call<'ctx>(
         "DeflateWriter" => (ctx.deflate_writer_close, ctx.deflate_writer_write_chunk),
         "ZlibWriter" => (ctx.zlib_writer_close, ctx.zlib_writer_write_chunk),
         "ZstdWriter" => (ctx.zstd_writer_close, ctx.zstd_writer_write_chunk),
+        "Lz4Writer" => (ctx.lz4_writer_close, ctx.lz4_writer_write_chunk),
         _ => unreachable!(),
       };
       if method == "close" {
@@ -9575,7 +9590,7 @@ fn build_method_call<'ctx>(
     // out shape `TlsStream` above establishes.
     if matches!(
       local_classes.get(recv_name).map(String::as_str),
-      Some("GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader")
+      Some("GzipReader" | "DeflateReader" | "ZlibReader" | "ZstdReader" | "Lz4Reader")
     ) {
       let class_name = local_classes.get(recv_name).map(String::as_str).unwrap();
       let (recv_val, _) = build_expr(
@@ -9592,6 +9607,7 @@ fn build_method_call<'ctx>(
         "DeflateReader" => (ctx.deflate_reader_close, ctx.deflate_reader_read_chunk),
         "ZlibReader" => (ctx.zlib_reader_close, ctx.zlib_reader_read_chunk),
         "ZstdReader" => (ctx.zstd_reader_close, ctx.zstd_reader_read_chunk),
+        "Lz4Reader" => (ctx.lz4_reader_close, ctx.lz4_reader_read_chunk),
         _ => unreachable!(),
       };
       if method == "close" {
@@ -11622,7 +11638,7 @@ fn build_method_call<'ctx>(
   // argument/return is a plain `i64_ty` `Bytes` value (see `gzip.rs`'s
   // own module doc), so this dispatch just builds the one arg and
   // forwards it.
-  if matches!(recv_name.as_str(), "Gzip" | "Deflate" | "Zlib") {
+  if matches!(recv_name.as_str(), "Gzip" | "Deflate" | "Zlib" | "Lz4") {
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
     for a in args {
       let (v, _) = build_expr(
@@ -11643,6 +11659,8 @@ fn build_method_call<'ctx>(
       ("Deflate", "decompress") => ctx.deflate_decompress,
       ("Zlib", "compress") => ctx.zlib_compress,
       ("Zlib", "decompress") => ctx.zlib_decompress,
+      ("Lz4", "compress") => ctx.lz4_compress,
+      ("Lz4", "decompress") => ctx.lz4_decompress,
       (name, other) => {
         return Err(format!(
           "codegen: unsupported {name} static method `{other}`"
@@ -11699,6 +11717,8 @@ fn build_method_call<'ctx>(
       | "ZlibReader"
       | "ZstdWriter"
       | "ZstdReader"
+      | "Lz4Writer"
+      | "Lz4Reader"
   ) {
     let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
     for a in args {
@@ -11727,6 +11747,8 @@ fn build_method_call<'ctx>(
       "ZlibReader" => ctx.zlib_reader_open,
       "ZstdWriter" => ctx.zstd_writer_open,
       "ZstdReader" => ctx.zstd_reader_open,
+      "Lz4Writer" => ctx.lz4_writer_open,
+      "Lz4Reader" => ctx.lz4_reader_open,
       _ => unreachable!(),
     };
     let call = builder
@@ -25758,6 +25780,50 @@ fn compile_to_object_impl(
     void_ty.fn_type(&[i64_ty.into()], false),
     Some(Linkage::External),
   );
+  // Plan 134 (LZ4 Compression): `Lz4.compress`/`.decompress`/
+  // `Lz4Writer`/`Lz4Reader` all cross the FFI boundary with the exact
+  // same shapes as plan 130's `Gzip`/`GzipWriter`/`GzipReader` -- no
+  // real `level: Int64` parameter the way plan 131's `Zstd` needs.
+  let lz4_compress = module.add_function(
+    "emerald_rt_lz4_compress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let lz4_decompress = module.add_function(
+    "emerald_rt_lz4_decompress",
+    i64_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let lz4_writer_open = module.add_function(
+    "emerald_rt_lz4_writer_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let lz4_writer_write_chunk = module.add_function(
+    "emerald_rt_lz4_writer_write_chunk",
+    void_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let lz4_writer_close = module.add_function(
+    "emerald_rt_lz4_writer_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let lz4_reader_open = module.add_function(
+    "emerald_rt_lz4_reader_open",
+    i64_ty.fn_type(&[ptr_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let lz4_reader_read_chunk = module.add_function(
+    "emerald_rt_lz4_reader_read_chunk",
+    i64_ty.fn_type(&[i64_ty.into(), i64_ty.into()], false),
+    Some(Linkage::External),
+  );
+  let lz4_reader_close = module.add_function(
+    "emerald_rt_lz4_reader_close",
+    void_ty.fn_type(&[i64_ty.into()], false),
+    Some(Linkage::External),
+  );
   // Plan 132 (Tar Archives): `Tar.create`'s own `paths: Array[String]`
   // argument crosses as its own already-unpacked `(elements_base:
   // ptr_ty, count: i64_ty)` pair, not the array's header-inclusive
@@ -27818,6 +27884,11 @@ fn compile_to_object_impl(
   // newtype, not just one.
   newtypes.insert("ZstdWriter".to_string());
   newtypes.insert("ZstdReader".to_string());
+  // Plan 134's Decision log: `Lz4Writer`/`Lz4Reader` -- added here as
+  // well as `NEWTYPE_UNDERLYING` above, per the same `GzipWriter`/
+  // `GzipReader` gap plan 131's own execution already found and fixed.
+  newtypes.insert("Lz4Writer".to_string());
+  newtypes.insert("Lz4Reader".to_string());
   // Plan 163's Decision log: `BigInt` (a `crate::handle`-registry
   // opaque `Int64` handle) — `Decimal` is deliberately NOT added here,
   // since it is an ordinary compiler-synthesized `Type::Class`, not a
@@ -28239,6 +28310,14 @@ fn compile_to_object_impl(
     zstd_reader_open,
     zstd_reader_read_chunk,
     zstd_reader_close,
+    lz4_compress,
+    lz4_decompress,
+    lz4_writer_open,
+    lz4_writer_write_chunk,
+    lz4_writer_close,
+    lz4_reader_open,
+    lz4_reader_read_chunk,
+    lz4_reader_close,
     tar_create,
     tar_extract,
     tar_reader_open,

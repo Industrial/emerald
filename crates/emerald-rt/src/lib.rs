@@ -227,6 +227,12 @@ mod json;
 mod jwt;
 mod kdf;
 mod log;
+// Plan 134 (LZ4 Compression) — `Lz4.compress`/`.decompress`,
+// `Lz4Writer`/`Lz4Reader`, wrapping `lz4_flex` — see `lz4.rs`'s own
+// module doc. No external-crate-name collision to dodge (the wrapped
+// crate is `lz4_flex`, not `lz4`), unlike `zstds`'s own `#[path]`
+// dodge immediately below.
+mod lz4;
 mod math;
 // Plan 125 (Binary Serialization: bincode/msgpack), `MessagePack`
 // half — wraps `rmp-serde`; no external-crate-name collision to dodge
@@ -3934,6 +3940,86 @@ pub unsafe extern "C" fn emerald_rt_zstd_reader_read_chunk(id: i64, max_len: i64
 #[no_mangle]
 pub unsafe extern "C" fn emerald_rt_zstd_reader_close(id: i64) {
   catch_and_raise(move || zstds::zstd_reader_close(id))
+}
+
+// Plan 134 (LZ4 Compression): `Lz4.compress`/`.decompress`,
+// `Lz4Writer`/`Lz4Reader` — see `lz4.rs`'s own module doc. Every
+// `Bytes` value (parameter or return) crosses this boundary as a plain
+// `i64`, identical to plan 130's/131's `Gzip`/`Zstd` immediately above.
+
+/// `Lz4.compress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_compress(data_id: i64) -> i64 {
+  catch_and_raise(move || lz4::lz4_compress(data_id))
+}
+
+/// `Lz4.decompress(data: Bytes): Bytes`.
+///
+/// # Safety
+/// `data_id` must be a live `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_decompress(data_id: i64) -> i64 {
+  catch_and_raise(move || lz4::lz4_decompress(data_id))
+}
+
+/// `Lz4Writer.open(path: String): Lz4Writer`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_writer_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || lz4::lz4_writer_open(path))
+}
+
+/// `Lz4Writer#write_chunk(self, data: Bytes): Void`.
+///
+/// # Safety
+/// `id` must be a live `Lz4Writer` handle; `data_id` must be a live
+/// `Bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_writer_write_chunk(id: i64, data_id: i64) {
+  catch_and_raise(move || lz4::lz4_writer_write_chunk(id, data_id))
+}
+
+/// `Lz4Writer#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `Lz4Writer` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_writer_close(id: i64) {
+  catch_and_raise(move || lz4::lz4_writer_close(id))
+}
+
+/// `Lz4Reader.open(path: String): Lz4Reader`.
+///
+/// # Safety
+/// `path`, if non-null, must point to a valid, NUL-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_reader_open(path: *const c_char) -> i64 {
+  catch_and_raise(move || lz4::lz4_reader_open(path))
+}
+
+/// `Lz4Reader#read_chunk(self, max_len: Int64): Bytes`.
+///
+/// # Safety
+/// `id` must be a live `Lz4Reader` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_reader_read_chunk(id: i64, max_len: i64) -> i64 {
+  catch_and_raise(move || lz4::lz4_reader_read_chunk(id, max_len))
+}
+
+/// `Lz4Reader#close(self): Void`.
+///
+/// # Safety
+/// `id` must be a live `Lz4Reader` handle.
+#[no_mangle]
+pub unsafe extern "C" fn emerald_rt_lz4_reader_close(id: i64) {
+  catch_and_raise(move || lz4::lz4_reader_close(id))
 }
 
 // Plan 132 (Tar Archives): `Tar.create`/`.extract`, `TarReader.open`/

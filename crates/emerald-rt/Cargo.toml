@@ -542,6 +542,32 @@ flate2 = { version = "1.1.10", default-features = false, features = [
 # 404 — no advisory ever filed). `Zstd.compress`/`.decompress`,
 # `ZstdWriter`/`ZstdReader`'s direct backing. See DEPENDENCIES.md.
 zstd = { version = "0.14", default-features = false }
+# Plan 134 (LZ4 Compression): `lz4_flex` 0.14.0 (already resolved into
+# this workspace's local registry cache at this plan's own execution
+# time), a from-scratch, pure-Rust LZ4 implementation with zero C
+# dependencies (`PSeitz/lz4_flex`) — the maintainer's own published
+# benchmarks report it beating or closely matching `lzzz` (a real
+# `liblz4` C binding) on both compression and decompression throughput,
+# so the pure-Rust choice here is not a compromise against a C-bound
+# alternative, unlike plan 131's own `zstd`. `default-features = false,
+# features = ["frame"]` keeps the crate's own real default `safe-
+# encode`/`safe-decode` features enabled (bounds-checked, zero
+# `unsafe`, per the crate's own README) rather than trading that
+# guarantee for the documented ~25-35% faster `unsafe` path — the same
+# conservative-safety call plan 130's own `miniz_oxide`-over-`zlib-rs`
+# pin already makes — and adds `frame`, the LZ4 Frame format
+# `Lz4Writer`/`Lz4Reader`'s streaming API needs on top of the crate's
+# other, in-memory-only block format (`Lz4.compress`/`.decompress`'s
+# own backing, via `compress_prepend_size`/`decompress_size_prepended`).
+# No RustSec advisory found. `Lz4Writer`/`Lz4Reader`'s own
+# `FrameEncoder`/`FrameDecoder` are used at the crate's real, unmodified
+# default `FrameInfo` (`#[derive(Default)]`: `BlockSize::Auto`,
+# `BlockMode::Independent`, no block/content checksum, no dictionary) —
+# read directly from `frame/header.rs` this session and found to already
+# suit this plan's own stated proof (a full round trip through a real
+# file/in-memory buffer); no Emerald-level `FrameInfo` configuration
+# surface is exposed in v1. See DEPENDENCIES.md.
+lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
 # Plan 132 (Tar Archives): `tar` 0.4.46 (real, current pin at this
 # plan's own authoring time, verified against its own `README.md`/
 # `Cargo.toml` on `alexcrichton/tar-rs`'s `main` branch) - the de facto

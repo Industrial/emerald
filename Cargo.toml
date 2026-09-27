@@ -57,3 +57,38 @@ install-updater = false
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Plan 134 (LZ4 Compression): a real, disclosed finding from this
+# plan's own EXECUTE-time speed-comparison test (`crates/emerald-rt/
+# src/lz4.rs`'s own `#[cfg(test)]` module) — `zstd`'s own C backend
+# (`zstd-sys`, `cc`-compiled) is always built at the C compiler's own
+# optimization level regardless of Cargo's Rust-side profile, so it
+# stays fast under a plain `cargo test`; `lz4_flex` is pure Rust and
+# would otherwise compile fully unoptimized under the ordinary `dev`/
+# `test` profile `cargo test` uses by default, an apples-to-oranges
+# comparison that (measured directly this session) actually reversed
+# the real, published, optimized-build throughput relationship this
+# plan's own Decision log documents. `opt-level = 3` scoped to just
+# this one, small dependency (not a blanket `[profile.dev]` override,
+# which would slow every other crate's own dev/test build) restores a
+# fair comparison — matching Cargo's own documented use case for
+# `[profile.dev.package]` overrides (a slow pure-Rust dependency in an
+# otherwise fast-iterating dev build) — but only for the half of the
+# test this override alone can reach: see `lz4.rs`'s own test module
+# comment for the other half of this same finding (`lz4_flex`'s own
+# decompression path still gets re-codegen'd at the CALLING crate's own
+# unoptimized level via ordinary per-crate monomorphization, which this
+# package override cannot reach at all, since Cargo never applies a
+# package override to "the primary package" being built/tested) — see
+# `lz4.rs`'s own test comment for the full account, including why the
+# comparative speed assertion this override exists for is `#[ignore]`d
+# by default rather than paired with a root-level `[profile.test]`
+# override: a workspace-wide test-profile change is a permanent compile-
+# time cost on every future `cargo test` run for every crate, a
+# disproportionate price for one comparative micro-benchmark when the
+# correctness tests (round-trip, zero-length, non-UTF8, streaming) need
+# no such override at all. This narrower, Cargo-documented-use-case
+# override (a single slow-in-debug pure-Rust dependency) is kept since
+# it's cheap and correctly scoped; the root-level one was reverted.
+[profile.dev.package.lz4_flex]
+opt-level = 3

@@ -923,6 +923,19 @@ fn zstd_roundtrip_em_prints_expected_sequence() {
   );
 }
 
+// Plan 134 (LZ4 Compression): `Lz4.compress`/`.decompress` round-
+// tripping a real, repetitive input plus a zero-length edge case — see
+// `examples/lz4_roundtrip.em`'s own header comment for the real,
+// disclosed adaptations from the plan's own literal Concrete Proof
+// text, reused verbatim from plan 130's own `gzip_roundtrip.em`/plan
+// 131's own `zstd_roundtrip.em`, plus one new difference: `Bytes.
+// length` (plan 125) is used directly for the compression-ratio check,
+// since this plan executes after that method already existed.
+#[test]
+fn lz4_roundtrip_em_prints_expected_sequence() {
+  assert_eq!(compile_and_run("lz4_roundtrip.em"), "true\ntrue\ntrue\n");
+}
+
 // Plan 144 (Extended Filesystem Operations): `Dir.entries`/`.entries_
 // count`/`.walk`/`.walk_count` (non-recursive `std::fs::read_dir` +
 // recursive, symlink-cycle-safe `walkdir` traversal) and `Path.exists`/
